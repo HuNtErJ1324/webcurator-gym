@@ -1,0 +1,398 @@
+"""Cutoff-filtered Hugging Face universe access.
+
+The `DatasetSearchClient` Protocol keeps the environment testable with a fake
+client, while `HuggingFaceDatasetClient` provides the live Hub implementation.
+
+External access is wrapped with timeouts, bounded retry/backoff, typed errors
+(`DatasetAccessError`), and a process-wide concurrency bound so a flaky or
+missing dataset never crashes a tool call or the reward pass.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import weakref
+from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
+from typing import Any, Callable, Protocol, TypeVar
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# Error kinds that are deterministic facts about the request and must NOT be
+# retried (the answer will not change); everything else is treated as transient.
+PERMANENT_KINDS = frozenset(
+    {"missing", "auth", "bad_split", "bad_config", "bad_field"}
+)
+
+
+class DatasetAccessError(RuntimeError):
+    """A classified, structured failure accessing the Hugging Face Hub.
+
+    `kind` is one of: ``missing``, ``auth``, ``bad_split``, ``bad_config``,
+    ``bad_field``, ``network``, ``timeout``, ``unknown``.
+    """
+
+    def __init__(
+        self, message: str, *, kind: str = "unknown", dataset_id: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.dataset_id = dataset_id
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "error": str(self),
+            "error_kind": self.kind,
+            "dataset_id": self.dataset_id,
+        }
+
+
+def classify_exception(exc: BaseException) -> str:
+    """Map an arbitrary access exception onto a stable `DatasetAccessError.kind`.
+
+    Classification is intentionally duck-typed (by class name and message text)
+    so it works regardless of which optional `datasets`/`huggingface_hub` error
+    classes are importable at runtime, and so tests can simulate failures with
+    plain exceptions.
+    """
+    if isinstance(exc, DatasetAccessError):
+        return exc.kind
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    if name in {"DatasetNotFoundError", "RepositoryNotFoundError", "EntryNotFoundError"}:
+        return "missing"
+    if name in {"GatedRepoError", "UnauthorizedError", "PaymentRequiredError"}:
+        return "auth"
+    if name in {"ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout"}:
+        return "network"
+    if "401" in msg or "403" in msg or "unauthorized" in msg or "authentication" in msg:
+        return "auth"
+    if "gated" in msg or "private" in msg or "access to this dataset" in msg:
+        return "auth"
+    if "404" in msg or "not found" in msg or "doesn't exist" in msg or "does not exist" in msg:
+        return "missing"
+    if "split" in msg and ("unknown" in msg or "invalid" in msg or "not" in msg):
+        return "bad_split"
+    if "config" in msg or "builderconfig" in msg or "subset" in msg:
+        return "bad_config"
+    if (
+        isinstance(exc, KeyError)
+        or "column" in msg
+        or "text_field" in msg
+        or "field" in msg
+        or "key" in msg
+    ):
+        return "bad_field"
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "network"
+    if "timed out" in msg or "timeout" in msg:
+        return "timeout"
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class FetchKey:
+    """Deterministic cache identity for a sampled document slice.
+
+    Two fetches with the same `(dataset_id, config, split, text_field, n)` MUST
+    observe identical documents (so a preview and final scoring agree, and cost
+    is charged once).
+    """
+
+    dataset_id: str
+    config: str | None
+    split: str
+    text_field: str
+    n: int
+
+    def as_str(self) -> str:
+        return json.dumps(
+            [self.dataset_id, self.config, self.split, self.text_field, self.n],
+            separators=(",", ":"),
+        )
+
+
+@dataclass
+class RetryPolicy:
+    """Bounded retry/backoff + per-attempt timeout for blocking external calls."""
+
+    attempts: int = 3
+    base_delay: float = 0.05
+    max_delay: float = 2.0
+    timeout: float = 30.0
+
+
+# Loop-local concurrency bound for Hub fetches. Semaphores are bound to the
+# running event loop on first use, so we key one per loop (a rare, explicitly
+# sanctioned process-level handle). Finished loops are dropped automatically.
+_FETCH_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def loop_local_semaphore(
+    registry: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]",
+    limit: int,
+) -> asyncio.Semaphore:
+    """Return the loop-local semaphore, bound to the MOST RESTRICTIVE limit yet
+    requested for that loop (a later, smaller limit tightens it, so a second env
+    instance sharing the loop never inherits a larger bound than it asked for).
+    """
+    loop = asyncio.get_running_loop()
+    sem = registry.get(loop)
+    if sem is None or getattr(sem, "_pdc_limit", limit) > limit:
+        sem = asyncio.Semaphore(limit)
+        sem._pdc_limit = limit  # remember the bound, so a smaller later limit wins
+        registry[loop] = sem
+    return sem
+
+
+def hf_fetch_semaphore(limit: int) -> asyncio.Semaphore:
+    """Process-wide (loop-local) bound on concurrent Hugging Face fetches."""
+    return loop_local_semaphore(_FETCH_SEMAPHORES, limit)
+
+
+async def run_blocking_with_retry(
+    fn: Callable[[], T],
+    *,
+    policy: RetryPolicy,
+    semaphore: asyncio.Semaphore,
+    dataset_id: str | None = None,
+) -> T:
+    """Run a blocking callable off the event loop with bound+timeout+retry.
+
+    Offloads `fn` via `asyncio.to_thread`, caps each attempt with
+    `asyncio.wait_for`, retries transient failures with exponential backoff, and
+    raises a classified `DatasetAccessError` on permanent failure or exhaustion.
+    """
+    last: DatasetAccessError | None = None
+    for attempt in range(1, policy.attempts + 1):
+        try:
+            async with semaphore:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(fn), timeout=policy.timeout
+                )
+        except (asyncio.TimeoutError, TimeoutError):
+            last = DatasetAccessError(
+                f"access to {dataset_id or 'dataset'} timed out after "
+                f"{policy.timeout}s",
+                kind="timeout",
+                dataset_id=dataset_id,
+            )
+        except DatasetAccessError as exc:
+            last = exc
+            if exc.kind in PERMANENT_KINDS:
+                raise
+        except Exception as exc:  # noqa: BLE001 - classify, then decide retry
+            kind = classify_exception(exc)
+            err = DatasetAccessError(
+                str(exc) or type(exc).__name__, kind=kind, dataset_id=dataset_id
+            )
+            if kind in PERMANENT_KINDS:
+                raise err from exc
+            last = err
+        if attempt < policy.attempts:
+            await asyncio.sleep(
+                min(policy.base_delay * (2 ** (attempt - 1)), policy.max_delay)
+            )
+    assert last is not None  # loop runs at least once
+    logger.warning("HF access failed after %d attempts: %s", policy.attempts, last)
+    raise last
+
+
+async def fetch_documents(
+    sample_fn: Callable[[str, str | None, str, str, int], list[str]],
+    key: FetchKey,
+    *,
+    policy: RetryPolicy,
+    semaphore: asyncio.Semaphore,
+) -> list[str]:
+    """Fetch documents for `key` via `sample_fn`, robustly. Raises DatasetAccessError."""
+
+    def _call() -> list[str]:
+        return list(
+            sample_fn(key.dataset_id, key.config, key.split, key.text_field, key.n)
+        )
+
+    return await run_blocking_with_retry(
+        _call, policy=policy, semaphore=semaphore, dataset_id=key.dataset_id
+    )
+
+
+async def search_with_retry(
+    search_fn: Callable[[str, int], list[Any]],
+    query: str,
+    scan_limit: int,
+    *,
+    policy: RetryPolicy,
+    semaphore: asyncio.Semaphore,
+) -> list[Any]:
+    """Search the Hub via `search_fn`, robustly. Raises DatasetAccessError."""
+
+    def _call() -> list[Any]:
+        return list(search_fn(query, scan_limit))
+
+    return await run_blocking_with_retry(_call, policy=policy, semaphore=semaphore)
+
+
+@dataclass(frozen=True)
+class DatasetCandidate:
+    dataset_id: str
+    modified_at: datetime
+    downloads: int
+    likes: int
+    tags: tuple[str, ...]
+    source: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "dataset_id": self.dataset_id,
+            "modified_at": self.modified_at.date().isoformat(),
+            "downloads": self.downloads,
+            "likes": self.likes,
+            "tags": list(self.tags),
+            "source": self.source,
+        }
+
+
+class DatasetSearchClient(Protocol):
+    def search_datasets(self, query: str, scan_limit: int) -> list[Any]: ...
+
+    def sample_documents(
+        self,
+        dataset_id: str,
+        config: str | None,
+        split: str,
+        text_field: str,
+        n: int,
+    ) -> list[str]: ...
+
+
+class HuggingFaceDatasetClient:
+    """Live Hugging Face Hub client (search + streaming document sampling)."""
+
+    def __init__(self, token: str) -> None:
+        from huggingface_hub import HfApi
+
+        self._api = HfApi(token=token)
+        self._token = token
+
+    def search_datasets(self, query: str, scan_limit: int) -> list[Any]:
+        return list(
+            self._api.list_datasets(
+                search=query,
+                limit=scan_limit,
+                expand=["lastModified", "downloads", "likes", "tags"],
+                token=True,
+            )
+        )
+
+    def sample_documents(
+        self,
+        dataset_id: str,
+        config: str | None,
+        split: str,
+        text_field: str,
+        n: int,
+    ) -> list[str]:
+        from datasets import load_dataset
+
+        stream = load_dataset(
+            dataset_id,
+            name=config,
+            split=split,
+            streaming=True,
+            token=self._token,
+        )
+        docs: list[str] = []
+        for i, row in enumerate(stream):
+            if i >= n:
+                break
+            value = row.get(text_field) if isinstance(row, dict) else None
+            if not isinstance(value, str):
+                value = row.get("text") if isinstance(row, dict) else None
+            if isinstance(value, str) and value.strip():
+                docs.append(value)
+        return docs
+
+
+def parse_cutoff(cutoff_date: str | date | datetime) -> datetime:
+    """Parse a cutoff into a UTC datetime; date-only values cover the whole day."""
+    if isinstance(cutoff_date, datetime):
+        parsed = cutoff_date
+    elif isinstance(cutoff_date, date):
+        parsed = datetime.combine(cutoff_date, time.max)
+    else:
+        raw = cutoff_date.strip()
+        if not raw:
+            raise ValueError("cutoff_date must not be empty")
+        if "T" in raw:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        else:
+            parsed = datetime.combine(date.fromisoformat(raw), time.max)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def candidate_from_info(info: Any) -> DatasetCandidate | None:
+    """Convert a raw Hub search result into a `DatasetCandidate`, or None."""
+    dataset_id = getattr(info, "id", None)
+    modified_at = getattr(info, "last_modified", None) or getattr(
+        info, "lastModified", None
+    )
+    if not dataset_id or not isinstance(modified_at, datetime):
+        return None
+    if modified_at.tzinfo is None:
+        modified_at = modified_at.replace(tzinfo=timezone.utc)
+    tags = tuple(str(tag) for tag in (getattr(info, "tags", None) or ()))
+    return DatasetCandidate(
+        dataset_id=str(dataset_id),
+        modified_at=modified_at.astimezone(timezone.utc),
+        downloads=int(getattr(info, "downloads", None) or 0),
+        likes=int(getattr(info, "likes", None) or 0),
+        tags=tags,
+        source=f"https://huggingface.co/datasets/{dataset_id}",
+    )
+
+
+def query_variants(query: str) -> list[str]:
+    """Expand a query into progressively broader variants for better recall."""
+    stopwords = {
+        "and",
+        "data",
+        "dataset",
+        "datasets",
+        "for",
+        "or",
+        "the",
+        "training",
+    }
+    normalized = " ".join(query.split())
+    variants: list[str] = []
+    if normalized:
+        variants.append(normalized)
+    for part in normalized.replace(" OR ", "|").replace(" or ", "|").split("|"):
+        part = part.strip()
+        if part and part not in variants:
+            variants.append(part)
+    for token in normalized.replace("/", " ").replace("-", " ").split():
+        token = token.strip(" ,;:()[]{}\"'").lower()
+        if len(token) >= 3 and token not in stopwords and token not in variants:
+            variants.append(token)
+    return variants
+
+
+def estimate_tokens(text: str) -> int:
+    """Cheap, deterministic token estimate (~4 chars/token, min by whitespace)."""
+    if not text:
+        return 0
+    words = len(text.split())
+    chars = len(text)
+    return max(words, chars // 4)
