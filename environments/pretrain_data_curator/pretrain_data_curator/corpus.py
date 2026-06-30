@@ -128,6 +128,14 @@ def _weight_token_target(
     return int((source.weight / total_weight) * token_budget)
 
 
+def _est_fetch_docs(token_target: int, cap: int) -> int:
+    """Estimate docs needed to reach `token_target`, conservatively at 250 tokens/doc.
+
+    Capped at `cap` (sample_docs_per_source) so we never over-fetch.
+    """
+    return min(max(token_target // 250, 1), cap)
+
+
 class CorpusBuilder:
     """Builds a `CuratedCorpus` from a `Manifest` using a search client.
 
@@ -253,9 +261,21 @@ class CorpusBuilder:
         sources: list[SourceCorpus] = []
         total_weight = sum(s.weight for s in manifest.sources)
         for source in manifest.sources:
-            raw, _error = await self.fetch_source_docs(state, self.source_key(source))
-            filtered = self._filter.apply(raw, source.filters)
             weight_target = _weight_token_target(source, manifest.token_budget, total_weight)
+            n = (
+                _est_fetch_docs(weight_target, self._sample_docs_per_source)
+                if weight_target is not None
+                else self._sample_docs_per_source
+            )
+            key = FetchKey(
+                dataset_id=source.dataset_id,
+                config=source.config,
+                split=source.split,
+                text_field=source.text_field,
+                n=n,
+            )
+            raw, _error = await self.fetch_source_docs(state, key)
+            filtered = self._filter.apply(raw, source.filters)
             documents = self._apply_sampling(filtered, source, weight_target)
             sources.append(
                 SourceCorpus(
@@ -286,15 +306,20 @@ class CorpusBuilder:
     def _materialize_source(
         self, source: Source, token_budget: int, total_weight: float
     ) -> list[str]:
+        weight_target = _weight_token_target(source, token_budget, total_weight)
+        n = (
+            _est_fetch_docs(weight_target, self._sample_docs_per_source)
+            if weight_target is not None
+            else self._sample_docs_per_source
+        )
         raw = self._client.sample_documents(
             source.dataset_id,
             source.config,
             source.split,
             source.text_field,
-            self._sample_docs_per_source,
+            n,
         )
         filtered = self._filter.apply(raw, source.filters)
-        weight_target = _weight_token_target(source, token_budget, total_weight)
         return self._apply_sampling(filtered, source, weight_target)
 
     def _apply_sampling(
