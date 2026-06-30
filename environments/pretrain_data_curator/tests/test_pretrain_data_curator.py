@@ -496,6 +496,119 @@ def test_corpus_builder_applies_filters_and_sampling():
     assert corpus.total_tokens > 0
 
 
+def test_weight_proportional_sampling_allocates_correct_proportions():
+    # Build a client with controlled documents so we can count tokens precisely.
+    # Each doc is ~25 chars -> estimate_tokens = 25//4 = 6 tokens.
+    doc = "a" * 25  # 6 tokens each
+    n_docs = 50
+
+    class _FixedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * min(n, n_docs)
+
+    client = _FixedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+
+    # 2:1 weight ratio with 300-token budget -> targets: source A=200, source B=100
+    manifest = Manifest(
+        token_budget=300,
+        sources=[
+            Source(dataset_id="good/encyclopedia", weight=2.0),
+            Source(dataset_id="good/science", weight=1.0),
+        ],
+    )
+    corpus = builder.build(manifest)
+    tokens_a = corpus.sources[0].tokens
+    tokens_b = corpus.sources[1].tokens
+
+    # Source A gets ~200 tokens, source B gets ~100 tokens (within one doc = 6 tokens).
+    assert tokens_a <= 200
+    assert tokens_b <= 100
+    # Both should have fetched something meaningful.
+    assert tokens_a > 0
+    assert tokens_b > 0
+    # A should have roughly twice as many tokens as B.
+    assert tokens_a > tokens_b
+
+
+def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
+    doc = "a" * 25  # 6 tokens each
+    n_docs = 50
+
+    class _FixedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * min(n, n_docs)
+
+    client = _FixedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+
+    # Weight-derived target for source A: (2/3) * 3000 = 2000 tokens.
+    # Explicit max_tokens=30 is tighter -> effective cap = 30.
+    manifest = Manifest(
+        token_budget=3000,
+        sources=[
+            Source(
+                dataset_id="good/encyclopedia",
+                weight=2.0,
+                sampling={"max_tokens": 30},
+            ),
+            Source(dataset_id="good/science", weight=1.0),
+        ],
+    )
+    corpus = builder.build(manifest)
+    # Source A: capped at explicit 30 tokens (tighter than the 2000-token weight target).
+    assert corpus.sources[0].tokens <= 30
+    # Source B: weight-derived ~1000 tokens (no explicit cap), pulls all 50 docs * 6 tokens = 300.
+    assert corpus.sources[1].tokens <= 1000
+
+
+def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
+    doc = "a" * 25  # 6 tokens each
+    n_docs = 10
+
+    class _FixedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * min(n, n_docs)
+
+    client = _FixedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+
+    # All sources have weight=0 -> total_weight=0 -> uncapped (current behavior).
+    manifest = Manifest(
+        token_budget=6,  # tiny budget that would cap everything if proportional
+        sources=[
+            Source(dataset_id="good/encyclopedia", weight=0.0),
+            Source(dataset_id="good/science", weight=0.0),
+        ],
+    )
+    corpus = builder.build(manifest)
+    # No weight-derived cap applied -> all 10 docs per source are kept.
+    assert len(corpus.sources[0].documents) == n_docs
+    assert len(corpus.sources[1].documents) == n_docs
+
+
+def test_weight_proportional_single_source_gets_full_budget():
+    doc = "a" * 25  # 6 tokens each
+    n_docs = 50
+
+    class _FixedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * min(n, n_docs)
+
+    client = _FixedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+
+    # Single source gets 100% of the budget.
+    manifest = Manifest(
+        token_budget=60,  # 10 docs * 6 tokens each
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+    )
+    corpus = builder.build(manifest)
+    # All 60 tokens (10 docs) fit exactly within the 60-token budget.
+    assert corpus.sources[0].tokens <= 60
+    assert len(corpus.sources[0].documents) == 10
+
+
 def test_leakage_detects_exact_and_paraphrase():
     eval_docs = [
         "The mitochondrion is the powerhouse of the cell and provides energy.",

@@ -119,6 +119,15 @@ def _dedup_exact(docs: list[str]) -> list[str]:
     return result
 
 
+def _weight_token_target(
+    source: Source, token_budget: int, total_weight: float
+) -> int | None:
+    """Return the weight-proportional token target for `source`, or None if uncapped."""
+    if total_weight <= 0 or source.weight <= 0:
+        return None
+    return int((source.weight / total_weight) * token_budget)
+
+
 class CorpusBuilder:
     """Builds a `CuratedCorpus` from a `Manifest` using a search client.
 
@@ -242,10 +251,12 @@ class CorpusBuilder:
     async def materialize(self, manifest: Manifest, state: CuratorState) -> CuratedCorpus:
         """Cache-aware async corpus build; the single materialization per rollout."""
         sources: list[SourceCorpus] = []
+        total_weight = sum(s.weight for s in manifest.sources)
         for source in manifest.sources:
             raw, _error = await self.fetch_source_docs(state, self.source_key(source))
             filtered = self._filter.apply(raw, source.filters)
-            documents = self._apply_sampling(filtered, source)
+            weight_target = _weight_token_target(source, manifest.token_budget, total_weight)
+            documents = self._apply_sampling(filtered, source, weight_target)
             sources.append(
                 SourceCorpus(
                     dataset_id=source.dataset_id,
@@ -259,8 +270,9 @@ class CorpusBuilder:
     def build(self, manifest: Manifest) -> CuratedCorpus:
         """Synchronous, cache-free build (direct client access; testing/fallback)."""
         sources: list[SourceCorpus] = []
+        total_weight = sum(s.weight for s in manifest.sources)
         for source in manifest.sources:
-            documents = self._materialize_source(source)
+            documents = self._materialize_source(source, manifest.token_budget, total_weight)
             sources.append(
                 SourceCorpus(
                     dataset_id=source.dataset_id,
@@ -271,7 +283,9 @@ class CorpusBuilder:
             )
         return CuratedCorpus(sources=sources)
 
-    def _materialize_source(self, source: Source) -> list[str]:
+    def _materialize_source(
+        self, source: Source, token_budget: int, total_weight: float
+    ) -> list[str]:
         raw = self._client.sample_documents(
             source.dataset_id,
             source.config,
@@ -280,15 +294,26 @@ class CorpusBuilder:
             self._sample_docs_per_source,
         )
         filtered = self._filter.apply(raw, source.filters)
-        return self._apply_sampling(filtered, source)
+        weight_target = _weight_token_target(source, token_budget, total_weight)
+        return self._apply_sampling(filtered, source, weight_target)
 
-    def _apply_sampling(self, docs: list[str], source: Source) -> list[str]:
+    def _apply_sampling(
+        self, docs: list[str], source: Source, weight_target: int | None = None
+    ) -> list[str]:
         capped = docs
         if source.sampling.max_docs is not None:
             capped = capped[: source.sampling.max_docs]
+        # Effective token cap: weight-derived target, tightened by explicit cap if set.
+        token_cap = weight_target
         if source.sampling.max_tokens is not None:
+            token_cap = (
+                min(token_cap, source.sampling.max_tokens)
+                if token_cap is not None
+                else source.sampling.max_tokens
+            )
+        if token_cap is not None:
             limited: list[str] = []
-            budget = source.sampling.max_tokens
+            budget = token_cap
             for doc in capped:
                 cost = estimate_tokens(doc)
                 if cost > budget:
