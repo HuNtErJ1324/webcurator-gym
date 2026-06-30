@@ -27,7 +27,7 @@ def load_environment(
     lambda_cost: float = 0.1,
     lambda_leakage: float = 1.0,
     perf_baseline_loss: float = math.log(50304),
-    baseline_relative_perf: bool = False,
+    baseline_relative_perf: bool = True,
     max_concurrent_fetches: int = 8,
     max_concurrent_training: int = 1,
     fetch_timeout_seconds: float = 30.0,
