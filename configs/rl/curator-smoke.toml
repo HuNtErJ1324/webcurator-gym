@@ -1,0 +1,25 @@
+# Smoke test: verifies the RL train loop runs end-to-end with heuristic proxy.
+# Free model + tiny batch + minimal steps = no cost, fast feedback.
+#
+# Run with:
+#   prime train configs/rl/curator-smoke.toml --env-file secrets.env --plain
+
+name = "curator-smoke"
+model = "openai/gpt-oss-20b"
+loss = "rl"
+max_steps = 3
+batch_size = 8          # 2 prompt groups × rollouts_per_example=4; keep small for smoke
+rollouts_per_example = 4
+
+# env_files = ["secrets.env"]  # pass via --env-file secrets.env on CLI instead
+
+[sampling]
+max_tokens = 2048       # cap episode length for speed; real runs use 8192
+
+[[env]]
+id = "hunterj/pretrain-data-curator"
+args.use_real_trainer = false   # heuristic CPU proxy — no GPU/Modal needed
+args.token_budget = 500_000     # small token budget so episodes finish fast
+args.max_turns = 12             # default budget; enough to discover sources and commit
+args.candidate_limit = 3        # fewer candidates to keep rollouts short
+args.scan_limit = 10

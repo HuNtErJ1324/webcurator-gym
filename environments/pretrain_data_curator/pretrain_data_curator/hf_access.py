@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import weakref
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
@@ -108,12 +109,18 @@ class FetchKey:
     dataset_id: str
     config: str | None
     split: str
-    text_field: str
+    text_field: str | None
     n: int
 
     def as_str(self) -> str:
         return json.dumps(
-            [self.dataset_id, self.config, self.split, self.text_field, self.n],
+            [
+                self.dataset_id,
+                self.config,
+                self.split,
+                "__auto__" if self.text_field is None else self.text_field,
+                self.n,
+            ],
             separators=(",", ":"),
         )
 
@@ -207,7 +214,7 @@ async def run_blocking_with_retry(
 
 
 async def fetch_documents(
-    sample_fn: Callable[[str, str | None, str, str, int], list[str]],
+    sample_fn: Callable[[str, str | None, str, str | None, int], list[str]],
     key: FetchKey,
     *,
     policy: RetryPolicy,
@@ -269,7 +276,7 @@ class DatasetSearchClient(Protocol):
         dataset_id: str,
         config: str | None,
         split: str,
-        text_field: str,
+        text_field: str | None,
         n: int,
     ) -> list[str]: ...
 
@@ -277,7 +284,17 @@ class DatasetSearchClient(Protocol):
 class HuggingFaceDatasetClient:
     """Live Hugging Face Hub client (search + streaming document sampling)."""
 
-    def __init__(self, token: str) -> None:
+    def __init__(
+        self, token: str | None = None, *, token_env: str = "HF_TOKEN"
+    ) -> None:
+        token = token or os.environ.get(token_env)
+        if not token:
+            raise RuntimeError(
+                f"Hugging Face token environment variable {token_env!r} is "
+                "required for rollouts; set it in the env-server container "
+                "before the first Hub API use."
+            )
+
         from huggingface_hub import HfApi
 
         self._api = HfApi(token=token)
@@ -298,7 +315,7 @@ class HuggingFaceDatasetClient:
         dataset_id: str,
         config: str | None,
         split: str,
-        text_field: str,
+        text_field: str | None,
         n: int,
     ) -> list[str]:
         from datasets import load_dataset
@@ -314,9 +331,46 @@ class HuggingFaceDatasetClient:
         for i, row in enumerate(stream):
             if i >= n:
                 break
-            value = row.get(text_field) if isinstance(row, dict) else None
-            if not isinstance(value, str):
-                value = row.get("text") if isinstance(row, dict) else None
+            if not isinstance(row, dict):
+                continue
+
+            value = row.get(text_field) if text_field is not None else None
+            if not isinstance(value, str) or not value.strip():
+                candidates: list[object] = []
+                for field in (
+                    "text",
+                    "content",
+                    "passage",
+                    "document",
+                    "abstract",
+                    "body",
+                    "article",
+                    "sentence",
+                    "query",
+                    "answer",
+                    "response",
+                    "output",
+                    "instruction",
+                    "input",
+                    "context",
+                ):
+                    if field == "query" and (
+                        row.get("query") is not None or row.get("response") is not None
+                    ):
+                        candidates.append(
+                            str(row.get("query", ""))
+                            + " "
+                            + str(row.get("response", ""))
+                        )
+                    candidates.append(row.get(field))
+                value = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if isinstance(candidate, str) and candidate.strip()
+                    ),
+                    None,
+                )
             if isinstance(value, str) and value.strip():
                 docs.append(value)
         return docs

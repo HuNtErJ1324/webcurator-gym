@@ -1,14 +1,16 @@
 [project]
 name = "pretrain-data-curator"
-description = "Agent curates an LLM pretraining corpus from the pre-cutoff Hugging Face universe, scored by a proxy-student training run plus quality, diversity, cost, and leakage terms."
+description = "Agent curates an LLM pretraining corpus from the pre-cutoff Hugging Face universe, scored by proxy-student cross-entropy plus cost and leakage penalties."
 tags = ["huggingface", "datasets", "data-curation", "pretraining", "tool-use", "multi-turn", "train", "eval"]
-version = "0.1.0"
-requires-python = ">=3.10"
+version = "0.4.2"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "verifiers>=0.1.14",
+    "verifiers==0.1.15.dev376",
+    "renderers==0.1.8.dev49",
     "datasets>=2.18.0",
     "huggingface-hub>=0.24.0",
     "numpy>=1.24.0",
+    "modal>=0.73",
 ]
 
 [project.optional-dependencies]
@@ -16,10 +18,12 @@ dependencies = [
 # imported lazily on that path so the default heuristic backend has no GPU/
 # sandbox dependency.
 sandbox = ["prime-sandboxes"]
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["pretrain_data_curator"]
@@ -30,3 +34,9 @@ include = ["pretrain_data_curator/**/*.py", "pyproject.toml"]
 [tool.verifiers.eval]
 num_examples = 4
 rollouts_per_example = 1
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]

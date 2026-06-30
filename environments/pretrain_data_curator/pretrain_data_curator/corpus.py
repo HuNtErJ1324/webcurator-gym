@@ -23,7 +23,7 @@ from .hf_access import (
     hf_fetch_semaphore,
 )
 from .models import FilterSpec, Manifest, Source
-from .rollout_state import RolloutStore
+from .rollout_state import CuratorState, RolloutStore
 
 
 @dataclass
@@ -184,7 +184,7 @@ class CorpusBuilder:
             locks.pop(lock_key, None)
 
     async def fetch_source_docs(
-        self, state: dict[str, Any], key: FetchKey
+        self, state: CuratorState, key: FetchKey
     ) -> tuple[list[str], dict[str, Any] | None]:
         """Return `(docs, error)` for `key`, using/populating the rollout cache.
 
@@ -205,7 +205,11 @@ class CorpusBuilder:
         cached = RolloutStore.cached_docs(state, cache_key)
         if cached is not None:
             return cached, None
-        token = str(state.get("trajectory_id") or id(state))
+        # The single-flight lock is keyed per (rollout, fetch key). The rollout's
+        # identity is the live state object: in v1 each rollout owns one
+        # ``CuratorState`` for its lifetime, so ``id(state)`` is stable within the
+        # rollout (mirrors the v0 fallback when no trajectory id was present).
+        token = str(id(state))
         lock_key = f"{token}\x00{cache_key}"
         lock = self._fetch_lock(lock_key)
         try:
@@ -235,7 +239,7 @@ class CorpusBuilder:
         finally:
             self._discard_fetch_lock(lock_key)
 
-    async def materialize(self, manifest: Manifest, state: dict[str, Any]) -> CuratedCorpus:
+    async def materialize(self, manifest: Manifest, state: CuratorState) -> CuratedCorpus:
         """Cache-aware async corpus build; the single materialization per rollout."""
         sources: list[SourceCorpus] = []
         for source in manifest.sources:

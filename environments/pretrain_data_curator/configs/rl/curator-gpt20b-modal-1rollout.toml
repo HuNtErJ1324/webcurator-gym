@@ -1,0 +1,29 @@
+# Single-rollout smoke test — fastest possible run to verify modal fires end-to-end
+name  = "pretrain-data-curator-gpt20b-modal-1rollout"
+model = "openai/gpt-oss-20b"
+loss  = "rl"
+
+max_steps            = 1
+batch_size           = 2
+rollouts_per_example = 2
+# A small batch needs a clean advantage signal. Keep the filter override so the
+# smoke run always completes even if the centered advantage is zero.
+post_batch_filters   = []
+
+[sampling]
+max_tokens    = 16384
+temperature   = 0.9
+
+[[env]]
+id = "hunterj/pretrain-data-curator"
+
+args.use_real_trainer          = true
+args.max_turns                 = 25
+args.token_budget              = 500_000
+args.candidate_limit           = 8
+args.scan_limit                = 10
+
+args.proxy_student.trainer_backend    = "modal"
+args.proxy_student.modal_gpu          = "L4"
+# Keep hosted smoke cheap while forcing a positive student-training schedule.
+args.proxy_student.train_token_budget = 40_000

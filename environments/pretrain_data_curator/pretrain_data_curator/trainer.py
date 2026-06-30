@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import inspect
 import json
 import logging
 import math
 import weakref
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel
@@ -118,7 +120,11 @@ class HeuristicProxyTrainer:
                 backend="heuristic",
             )
         tokens = corpus.total_tokens
-        target_tokens = max(config.steps * config.batch_size * config.block_size, 1)
+        # ``effective_train_tokens`` folds in ``train_token_budget`` (steps derived
+        # from the budget when set), so a larger budget raises the data the schedule
+        # would consume; ``tokens_trained`` is still capped at the corpus's tokens,
+        # so the heuristic never bills for data it does not have and stays cheap.
+        target_tokens = max(config.effective_train_tokens, 1)
         tokens_trained = min(tokens, target_tokens)
 
         # Data-scale term: more (effective) tokens -> lower loss, with diminishing
@@ -166,7 +172,10 @@ def _source_diversity(corpus: CuratedCorpus) -> float:
 
 
 _NANOGPT_TRAIN_SCRIPT_TEMPLATE = r'''
-import json, math, os, subprocess, sys
+import sys
+sys.stderr = open('/workspace/stderr.txt', 'w')
+
+import json, math, os, subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -216,104 +225,122 @@ else:
 
 block = int(cfg["block_size"]); batch = int(cfg["batch_size"])
 
-def get_train_batch():
-    src = train_data
-    if len(src) <= block + 1:
-        src = src.repeat(math.ceil((block + 2) / max(len(src), 1)))
-    ix = torch.randint(len(src) - block - 1, (batch,))
-    x = torch.stack([src[i:i+block] for i in ix])
-    y = torch.stack([src[i+1:i+block+1] for i in ix])
-    return x.to(device), y.to(device)
+# __STUDENT_MODEL__  (replaced with the verbatim student_model.py model source)
 
-class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = nn.MultiheadAttention(n_embd, n_head, batch_first=True)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = nn.Sequential(nn.Linear(n_embd, 4*n_embd), nn.GELU(), nn.Linear(4*n_embd, n_embd))
-    def forward(self, x):
-        h = self.ln1(x)
-        mask = torch.triu(torch.ones(h.size(1), h.size(1), device=x.device), diagonal=1).bool()
-        a, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False)
-        x = x + a
-        x = x + self.mlp(self.ln2(x))
-        return x
+# __STUDENT_TRAINING__  (replaced with the verbatim student_train.py recipe source)
 
-class GPT(nn.Module):
-    def __init__(self, vocab, n_embd, n_head, n_layer, block):
-        super().__init__()
-        self.tok = nn.Embedding(vocab, n_embd)
-        self.pos = nn.Embedding(block, n_embd)
-        self.blocks = nn.ModuleList([Block(n_embd, n_head) for _ in range(n_layer)])
-        self.ln = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab)
-        self.block = block
-    def forward(self, idx):
-        pos = torch.arange(idx.size(1), device=idx.device)
-        x = self.tok(idx) + self.pos(pos)[None]
-        for b in self.blocks:
-            x = b(x)
-        return self.head(self.ln(x))
+def build_model():
+    # Fixed architecture; everything is fixed but the curated training data, so a
+    # fresh model is rebuilt per averaged run (after that run's seed is set).
+    return GPT(
+        vocab_size=vocab_size,
+        num_layers=int(cfg["n_layer"]),
+        model_dim=int(cfg["n_embd"]),
+        num_heads=int(cfg["n_head"]),
+        mlp_ratio=int(cfg["mlp_ratio"]),
+        softcap=float(cfg["lm_head_softcap"]),
+        num_value_embeds=int(cfg["num_value_embeds"]),
+    ).to(device)
 
-model = GPT(vocab_size, int(cfg["n_embd"]), int(cfg["n_head"]), int(cfg["n_layer"]), block).to(device)
-opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["learning_rate"]))
-steps = int(cfg["steps"])
-model.train()
-for step in range(steps):
-    x, y = get_train_batch()
-    logits = model(x)
-    loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    opt.step()
-
-# Cross-entropy (nats/token, mean reduction) over EVERY predictable next-token
-# position of the held-out val stream: all len(val_data)-1 targets, including the
-# final partial window. plan_val_windows raises on a degenerate (<=1 token) val
-# set, so an empty score set degrades to the sentinel rather than reporting a
-# bogus perfect 0.0. The denominator is the actual number of scored targets.
-model.eval()
-val_windows = plan_val_windows(len(val_data), block)
-total = sum(L for _, L in val_windows)  # == len(val_data) - 1, always > 0 here
-loss_sum = 0.0; correct = 0
-with torch.no_grad():
-    wi = 0
-    while wi < len(val_windows):
-        # Batch consecutive equal-length windows (all full blocks, then the final
-        # partial window alone) so variable lengths never get stacked together.
-        L = val_windows[wi][1]
-        starts = []
-        while wi < len(val_windows) and val_windows[wi][1] == L and len(starts) < batch:
-            starts.append(val_windows[wi][0]); wi += 1
-        x = torch.stack([val_data[s:s+L] for s in starts]).to(device)
-        y = torch.stack([val_data[s+1:s+L+1] for s in starts]).to(device)
-        logits = model(x)
-        loss_sum += F.cross_entropy(
-            logits.reshape(-1, vocab_size), y.reshape(-1), reduction="sum"
-        ).item()
-        correct += (logits.argmax(-1) == y).sum().item()
-val_loss = loss_sum / total
-acc = correct / total
-n_params = sum(p.numel() for p in model.parameters())
-tokens_trained = steps * batch * block
-flops = 6.0 * n_params * tokens_trained
-print("RESULT_JSON " + json.dumps({
+# record_01 recipe (single source of truth in student_train.py, embedded above):
+# AdamW(betas, eps, weight_decay) + linear warmup + cosine-to-floor LR + grad-clip,
+# CONTIGUOUS-window batching, AVERAGED over n_train_runs distinct seeds. Any
+# non-finite run collapses to the infinite-loss sentinel (perf -> 0); FLOPs/tokens
+# are summed across runs so cost accounting bills every run.
+val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
+    build_model,
+    train_data,
+    val_data,
+    n_runs=int(cfg.get("n_train_runs", 1)),
+    base_seed=seed,
+    device=device,
+    block_size=block,
+    batch_size=batch,
+    steps=int(cfg["steps"]),
+    base_lr=float(cfg["learning_rate"]),
+    warmup_steps=int(cfg["warmup_steps"]),
+    weight_decay=float(cfg["weight_decay"]),
+    grad_clip=float(cfg["grad_clip"]),
+    beta1=float(cfg["adam_beta1"]),
+    beta2=float(cfg["adam_beta2"]),
+    eps=float(cfg["adam_eps"]),
+    lr_min_ratio=float(cfg["lr_min_ratio"]),
+    vocab_size=vocab_size,
+)
+result = {
     "loss": val_loss, "accuracy": acc, "flops": flops,
     "tokens_trained": tokens_trained, "n_params": n_params, "vocab_size": vocab_size,
-    "val_tokens": int(len(val_data)), "val_scored_targets": int(total),
-    "val_source": val_source,
-}))
+    "val_tokens": int(len(val_data)), "val_scored_targets": int(len(val_data) - 1),
+    "val_source": val_source, "n_train_runs": int(cfg.get("n_train_runs", 1)),
+}
+print("RESULT_JSON " + json.dumps(result), flush=True)
+import pathlib
+pathlib.Path("/workspace/result.json").write_text(json.dumps(result))
 '''
 
 
-# Embed the exact, CPU-tested ``plan_val_windows`` source into the sandbox script
-# so the validation windowing/coverage that no GPU test can reach is guarded by
-# this module's unit tests (the script runs the identical function).
-NANOGPT_TRAIN_SCRIPT = _NANOGPT_TRAIN_SCRIPT_TEMPLATE.replace(
-    "# __PLAN_VAL_WINDOWS__  (replaced with the tested plan_val_windows source)",
-    inspect.getsource(plan_val_windows).rstrip(),
-)
+# Embed the exact, CPU-tested ``plan_val_windows`` source, the verbatim
+# ``student_model`` architecture, AND the verbatim ``student_train`` recipe
+# (optimizer schedule, contiguous batching, multi-run averaging) into the sandbox
+# script, so the validation windowing, the model, and the training recipe that no
+# GPU test can reach are ALL guarded by this package's CPU unit tests (the script
+# runs the identical code).
+def _module_definitions_source(module_filename: str, names: tuple[str, ...]) -> str:
+    source = (Path(__file__).with_name(module_filename)).read_text()
+    tree = ast.parse(source)
+    by_name = {
+        node.name: ast.get_source_segment(source, node)
+        for node in tree.body
+        if isinstance(node, ast.ClassDef | ast.FunctionDef)
+    }
+    missing = [name for name in names if not by_name.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"could not embed {module_filename} definitions: {', '.join(missing)}"
+        )
+    return "\n\n\n".join(by_name[name].rstrip() for name in names)
+
+
+def _nanogpt_train_script() -> str:
+    return (
+        _NANOGPT_TRAIN_SCRIPT_TEMPLATE.replace(
+            "# __PLAN_VAL_WINDOWS__  (replaced with the tested plan_val_windows source)",
+            inspect.getsource(plan_val_windows).rstrip(),
+        )
+        .replace(
+            "# __STUDENT_MODEL__  (replaced with the verbatim student_model.py model source)",
+            _module_definitions_source(
+                "student_model.py",
+                (
+                    "RMSNorm",
+                    "Rotary",
+                    "CausalSelfAttention",
+                    "MLP",
+                    "Block",
+                    "ValueEmbedding",
+                    "GPT",
+                ),
+            ),
+        )
+        .replace(
+            "# __STUDENT_TRAINING__  (replaced with the verbatim student_train.py recipe source)",
+            _module_definitions_source(
+                "student_train.py",
+                (
+                    "lr_at_step",
+                    "plan_train_windows",
+                    "train_and_eval_student",
+                    "averaged_train_and_eval",
+                ),
+            ),
+        )
+    )
+
+
+def __getattr__(name: str) -> Any:
+    if name == "NANOGPT_TRAIN_SCRIPT":
+        return _nanogpt_train_script()
+    raise AttributeError(name)
 
 
 class SandboxProxyTrainer:
@@ -345,12 +372,15 @@ class SandboxProxyTrainer:
 
     def __init__(
         self,
-        max_corpus_chars: int = 5_000_000,
+        max_corpus_chars: int | None = None,
         concurrency_limit: int = 1,
         client_factory: Callable[[], Any] | None = None,
         request_factory: Callable[[ProxyStudentConfig, str], Any] | None = None,
         val_loader: ValTokenLoader | None = None,
     ) -> None:
+        # ``None`` (default) derives the cap per-run from the config's budget
+        # (``ProxyStudentConfig.effective_max_corpus_chars``); an explicit value
+        # here is an injection-seam override (e.g. to force a small cap in a test).
         self._max_corpus_chars = max_corpus_chars
         self._concurrency_limit = concurrency_limit
         self._client_factory = client_factory
@@ -378,13 +408,19 @@ class SandboxProxyTrainer:
             disk_size_gb=config.disk_size_gb,
             gpu_count=config.gpu_count,
             gpu_type=config.gpu_type,
-            timeout_minutes=config.timeout_minutes,
+            vm=config.vm,
+            timeout_minutes=config.effective_timeout_minutes,
         )
 
     async def train_and_eval(
         self, corpus: CuratedCorpus, config: ProxyStudentConfig
     ) -> TrainResult:
-        text = "\n\n".join(corpus.documents)[: self._max_corpus_chars]
+        cap = (
+            self._max_corpus_chars
+            if self._max_corpus_chars is not None
+            else config.effective_max_corpus_chars
+        )
+        text = "\n\n".join(corpus.documents)[:cap]
         if not text.strip():
             return TrainResult(
                 loss=float("inf"),
@@ -403,13 +439,31 @@ class SandboxProxyTrainer:
             "n_layer": config.n_layer,
             "n_head": config.n_head,
             "n_embd": config.n_embd,
+            "mlp_ratio": config.mlp_ratio,
+            "lm_head_softcap": config.lm_head_softcap,
+            "num_value_embeds": config.num_value_embeds,
             "block_size": config.block_size,
             "batch_size": config.batch_size,
-            "steps": config.steps,
+            # Budget-derived training length: the sandbox computes
+            # tokens_trained = steps * batch * block and bills FLOPs off it, so a
+            # larger train_token_budget scales tokens and FLOP cost together.
+            "steps": config.effective_steps,
             "learning_rate": config.learning_rate,
             "seed": config.seed,
             "val_fraction": config.val_fraction,
             "tokenizer": val_set.tokenizer if val_set else NANOGPT_VAL_TOKENIZER,
+            # record_01 optimizer schedule + regularization + averaging knobs. The
+            # sandbox script reads these to build AdamW(betas, eps, weight_decay),
+            # the warmup+cosine LR schedule, the grad clip, and the n_train_runs
+            # averaging. ``warmup_steps`` is the budget-aware effective value.
+            "weight_decay": config.weight_decay,
+            "adam_beta1": config.adam_beta1,
+            "adam_beta2": config.adam_beta2,
+            "adam_eps": config.adam_eps,
+            "grad_clip": config.grad_clip,
+            "warmup_steps": config.effective_warmup_steps,
+            "lr_min_ratio": config.lr_min_ratio,
+            "n_train_runs": config.n_train_runs,
         }
 
         async with training_semaphore(self._concurrency_limit):
@@ -461,7 +515,11 @@ class SandboxProxyTrainer:
                 json.dumps(payload).encode("utf-8"),
                 "config.json",
             ),
-            ("/workspace/train.py", NANOGPT_TRAIN_SCRIPT.encode("utf-8"), "train.py"),
+            (
+                "/workspace/train.py",
+                _nanogpt_train_script().encode("utf-8"),
+                "train.py",
+            ),
         ]
         if val_set is not None:
             # Header-free little-endian uint16 GPT-2 token ids: exactly the first
@@ -476,7 +534,7 @@ class SandboxProxyTrainer:
     async def _run_training(
         self, client: Any, sandbox_id: str, config: ProxyStudentConfig
     ) -> Any:
-        execute_timeout = config.timeout_minutes * 60
+        execute_timeout = config.effective_timeout_minutes * 60
         try:
             result = await asyncio.wait_for(
                 client.execute_command(

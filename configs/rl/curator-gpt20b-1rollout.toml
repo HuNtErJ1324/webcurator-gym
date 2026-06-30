@@ -1,0 +1,39 @@
+# Smoke test: verifies the RL train loop with the real Modal GPU trainer.
+# Uses L4 GPU (cheapest, ~$0.80/hr billed per-second).
+# A 1-step run with batch_size=4 covers all four curator tasks once. Some tasks
+# may still pick sources that materialize zero rows; at least one general-text
+# task should exercise the Modal trainer and emit corpus/token/FLOP metrics.
+#
+# Credentials required (pass via --env-file secrets.env):
+#   HF_TOKEN         — HuggingFace read token
+#   MODAL_TOKEN_ID   — from ~/.modal.toml or Modal dashboard
+#   MODAL_TOKEN_SECRET
+#
+# Run with:
+#   prime train configs/rl/curator-gpt20b-1rollout.toml --env-file secrets.env --plain
+
+name = "curator-gpt20b-modal-1rollout"
+model = "openai/gpt-oss-20b"
+loss = "rl"
+max_steps = 1
+batch_size = 4
+rollouts_per_example = 1
+# Tiny smoke batches can have zero centered advantage; do not drop them.
+post_batch_filters = []
+
+[sampling]
+max_tokens = 8192       # max_turns=25 needs headroom
+
+[[env]]
+id = "hunterj/pretrain-data-curator"
+args.use_real_trainer = true
+args.token_budget = 500_000     # small corpus so Modal trains fast
+args.max_turns = 25
+args.candidate_limit = 3
+args.scan_limit = 10
+
+# Modal GPU trainer — L4 is cheapest and sufficient for the 55M-param student
+args.proxy_student.trainer_backend = "modal"
+args.proxy_student.modal_gpu = "L4"
+# Keep hosted smoke cheap while forcing a positive student-training schedule.
+args.proxy_student.train_token_budget = 40_000
