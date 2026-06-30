@@ -10,6 +10,20 @@ from datasets import Dataset
 from verifiers.v1.clients.config import EvalClientConfig, TrainClientConfig
 
 
+def _branch_prompt_len(branch: Any) -> int:
+    """Final-turn prompt length without relying on Branch convenience properties."""
+    last_completion = next(
+        (sum(node.mask) for node in reversed(branch.nodes) if any(node.mask)),
+        0,
+    )
+    return len(branch.token_ids) - last_completion
+
+
+def _branch_completion_len(branch: Any) -> int:
+    """Completion length without relying on Branch convenience properties."""
+    return sum(sum(node.mask) for node in branch.nodes)
+
+
 class Environment(vf.Environment, legacy_vf.Environment):
     """Run v1 episodes behind the v0 ``Environment`` API used by Prime CLI 0.6.15."""
 
@@ -172,18 +186,24 @@ class Environment(vf.Environment, legacy_vf.Environment):
             "trajectory": cls._trajectory(trace),
             "token_usage": {
                 "input_tokens": (
-                    usage.input_tokens if usage is not None else trace.prompt_len
+                    usage.input_tokens
+                    if usage is not None
+                    else sum(_branch_prompt_len(branch) for branch in branches)
                 ),
                 "output_tokens": (
                     usage.completion_tokens
                     if usage is not None
-                    else trace.completion_len
+                    else sum(_branch_completion_len(branch) for branch in branches)
                 ),
                 "final_input_tokens": (
-                    final_branch.prompt_len if final_branch is not None else 0
+                    _branch_prompt_len(final_branch)
+                    if final_branch is not None
+                    else 0
                 ),
                 "final_output_tokens": (
-                    final_branch.completion_len if final_branch is not None else 0
+                    _branch_completion_len(final_branch)
+                    if final_branch is not None
+                    else 0
                 ),
             },
         }
