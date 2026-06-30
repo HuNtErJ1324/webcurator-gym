@@ -378,9 +378,12 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     alpha_perf: float = 1.0
     lambda_cost: float = 0.1
     lambda_leakage: float = 1.0
-    # Baseline-relative Perf signal (additive; default-OFF preserves calibration).
+    # Baseline-relative Perf signal. True (default) uses relative loss reduction
+    # over ``perf_baseline_loss`` as the Perf reward — the right choice for real
+    # LMs where loss ~ 9 nats and exp(-loss) ≈ 0.  Set to False only for toy
+    # models where absolute loss < 1 and exp(-loss) is meaningful.
     perf_baseline_loss: float = math.log(50304)
-    baseline_relative_perf: bool = False
+    baseline_relative_perf: bool = True
     max_concurrent_fetches: int = 8
     max_concurrent_training: int = 1
     fetch_timeout_seconds: float = 30.0

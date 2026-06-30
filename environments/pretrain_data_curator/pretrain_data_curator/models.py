@@ -427,10 +427,13 @@ class CuratorConfig(BaseModel):
     # no-information reference for the real trainer's nats/token CE. (The default
     # HeuristicProxyTrainer uses a smaller synthetic ``reference_loss`` of 5.0.)
     perf_baseline_loss: float = Field(default=math.log(50304), gt=0.0)
-    # When True, the Perf REWARD term becomes the bounded relative loss reduction
-    # over ``perf_baseline_loss`` instead of ``exp(-loss)``. The
-    # relative-improvement diagnostic is surfaced either way.
-    baseline_relative_perf: bool = False
+    # When True (the default), the Perf REWARD term is the bounded relative loss
+    # reduction over ``perf_baseline_loss`` instead of ``exp(-loss)``.  Set to
+    # False only when the absolute loss is meaningful (e.g. a tiny toy model with
+    # loss < 1): for real LMs (loss ~ 9 nats/token, 50K vocab) exp(-loss) ≈ 0
+    # and collapses the reward to zero.  The relative-improvement diagnostic
+    # (perf_vs_baseline) is always surfaced regardless of this flag.
+    baseline_relative_perf: bool = True
 
     # Bounded concurrency and robustness knobs for external (HF/sandbox) access.
     max_concurrent_fetches: int = Field(default=8, ge=1, le=1024)

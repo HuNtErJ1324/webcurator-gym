@@ -509,9 +509,10 @@ def test_weight_proportional_sampling_allocates_correct_proportions():
     client = _FixedClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
 
-    # 2:1 weight ratio with 300-token budget -> targets: source A=200, source B=100
+    # 2:1 weight ratio with 3000-token budget -> targets: A=2000, B=1000.
+    # est_docs: A = 2000//250 = 8, B = 1000//250 = 4 (both well under n_docs=50).
     manifest = Manifest(
-        token_budget=300,
+        token_budget=3000,
         sources=[
             Source(dataset_id="good/encyclopedia", weight=2.0),
             Source(dataset_id="good/science", weight=1.0),
@@ -521,9 +522,9 @@ def test_weight_proportional_sampling_allocates_correct_proportions():
     tokens_a = corpus.sources[0].tokens
     tokens_b = corpus.sources[1].tokens
 
-    # Source A gets ~200 tokens, source B gets ~100 tokens (within one doc = 6 tokens).
-    assert tokens_a <= 200
-    assert tokens_b <= 100
+    # Source A fetches 8 docs (48 tokens) <= weight target 2000; B fetches 4 (24 tokens) <= 1000.
+    assert tokens_a <= 2000
+    assert tokens_b <= 1000
     # Both should have fetched something meaningful.
     assert tokens_a > 0
     assert tokens_b > 0
@@ -558,7 +559,7 @@ def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
     corpus = builder.build(manifest)
     # Source A: capped at explicit 30 tokens (tighter than the 2000-token weight target).
     assert corpus.sources[0].tokens <= 30
-    # Source B: weight-derived ~1000 tokens (no explicit cap), pulls all 50 docs * 6 tokens = 300.
+    # Source B: weight-derived 1000 tokens (no explicit cap); est_docs = 1000//250 = 4 docs (24 tokens).
     assert corpus.sources[1].tokens <= 1000
 
 
@@ -598,15 +599,59 @@ def test_weight_proportional_single_source_gets_full_budget():
     client = _FixedClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
 
-    # Single source gets 100% of the budget.
+    # Single source gets 100% of the budget; budget large enough to fetch all n_docs.
+    # est_docs = n_docs * 250 // 250 = n_docs, capped at sample_docs_per_source = n_docs.
     manifest = Manifest(
-        token_budget=60,  # 10 docs * 6 tokens each
+        token_budget=n_docs * 250,  # = 12500; ensures est_docs = n_docs = 50
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
     corpus = builder.build(manifest)
-    # All 60 tokens (10 docs) fit exactly within the 60-token budget.
-    assert corpus.sources[0].tokens <= 60
-    assert len(corpus.sources[0].documents) == 10
+    # All n_docs fetched; their token total (n_docs*6=300) fits within the budget.
+    assert corpus.sources[0].tokens <= n_docs * 250
+    assert len(corpus.sources[0].documents) == n_docs
+
+
+def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
+    """Large token_target: est_docs hits the sample_docs_per_source cap."""
+    doc = "a" * 25  # 6 tokens each
+    cap = 8
+
+    class _FixedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * n  # return exactly n (unbounded supply)
+
+    client = _FixedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=cap)
+
+    # weight_target = 10_000 -> est_docs = 10_000 // 250 = 40 > cap=8 -> capped to 8.
+    manifest = Manifest(
+        token_budget=10_000,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+    )
+    corpus = builder.build(manifest)
+    assert len(corpus.sources[0].documents) == cap
+
+
+def test_fetch_count_proportional_to_small_token_target():
+    """Small token_target: est_docs is proportionally smaller than sample_docs_per_source."""
+    doc = "a" * 25  # 6 tokens each
+    cap = 100
+
+    class _FixedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * n
+
+    client = _FixedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=cap)
+
+    # weight_target = 500 -> est_docs = 500 // 250 = 2, well below cap=100.
+    manifest = Manifest(
+        token_budget=500,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+    )
+    corpus = builder.build(manifest)
+    assert len(corpus.sources[0].documents) == 2
+    assert len(corpus.sources[0].documents) < cap
 
 
 def test_leakage_detects_exact_and_paraphrase():
@@ -3129,17 +3174,17 @@ def test_docker_image_default_is_backend_aware():
     )
 
 
-# --- Tier S: baseline-relative Perf signal (additive; default-OFF) -----------
+# --- Tier S: baseline-relative Perf signal (default-ON) ----------------------
 #
-# The downstream-loss (Perf) term gains a baseline-relative reading: the relative
-# val-loss reduction over a neutral reference. It is ALWAYS surfaced as a
-# zero-weight diagnostic; a default-OFF flag makes the Perf REWARD use it instead
-# of the absolute formula, with the flag off preserving reward calibration exactly.
+# The Perf REWARD defaults to the bounded relative val-loss reduction over a
+# neutral baseline (``perf_vs_baseline``), which is always surfaced as a
+# zero-weight diagnostic too.  Setting baseline_relative_perf=False falls back
+# to exp(-loss) — only meaningful for tiny toy models where loss < 1.
 
 
-def test_curator_config_baseline_defaults_are_off_and_neutral():
+def test_curator_config_baseline_defaults():
     cfg = CuratorConfig()
-    assert cfg.baseline_relative_perf is False  # default OFF preserves calibration
+    assert cfg.baseline_relative_perf is True  # default ON: safe for real LMs
     # The neutral reference is the CE of a uniform student over the padded GPT-2
     # vocab (ln(50304)); it is a constant — no extra training run is performed.
     assert cfg.perf_baseline_loss == pytest.approx(math.log(50304))
@@ -3147,9 +3192,12 @@ def test_curator_config_baseline_defaults_are_off_and_neutral():
         CuratorConfig(perf_baseline_loss=0.0)
 
 
-def test_default_perf_reward_depends_only_on_cross_entropy():
-    # Flag OFF (default): _perf == exp(-loss), independent of accuracy.
-    scorer = _scorer(HeuristicProxyTrainer())
+def test_exp_loss_perf_reward_when_flag_off():
+    # Flag explicitly OFF: _perf == exp(-loss), independent of accuracy.
+    # This preserves the legacy formula as a backwards-compat fallback for toy
+    # models where loss < 1 and exp(-loss) is a meaningful signal.
+    cfg = CuratorConfig(baseline_relative_perf=False)
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
     assert scorer.config.baseline_relative_perf is False
     r = TrainResult(loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
     assert scorer._perf(r) == scorer._perf_from_result(r)
@@ -3159,6 +3207,27 @@ def test_default_perf_reward_depends_only_on_cross_entropy():
     )
     assert scorer._perf(different_accuracy) == pytest.approx(scorer._perf(r))
     # The sentinel still scores zero perf under either mode.
+    sentinel = TrainResult(
+        loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
+    )
+    assert scorer._perf(sentinel) == 0.0
+
+
+def test_default_perf_reward_is_baseline_relative_improvement():
+    # Default (baseline_relative_perf=True): _perf == bounded relative loss reduction,
+    # NOT exp(-loss).  For real LMs loss ~ 9 nats so exp(-9) ≈ 0.0001 collapses
+    # reward; the relative formula gives a meaningful signal in [0, 1].
+    scorer = _scorer(HeuristicProxyTrainer())  # uses CuratorConfig() defaults
+    assert scorer.config.baseline_relative_perf is True
+    baseline = scorer.config.perf_baseline_loss
+    r = TrainResult(loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
+    expected = max(0.0, min(1.0, (baseline - r.loss) / baseline))
+    assert scorer._perf(r) == pytest.approx(expected)
+    # Must NOT equal exp(-loss) (the old collapsed formula).
+    assert scorer._perf(r) != pytest.approx(math.exp(-r.loss))
+    # Worse-than-baseline clamps to 0; sentinel -> 0.
+    worse = TrainResult(loss=baseline + 1.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    assert scorer._perf(worse) == 0.0
     sentinel = TrainResult(
         loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
     )
@@ -3198,17 +3267,11 @@ async def test_perf_vs_baseline_diagnostic_always_surfaced():
 
 
 @pytest.mark.asyncio
-async def test_baseline_relative_flag_only_changes_perf_when_on():
+async def test_baseline_relative_flag_only_changes_perf_when_off():
     # Two curators differing ONLY in the flag, same finalized manifest + heuristic
-    # trainer: default perf is exp(-loss); enabling the flag
-    # swaps in the relative term (a different perf value), so calibration is
-    # changed only when explicitly opted into.
-    off = await _make()
-    await _finalized(off)
-    off_scoring = await off.prepared()
-    abs_perf = min(1.0, math.exp(-off_scoring["loss"]))
-    assert off_scoring["perf"] == pytest.approx(abs_perf)
-
+    # trainer: the default (on) perf is the relative term; disabling the flag
+    # swaps in exp(-loss), proving the two formulae differ and calibration is
+    # controlled by the flag.
     on = await _make(baseline_relative_perf=True)
     await _finalized(on)
     on_scoring = await on.prepared()
@@ -3216,6 +3279,13 @@ async def test_baseline_relative_flag_only_changes_perf_when_on():
     assert on_scoring["perf"] == pytest.approx(
         max(0.0, min(1.0, (baseline - on_scoring["loss"]) / baseline))
     )
+
+    off = await _make(baseline_relative_perf=False)
+    await _finalized(off)
+    off_scoring = await off.prepared()
+    abs_perf = min(1.0, math.exp(-off_scoring["loss"]))
+    assert off_scoring["perf"] == pytest.approx(abs_perf)
+
     # The same corpus + trainer yields the same loss but a different perf term.
     assert on_scoring["loss"] == pytest.approx(off_scoring["loss"])
     assert on_scoring["perf"] != pytest.approx(off_scoring["perf"])

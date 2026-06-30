@@ -2,8 +2,11 @@
 
 ``CuratorScorer`` computes
 
-    R(M) = alpha_perf*exp(-validation_cross_entropy)
-           - lambda_cost*Cost(M) - lambda_leakage*Leakage(M)
+    R(M) = alpha_perf * Perf(M) - lambda_cost*Cost(M) - lambda_leakage*Leakage(M)
+
+where Perf(M) defaults to the bounded relative val-loss reduction over a neutral
+baseline (``baseline_relative_perf=True``), or falls back to ``exp(-loss)`` for
+toy models when ``baseline_relative_perf=False``.
 
 Performance, cost, and leakage derive from one prepared scoring pass over the
 finalized manifest. The expensive corpus build and proxy-student training run
