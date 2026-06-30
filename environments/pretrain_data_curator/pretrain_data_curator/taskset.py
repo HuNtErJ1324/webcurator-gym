@@ -605,17 +605,14 @@ class CuratorTaskset(_TasksetBase):
     def _finalize_manifest(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
         """Return the most recent usable manifest across assistant turns.
 
-        Three-tier lookup — each tier is tried only if the previous produced nothing:
+        Two-tier lookup — each tier is tried only if the previous produced nothing:
 
         1. **Parse** a fenced JSON manifest from any assistant text message (newest
-           first).  This is the primary path and is unchanged.
-        2. **State candidates** — synthesize from ``RolloutStore.candidates(state)``
-           when populated (MCP-tool harnesses).
-        3. **Trace fallback** — synthesize from dataset ids actually observed in the
-           rollout's bash tool calls / outputs (bash harness).  Uses only ids the
-           agent genuinely discovered; never invents ids.  ``config`` is set to
-           ``null`` for all sources unless a config was explicitly shown in tool
-           output (which is not parsed here — configless is the safe default).
+           first).  This is the primary path.
+        2. **Trace fallback** — synthesize from dataset ids actually observed in the
+           rollout's bash tool calls / outputs.  Uses only ids the agent genuinely
+           discovered; never invents ids.  ``config`` is set to ``null`` for all
+           sources unless a config was explicitly shown in tool output.
         """
         # Tier 1: parse manifest from assistant message text.
         manifest = parse_manifest(
@@ -630,19 +627,7 @@ class CuratorTaskset(_TasksetBase):
             if manifest is not None and manifest.sources:
                 return manifest
 
-        # Tier 2: synthesize from the rollout state's candidate pool (MCP harnesses).
-        state = trace.state
-        candidates = RolloutStore.candidates(state)
-        if candidates:
-            limit = self.curator.candidate_limit
-            sources = [
-                Source(dataset_id=did, config=None, weight=1.0)
-                for did in list(candidates)[:limit]
-            ]
-            if sources:
-                return Manifest(token_budget=task.token_budget, sources=sources)
-
-        # Tier 3: synthesize from ids observed in bash tool calls / outputs.
+        # Tier 2: synthesize from ids observed in bash tool calls / outputs.
         observed = _ids_from_trace(trace)
         if observed:
             limit = self.curator.candidate_limit

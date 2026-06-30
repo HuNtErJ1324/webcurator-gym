@@ -232,45 +232,7 @@ async def fetch_documents(
     )
 
 
-async def search_with_retry(
-    search_fn: Callable[[str, int], list[Any]],
-    query: str,
-    scan_limit: int,
-    *,
-    policy: RetryPolicy,
-    semaphore: asyncio.Semaphore,
-) -> list[Any]:
-    """Search the Hub via `search_fn`, robustly. Raises DatasetAccessError."""
-
-    def _call() -> list[Any]:
-        return list(search_fn(query, scan_limit))
-
-    return await run_blocking_with_retry(_call, policy=policy, semaphore=semaphore)
-
-
-@dataclass(frozen=True)
-class DatasetCandidate:
-    dataset_id: str
-    modified_at: datetime
-    downloads: int
-    likes: int
-    tags: tuple[str, ...]
-    source: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "dataset_id": self.dataset_id,
-            "modified_at": self.modified_at.date().isoformat(),
-            "downloads": self.downloads,
-            "likes": self.likes,
-            "tags": list(self.tags),
-            "source": self.source,
-        }
-
-
 class DatasetSearchClient(Protocol):
-    def search_datasets(self, query: str, scan_limit: int) -> list[Any]: ...
-
     def sample_documents(
         self,
         dataset_id: str,
@@ -282,7 +244,7 @@ class DatasetSearchClient(Protocol):
 
 
 class HuggingFaceDatasetClient:
-    """Live Hugging Face Hub client (search + streaming document sampling)."""
+    """Live Hugging Face Hub client (streaming document sampling)."""
 
     def __init__(
         self, token: str | None = None, *, token_env: str = "HF_TOKEN"
@@ -299,16 +261,6 @@ class HuggingFaceDatasetClient:
 
         self._api = HfApi(token=token)
         self._token = token
-
-    def search_datasets(self, query: str, scan_limit: int) -> list[Any]:
-        return list(
-            self._api.list_datasets(
-                search=query,
-                limit=scan_limit,
-                expand=["lastModified", "downloads", "likes", "tags"],
-                token=True,
-            )
-        )
 
     def sample_documents(
         self,
@@ -393,54 +345,6 @@ def parse_cutoff(cutoff_date: str | date | datetime) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def candidate_from_info(info: Any) -> DatasetCandidate | None:
-    """Convert a raw Hub search result into a `DatasetCandidate`, or None."""
-    dataset_id = getattr(info, "id", None)
-    modified_at = getattr(info, "last_modified", None) or getattr(
-        info, "lastModified", None
-    )
-    if not dataset_id or not isinstance(modified_at, datetime):
-        return None
-    if modified_at.tzinfo is None:
-        modified_at = modified_at.replace(tzinfo=timezone.utc)
-    tags = tuple(str(tag) for tag in (getattr(info, "tags", None) or ()))
-    return DatasetCandidate(
-        dataset_id=str(dataset_id),
-        modified_at=modified_at.astimezone(timezone.utc),
-        downloads=int(getattr(info, "downloads", None) or 0),
-        likes=int(getattr(info, "likes", None) or 0),
-        tags=tags,
-        source=f"https://huggingface.co/datasets/{dataset_id}",
-    )
-
-
-def query_variants(query: str) -> list[str]:
-    """Expand a query into progressively broader variants for better recall."""
-    stopwords = {
-        "and",
-        "data",
-        "dataset",
-        "datasets",
-        "for",
-        "or",
-        "the",
-        "training",
-    }
-    normalized = " ".join(query.split())
-    variants: list[str] = []
-    if normalized:
-        variants.append(normalized)
-    for part in normalized.replace(" OR ", "|").replace(" or ", "|").split("|"):
-        part = part.strip()
-        if part and part not in variants:
-            variants.append(part)
-    for token in normalized.replace("/", " ").replace("-", " ").split():
-        token = token.strip(" ,;:()[]{}\"'").lower()
-        if len(token) >= 3 and token not in stopwords and token not in variants:
-            variants.append(token)
-    return variants
 
 
 def estimate_tokens(text: str) -> int:

@@ -41,8 +41,6 @@ class CuratorState(vf.State):
     cutoff_date: str | None = None
     manifest: dict[str, Any] = Field(default_factory=lambda: Manifest().model_dump())
     cost_ledger: dict[str, Any] = Field(default_factory=lambda: CostLedger().model_dump())
-    candidates: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    inspected: dict[str, dict[str, Any]] = Field(default_factory=dict)
     doc_cache: dict[str, list[str]] = Field(default_factory=dict)
     tool_errors: dict[str, int] = Field(default_factory=dict)
     external_failure: bool = False
@@ -65,8 +63,6 @@ class RolloutStore:
         state.schema_version = STATE_SCHEMA_VERSION
         state.manifest = manifest.model_dump()
         state.cost_ledger = ledger.model_dump()
-        state.candidates = {}
-        state.inspected = {}
         state.doc_cache = {}
         state.tool_errors = {}
         state.external_failure = False
@@ -88,14 +84,6 @@ class RolloutStore:
     @classmethod
     def set_ledger(cls, state: CuratorState, ledger: CostLedger) -> None:
         state.cost_ledger = ledger.model_dump()
-
-    @classmethod
-    def candidates(cls, state: CuratorState) -> dict[str, dict[str, Any]]:
-        return state.candidates
-
-    @classmethod
-    def inspected(cls, state: CuratorState) -> dict[str, dict[str, Any]]:
-        return state.inspected
 
     @classmethod
     def is_finalized(cls, state: CuratorState) -> bool:
@@ -159,7 +147,7 @@ class RolloutStore:
 
         The schema version is serialized under ``state_schema_version`` (the
         in-state pydantic field stays the unqualified ``schema_version``).
-        Transient bookkeeping (cost ledger, candidate cache, telemetry) is excluded,
+        Transient bookkeeping (cost ledger, telemetry) is excluded,
         so it identifies *what was curated*, not how it was discovered.
         """
         return {

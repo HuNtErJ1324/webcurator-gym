@@ -28,7 +28,6 @@ from pretrain_data_curator.hf_access import (
     classify_exception,
     loop_local_semaphore,
     parse_cutoff,
-    query_variants,
 )
 from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
 from pretrain_data_curator.models import (
@@ -1527,15 +1526,6 @@ def test_parse_cutoff_forms():
     assert parse_cutoff(date(2023, 1, 1)).tzinfo is not None
     with pytest.raises(ValueError):
         parse_cutoff("   ")
-
-
-def test_query_variants_expansion():
-    variants = query_variants("math OR code datasets for training")
-    assert "math" in variants
-    assert "code" in variants
-    # stopwords ("for", "training", "datasets") are not emitted as bare tokens
-    assert "for" not in variants
-    assert len(variants) == len(set(variants))  # deduplicated
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------

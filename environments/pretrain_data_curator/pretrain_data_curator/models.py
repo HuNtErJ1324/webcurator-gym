@@ -98,20 +98,6 @@ class Manifest(BaseModel):
         self.sources = [s for s in self.sources if s.key() != (dataset_id, config)]
         return len(self.sources) < before
 
-    def normalized_weights(self) -> dict[str, float]:
-        total = sum(s.weight for s in self.sources)
-        if total <= 0:
-            return {s.dataset_id: 0.0 for s in self.sources}
-        return {s.dataset_id: s.weight / total for s in self.sources}
-
-    def weight_entropy(self) -> float:
-        """Shannon entropy of normalized weights, in [0, 1] (1 == perfectly even)."""
-        weights = [w for w in self.normalized_weights().values() if w > 0]
-        if len(weights) <= 1:
-            return 0.0
-        entropy = -sum(w * math.log(w) for w in weights)
-        return entropy / math.log(len(weights))
-
 
 class CostPrices(BaseModel):
     """Per-unit prices charged on the single cost ledger."""
