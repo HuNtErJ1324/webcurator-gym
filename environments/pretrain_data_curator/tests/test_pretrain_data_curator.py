@@ -427,15 +427,6 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
     assert runtime.disk == 20.0
     assert docker_env.config.timeout.scoring == 2340.0
 
-    modal_env = load_environment(
-        use_real_trainer=True,
-        proxy_student={"trainer_backend": "modal"},
-    )
-    assert modal_env.harness.config.env == {}
-    assert isinstance(modal_env.harness.config.runtime, vf.SubprocessConfig)
-    assert modal_env.config.timeout.scoring is None
-
-
 def test_load_environment_rejects_remote_docker_host():
     with pytest.raises(ValueError, match="docker_host is not supported"):
         load_environment(

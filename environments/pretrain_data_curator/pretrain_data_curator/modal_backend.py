@@ -1,14 +1,10 @@
-"""Modal GPU training backend for the proxy-student trainer.
+"""Proxy-student training inside the rollout's declarative Modal runtime.
 
-Implements ModalProxyTrainer as a drop-in third backend alongside
-HeuristicProxyTrainer (CPU heuristic) and SandboxProxyTrainer (Prime/Docker).
-Calls modal.Sandbox.create(...) so it works from a CPU-only env-server in
-Hosted Training.
-
-``modal`` is imported lazily inside ``_run_in_modal`` so the default heuristic
-and the other real-training backends do not initialize the Modal SDK.
-
-Credentials: ``MODAL_TOKEN_ID`` + ``MODAL_TOKEN_SECRET`` env vars.
+The v1 rollout owns exactly one runtime for its full lifecycle. When the
+``modal`` trainer backend is selected, that runtime is also the training
+sandbox: this trainer writes the corpus and script through :class:`vf.Runtime`
+and executes training on the same live Modal sandbox. Runtime provisioning and
+normal teardown remain the rollout's responsibility.
 """
 
 from __future__ import annotations
@@ -18,15 +14,22 @@ import json
 import logging
 from typing import Any
 
+import verifiers.v1 as vf
+
 from .corpus import CuratedCorpus
 from .models import ProxyStudentConfig
-from .trainer import TrainResult, TrainerError, _nanogpt_train_script, training_semaphore
+from .trainer import (
+    TrainResult,
+    TrainerError,
+    _nanogpt_train_script,
+    training_semaphore,
+)
 from .val_set import NANOGPT_VAL_TOKENIZER, HeldOutValSet, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
-# Maps ProxyStudentConfig.modal_gpu → Modal GPU string. Anything not in the
-# map falls through to the L4 default (cheapest GPU available on Modal).
+# Maps ProxyStudentConfig.modal_gpu to Modal's GPU specifier. Unknown values
+# preserve the historical L4 fallback.
 _MODAL_GPU_MAP: dict[str, str] = {
     "H100": "H100",
     "H200": "H200",
@@ -36,22 +39,11 @@ _DEFAULT_MODAL_GPU = "L4"
 
 
 def _modal_gpu_for(modal_gpu: str) -> str:
-    """Map a ProxyStudentConfig.modal_gpu value to a Modal GPU specifier."""
     return _MODAL_GPU_MAP.get(modal_gpu, _DEFAULT_MODAL_GPU)
 
 
 class ModalProxyTrainer:
-    """Trains the fixed proxy-student in a Modal GPU sandbox on the curated data.
-
-    Uses ``modal.Sandbox.create(...)`` (v1 Modal API) — works from a CPU-only
-    env-server in Hosted Training. The GPU type comes from
-    ``ProxyStudentConfig.modal_gpu``; the training script, corpus, and config
-    are uploaded as workspace files; the result is polled from
-    ``/workspace/result.json`` once training writes it.
-
-    ``modal`` is imported lazily inside ``_run_in_modal`` so this module is
-    importable without modal installed.
-    """
+    """Train on the live Modal runtime supplied to taskset scoring."""
 
     STDERR_TAIL = 2000
 
@@ -61,19 +53,27 @@ class ModalProxyTrainer:
         concurrency_limit: int = 1,
         val_loader: ValTokenLoader | None = None,
     ) -> None:
-        # ``None`` derives the cap per-run from ``ProxyStudentConfig.effective_max_corpus_chars``.
         self._max_corpus_chars = max_corpus_chars
         self._concurrency_limit = concurrency_limit
         self._val_loader = val_loader
 
-    async def _resolve_val_set(self) -> HeldOutValSet | None:
-        if self._val_loader is None:
-            return None
-        return await self._val_loader.load()
-
     async def train_and_eval(
-        self, corpus: CuratedCorpus, config: ProxyStudentConfig
+        self,
+        corpus: CuratedCorpus,
+        config: ProxyStudentConfig,
+        *,
+        runtime: vf.Runtime | None = None,
     ) -> TrainResult:
+        if runtime is None:
+            raise TrainerError(
+                "modal proxy-student training requires the live harness runtime"
+            )
+        if runtime.type != "modal":
+            raise TrainerError(
+                f"modal proxy-student training requires a Modal runtime, got "
+                f"{runtime.type!r}"
+            )
+
         cap = (
             self._max_corpus_chars
             if self._max_corpus_chars is not None
@@ -90,8 +90,40 @@ class ModalProxyTrainer:
             )
 
         val_set = await self._resolve_val_set()
+        payload = self._payload(config, val_set)
 
-        payload: dict[str, Any] = {
+        # Rollout concurrency can exceed the intended number of simultaneous
+        # paid GPU training jobs.
+        async with training_semaphore(self._concurrency_limit):
+            try:
+                await self._write_inputs(runtime, text, payload, config, val_set)
+                self._raise_if_cancelling()
+                result = await self._run_training(runtime, config)
+                self._raise_if_cancelling()
+                return self._parse_result(result.stdout, result.stderr)
+            except BaseException:
+                # A failed or cancelled exec can continue consuming a Modal GPU.
+                # Stop immediately; Rollout.run() also calls the idempotent stop.
+                await self._stop_cancel_safe(runtime)
+                raise
+
+    @staticmethod
+    def _raise_if_cancelling() -> None:
+        """Recover cancellation swallowed by pre-3.12 asyncio.wait_for races."""
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError()
+
+    async def _resolve_val_set(self) -> HeldOutValSet | None:
+        if self._val_loader is None:
+            return None
+        return await self._val_loader.load()
+
+    @staticmethod
+    def _payload(
+        config: ProxyStudentConfig, val_set: HeldOutValSet | None
+    ) -> dict[str, Any]:
+        return {
             "n_layer": config.n_layer,
             "n_head": config.n_head,
             "n_embd": config.n_embd,
@@ -100,14 +132,11 @@ class ModalProxyTrainer:
             "num_value_embeds": config.num_value_embeds,
             "block_size": config.block_size,
             "batch_size": config.batch_size,
-            # Budget-derived step count: tokens_trained = steps * batch * block
-            # so a larger train_token_budget scales tokens and FLOPs together.
             "steps": config.effective_steps,
             "learning_rate": config.learning_rate,
             "seed": config.seed,
             "val_fraction": config.val_fraction,
             "tokenizer": val_set.tokenizer if val_set else NANOGPT_VAL_TOKENIZER,
-            # record_01 optimizer schedule + regularization + averaging.
             "weight_decay": config.weight_decay,
             "adam_beta1": config.adam_beta1,
             "adam_beta2": config.adam_beta2,
@@ -118,126 +147,95 @@ class ModalProxyTrainer:
             "n_train_runs": config.n_train_runs,
         }
 
-        async with training_semaphore(self._concurrency_limit):
-            try:
-                stdout, stderr = await self._run_in_modal(text, payload, config, val_set)
-                return self._parse_result(stdout, stderr)
-            except TrainerError:
-                raise
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                raise TrainerError(
-                    f"modal training timed out after "
-                    f"{config.effective_timeout_minutes} minutes"
-                ) from exc
-            except Exception as exc:
-                logger.error("modal training failed: %s", exc)
-                raise TrainerError(
-                    f"modal training failed: {type(exc).__name__}: {exc}"
-                ) from exc
-
-    async def _run_in_modal(
+    async def _write_inputs(
         self,
+        runtime: vf.Runtime,
         text: str,
         payload: dict[str, Any],
         config: ProxyStudentConfig,
         val_set: HeldOutValSet | None,
-    ) -> tuple[str, str]:
-        import modal  # lazy: modal is an optional dependency
-
-        gpu_str = _modal_gpu_for(config.modal_gpu)
-        timeout_sec = config.effective_timeout_minutes * 60
-        image = modal.Image.debian_slim().pip_install(["torch", "tiktoken", "numpy"])
-        app = await modal.App.lookup.aio(
-            "pretrain-data-curator-trainer", create_if_missing=True
-        )
-
-        sb = await asyncio.wait_for(
-            modal.Sandbox.create.aio(
-                image=image,
-                app=app,
-                gpu=gpu_str,
-                timeout=timeout_sec,
-                workdir="/workspace",
-            ),
-            timeout=config.create_timeout_seconds,
-        )
-        try:
-            await _write_file(sb, "/workspace/train.py", _nanogpt_train_script().encode())
-            await _write_file(sb, "/workspace/corpus.txt", text.encode("utf-8"))
-            await _write_file(sb, "/workspace/config.json", json.dumps(payload).encode())
-            if val_set is not None:
-                await _write_file(sb, "/workspace/val.bin", val_set.to_uint16_bytes())
-
-            await sb.exec.aio("python", "/workspace/train.py", text=False)
-
-            # Poll for result.json rather than waiting on the process (exec_wait RPC hangs
-            # in Modal SDK v1.5.1 even after the process exits).
-            deadline = asyncio.get_event_loop().time() + timeout_sec + 60.0
-            result_json_text: str | None = None
-            while asyncio.get_event_loop().time() < deadline:
-                await asyncio.sleep(5)
-                try:
-                    candidate = await asyncio.to_thread(
-                        lambda: sb.open("/workspace/result.json", "r").read()
-                    )
-                    if candidate and candidate.strip():
-                        json.loads(candidate)  # validate complete JSON before accepting
-                        result_json_text = candidate
-                        break
-                except Exception:
-                    pass  # file not yet written or incomplete — keep polling
-
-            if result_json_text is None:
-                # Training timed out. Try to read stderr for diagnostics.
-                stderr_text = ""
-                try:
-                    stderr_text = await asyncio.to_thread(
-                        lambda: sb.open("/workspace/stderr.txt", "r").read()
-                    )
-                except Exception:
-                    pass
-                raise TrainerError(
-                    f"modal training timed out after {timeout_sec + 60:.0f}s — no result.json appeared",
-                    stderr_tail=stderr_text[-self.STDERR_TAIL:],
-                )
-
-            return f"RESULT_JSON {result_json_text}\n", ""
-        finally:
+    ) -> None:
+        files = [
+            ("/workspace/corpus.txt", text.encode("utf-8")),
+            ("/workspace/config.json", json.dumps(payload).encode("utf-8")),
+            ("/workspace/train.py", _nanogpt_train_script().encode("utf-8")),
+        ]
+        if val_set is not None:
+            files.append(("/workspace/val.bin", val_set.to_uint16_bytes()))
+        for path, data in files:
             try:
-                await sb.terminate.aio()
-            except Exception as exc:  # noqa: BLE001 - cleanup must not mask run errors
-                logger.warning(
-                    "modal sandbox terminate failed: %s: %s", type(exc).__name__, exc
+                await asyncio.wait_for(
+                    runtime.write(path, data),
+                    timeout=config.upload_timeout_seconds,
                 )
+                # A cancellation delivered as write completes can be swallowed
+                # by asyncio.wait_for on Python <3.12.
+                self._raise_if_cancelling()
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TrainerError(
+                    f"timed out writing proxy-student input {path!r}"
+                ) from exc
+
+    async def _run_training(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> Any:
+        timeout = config.effective_timeout_minutes * 60
+        try:
+            result = await asyncio.wait_for(
+                runtime.run(["python", "/workspace/train.py"], {}),
+                timeout=timeout,
+            )
+            # Apply the same pre-3.12 wait_for cancellation-race guard before
+            # inspecting a result or returning to the caller.
+            self._raise_if_cancelling()
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise TrainerError(
+                f"proxy-student training timed out after {timeout}s"
+            ) from exc
+        if result.exit_code not in (0, None):
+            raise TrainerError(
+                f"proxy-student training exited with code {result.exit_code}",
+                stderr_tail=(result.stderr or "")[-self.STDERR_TAIL :],
+            )
+        return result
 
     def _parse_result(self, stdout: str, stderr: str) -> TrainResult:
-        for line in reversed((stdout or "").splitlines()):
-            if line.startswith("RESULT_JSON "):
-                data = json.loads(line[len("RESULT_JSON ") :])
-                return TrainResult(
-                    loss=float(data["loss"]),
-                    accuracy=float(data.get("accuracy", 0.0)),
-                    flops=float(data.get("flops", 0.0)),
-                    tokens_trained=int(data.get("tokens_trained", 0)),
-                    backend="modal",
-                )
-        logger.error(
-            "modal training produced no RESULT_JSON. stderr: %s", stderr[-500:]
+        marker = next(
+            (
+                line[len("RESULT_JSON ") :]
+                for line in reversed((stdout or "").splitlines())
+                if line.startswith("RESULT_JSON ")
+            ),
+            None,
         )
-        raise TrainerError(
-            "modal training produced no RESULT_JSON",
-            stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
-        )
+        if marker is None:
+            raise TrainerError(
+                "proxy-student training produced no RESULT_JSON marker",
+                stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
+            )
+        try:
+            data = json.loads(marker)
+            return TrainResult(
+                loss=float(data["loss"]),
+                accuracy=float(data.get("accuracy", 0.0)),
+                flops=float(data.get("flops", 0.0)),
+                tokens_trained=int(data.get("tokens_trained", 0)),
+                backend="modal",
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TrainerError(
+                f"proxy-student training produced malformed RESULT_JSON: {exc}",
+                stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
+            ) from exc
 
-async def _write_file(sb: Any, path: str, data: bytes) -> None:
-    """Write bytes to an absolute path inside the sandbox.
-
-    Uses the synchronous ``Sandbox.open`` API (same pattern as the
-    nanogpt_speedrun env, which is confirmed working) wrapped in
-    ``asyncio.to_thread`` so we don't block the event loop.
-    """
-    def _sync_write() -> None:
-        with sb.open(path, "wb") as f:
-            f.write(data)
-
-    await asyncio.to_thread(_sync_write)
+    @staticmethod
+    async def _stop_cancel_safe(runtime: vf.Runtime) -> None:
+        """Finish paid-resource teardown even while the caller is cancelled."""
+        teardown = asyncio.create_task(runtime.stop())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            await asyncio.shield(teardown)
+            raise
+        except Exception:
+            logger.warning("modal harness runtime teardown failed", exc_info=True)

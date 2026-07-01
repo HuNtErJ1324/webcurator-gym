@@ -63,8 +63,8 @@ Measured/estimated training FLOPs are charged back onto the cost ledger.
 
 #### Real-trainer backends: Prime, Docker, and Modal
 
-When `use_real_trainer=true`, `SandboxProxyTrainer` runs on one of three
-**selectable** backends, chosen by `proxy_student.trainer_backend`:
+When `use_real_trainer=true`, proxy training uses one of three **selectable**
+backends, chosen by `proxy_student.trainer_backend`:
 
 - **`prime`** (default): provisions a Prime GPU sandbox via `prime_sandboxes`.
   GPU-request guards (`vm=true`, a non-empty `gpu_type`) and the Prime 24h
@@ -74,12 +74,13 @@ When `use_real_trainer=true`, `SandboxProxyTrainer` runs on one of three
   use the same rollout-owned container on a Docker daemon co-located with the
   eval worker. Scoring receives that live runtime and writes/runs training
   directly through `runtime.write()` and `runtime.run()`.
-- **`modal`**: provisions a Modal GPU sandbox via `modal.Sandbox.create()` (v1
-  Modal API). **Recommended for Prime Hosted Training**: the env-server is
-  CPU-only with no Docker daemon, but outbound HTTPS to Modal works. Requires
-  `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` in the environment; `modal>=0.73` is
-  included in base dependencies. Set `modal_gpu` (default `"L4"`) to choose the
-  GPU type — ~$0.011/run at the 200-step default, ~$0.055/run on H100.
+- **`modal`**: declares a GPU-capable v1 `ModalConfig` on the bash harness.
+  Dataset discovery, the agent loop, finalization, and proxy-student scoring all
+  use the same rollout-owned Modal sandbox. The CPU-only env-server needs no
+  Docker daemon or GPU; it uses outbound HTTPS and the Modal SDK. Requires
+  `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. Set `modal_gpu` (default `"L4"`)
+  to choose the GPU type. Because the GPU sandbox now hosts the full rollout,
+  Modal billing covers discovery through scoring, not only the training phase.
 
 The Docker backend lifts the Prime-specific config rules: `vm` and `gpu_type` are
 ignored (Docker maps `gpu_count` → `--gpus <count>`), so `vm=false` is allowed,
@@ -129,12 +130,13 @@ On Docker Desktop under WSL2, the environment automatically advertises the
 interception server on the WSL interface; `PDC_DOCKER_HOST_IP` can override the
 detected address if necessary.
 
-The proxy-student command retains its budget-derived deadline and structured
-exit/`RESULT_JSON` validation. Timeout or cancellation stops the shared runtime
-immediately, and the rollout's `finally` performs the idempotent teardown
-backstop. `max_concurrent_training` bounds training commands independently of
-rollout concurrency. The framework scoring timeout is expanded from the trainer
-deadline so multi-hour jobs are not cancelled by a short reward timeout.
+The Docker and Modal proxy-student commands retain their budget-derived
+deadline and structured exit/`RESULT_JSON` validation. Timeout or cancellation
+stops the shared runtime immediately, and the rollout's `finally` performs the
+idempotent teardown backstop. `max_concurrent_training` bounds training commands
+independently of rollout concurrency. The framework scoring timeout is expanded
+from the trainer deadline so multi-hour jobs are not cancelled by a short
+reward timeout.
 
 ## Agent interface
 
@@ -246,7 +248,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
 - `trainer.py` — `ProxyStudentTrainer` interface, heuristic + GPU-sandbox backends.
 - `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
-- `modal_backend.py` — Modal GPU sandbox adapter for `trainer_backend="modal"`; uploads corpus and training script to a `modal.Sandbox` and parses `RESULT_JSON` from stdout. `modal>=0.73` is a base dependency.
+- `modal_backend.py` — proxy-student execution on the rollout-owned v1 Modal runtime, including GPU mapping, training limits, timeout/cancellation teardown, and structured result parsing.
 - `student_model.py` — modern modded-nanogpt proxy-student architecture embedded into the sandbox script.
 - `student_train.py` — AdamW schedule, contiguous batching, and multi-run averaging, also embedded into the sandbox script.
 - `rewards.py` — `CuratorScorer`, the framework-agnostic heavy scoring pass.

@@ -505,9 +505,8 @@ class CuratorTaskset(_TasksetBase):
         — no factories, so ``SandboxProxyTrainer`` imports ``prime_sandboxes`` and
         provisions a Prime GPU sandbox. ``'docker'`` trains directly in the live
         declarative Docker runtime owned by the rollout.
-        ``'modal'`` builds a ``ModalProxyTrainer`` that calls
-        ``modal.Sandbox.create``; works from a CPU-only env-server in Hosted
-        Training without a local Docker daemon or Prime account.
+        ``'modal'`` trains directly in the live declarative Modal runtime owned
+        by the rollout.
         """
         ps = self.curator.proxy_student
 
@@ -559,6 +558,24 @@ class CuratorTaskset(_TasksetBase):
                     ),
                 }
             )
+        elif self.curator.use_real_trainer and ps.trainer_backend == "modal":
+            from .modal_backend import _modal_gpu_for
+
+            updates.update(
+                {
+                    "image": ps.docker_image,
+                    "workdir": "/workspace",
+                    "resources": vf.TaskResources(
+                        cpu=float(ps.cpu_cores),
+                        memory=float(ps.memory_gb),
+                        gpu=_modal_gpu_for(ps.modal_gpu),
+                        disk=float(ps.disk_size_gb),
+                    ),
+                    "timeout": vf.TaskTimeout(
+                        scoring=ps.effective_scoring_timeout_seconds
+                    ),
+                }
+            )
         return [task.model_copy(update=updates) for task in tasks]
 
     def _system_prompt(self) -> str:
@@ -599,7 +616,7 @@ class CuratorTaskset(_TasksetBase):
     # non-MCP gate (env.py:239-247) pass for codex / kimi_code / bash harnesses.
 
     async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:
-        """Reject a Docker trainer paired with a non-Docker rollout runtime."""
+        """Reject harness-runtime trainers paired with the wrong runtime."""
         if (
             self.curator.use_real_trainer
             and self.curator.proxy_student.trainer_backend == "docker"
@@ -608,6 +625,15 @@ class CuratorTaskset(_TasksetBase):
             raise TrainerError(
                 "trainer_backend='docker' requires the rollout harness to use a "
                 "Docker runtime; pass --harness.runtime.type docker"
+            )
+        if (
+            self.curator.use_real_trainer
+            and self.curator.proxy_student.trainer_backend == "modal"
+            and runtime.type != "modal"
+        ):
+            raise TrainerError(
+                "trainer_backend='modal' requires the rollout harness to use a "
+                "Modal runtime; pass --harness.runtime.type modal"
             )
         if runtime.type == "docker":
             DockerHostReachability.configure()
