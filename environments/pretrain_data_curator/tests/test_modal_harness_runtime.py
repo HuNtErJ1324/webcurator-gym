@@ -307,6 +307,7 @@ def test_load_environment_uses_modal_config_and_gpu_mapping(monkeypatch):
     )
 
     runtime = env.harness.config.runtime
+    assert env.harness.config.env == {}
     assert isinstance(runtime, ModalConfig)
     assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
     assert runtime.workdir == "/workspace"
