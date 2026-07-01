@@ -1,0 +1,8 @@
+FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
+
+# One image serves both phases of the rollout: the bash harness needs the `hf`
+# discovery CLI, while scoring needs CUDA PyTorch and the proxy-student tokenizer.
+RUN python -m pip install --no-cache-dir \
+    "huggingface-hub>=0.34" \
+    tiktoken \
+    uv

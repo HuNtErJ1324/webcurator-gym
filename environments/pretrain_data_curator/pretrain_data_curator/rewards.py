@@ -21,6 +21,8 @@ import logging
 import math
 from typing import Any
 
+import verifiers.v1 as vf
+
 from .corpus import CorpusBuilder, CuratedCorpus
 from .leakage import LeakageDetector
 from .models import CuratorConfig
@@ -45,14 +47,16 @@ class CuratorScorer:
         self.trainer = trainer
         self.leakage_detector = leakage_detector
 
-    async def compute_scoring(self, state: CuratorState) -> dict[str, Any]:
+    async def compute_scoring(
+        self, state: CuratorState, runtime: vf.Runtime | None = None
+    ) -> dict[str, Any]:
         manifest = RolloutStore.manifest(state)
         finalized = RolloutStore.is_finalized(state)
         if not finalized or not manifest.sources:
             return self._empty_scoring(state)
 
         corpus = await self.corpus_builder.materialize(manifest, state)
-        train_result = await self._train(corpus, state)
+        train_result = await self._train(corpus, state, runtime)
 
         ledger = RolloutStore.ledger(state)
         ledger.train_flops += train_result.flops
@@ -79,7 +83,12 @@ class CuratorScorer:
             "perf_baseline_loss": self.config.perf_baseline_loss,
         }
 
-    async def _train(self, corpus: CuratedCorpus, state: CuratorState) -> TrainResult:
+    async def _train(
+        self,
+        corpus: CuratedCorpus,
+        state: CuratorState,
+        runtime: vf.Runtime | None = None,
+    ) -> TrainResult:
         """Train the proxy student, degrading external failures to a sentinel.
 
         A trainer/sandbox failure records typed telemetry and yields a defined
@@ -87,6 +96,10 @@ class CuratorScorer:
         completes and scoring stays deterministic rather than crashing.
         """
         try:
+            if self.config.proxy_student.trainer_backend == "docker":
+                return await self.trainer.train_and_eval(
+                    corpus, self.config.proxy_student, runtime=runtime
+                )
             return await self.trainer.train_and_eval(corpus, self.config.proxy_student)
         except Exception as exc:  # noqa: BLE001 - surfaced as telemetry + sentinel
             stderr_tail = getattr(exc, "stderr_tail", "")

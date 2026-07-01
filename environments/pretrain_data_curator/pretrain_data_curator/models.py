@@ -189,17 +189,16 @@ class ProxyStudentConfig(BaseModel):
     # --- real-trainer backend selection (only used when use_real_trainer) -----
     # Which backend runs the real proxy-student training. ``'prime'`` (default)
     # provisions a Prime GPU sandbox via ``prime_sandboxes`` exactly as before —
-    # the byte-identical historical path. ``'docker'`` drives verifiers' v1
-    # ``DockerRuntime`` against a Docker daemon, typically a remote rented host
-    # reached over ``DOCKER_HOST=ssh://user@host`` (see ``docker_backend.py``).
+    # the byte-identical historical path. ``'docker'`` places the rollout harness
+    # and proxy-student training in one declarative v1 ``DockerRuntime`` on the
+    # local/co-located Docker daemon (see ``docker_backend.py``).
     # ``'modal'`` provisions a Modal GPU sandbox via ``modal.Sandbox.create``,
     # which works from a CPU-only env-server in Hosted Training without a local
     # Docker daemon or Prime account (see ``modal_backend.py``).
     trainer_backend: Literal["prime", "docker", "modal"] = "prime"
-    # Remote Docker endpoint for the docker backend, e.g. ``"ssh://user@host"``.
-    # ``None`` relies on the ambient ``DOCKER_HOST`` (or a local daemon). The
-    # adapter sets ``os.environ["DOCKER_HOST"]`` from this when it is not already
-    # set. Ignored by the prime and modal backends.
+    # Retained for config compatibility, but remote Docker is not supported by
+    # the shared harness-runtime path. ``load_environment`` rejects a non-None
+    # value for the docker backend. Ignored by prime and modal.
     docker_host: str | None = None
     # Modal GPU type for the modal backend. Maps to a Modal GPU specifier string:
     # ``"H100"`` → ``"H100"``, ``"H200"`` → ``"H200"``, ``"A100"`` → ``"A100-80GB"``,
