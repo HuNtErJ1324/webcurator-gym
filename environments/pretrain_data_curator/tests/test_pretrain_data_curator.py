@@ -6,8 +6,7 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,20 +75,10 @@ from pretrain_data_curator.val_set import (
 )
 
 
-@dataclass
-class FakeDatasetInfo:
-    id: str
-    last_modified: datetime | None
-    downloads: int = 0
-    likes: int = 0
-    tags: list[str] | None = None
-
-
 class FakeClient:
     """In-memory HF stand-in: cutoff-relevant search + canned documents."""
 
     def __init__(self) -> None:
-        self.search_calls: list[tuple[str, int]] = []
         self.sample_calls: list[str] = []
         self._docs = {
             "good/encyclopedia": [
@@ -108,39 +97,6 @@ class FakeClient:
             * 8,
             "noisy/symbols": ["$$$ @@@ ### %%% ^^^ &&& !!!"] * 8,
         }
-
-    def search_datasets(self, query: str, scan_limit: int) -> list[FakeDatasetInfo]:
-        self.search_calls.append((query, scan_limit))
-        return [
-            FakeDatasetInfo(
-                id="good/encyclopedia",
-                last_modified=datetime(2024, 1, 4, tzinfo=timezone.utc),
-                downloads=5000,
-                likes=120,
-                tags=["encyclopedia", "text"],
-            ),
-            FakeDatasetInfo(
-                id="good/science",
-                last_modified=datetime(2024, 3, 4, tzinfo=timezone.utc),
-                downloads=3000,
-                likes=80,
-                tags=["science"],
-            ),
-            FakeDatasetInfo(
-                id="too/new",
-                last_modified=datetime(2025, 6, 4, tzinfo=timezone.utc),
-                downloads=9000,
-                likes=400,
-                tags=["new"],
-            ),
-            FakeDatasetInfo(
-                id="noisy/symbols",
-                last_modified=datetime(2023, 5, 10, tzinfo=timezone.utc),
-                downloads=10,
-                likes=1,
-                tags=["misc"],
-            ),
-        ]
 
     def sample_documents(self, dataset_id, config, split, text_field, n):
         self.sample_calls.append(dataset_id)

@@ -15,10 +15,9 @@ After generation, ``finalize`` (run before scoring, while the runtime is live):
      reconstructing hf calls from the trace.
 
 Scoring is unchanged from v1: the finalized manifest's datasets are materialized
-and used to train the fixed proxy student, and the composite reward is preserved
-1:1 from v0:
+and used to train the fixed proxy student, and the composite reward is:
 
-    R(M, H) = a1*Perf + a2*Quality + a3*Diversity - l1*Cost - l2*Leakage
+    R(M, H) = alpha_perf*Perf - lambda_cost*Cost - lambda_leakage*Leakage
 
 The reward coefficients are runtime config, so each ``@vf.reward`` is registered
 with the framework weight ``1.0`` and folds its (signed) coefficient into the

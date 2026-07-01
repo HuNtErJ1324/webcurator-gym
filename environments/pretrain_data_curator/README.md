@@ -249,6 +249,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
 - `trainer.py` — `ProxyStudentTrainer` interface, heuristic + GPU-sandbox backends.
 - `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
+- `docker_network.py` — `DockerHostReachability`: binds the host interception server to the WSL interface (instead of localhost) so containers started by Docker Desktop's WSL2 VM can reach it; a no-op outside WSL.
 - `modal_backend.py` — proxy-student execution on the rollout-owned v1 Modal runtime, including GPU mapping, training limits, timeout/cancellation teardown, and structured result parsing.
 - `student_model.py` — modern modded-nanogpt proxy-student architecture embedded into the sandbox script.
 - `student_train.py` — AdamW schedule, contiguous batching, and multi-run averaging, also embedded into the sandbox script.
