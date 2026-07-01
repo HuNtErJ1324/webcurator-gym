@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import inspect
 import math
+import sys
+import time
 
 import torch
 from torch.nn import functional as F
+from tqdm import tqdm
 
 from .val_set import plan_val_windows
 
@@ -111,6 +114,7 @@ def train_and_eval_student(
     vocab_size,
     device,
     generator,
+    run_label="",
 ):
     """Train ``model`` on ``train_data`` (record_01 recipe) and score held-out CE.
 
@@ -122,6 +126,15 @@ def train_and_eval_student(
     cross-entropy (nats/token) over EVERY predictable next-token position of
     ``val_data`` (via :func:`plan_val_windows`, which raises on a degenerate
     <=1-token val set rather than scoring a bogus 0.0).
+
+    Purely observational: a live ``tqdm`` bar (step/total, EMA loss, tok/s,
+    elapsed, ETA) tracks the loop -- prefixed with ``run_label`` (e.g.
+    ``"run 2/3 "``) when :func:`averaged_train_and_eval` runs >1 seeded run --
+    plus coarse newline-terminated progress lines on stdout every ``log_every``
+    steps (and always the first/last step) so long unattended runs stay legible
+    from a captured, non-interactive stdout blob. The extra per-step ``.item()``
+    GPU sync this needs is throttled to that same cadence, never every step, so
+    it never touches the training math or the returned values.
     """
     block = int(block_size)
     batch = int(batch_size)
@@ -162,7 +175,21 @@ def train_and_eval_student(
         weight_decay=weight_decay,
     )
     model.train()
-    for step in range(steps):
+    # Coarse plain-text cadence: every ~2% of steps or every 50 steps, whichever
+    # is COARSER (the larger gap), so a huge run logs a bounded number of lines
+    # and a tiny test-sized run doesn't spam one per step; the first and last
+    # step always log regardless, so even steps<=1 gets at least one line.
+    log_every = max(50, max(1, steps // 50))
+    ema_loss_tensor = None
+    ema_decay = 0.9
+    start_time = time.time()
+    desc = f"{run_label}train" if run_label else "train"
+    # ``file=sys.stdout``: in the sandbox script (trainer.py) ``sys.stderr`` is
+    # redirected to a file, so a bar left on tqdm's stderr default would never
+    # surface; stdout is what's actually captured, so that's where the live bar
+    # (and the plain lines below, via ``pbar.write``) both go.
+    pbar = tqdm(range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout)
+    for step in pbar:
         lr = lr_at_step(step, steps, warmup_steps, base_lr, lr_min_ratio)
         for group in opt.param_groups:
             group["lr"] = lr
@@ -174,6 +201,30 @@ def train_and_eval_student(
         if grad_clip and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
+
+        # Real per-step EMA, kept on-device as a tensor so this costs no new GPU
+        # sync (`.item()`) -- only converted to a Python float below, and only at
+        # the throttled logging cadence.
+        with torch.no_grad():
+            loss_detached = loss.detach()
+            ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
+                ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+            )
+
+        completed = step + 1
+        if step == 0 or completed == steps or completed % log_every == 0:
+            # The only GPU sync (`.item()`) added for display; throttled to this
+            # cadence, never on every step.
+            ema_loss = ema_loss_tensor.item()
+            elapsed = time.time() - start_time
+            tokens_per_sec = (completed * batch * block) / elapsed if elapsed > 0 else 0.0
+            eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+            pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
+            pbar.write(
+                f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
+                f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
+            )
+    pbar.close()
 
     # Cross-entropy (nats/token, mean) over EVERY predictable next-token position of
     # the held-out val stream, batching consecutive equal-length windows so variable
@@ -228,8 +279,10 @@ def averaged_train_and_eval(
         torch.manual_seed(base_seed + run)
         generator = torch.Generator().manual_seed(base_seed + run)
         model = build_model()
+        run_label = f"run {run + 1}/{n_runs} " if n_runs > 1 else ""
         loss, acc, tokens_trained = train_and_eval_student(
-            model, train_data, val_data, device=device, generator=generator, **hparams
+            model, train_data, val_data, device=device, generator=generator,
+            run_label=run_label, **hparams
         )
         if not math.isfinite(loss):
             return float("inf"), 0.0, 0.0, 0, 0

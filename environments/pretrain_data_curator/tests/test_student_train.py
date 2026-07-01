@@ -15,6 +15,7 @@ import ast
 import inspect
 import math
 import random
+import sys
 
 import pytest
 import torch
@@ -475,3 +476,298 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     # ...and the OLD constant-LR plain-AdamW + random-with-replacement sampler is gone.
     assert "torch.randint(len(src) - block - 1" not in NANOGPT_TRAIN_SCRIPT
     assert "opt = torch.optim.AdamW(model.parameters(), lr=float(cfg" not in NANOGPT_TRAIN_SCRIPT
+    # The sandbox script imports tqdm (installed on demand, like tiktoken) so the
+    # embedded training loop's progress bar/logging actually runs there too.
+    assert "from tqdm import tqdm" in NANOGPT_TRAIN_SCRIPT
+
+
+def test_sandbox_tqdm_fallback_shim_works_when_import_and_install_both_fail(
+    monkeypatch, capsys
+):
+    # If tqdm can't be imported AND the on-demand pip install also fails
+    # (offline container, no pip, read-only fs, ...), training must never
+    # crash just because tqdm was unavailable -- the embedded script falls
+    # back to a no-op progress shim. Extract the EXACT tqdm-import snippet
+    # from the assembled sandbox script and execute it with both failures
+    # forced, then verify the resulting `tqdm` name is usable exactly the way
+    # train_and_eval_student uses it (iteration, .write, .set_postfix, .close)
+    # so the throttled plain print()-style lines still work with no live bar.
+    script = NANOGPT_TRAIN_SCRIPT
+    start = script.index("try:\n    from tqdm import tqdm")
+    # The `# __PLAN_VAL_WINDOWS__` placeholder is already substituted with the
+    # real function source by the time NANOGPT_TRAIN_SCRIPT is assembled, so
+    # anchor on that function's def line instead.
+    end = script.index("def plan_val_windows(", start)
+    snippet = script[start:end].rstrip()
+
+    class _FailingSubprocess:
+        @staticmethod
+        def run(*args, **kwargs):
+            raise RuntimeError("simulated: no network/pip available")
+
+    # Force `from tqdm import tqdm` to raise ImportError even though tqdm IS
+    # actually installed in this test env (it's a real dependency now).
+    monkeypatch.setitem(sys.modules, "tqdm", None)
+    namespace = {"sys": sys, "subprocess": _FailingSubprocess}
+    exec(snippet, namespace)
+
+    shim_tqdm = namespace["tqdm"]
+    bar = shim_tqdm(range(3), total=3, desc="test", unit="step", leave=False, file=sys.stdout)
+    assert list(bar) == [0, 1, 2]
+    bar.set_postfix(loss="1.0000")  # no-op, must not raise
+    bar.write("[test] step 3/3")
+    bar.close()  # no-op, must not raise
+    assert "[test] step 3/3" in capsys.readouterr().out
+
+
+# --- (7) OBSERVABILITY: tqdm progress bar + throttled stdout progress lines --
+
+
+def test_progress_lines_emitted_for_first_and_last_step(capsys):
+    # A tiny run (steps=5, well under the 50-step floor cadence) must still emit
+    # the first and last step's plain progress line on stdout -- and ONLY those --
+    # so degenerate test-sized runs stay legible from a captured stdout blob
+    # without spamming a line per step.
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (100,))
+    gen = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model, data, data, block_size=8, batch_size=2, steps=5,
+        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
+        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+        device="cpu", generator=gen,
+    )
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("[train]")]
+    assert len(lines) == 2
+    assert "step 1/5" in lines[0]
+    assert "step 5/5" in lines[1]
+    for line in lines:
+        assert "loss" in line and "tok/s" in line and "elapsed" in line and "eta" in line
+
+
+def test_progress_line_survives_a_single_step_run():
+    # steps=1: the first step IS the last step. Must not crash, hang, or double-log.
+    import io
+    from contextlib import redirect_stdout
+
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (50,))
+    gen = torch.Generator().manual_seed(0)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        train_and_eval_student(
+            model, data, data, block_size=8, batch_size=2, steps=1,
+            base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
+            beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+            device="cpu", generator=gen,
+        )
+    lines = [line for line in buf.getvalue().splitlines() if line.startswith("[train]")]
+    assert len(lines) == 1
+    assert "step 1/1" in lines[0]
+
+
+def test_progress_lines_throttled_for_a_longer_run(capsys):
+    # steps=120 with the "50 steps or 2%, whichever is coarser" cadence logs at
+    # completed in {1, 50, 100, 120} -- 4 lines, never one per step -- proving the
+    # throttle actually throttles instead of spamming.
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (300,))
+    gen = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model, data, data, block_size=8, batch_size=2, steps=120,
+        base_lr=1e-3, warmup_steps=4, weight_decay=0.1, grad_clip=1.0,
+        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+        device="cpu", generator=gen,
+    )
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("[train]")]
+    logged_steps = [int(line.split("step ")[1].split("/")[0]) for line in lines]
+    assert logged_steps == [1, 50, 100, 120]
+
+
+def test_ema_loss_updates_every_step_not_just_at_log_points(monkeypatch, capsys):
+    # Regression test for a bug where the EMA only updated INSIDE the throttled
+    # logging branch, so a 120-step run only ever averaged in the ~4 sampled
+    # losses instead of all 120. Spy on F.cross_entropy to capture every
+    # step's real raw training loss, independently compute the reference
+    # full per-step EMA (decay=0.9) over ALL of them, and confirm the final
+    # logged line's reported loss matches it -- which only holds if the EMA is
+    # actually updated every step.
+    import pretrain_data_curator.student_train as st
+
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (400,))
+    gen = torch.Generator().manual_seed(0)
+    steps = 120
+
+    real_cross_entropy = st.F.cross_entropy
+    captured_losses = []
+
+    def spy_cross_entropy(*args, **kwargs):
+        out = real_cross_entropy(*args, **kwargs)
+        # Only the training-loop call site omits `reduction` (default "mean");
+        # the val-scoring call site always passes reduction="sum" explicitly,
+        # so this filter captures exactly the per-step training losses.
+        if kwargs.get("reduction", "mean") == "mean":
+            captured_losses.append(out.detach().clone())
+        return out
+
+    monkeypatch.setattr(st.F, "cross_entropy", spy_cross_entropy)
+    train_and_eval_student(
+        model, data, data, block_size=8, batch_size=2, steps=steps,
+        base_lr=1e-3, warmup_steps=4, weight_decay=0.1, grad_clip=1.0,
+        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+        device="cpu", generator=gen,
+    )
+    assert len(captured_losses) == steps  # one captured training loss per step
+
+    ema_decay = 0.9
+    ref_ema = None
+    for loss_val in (t.item() for t in captured_losses):
+        ref_ema = (
+            loss_val if ref_ema is None else ema_decay * ref_ema + (1 - ema_decay) * loss_val
+        )
+
+    out = capsys.readouterr().out
+    last_line = [line for line in out.splitlines() if line.startswith("[train]")][-1]
+    reported_loss = float(last_line.split("loss ")[1].split(" |")[0])
+    assert reported_loss == pytest.approx(ref_ema, rel=1e-3)
+
+
+def test_run_label_prefixes_progress_lines_when_multiple_runs(capsys):
+    # n_runs > 1 must tag each run's progress lines with "run k/n" so the log of a
+    # multi-run averaged eval is legible about which seeded run is in flight.
+    V = 16
+    cfg = _tiny_cfg(V)
+    data = torch.randint(0, V, (100,))
+    averaged_train_and_eval(
+        cfg.build, data, data, n_runs=2, base_seed=0, device="cpu",
+        block_size=8, batch_size=2, steps=2, base_lr=1e-3, warmup_steps=1,
+        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
+        lr_min_ratio=0.1, vocab_size=V,
+    )
+    out = capsys.readouterr().out
+    assert "[run 1/2 train] step 1/2" in out
+    assert "[run 1/2 train] step 2/2" in out
+    assert "[run 2/2 train] step 1/2" in out
+    assert "[run 2/2 train] step 2/2" in out
+
+
+def test_run_label_absent_for_a_single_run(capsys):
+    # n_runs == 1 (the default/common case) must NOT prefix a "run 1/1" label --
+    # single-run output stays exactly as plain as before, uncluttered.
+    V = 16
+    cfg = _tiny_cfg(V)
+    data = torch.randint(0, V, (100,))
+    averaged_train_and_eval(
+        cfg.build, data, data, n_runs=1, base_seed=0, device="cpu",
+        block_size=8, batch_size=2, steps=2, base_lr=1e-3, warmup_steps=1,
+        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
+        lr_min_ratio=0.1, vocab_size=V,
+    )
+    out = capsys.readouterr().out
+    assert "[train] step 1/2" in out
+    assert "run 1/1" not in out
+
+
+def test_progress_instrumentation_matches_pre_instrumentation_reference_loop():
+    # Running train_and_eval_student twice and comparing its own output to
+    # itself would only prove REPEATABILITY -- it would still pass even if the
+    # progress-bar code silently, but deterministically, perturbed the RNG
+    # stream or the training math (e.g. an extra generator draw, an EMA update
+    # that fed back into `loss`, etc). Instead this reimplements the loop
+    # EXACTLY as it read before the progress bar was added -- byte-for-byte the
+    # same AdamW, per-step LR schedule, contiguous-window batching, grad clip,
+    # and val scoring, with NO tqdm, NO extra `.item()` calls, and NO print()s
+    # at all -- and checks it reaches the EXACT same (val_loss, accuracy,
+    # tokens_trained) as train_and_eval_student for an identical seed. Any
+    # hypothetical bug where the instrumentation perturbs the RNG stream or the
+    # training math would desync the two and fail this.
+    from pretrain_data_curator.val_set import plan_val_windows
+
+    V = 16
+    block, batch, steps = 8, 4, 12
+    data = torch.randint(0, V, (200,))
+    hparams = dict(
+        block_size=block, batch_size=batch, steps=steps, base_lr=1e-3,
+        warmup_steps=2, weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95,
+        eps=1e-8, lr_min_ratio=0.1, vocab_size=V, device="cpu",
+    )
+
+    torch.manual_seed(0)
+    model_a = _tiny_cfg(V).build()
+    gen_a = torch.Generator().manual_seed(0)
+    result_a = train_and_eval_student(model_a, data, data, generator=gen_a, **hparams)
+
+    # --- Reference: the pre-instrumentation recipe, verbatim, no bar/logging. ---
+    torch.manual_seed(0)
+    model_b = _tiny_cfg(V).build()
+    gen_b = torch.Generator().manual_seed(0)
+
+    train_src = data
+    starts = plan_train_windows(len(train_src), block)
+    order, cursor = [], 0
+
+    def next_batch():
+        nonlocal order, cursor
+        xs, ys = [], []
+        for _ in range(batch):
+            if cursor >= len(order):
+                perm = torch.randperm(len(starts), generator=gen_b)
+                order = [starts[i] for i in perm.tolist()]
+                cursor = 0
+            i = order[cursor]
+            cursor += 1
+            xs.append(train_src[i : i + block])
+            ys.append(train_src[i + 1 : i + block + 1])
+        return torch.stack(xs), torch.stack(ys)
+
+    opt = torch.optim.AdamW(
+        model_b.parameters(), lr=hparams["base_lr"],
+        betas=(hparams["beta1"], hparams["beta2"]), eps=hparams["eps"],
+        weight_decay=hparams["weight_decay"],
+    )
+    model_b.train()
+    for step in range(steps):
+        lr = lr_at_step(
+            step, steps, hparams["warmup_steps"], hparams["base_lr"], hparams["lr_min_ratio"]
+        )
+        for group in opt.param_groups:
+            group["lr"] = lr
+        x, y = next_batch()
+        logits = model_b(x)
+        loss = torch.nn.functional.cross_entropy(logits.view(-1, V), y.view(-1))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model_b.parameters(), hparams["grad_clip"])
+        opt.step()
+
+    model_b.eval()
+    val_windows = plan_val_windows(len(data), block)
+    total = sum(L for _, L in val_windows)
+    loss_sum, correct = 0.0, 0
+    with torch.no_grad():
+        wi = 0
+        while wi < len(val_windows):
+            L = val_windows[wi][1]
+            vs = []
+            while wi < len(val_windows) and val_windows[wi][1] == L and len(vs) < batch:
+                vs.append(val_windows[wi][0])
+                wi += 1
+            xb = torch.stack([data[s : s + L] for s in vs])
+            yb = torch.stack([data[s + 1 : s + L + 1] for s in vs])
+            logits = model_b(xb)
+            loss_sum += torch.nn.functional.cross_entropy(
+                logits.reshape(-1, V), yb.reshape(-1), reduction="sum"
+            ).item()
+            correct += (logits.argmax(-1) == yb).sum().item()
+    result_b = (loss_sum / total, correct / total, steps * batch * block)
+
+    assert result_a[0] == pytest.approx(result_b[0], abs=1e-6)
+    assert result_a[1] == pytest.approx(result_b[1])
+    assert result_a[2] == result_b[2]

@@ -175,11 +175,43 @@ _NANOGPT_TRAIN_SCRIPT_TEMPLATE = r'''
 import sys
 sys.stderr = open('/workspace/stderr.txt', 'w')
 
-import json, math, os, subprocess
+import json, math, os, subprocess, time
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# tqdm drives the training progress bar/log lines (student_train.py); installed
+# on demand like tiktoken below, since the base image may not ship it. Training
+# must never fail just because tqdm couldn't be installed (offline container,
+# no pip, read-only fs, ...), so a failed install falls back to a minimal
+# tqdm-compatible shim: no live bar, but the throttled plain print()-style
+# progress lines (via `.write`) still work since they don't depend on a real
+# bar.
+try:
+    from tqdm import tqdm
+except ImportError:
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "tqdm"], check=True)
+        from tqdm import tqdm
+    except Exception:
+        class _NoOpProgressBar:
+            def __init__(self, iterable=None, total=None, **kwargs):
+                self._iterable = range(total) if iterable is None else iterable
+
+            def __iter__(self):
+                return iter(self._iterable)
+
+            def set_postfix(self, *args, **kwargs):
+                pass
+
+            def write(self, s, *args, **kwargs):
+                print(s)
+
+            def close(self):
+                pass
+
+        tqdm = _NoOpProgressBar
 
 # __PLAN_VAL_WINDOWS__  (replaced with the tested plan_val_windows source)
 
