@@ -84,7 +84,17 @@ class HarnessRuntimeProxyTrainer:
         async with training_semaphore(self._concurrency_limit):
             try:
                 await self._write_inputs(runtime, text, payload, config, val_set)
+                # asyncio.wait_for() (pre-3.12) can race: a cancellation delivered
+                # while the wrapped write is *also* completing gets silently
+                # absorbed by wait_for's `if fut.done(): return fut.result()`
+                # shortcut instead of propagating. That leaves the task's
+                # cancellation request pending but undelivered, so re-raise it
+                # explicitly here rather than falling through into the
+                # potentially-unbounded `_run_training` await with no cancellation
+                # left to interrupt it.
+                self._raise_if_cancelling()
                 result = await self._run_training(runtime, config)
+                self._raise_if_cancelling()
                 return self._parse_result(result.stdout, result.stderr)
             except BaseException:
                 # A failed/cancelled docker exec may leave the process running in
@@ -92,6 +102,12 @@ class HarnessRuntimeProxyTrainer:
                 # in its finally, and DockerRuntime.stop() is idempotent.
                 await self._stop_cancel_safe(runtime)
                 raise
+
+    @staticmethod
+    def _raise_if_cancelling() -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError()
 
     async def _resolve_val_set(self) -> HeldOutValSet | None:
         if self._val_loader is None:
