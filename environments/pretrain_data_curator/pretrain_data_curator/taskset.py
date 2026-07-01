@@ -39,6 +39,7 @@ import verifiers.v1 as vf
 from pydantic import ValidationError
 
 from .corpus import CorpusBuilder
+from .docker_network import DockerHostReachability
 from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
@@ -47,7 +48,12 @@ from .models import CuratorConfig, FilterSpec, Manifest, ProxyStudentConfig, Sam
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
 from .tasks import CuratorTask, build_tasks
-from .trainer import HeuristicProxyTrainer, ProxyStudentTrainer, SandboxProxyTrainer
+from .trainer import (
+    HeuristicProxyTrainer,
+    ProxyStudentTrainer,
+    SandboxProxyTrainer,
+    TrainerError,
+)
 from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
@@ -497,9 +503,8 @@ class CuratorTaskset(_TasksetBase):
 
         ``trainer_backend='prime'`` (default) builds the trainer EXACTLY as before
         — no factories, so ``SandboxProxyTrainer`` imports ``prime_sandboxes`` and
-        provisions a Prime GPU sandbox. ``'docker'`` injects ``client_factory`` /
-        ``request_factory`` that drive verifiers' v1 ``DockerRuntime`` against a
-        (typically remote) Docker daemon, leaving the trainer lifecycle untouched.
+        provisions a Prime GPU sandbox. ``'docker'`` trains directly in the live
+        declarative Docker runtime owned by the rollout.
         ``'modal'`` builds a ``ModalProxyTrainer`` that calls
         ``modal.Sandbox.create``; works from a CPU-only env-server in Hosted
         Training without a local Docker daemon or Prime account.
@@ -515,29 +520,11 @@ class CuratorTaskset(_TasksetBase):
             )
 
         if ps.trainer_backend == "docker":
-            # Lazy import: the docker runtime is only needed on this path.
-            from .docker_backend import DockerRunRequest, DockerRuntimeClient
+            from .docker_backend import HarnessRuntimeProxyTrainer
 
-            docker_host = ps.docker_host
-
-            def request_factory(cfg: ProxyStudentConfig, name: str) -> DockerRunRequest:
-                return DockerRunRequest(
-                    name=name,
-                    image=cfg.docker_image,
-                    workdir="/workspace",
-                    # Docker maps gpu_count -> ``--gpus N`` and ignores gpu_type.
-                    gpu=str(cfg.gpu_count) if cfg.gpu_count > 0 else None,
-                    cpu=float(cfg.cpu_cores),
-                    memory=float(cfg.memory_gb),
-                    disk=float(cfg.disk_size_gb),
-                    timeout_minutes=cfg.effective_timeout_minutes,
-                )
-
-            return SandboxProxyTrainer(
+            return HarnessRuntimeProxyTrainer(
                 concurrency_limit=self.curator.max_concurrent_training,
                 val_loader=self._val_loader,
-                client_factory=lambda: DockerRuntimeClient(docker_host=docker_host),
-                request_factory=request_factory,
             )
 
         # prime backend (default): unchanged — no factories => prime_sandboxes.
@@ -551,7 +538,28 @@ class CuratorTaskset(_TasksetBase):
     def load_tasks(self) -> list[CuratorTask]:
         tasks = build_tasks(self.curator.cutoff_date, self.curator.token_budget)
         system_prompt = self._system_prompt()
-        return [t.model_copy(update={"system_prompt": system_prompt}) for t in tasks]
+        updates: dict[str, Any] = {"system_prompt": system_prompt}
+        ps = self.curator.proxy_student
+        if self.curator.use_real_trainer and ps.trainer_backend == "docker":
+            # Native taskset runs do not call load_environment(), so declare the
+            # image, resources, and scoring deadline on each task. A task image
+            # also makes a subprocess runtime fail before rollout.
+            updates.update(
+                {
+                    "image": ps.docker_image,
+                    "workdir": "/workspace",
+                    "resources": vf.TaskResources(
+                        cpu=float(ps.cpu_cores),
+                        memory=float(ps.memory_gb),
+                        gpu=str(ps.gpu_count) if ps.gpu_count > 0 else None,
+                        disk=float(ps.disk_size_gb),
+                    ),
+                    "timeout": vf.TaskTimeout(
+                        scoring=ps.effective_scoring_timeout_seconds
+                    ),
+                }
+            )
+        return [task.model_copy(update=updates) for task in tasks]
 
     def _system_prompt(self) -> str:
         """Render the configured turn budget into the per-rollout prompt.
@@ -589,6 +597,20 @@ class CuratorTaskset(_TasksetBase):
     # `hf` CLI in its own shell, so the taskset exposes no MCP tool servers and
     # ``type(CuratorTaskset).tools is Taskset.tools`` holds. This is what lets the
     # non-MCP gate (env.py:239-247) pass for codex / kimi_code / bash harnesses.
+
+    async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:
+        """Reject a Docker trainer paired with a non-Docker rollout runtime."""
+        if (
+            self.curator.use_real_trainer
+            and self.curator.proxy_student.trainer_backend == "docker"
+            and runtime.type != "docker"
+        ):
+            raise TrainerError(
+                "trainer_backend='docker' requires the rollout harness to use a "
+                "Docker runtime; pass --harness.runtime.type docker"
+            )
+        if runtime.type == "docker":
+            DockerHostReachability.configure()
 
     @vf.stop
     async def max_turns_reached(self, trace: vf.Trace) -> bool:
@@ -676,7 +698,9 @@ class CuratorTaskset(_TasksetBase):
             self._scoring_locks[key] = lock
         return lock
 
-    async def _prepared(self, trace: vf.Trace) -> dict[str, Any]:
+    async def _prepared(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> dict[str, Any]:
         """The single heavy scoring pass for a rollout, cached per trace.
 
         Double-checked locking: the cache is populated exactly once even when many
@@ -691,7 +715,7 @@ class CuratorTaskset(_TasksetBase):
             cached = self._scoring_cache.get(trace.id)
             if cached is not None:
                 return cached
-            scoring = await scorer.compute_scoring(trace.state)
+            scoring = await scorer.compute_scoring(trace.state, runtime)
             self._scoring_cache[trace.id] = scoring
         # Safe to drop: later callers short-circuit on the populated cache above.
         self._scoring_locks.pop(trace.id, None)
@@ -700,61 +724,89 @@ class CuratorTaskset(_TasksetBase):
     # -- rewards (weighted contributions; coefficients folded in) --------------
 
     @vf.reward(weight=1.0)
-    async def perf_reward(self, trace: vf.Trace) -> float:
-        return self.curator.alpha_perf * (await self._prepared(trace))["perf"]
+    async def perf_reward(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return self.curator.alpha_perf * (await self._prepared(trace, runtime))["perf"]
 
     @vf.reward(weight=1.0)
-    async def cost_penalty(self, trace: vf.Trace) -> float:
-        return -self.curator.lambda_cost * (await self._prepared(trace))["cost"]
+    async def cost_penalty(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return -self.curator.lambda_cost * (await self._prepared(trace, runtime))["cost"]
 
     @vf.reward(weight=1.0)
-    async def leakage_penalty(self, trace: vf.Trace) -> float:
-        return -self.curator.lambda_leakage * (await self._prepared(trace))["leakage"]["overall"]
+    async def leakage_penalty(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return -self.curator.lambda_leakage * (
+            await self._prepared(trace, runtime)
+        )["leakage"]["overall"]
 
     # -- zero-weight diagnostic metrics (recorded, not summed into reward) -----
 
     @vf.metric
-    async def perf_loss(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["loss"]
+    async def perf_loss(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["loss"]
 
     @vf.metric
-    async def perf_accuracy(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["accuracy"]
+    async def perf_accuracy(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["accuracy"]
 
     @vf.metric
-    async def perf_vs_baseline(self, trace: vf.Trace) -> float:
+    async def perf_vs_baseline(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
         """Relative val-loss reduction over the neutral baseline (always surfaced,
         zero-weight). Positive => the curated corpus beat the no-information
         baseline; this is the sharpened, scale-anchored read on data quality."""
-        return (await self._prepared(trace))["perf_vs_baseline"]
+        return (await self._prepared(trace, runtime))["perf_vs_baseline"]
 
     @vf.metric
-    async def train_flops(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["flops"]
+    async def train_flops(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["flops"]
 
     @vf.metric
-    async def corpus_tokens(self, trace: vf.Trace) -> float:
-        return float((await self._prepared(trace))["tokens"])
+    async def corpus_tokens(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return float((await self._prepared(trace, runtime))["tokens"])
 
     @vf.metric
-    async def num_sources(self, trace: vf.Trace) -> float:
-        return float((await self._prepared(trace))["num_sources"])
+    async def num_sources(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return float((await self._prepared(trace, runtime))["num_sources"])
 
     @vf.metric
-    async def leakage_exact(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["leakage"]["exact"]
+    async def leakage_exact(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["leakage"]["exact"]
 
     @vf.metric
-    async def leakage_fuzzy(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["leakage"]["fuzzy"]
+    async def leakage_fuzzy(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["leakage"]["fuzzy"]
 
     @vf.metric
-    async def leakage_semantic(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["leakage"]["semantic"]
+    async def leakage_semantic(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["leakage"]["semantic"]
 
     @vf.metric
-    async def cost_total(self, trace: vf.Trace) -> float:
-        return (await self._prepared(trace))["cost"]
+    async def cost_total(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime))["cost"]
 
     @vf.metric
     async def finalized(self, trace: vf.Trace) -> float:
@@ -762,25 +814,35 @@ class CuratorTaskset(_TasksetBase):
 
     # Diagnostics that separate "bad curation" from "external/HF/sandbox failure".
     @vf.metric
-    async def tool_error_count(self, trace: vf.Trace) -> float:
+    async def tool_error_count(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
         return float(RolloutStore.tool_error_count(trace.state))
 
     @vf.metric
-    async def external_failure(self, trace: vf.Trace) -> float:
+    async def external_failure(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
         return 1.0 if RolloutStore.has_external_failure(trace.state) else 0.0
 
-    async def trainer_error_str(self, trace: vf.Trace) -> str:
+    async def trainer_error_str(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> str:
         """Log and return the trainer error message, truncated for diagnostics."""
-        await self._prepared(trace)
+        await self._prepared(trace, runtime)
         err = (RolloutStore.trainer_error(trace.state) or "")[:500]
         if err:
             logger.warning("trainer error: %s", err)
         return err
 
     @vf.metric
-    async def trainer_error_msg(self, trace: vf.Trace) -> float:
+    async def trainer_error_msg(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
         """Whether a trainer error occurred. Zero-weight diagnostic."""
-        return 1.0 if await self.trainer_error_str(trace) else 0.0
+        return 1.0 if await self.trainer_error_str(trace, runtime) else 0.0
 
 
 __all__ = ["CuratorTaskset", "SYSTEM_PROMPT", "_ids_from_trace", "parse_manifest", "extract_json_object"]

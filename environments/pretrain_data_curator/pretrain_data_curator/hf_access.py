@@ -270,15 +270,35 @@ class HuggingFaceDatasetClient:
         text_field: str | None,
         n: int,
     ) -> list[str]:
-        from datasets import load_dataset
+        from datasets import get_dataset_config_names, load_dataset
 
-        stream = load_dataset(
-            dataset_id,
-            name=config,
-            split=split,
-            streaming=True,
-            token=self._token,
-        )
+        try:
+            stream = load_dataset(
+                dataset_id,
+                name=config,
+                split=split,
+                streaming=True,
+                token=self._token,
+            )
+        except ValueError as exc:
+            if config is not None or "config name is missing" not in str(exc).lower():
+                raise
+            configs = get_dataset_config_names(dataset_id, token=self._token)
+            resolved = self._preferred_config(configs)
+            if resolved is None:
+                raise
+            logger.info(
+                "dataset %s has no default config; selected %s",
+                dataset_id,
+                resolved,
+            )
+            stream = load_dataset(
+                dataset_id,
+                name=resolved,
+                split=split,
+                streaming=True,
+                token=self._token,
+            )
         docs: list[str] = []
         for i, row in enumerate(stream):
             if i >= n:
@@ -326,6 +346,19 @@ class HuggingFaceDatasetClient:
             if isinstance(value, str) and value.strip():
                 docs.append(value)
         return docs
+
+    @staticmethod
+    def _preferred_config(configs: list[str]) -> str | None:
+        """Choose a stable English/default config when a dataset has no default."""
+        if not configs:
+            return None
+        for preferred in ("default", "en", "english", "plain_text"):
+            if preferred in configs:
+                return preferred
+        for config in configs:
+            if config.endswith(".en") or config.startswith("en."):
+                return config
+        return configs[0]
 
 
 def parse_cutoff(cutoff_date: str | date | datetime) -> datetime:

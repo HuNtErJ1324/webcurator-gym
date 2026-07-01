@@ -8,6 +8,7 @@ from typing import Any
 import verifiers.v1 as vf
 
 from .hosted_compat import Environment
+from .models import ProxyStudentConfig
 from .taskset import SYSTEM_PROMPT, CuratorTasksetConfig
 
 TASKSET_ID = "pretrain-data-curator"
@@ -93,18 +94,42 @@ def load_environment(
         "eval_corpus": eval_corpus,
     }
     harness_env: dict[str, str] = {}
-    if use_real_trainer and (proxy_student or {}).get("trainer_backend") == "docker":
+    harness_runtime: vf.RuntimeConfig = vf.SubprocessConfig()
+    timeout = vf.TimeoutConfig()
+    ps = ProxyStudentConfig(**config.proxy_student)
+    if use_real_trainer and ps.trainer_backend == "docker":
+        if ps.docker_host is not None:
+            raise ValueError(
+                "proxy_student.docker_host is not supported by the shared harness "
+                "runtime Docker backend; run the rollout and Docker daemon on the "
+                "same machine and leave docker_host unset"
+            )
         # The v1 bash harness runs as a cached PEP 723 uv script. On local Docker
         # trainer runs, a stale script env can miss pydantic-core's compiled
         # extension and fail before reward training starts. Reinstall only that
         # package on this path; hosted/Prime/default paths keep the normal cache.
         harness_env["UV_REINSTALL_PACKAGE"] = "pydantic-core"
+        harness_runtime = vf.DockerConfig(
+            image=ps.docker_image,
+            workdir="/workspace",
+            gpu=str(ps.gpu_count) if ps.gpu_count > 0 else None,
+            cpu=float(ps.cpu_cores),
+            memory=float(ps.memory_gb),
+            disk=float(ps.disk_size_gb),
+        )
+        # Scoring includes corpus materialization, input writes, training, and
+        # leakage computation. Keep the framework deadline above the trainer's
+        # own multi-hour command deadline so the trainer can report/clean up.
+        timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
 
     return Environment(
         vf.EnvConfig(
             taskset=config,
             max_turns=max_turns,
-            harness=vf.HarnessConfig(id="bash", env=harness_env),
+            harness=vf.HarnessConfig(
+                id="bash", env=harness_env, runtime=harness_runtime
+            ),
+            timeout=timeout,
         ),
         env_args=env_args,
     )

@@ -11,7 +11,7 @@ constant**, combined with cross-entropy performance, cost, and leakage terms.
 - **Type**: toolless native verifiers v1 `CuratorTaskset` (`vf.Taskset`) — the agent discovers datasets using the preinstalled `hf` CLI in its own shell; no MCP tool server is exposed
 - **External service**: Hugging Face Hub API (search + streaming sampling)
 - **Required secret**: `HF_TOKEN` by default (checked lazily in the env-server, not at load time)
-- **Proxy-student training**: optional GPU training, off by default; selectable Prime GPU sandbox, Docker backend (local/remote `DOCKER_HOST`), **or Modal** (recommended for Hosted Training)
+- **Proxy-student training**: optional GPU training, off by default; selectable Prime GPU sandbox, a co-located harness-runtime Docker backend, **or Modal** (recommended for Hosted Training)
 
 The agent searches Hugging Face for datasets at or before a cutoff date,
 inspects them, assembles a weighted and filtered **manifest** `M`, previews
@@ -47,7 +47,7 @@ external/infrastructure failure (a flaky Hub or sandbox). See
   run and be tested without a GPU, but its `Perf` is a proxy, not a measurement.
   It trains no model, so it does **not** compute per-token CE on the held-out
   validation set and is unaffected by `validation_set`.
-- **`SandboxProxyTrainer`** (`use_real_trainer=true`): the path that yields a
+- **Real proxy-student training** (`use_real_trainer=true`): the path that yields a
   **meaningful** `Perf`. It actually trains a fixed small GPT (config in
   `ProxyStudentConfig`), GPT-2-BPE-tokenized, in a Prime GPU sandbox on the
   materialized corpus and scores it against a **fixed held-out validation token
@@ -69,10 +69,11 @@ When `use_real_trainer=true`, `SandboxProxyTrainer` runs on one of three
 - **`prime`** (default): provisions a Prime GPU sandbox via `prime_sandboxes`.
   GPU-request guards (`vm=true`, a non-empty `gpu_type`) and the Prime 24h
   timeout ceiling apply.
-- **`docker`**: runs the identical training script in a container via verifiers'
-  v1 `DockerRuntime` (the local `docker` CLI). Point it at a **remote rented
-  host** with `DOCKER_HOST=ssh://user@host` — only the GPU training runs there;
-  rollouts (HF discovery, scoring) stay local.
+- **`docker`**: declares a GPU-capable v1 `DockerConfig` on the bash harness.
+  Dataset discovery, the agent loop, finalization, and proxy-student scoring all
+  use the same rollout-owned container on a Docker daemon co-located with the
+  eval worker. Scoring receives that live runtime and writes/runs training
+  directly through `runtime.write()` and `runtime.run()`.
 - **`modal`**: provisions a Modal GPU sandbox via `modal.Sandbox.create()` (v1
   Modal API). **Recommended for Prime Hosted Training**: the env-server is
   CPU-only with no Docker daemon, but outbound HTTPS to Modal works. Requires
@@ -83,30 +84,57 @@ When `use_real_trainer=true`, `SandboxProxyTrainer` runs on one of three
 The Docker backend lifts the Prime-specific config rules: `vm` and `gpu_type` are
 ignored (Docker maps `gpu_count` → `--gpus <count>`), so `vm=false` is allowed,
 and the 24h timeout ceiling is relaxed (a self-hosted host has no such cap). The
-container image **must** ship torch + CUDA; if `docker_image` is left unset it
-defaults to `pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime` for this backend (pick
-a `-devel` tag if you need build tooling such as `nvcc` for `torch.compile`).
-
-**Docker-backend prerequisites (on the remote host):** Docker Engine + the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-(so `--gpus` works), and **key-based SSH** from the machine running the env (the
-`ssh://` Docker transport uses your SSH agent/keys — no password prompts). Verify
-the host first with `DOCKER_HOST=ssh://user@host docker run --rm --gpus 1 \
-  pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime nvidia-smi`.
+single runtime image must ship both sets of dependencies: bash plus the `hf`
+dataset-discovery CLI, and Python plus CUDA PyTorch for training. The included
+[`Dockerfile.runtime`](Dockerfile.runtime) derives such an image from the
+backend's existing `pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime` default:
 
 ```bash
-export DOCKER_HOST=ssh://user@gpu-host   # or set proxy_student.docker_host below
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"use_real_trainer": true, "proxy_student": {
-        "trainer_backend": "docker",
-        "docker_image": "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime",
-        "gpu_count": 1,
-        "docker_host": "ssh://user@gpu-host"}}'
+docker build -t pretrain-data-curator:gpu \
+  -f environments/pretrain_data_curator/Dockerfile.runtime \
+  environments/pretrain_data_curator
 ```
 
-`docker_host` (config) is applied to `DOCKER_HOST` only when that variable is not
-already set in the environment, so an ambient `export DOCKER_HOST=...` always
-wins.
+**Docker-backend prerequisites (on the eval/GPU host):** Docker Engine + the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+(so `--gpus` works). Verify the host first with
+`docker run --rm --gpus 1 pretrain-data-curator:gpu nvidia-smi`.
+
+```bash
+cd environments/pretrain_data_curator
+uv run eval pretrain-data-curator \
+  --harness.id bash \
+  --harness.runtime.type docker \
+  --harness.runtime.image pretrain-data-curator:gpu \
+  --harness.runtime.workdir /workspace \
+  --harness.runtime.gpu 1 \
+  --taskset.use-real-trainer true \
+  --taskset.token-budget 500000 \
+  --taskset.max-turns 12 \
+  --taskset.proxy-student \
+    '{"trainer_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":5000000,"gpu_count":1}' \
+  -m nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 -n 1 -r 1
+```
+
+Use the native v1 taskset command above for local Docker runs. The currently
+released `prime eval run` wrapper has no `--harness.runtime.*` passthrough, so it
+cannot select this runtime. An owner-qualified target such as
+`hunterj/pretrain-data-curator` also resolves the published Hub version rather
+than this local checkout.
+
+SSH-remote `docker_host` orchestration is intentionally unsupported by this
+single-runtime path; `load_environment` rejects a configured `docker_host`.
+Leave it unset and do not set an ambient remote `DOCKER_HOST`.
+On Docker Desktop under WSL2, the environment automatically advertises the
+interception server on the WSL interface; `PDC_DOCKER_HOST_IP` can override the
+detected address if necessary.
+
+The proxy-student command retains its budget-derived deadline and structured
+exit/`RESULT_JSON` validation. Timeout or cancellation stops the shared runtime
+immediately, and the rollout's `finally` performs the idempotent teardown
+backstop. `max_concurrent_training` bounds training commands independently of
+rollout concurrency. The framework scoring timeout is expanded from the trainer
+deadline so multi-hour jobs are not cancelled by a short reward timeout.
 
 ## Agent interface
 
@@ -145,6 +173,9 @@ Each source requires `id` (the Hugging Face dataset id) and `weight` (≥ 0).
 `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are
 optional. Supported filter kinds: `min_chars`, `max_chars`, `min_tokens`,
 `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, `dedup_exact`.
+When a multi-config dataset has no default and `config` is omitted, the
+materializer chooses a stable English/default config (for example `en` or a
+config ending in `.en`) before falling back to the first advertised config.
 
 See [`docs/tools.md`](docs/tools.md) for the full `hf` workflow, metering
 details, manifest schema, filter reference, and turn-budget guidance.
@@ -198,7 +229,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `fetch_timeout_seconds` | float | `30.0` | Per-attempt timeout for external HF calls. |
 | `fetch_max_attempts` | int | `3` | Max attempts (retry/backoff) for transient HF failures. |
 | `use_real_trainer` | bool | `false` | Use the GPU sandbox proxy-student instead of the heuristic. |
-| `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, GPU request: `gpu_count`/`gpu_type`/`vm`, etc.). GPU defaults (`gpu_count=1`, `gpu_type="H100"`, `vm=true`) form a valid Prime request; `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `trainer_backend` (`"prime"` default / `"docker"` / `"modal"`); for `"docker"` see `docker_host` and the backend-aware `docker_image` default above; for `"modal"` see `modal_gpu` (default `"L4"`) and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
+| `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, GPU request: `gpu_count`/`gpu_type`/`vm`, etc.). GPU defaults (`gpu_count=1`, `gpu_type="H100"`, `vm=true`) form a valid Prime request; `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `trainer_backend` (`"prime"` default / `"docker"` / `"modal"`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`) and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
 | `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set: FineWeb GPT-2 val tokens, first `10_485_760`). Real-trainer only. |
 | `eval_corpus` | list[str] | built-in | Held-out reference corpus for the leakage term. |
 
@@ -214,7 +245,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 - `leakage.py` — `LeakageDetector` (exact/fuzzy/semantic contamination).
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
 - `trainer.py` — `ProxyStudentTrainer` interface, heuristic + GPU-sandbox backends.
-- `docker_backend.py` — selectable Docker training backend (`DockerRuntimeClient`/`DockerRunRequest`) driving verifiers' v1 `DockerRuntime`, reachable on a remote host via `DOCKER_HOST=ssh://...`.
+- `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
 - `modal_backend.py` — Modal GPU sandbox adapter for `trainer_backend="modal"`; uploads corpus and training script to a `modal.Sandbox` and parses `RESULT_JSON` from stdout. `modal>=0.73` is a base dependency.
 - `student_model.py` — modern modded-nanogpt proxy-student architecture embedded into the sandbox script.
 - `student_train.py` — AdamW schedule, contiguous batching, and multi-run averaging, also embedded into the sandbox script.

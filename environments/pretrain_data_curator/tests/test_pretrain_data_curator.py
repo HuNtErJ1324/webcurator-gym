@@ -55,10 +55,6 @@ from pretrain_data_curator.taskset import (
 )
 from pretrain_data_curator import hf_meter
 from verifiers.v1.taskset import Taskset
-from pretrain_data_curator.docker_backend import (
-    DockerRunRequest,
-    DockerRuntimeClient,
-)
 from pretrain_data_curator.trainer import (
     HeuristicProxyTrainer,
     SandboxProxyTrainer,
@@ -330,6 +326,29 @@ def test_hf_client_auto_detects_text_columns_and_query_response(monkeypatch):
     ]
 
 
+def test_hf_client_resolves_missing_default_config_to_english(monkeypatch):
+    calls = []
+
+    def fake_load_dataset(dataset_id, *, name, **kwargs):
+        calls.append(name)
+        if name is None:
+            raise ValueError("Config name is missing. Please pick one.")
+        return iter([{"text": "configured document"}])
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        "datasets.get_dataset_config_names",
+        lambda dataset_id, token: ["20231101.ab", "20231101.en"],
+    )
+    client = object.__new__(HuggingFaceDatasetClient)
+    client._token = "test-token"
+
+    assert client.sample_documents("wikimedia/wikipedia", None, "train", None, 1) == [
+        "configured document"
+    ]
+    assert calls == [None, "20231101.en"]
+
+
 def test_source_defaults_to_auto_detected_text_field():
     assert Source(dataset_id="owner/name").text_field is None
 
@@ -390,7 +409,7 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.taskset.load_tasks()
 
 
-def test_load_environment_repairs_bash_uv_cache_only_for_docker_trainer():
+def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
     docker_env = load_environment(
         use_real_trainer=True,
         proxy_student={"trainer_backend": "docker", "gpu_count": 1},
@@ -398,12 +417,34 @@ def test_load_environment_repairs_bash_uv_cache_only_for_docker_trainer():
     assert docker_env.harness.config.env == {
         "UV_REINSTALL_PACKAGE": "pydantic-core"
     }
+    runtime = docker_env.harness.config.runtime
+    assert isinstance(runtime, vf.DockerConfig)
+    assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
+    assert runtime.workdir == "/workspace"
+    assert runtime.gpu == "1"
+    assert runtime.cpu == 4.0
+    assert runtime.memory == 16.0
+    assert runtime.disk == 20.0
+    assert docker_env.config.timeout.scoring == 2340.0
 
     modal_env = load_environment(
         use_real_trainer=True,
         proxy_student={"trainer_backend": "modal"},
     )
     assert modal_env.harness.config.env == {}
+    assert isinstance(modal_env.harness.config.runtime, vf.SubprocessConfig)
+    assert modal_env.config.timeout.scoring is None
+
+
+def test_load_environment_rejects_remote_docker_host():
+    with pytest.raises(ValueError, match="docker_host is not supported"):
+        load_environment(
+            use_real_trainer=True,
+            proxy_student={
+                "trainer_backend": "docker",
+                "docker_host": "ssh://user@gpu-host",
+            },
+        )
 
 
 def test_v1_loader_does_not_import_torch_for_default_load():
@@ -2826,251 +2867,7 @@ def test_shim_writes_jsonl_cost_record_when_hf_invoked(tmp_path, monkeypatch):
         shutil.rmtree(hf_meter.SHIM_DIR, ignore_errors=True)
 
 
-# --- Tier M: selectable docker training backend ----------------------------
-#
-# A SECOND, selectable real-trainer backend (Prime stays the default). The
-# adapter (`docker_backend.DockerRuntimeClient`) drives verifiers' v1
-# `DockerRuntime` behind the exact 5-method client contract the untouched
-# `SandboxProxyTrainer` lifecycle calls, so the whole lifecycle is reused as-is.
-
-
-class _FakeDockerRuntime:
-    """In-memory stand-in for verifiers' v1 ``DockerRuntime``.
-
-    Records writes and returns a ``RESULT_JSON`` line from ``run`` so the real
-    ``SandboxProxyTrainer`` lifecycle can be driven end to end without a daemon.
-    """
-
-    def __init__(self, config, name=None):
-        self.config = config
-        self.name = name or "vf-fake"
-        self.descriptor = None  # docker short id, assigned after start()
-        self.files: dict[str, bytes] = {}
-        self.commands: list = []
-        self.started = False
-        self.stopped = False
-        self.cleaned = False
-
-    async def start(self):
-        self.started = True
-        self.descriptor = "deadbeef0000"
-
-    async def run(self, argv, env):
-        self.commands.append((argv, env))
-        payload = json.dumps(
-            {"loss": 2.5, "accuracy": 0.4, "flops": 1e9, "tokens_trained": 1000}
-        )
-        return SimpleNamespace(stdout="RESULT_JSON " + payload, stderr="", exit_code=0)
-
-    async def write(self, path, data):
-        self.files[path] = data
-
-    async def read(self, path):
-        return self.files[path]
-
-    async def stop(self):
-        self.stopped = True
-
-    def cleanup(self):
-        self.cleaned = True
-
-
-@pytest.fixture
-def fake_docker_runtime(monkeypatch):
-    """Patch ``make_runtime`` at the ``verifiers.v1.runtimes`` boundary the adapter
-    imports from, capturing the real ``DockerConfig`` it builds and the runtime it
-    provisions (the adapter's lazy ``from ... import make_runtime`` re-reads the
-    module attribute each call, so patching the module works)."""
-    import verifiers.v1.runtimes as runtimes_mod
-
-    captured: dict = {}
-
-    def fake_make_runtime(config, name=None):
-        runtime = _FakeDockerRuntime(config, name)
-        captured["config"] = config
-        captured["name"] = name
-        captured["runtime"] = runtime
-        return runtime
-
-    monkeypatch.setattr(runtimes_mod, "make_runtime", fake_make_runtime)
-    return captured
-
-
-def _docker_request_factory(cfg, name):
-    return DockerRunRequest(
-        name=name,
-        image=cfg.docker_image,
-        workdir="/workspace",
-        gpu=str(cfg.gpu_count) if cfg.gpu_count > 0 else None,
-        cpu=float(cfg.cpu_cores),
-        memory=float(cfg.memory_gb),
-        disk=float(cfg.disk_size_gb),
-        timeout_minutes=cfg.effective_timeout_minutes,
-    )
-
-
-@pytest.mark.asyncio
-async def test_docker_backend_trains_end_to_end_through_fake_runtime(fake_docker_runtime):
-    # Drive the REAL SandboxProxyTrainer with the docker client + request factories
-    # over a fake runtime: create -> write -> execute(RESULT_JSON) -> delete, and
-    # assert the trainer yields a parsed TrainResult.
-    client = DockerRuntimeClient(docker_host=None)
-    cfg = ProxyStudentConfig(trainer_backend="docker")
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=_docker_request_factory,
-    )
-    result = await trainer.train_and_eval(_corpus_with_text(), cfg)
-
-    assert result.loss == 2.5
-    assert result.accuracy == 0.4
-    assert result.flops == 1e9
-    assert result.tokens_trained == 1000
-    assert result.backend == "sandbox"
-    assert result.cleanup_error is None
-
-    runtime = fake_docker_runtime["runtime"]
-    # The adapter built a VALID DockerConfig: docker-default image, /workspace
-    # workdir, and gpu_count mapped to the docker `--gpus` count spec ("1").
-    dconf = fake_docker_runtime["config"]
-    assert dconf.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
-    assert dconf.workdir == "/workspace"
-    assert dconf.gpu == "1"
-    assert dconf.cpu == 4.0 and dconf.memory == 16.0 and dconf.disk == 20.0
-    # Files were uploaded to absolute /workspace paths and the train script ran via
-    # `bash -lc`, exactly as the prime path runs `python /workspace/train.py`.
-    assert "/workspace/train.py" in runtime.files
-    assert "/workspace/corpus.txt" in runtime.files
-    assert "/workspace/config.json" in runtime.files
-    assert runtime.commands[0][0] == ["bash", "-lc", "python /workspace/train.py"]
-    # The container was torn down (stop + cleanup) on the trainer's finally.
-    assert runtime.stopped is True
-    assert runtime.cleaned is True
-
-
-@pytest.mark.asyncio
-async def test_docker_client_upload_exec_normalize_and_teardown(fake_docker_runtime):
-    client = DockerRuntimeClient()
-    handle = await client.create(
-        DockerRunRequest(name="n", image="img", workdir="/workspace")
-    )
-    await client.upload_bytes(handle.id, "/workspace/x.txt", b"hello", "x.txt")
-    runtime = fake_docker_runtime["runtime"]
-    assert runtime.files["/workspace/x.txt"] == b"hello"
-    # wait_for_creation is a no-op (start() already blocked until running).
-    assert await client.wait_for_creation(handle.id) is None
-    res = await client.execute_command(handle.id, "echo hi", timeout=5)
-    assert res.exit_code == 0
-    assert res.stdout.startswith("RESULT_JSON")
-    assert res.stderr == ""
-    await client.delete(handle.id)
-    assert runtime.stopped is True and runtime.cleaned is True
-
-
-@pytest.mark.asyncio
-async def test_docker_client_tears_down_on_exec_error(fake_docker_runtime):
-    # On a run-time exception the container must be torn down (no leak); a later
-    # delete is then an idempotent no-op.
-    client = DockerRuntimeClient()
-    handle = await client.create(DockerRunRequest(name="n", image="img"))
-    runtime = fake_docker_runtime["runtime"]
-
-    async def boom(argv, env):
-        raise RuntimeError("exec exploded")
-
-    runtime.run = boom
-    with pytest.raises(RuntimeError, match="exploded"):
-        await client.execute_command(handle.id, "python /workspace/train.py", timeout=5)
-    assert runtime.stopped is True and runtime.cleaned is True
-    await client.delete(handle.id)  # idempotent: already gone
-
-
-@pytest.mark.asyncio
-async def test_docker_client_create_tears_down_on_start_failure(monkeypatch):
-    # The trainer wraps create() in asyncio.wait_for(..., create_timeout_seconds);
-    # if start() (`docker run`) is cancelled/times out AFTER the daemon created the
-    # container but BEFORE the handle is stored, nothing else could ever tear it
-    # down. create() must stop()+cleanup() the just-created runtime and re-raise,
-    # leaving NO leaked handle in _runtimes. CancelledError is exactly what
-    # asyncio.wait_for raises into create()'s inner coroutine on timeout.
-    import verifiers.v1.runtimes as runtimes_mod
-
-    class _FailingStartRuntime(_FakeDockerRuntime):
-        async def start(self):
-            self.started = True
-            raise asyncio.CancelledError()
-
-    created: dict = {}
-
-    def failing_make_runtime(config, name=None):
-        runtime = _FailingStartRuntime(config, name)
-        created["runtime"] = runtime
-        return runtime
-
-    monkeypatch.setattr(runtimes_mod, "make_runtime", failing_make_runtime)
-
-    client = DockerRuntimeClient()
-    with pytest.raises(asyncio.CancelledError):
-        await client.create(DockerRunRequest(name="n", image="img"))
-
-    runtime = created["runtime"]
-    assert runtime.stopped is True  # torn down despite never being stored
-    assert runtime.cleaned is True
-    assert client._runtimes == {}  # NO leak
-
-
-@pytest.mark.asyncio
-async def test_docker_client_uniquifies_container_name_per_create(monkeypatch):
-    # The trainer always passes the CONSTANT name 'proxy-student-trainer'; with
-    # max_concurrent_training>1 a second concurrent `docker run --name <const>`
-    # would collide (and a retry after a leak would too). The adapter must uniquify
-    # the docker `--name` per create() so concurrent jobs can't collide, while the
-    # returned handle id stays unique + consistent for later upload/exec/delete.
-    import verifiers.v1.runtimes as runtimes_mod
-
-    names: list = []
-
-    class _NameKeyedRuntime(_FakeDockerRuntime):
-        async def start(self):
-            self.started = True
-            self.descriptor = None  # id falls back to the (unique) container name
-
-    def capturing_make_runtime(config, name=None):
-        names.append(name)
-        return _NameKeyedRuntime(config, name)
-
-    monkeypatch.setattr(runtimes_mod, "make_runtime", capturing_make_runtime)
-
-    client = DockerRuntimeClient()
-    h1 = await client.create(DockerRunRequest(name="proxy-student-trainer", image="img"))
-    h2 = await client.create(DockerRunRequest(name="proxy-student-trainer", image="img"))
-
-    # Two create() calls with the SAME requested name -> DISTINCT docker `--name`.
-    assert len(names) == 2 and names[0] != names[1]
-    assert all(n.startswith("proxy-student-trainer-") for n in names)
-    # Each handle keys its own runtime, so later lifecycle calls still resolve.
-    assert h1.id != h2.id
-    assert set(client._runtimes) == {h1.id, h2.id}
-
-
-def test_docker_client_docker_host_env_handling(monkeypatch):
-    # Sets DOCKER_HOST when unset.
-    monkeypatch.delenv("DOCKER_HOST", raising=False)
-    try:
-        client = DockerRuntimeClient(docker_host="ssh://user@host")
-        assert client._docker_host == "ssh://user@host"
-        assert os.environ["DOCKER_HOST"] == "ssh://user@host"
-    finally:
-        os.environ.pop("DOCKER_HOST", None)
-    # Does NOT override an ambient DOCKER_HOST the operator already set.
-    monkeypatch.setenv("DOCKER_HOST", "ssh://ambient@host")
-    DockerRuntimeClient(docker_host="ssh://other@host")
-    assert os.environ["DOCKER_HOST"] == "ssh://ambient@host"
-    # docker_host=None leaves the env untouched.
-    monkeypatch.delenv("DOCKER_HOST", raising=False)
-    DockerRuntimeClient(docker_host=None)
-    assert "DOCKER_HOST" not in os.environ
-
+# --- Tier M: selectable real-training backends ----------------------------
 
 def _real_trainer_taskset(**proxy_student):
     use_real = proxy_student.pop("use_real_trainer", True)
@@ -3086,30 +2883,6 @@ def _real_trainer_taskset(**proxy_student):
     ts._leakage_detector = LeakageDetector(DEFAULT_EVAL_CORPUS)
     return ts
 
-
-def test_backend_selection_docker_injects_docker_factories(monkeypatch):
-    monkeypatch.delenv("DOCKER_HOST", raising=False)
-    ts = _real_trainer_taskset(trainer_backend="docker", docker_host="ssh://user@host")
-    try:
-        ts._ensure()
-        trainer = ts._trainer
-        assert isinstance(trainer, SandboxProxyTrainer)
-        # Docker backend => the adapter factories are injected.
-        assert trainer._client_factory is not None
-        assert trainer._request_factory is not None
-        client = trainer._client_factory()
-        assert isinstance(client, DockerRuntimeClient)
-        assert client._docker_host == "ssh://user@host"
-        assert os.environ.get("DOCKER_HOST") == "ssh://user@host"
-        req = trainer._request_factory(ts.curator.proxy_student, "proxy-student-trainer")
-        assert isinstance(req, DockerRunRequest)
-        assert req.name == "proxy-student-trainer"
-        assert req.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
-        assert req.workdir == "/workspace"
-        assert req.gpu == "1"
-        assert req.cpu == 4.0 and req.memory == 16.0 and req.disk == 20.0
-    finally:
-        os.environ.pop("DOCKER_HOST", None)
 
 
 def test_backend_selection_prime_uses_prime_path_unchanged():

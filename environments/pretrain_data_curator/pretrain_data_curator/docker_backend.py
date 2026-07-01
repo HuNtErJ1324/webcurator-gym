@@ -1,227 +1,232 @@
-"""Docker training backend for the proxy-student trainer.
+"""Proxy-student training inside the rollout's declarative Docker runtime.
 
-This is an OPTIONAL, selectable backend for ``SandboxProxyTrainer`` (the Prime
-sandbox backend remains the default and is untouched). It implements the exact
-5-method, duck-typed client contract the trainer's lifecycle drives
-(``trainer.py``: ``create`` -> handle(.id), ``wait_for_creation``,
-``upload_bytes``, ``execute_command``, ``delete``) on top of verifiers' own v1
-``DockerRuntime`` (``verifiers.v1.runtimes.make_runtime`` + ``DockerConfig``).
-
-Because ``DockerRuntime`` shells out to the local ``docker`` CLI inheriting
-``os.environ``, pointing it at a remote rented host needs nothing more than the
-standard Docker mechanism: ``DOCKER_HOST=ssh://user@host`` (plus the TLS vars for
-a TLS endpoint). ``DockerRuntimeClient`` will set ``DOCKER_HOST`` from the config
-when it is not already present in the environment. Rollouts stay local; only the
-GPU training container runs on the remote host.
-
-The trainer never imports this module: ``taskset.py`` injects
-``DockerRuntimeClient`` / ``DockerRunRequest`` as the trainer's
-``client_factory`` / ``request_factory`` only when ``trainer_backend='docker'``.
+The v1 rollout owns exactly one runtime for its full lifecycle.  When the
+``docker`` trainer backend is selected, that runtime is also the training
+sandbox: this trainer writes the corpus and script through :class:`vf.Runtime`
+and executes training on the same live container.  Runtime provisioning and
+normal teardown remain the rollout's responsibility.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import os
-import uuid
-from dataclasses import dataclass
 from typing import Any
+
+import verifiers.v1 as vf
+
+from .corpus import CuratedCorpus
+from .models import ProxyStudentConfig
+from .trainer import (
+    TrainResult,
+    TrainerError,
+    _nanogpt_train_script,
+    training_semaphore,
+)
+from .val_set import NANOGPT_VAL_TOKENIZER, HeldOutValSet, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DockerRunRequest:
-    """The docker-backend analogue of ``CreateSandboxRequest``.
+class HarnessRuntimeProxyTrainer:
+    """Train on the live Docker runtime supplied to taskset scoring."""
 
-    Carries everything needed to build a ``DockerConfig`` and name the container.
-    ``timeout_minutes`` is informational here (the trainer derives the command
-    timeout from the config itself); Docker has no portable container-lifetime
-    limit, and ``disk`` is advisory (Docker has no portable per-container cap).
-    """
-
-    name: str
-    image: str
-    gpu: str | None = None
-    cpu: float | None = None
-    memory: float | None = None
-    disk: float | None = None
-    workdir: str = "/workspace"
-    timeout_minutes: int = 30
-
-
-@dataclass
-class _ExecResult:
-    """Normalized exec result exposing the ``.stdout/.stderr/.exit_code`` the
-    trainer's ``_parse_result`` / ``_run_training`` read (the same shape Prime's
-    ``CommandResult`` exposes)."""
-
-    stdout: str
-    stderr: str
-    exit_code: int
-
-
-@dataclass
-class _Handle:
-    """The ``create`` handle whose ``.id`` keys every later lifecycle call."""
-
-    id: str
-
-
-class DockerRuntimeClient:
-    """A sandbox-client over verifiers' v1 ``DockerRuntime``.
-
-    One instance owns the runtimes it provisions, keyed by the id returned from
-    ``create``. The five methods mirror the Prime ``AsyncSandboxClient`` surface
-    the trainer drives, so the trainer lifecycle is reused verbatim.
-    """
+    STDERR_TAIL = 2000
 
     def __init__(
         self,
-        docker_host: str | None = None,
-        tls_verify: bool = False,
-        cert_path: str | None = None,
+        max_corpus_chars: int | None = None,
+        concurrency_limit: int = 1,
+        val_loader: ValTokenLoader | None = None,
     ) -> None:
-        self._docker_host = docker_host
-        self._tls_verify = tls_verify
-        self._cert_path = cert_path
-        self._runtimes: dict[str, Any] = {}
-        self._apply_docker_host()
+        self._max_corpus_chars = max_corpus_chars
+        self._concurrency_limit = concurrency_limit
+        self._val_loader = val_loader
 
-    def _apply_docker_host(self) -> None:
-        """Point the docker CLI at the configured (remote) host.
-
-        REVIEWER NOTE: this MUTATES the process-global ``os.environ`` so the
-        ``docker`` CLI that ``DockerRuntime`` shells out to targets the remote
-        host. It is deliberately conservative — it never overrides an ambient
-        ``DOCKER_HOST`` the operator already set — but it is a global side effect.
-        """
-        if not self._docker_host:
-            return  # rely on the ambient DOCKER_HOST / local daemon
-        if "DOCKER_HOST" in os.environ:
-            ambient = os.environ["DOCKER_HOST"]
-            if ambient != self._docker_host:
-                # A mis-set ambient host would silently target the WRONG daemon;
-                # warn (not info) so the ignored request fails visibly rather than
-                # quietly aiming training at some other host. Behavior is unchanged:
-                # an ambient DOCKER_HOST is still never overridden.
-                logger.warning(
-                    "docker backend: ambient DOCKER_HOST (%s) differs from requested "
-                    "%s; the requested host is being IGNORED",
-                    ambient,
-                    self._docker_host,
-                )
-            else:
-                logger.info(
-                    "docker backend: DOCKER_HOST already set to the requested host "
-                    "(%s); nothing to do",
-                    ambient,
-                )
-            return
-        os.environ["DOCKER_HOST"] = self._docker_host
-        logger.info("docker backend: set DOCKER_HOST=%s", self._docker_host)
-        if self._tls_verify:
-            os.environ.setdefault("DOCKER_TLS_VERIFY", "1")
-        if self._cert_path:
-            os.environ.setdefault("DOCKER_CERT_PATH", self._cert_path)
-
-    async def create(self, request: DockerRunRequest) -> _Handle:
-        # Imported here (not at module top) so the docker runtime is only required
-        # on the live docker path, mirroring the trainer's lazy prime import.
-        from verifiers.v1.runtimes import DockerConfig, make_runtime
-
-        config = DockerConfig(
-            image=request.image,
-            workdir=request.workdir,
-            gpu=request.gpu,
-            cpu=request.cpu,
-            memory=request.memory,
-            disk=request.disk,
-        )
-        # The trainer passes a CONSTANT container name ('proxy-student-trainer');
-        # with max_concurrent_training>1 a second concurrent `docker run --name`
-        # would collide (and a retry after a leak would too). Uniquify the docker
-        # `--name` per create() here (the trainer stays untouched); the handle id
-        # below stays unique + consistent for every later lifecycle call.
-        container_name = f"{request.name}-{uuid.uuid4().hex[:8]}"
-        runtime = make_runtime(config, name=container_name)
-        try:
-            await runtime.start()
-        except BaseException:
-            # start() shells out to `docker run`. The trainer wraps create() in
-            # asyncio.wait_for(..., create_timeout_seconds); if that cancels/times
-            # out AFTER the daemon created the container but BEFORE we store the
-            # handle, nothing else could ever tear it down. Tear the just-created
-            # container down here (covering the CancelledError wait_for raises into
-            # this coroutine), then re-raise so the trainer still sees the failure.
-            await self._stop_and_cleanup(runtime)
-            raise
-        # The trainer uses this id for every subsequent call; prefer docker's short
-        # container id (set after start), fall back to the unique container name.
-        runtime_id = runtime.descriptor or runtime.name
-        self._runtimes[runtime_id] = runtime
-        return _Handle(id=runtime_id)
-
-    async def wait_for_creation(self, sandbox_id: str) -> None:
-        # ``DockerRuntime.start`` already blocked until the container was running,
-        # so there is nothing left to wait for.
-        return None
-
-    async def upload_bytes(
-        self, sandbox_id: str, path: str, data: bytes, name: str | None = None
-    ) -> None:
-        # The trainer uploads absolute ``/workspace/...`` paths; ``DockerRuntime``
-        # writes them with ``mkdir -p <parent> && cat > <path>``, so an absolute
-        # path lands exactly there regardless of the container workdir.
-        await self._runtime(sandbox_id).write(path, data)
-
-    async def execute_command(
-        self, sandbox_id: str, command: str, timeout: float | None = None
-    ) -> _ExecResult:
-        runtime = self._runtime(sandbox_id)
-        try:
-            result = await asyncio.wait_for(
-                runtime.run(["bash", "-lc", command], {}), timeout
-            )
-        except BaseException:
-            # On timeout/cancel/error, tear the container down so a failed or
-            # abandoned run never leaks a container on the remote host. The
-            # trainer's ``finally`` also calls ``delete``, which then no-ops.
-            await self._teardown(sandbox_id)
-            raise
-        return _ExecResult(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            exit_code=result.exit_code,
-        )
-
-    async def delete(self, sandbox_id: str) -> None:
-        await self._teardown(sandbox_id)
-
-    def _runtime(self, sandbox_id: str) -> Any:
-        try:
-            return self._runtimes[sandbox_id]
-        except KeyError:
-            raise KeyError(f"unknown docker runtime id {sandbox_id!r}") from None
-
-    async def _teardown(self, sandbox_id: str) -> None:
-        """Stop + remove the container and drop it from the map (idempotent)."""
-        runtime = self._runtimes.pop(sandbox_id, None)
+    async def train_and_eval(
+        self,
+        corpus: CuratedCorpus,
+        config: ProxyStudentConfig,
+        *,
+        runtime: vf.Runtime | None = None,
+    ) -> TrainResult:
         if runtime is None:
-            return  # already torn down (e.g. by execute_command on error)
-        await self._stop_and_cleanup(runtime)
+            raise TrainerError(
+                "docker proxy-student training requires the live harness runtime"
+            )
+        if runtime.type != "docker":
+            raise TrainerError(
+                f"docker proxy-student training requires a Docker runtime, got "
+                f"{runtime.type!r}"
+            )
+
+        cap = (
+            self._max_corpus_chars
+            if self._max_corpus_chars is not None
+            else config.effective_max_corpus_chars
+        )
+        text = "\n\n".join(corpus.documents)[:cap]
+        if not text.strip():
+            return TrainResult(
+                loss=float("inf"),
+                accuracy=0.0,
+                flops=0.0,
+                tokens_trained=0,
+                backend="docker",
+            )
+
+        val_set = await self._resolve_val_set()
+        payload = self._payload(config, val_set)
+
+        # The rollout may provision more runtime containers than there are GPUs.
+        # Bound the expensive commands independently of rollout concurrency.
+        async with training_semaphore(self._concurrency_limit):
+            try:
+                await self._write_inputs(runtime, text, payload, config, val_set)
+                # asyncio.wait_for() (pre-3.12) can race: a cancellation delivered
+                # while the wrapped write is *also* completing gets silently
+                # absorbed by wait_for's `if fut.done(): return fut.result()`
+                # shortcut instead of propagating. That leaves the task's
+                # cancellation request pending but undelivered, so re-raise it
+                # explicitly here rather than falling through into the
+                # potentially-unbounded `_run_training` await with no cancellation
+                # left to interrupt it.
+                self._raise_if_cancelling()
+                result = await self._run_training(runtime, config)
+                self._raise_if_cancelling()
+                return self._parse_result(result.stdout, result.stderr)
+            except BaseException:
+                # A failed/cancelled docker exec may leave the process running in
+                # the container. Stop the runtime now; Rollout.run() also stops it
+                # in its finally, and DockerRuntime.stop() is idempotent.
+                await self._stop_cancel_safe(runtime)
+                raise
 
     @staticmethod
-    async def _stop_and_cleanup(runtime: Any) -> None:
-        """Stop the container, with the synchronous ``cleanup`` as the backstop.
+    def _raise_if_cancelling() -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError()
 
-        ``cleanup`` is the source-of-truth teardown and is idempotent; call it in
-        a ``finally`` so it still runs if ``stop`` raised. Shared by ``_teardown``
-        (after the handle is stored) and ``create`` (a ``start`` that failed before
-        the handle was stored), so both paths tear a container down identically.
-        """
+    async def _resolve_val_set(self) -> HeldOutValSet | None:
+        if self._val_loader is None:
+            return None
+        return await self._val_loader.load()
+
+    @staticmethod
+    def _payload(
+        config: ProxyStudentConfig, val_set: HeldOutValSet | None
+    ) -> dict[str, Any]:
+        return {
+            "n_layer": config.n_layer,
+            "n_head": config.n_head,
+            "n_embd": config.n_embd,
+            "mlp_ratio": config.mlp_ratio,
+            "lm_head_softcap": config.lm_head_softcap,
+            "num_value_embeds": config.num_value_embeds,
+            "block_size": config.block_size,
+            "batch_size": config.batch_size,
+            "steps": config.effective_steps,
+            "learning_rate": config.learning_rate,
+            "seed": config.seed,
+            "val_fraction": config.val_fraction,
+            "tokenizer": val_set.tokenizer if val_set else NANOGPT_VAL_TOKENIZER,
+            "weight_decay": config.weight_decay,
+            "adam_beta1": config.adam_beta1,
+            "adam_beta2": config.adam_beta2,
+            "adam_eps": config.adam_eps,
+            "grad_clip": config.grad_clip,
+            "warmup_steps": config.effective_warmup_steps,
+            "lr_min_ratio": config.lr_min_ratio,
+            "n_train_runs": config.n_train_runs,
+        }
+
+    async def _write_inputs(
+        self,
+        runtime: vf.Runtime,
+        text: str,
+        payload: dict[str, Any],
+        config: ProxyStudentConfig,
+        val_set: HeldOutValSet | None,
+    ) -> None:
+        files = [
+            ("/workspace/corpus.txt", text.encode("utf-8")),
+            ("/workspace/config.json", json.dumps(payload).encode("utf-8")),
+            ("/workspace/train.py", _nanogpt_train_script().encode("utf-8")),
+        ]
+        if val_set is not None:
+            files.append(("/workspace/val.bin", val_set.to_uint16_bytes()))
+        for path, data in files:
+            try:
+                await asyncio.wait_for(
+                    runtime.write(path, data),
+                    timeout=config.upload_timeout_seconds,
+                )
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TrainerError(
+                    f"timed out writing proxy-student input {path!r}"
+                ) from exc
+
+    async def _run_training(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> Any:
+        timeout = config.effective_timeout_minutes * 60
         try:
-            await runtime.stop()
-        finally:
-            runtime.cleanup()
+            result = await asyncio.wait_for(
+                runtime.run(["python", "/workspace/train.py"], {}),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise TrainerError(
+                f"proxy-student training timed out after {timeout}s"
+            ) from exc
+        if result.exit_code not in (0, None):
+            raise TrainerError(
+                f"proxy-student training exited with code {result.exit_code}",
+                stderr_tail=(result.stderr or "")[-self.STDERR_TAIL :],
+            )
+        return result
+
+    def _parse_result(self, stdout: str, stderr: str) -> TrainResult:
+        marker = next(
+            (
+                line[len("RESULT_JSON ") :]
+                for line in reversed((stdout or "").splitlines())
+                if line.startswith("RESULT_JSON ")
+            ),
+            None,
+        )
+        if marker is None:
+            raise TrainerError(
+                "proxy-student training produced no RESULT_JSON marker",
+                stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
+            )
+        try:
+            data = json.loads(marker)
+            return TrainResult(
+                loss=float(data["loss"]),
+                accuracy=float(data.get("accuracy", 0.0)),
+                flops=float(data.get("flops", 0.0)),
+                tokens_trained=int(data.get("tokens_trained", 0)),
+                backend="docker",
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TrainerError(
+                f"proxy-student training produced malformed RESULT_JSON: {exc}",
+                stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
+            ) from exc
+
+    @staticmethod
+    async def _stop_cancel_safe(runtime: vf.Runtime) -> None:
+        """Finish teardown even when the caller is already being cancelled."""
+        teardown = asyncio.create_task(runtime.stop())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            # Shield keeps teardown alive. Wait for it before propagating the
+            # cancellation so the Docker container cannot outlive the rollout.
+            await asyncio.shield(teardown)
+            raise
+        except Exception:
+            logger.warning("docker harness runtime teardown failed", exc_info=True)
