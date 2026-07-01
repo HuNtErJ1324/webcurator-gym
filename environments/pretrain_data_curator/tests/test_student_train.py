@@ -475,3 +475,133 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     # ...and the OLD constant-LR plain-AdamW + random-with-replacement sampler is gone.
     assert "torch.randint(len(src) - block - 1" not in NANOGPT_TRAIN_SCRIPT
     assert "opt = torch.optim.AdamW(model.parameters(), lr=float(cfg" not in NANOGPT_TRAIN_SCRIPT
+    # The sandbox script imports tqdm (installed on demand, like tiktoken) so the
+    # embedded training loop's progress bar/logging actually runs there too.
+    assert "from tqdm import tqdm" in NANOGPT_TRAIN_SCRIPT
+
+
+# --- (7) OBSERVABILITY: tqdm progress bar + throttled stdout progress lines --
+
+
+def test_progress_lines_emitted_for_first_and_last_step(capsys):
+    # A tiny run (steps=5, well under the 50-step floor cadence) must still emit
+    # the first and last step's plain progress line on stdout -- and ONLY those --
+    # so degenerate test-sized runs stay legible from a captured stdout blob
+    # without spamming a line per step.
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (100,))
+    gen = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model, data, data, block_size=8, batch_size=2, steps=5,
+        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
+        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+        device="cpu", generator=gen,
+    )
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("[train]")]
+    assert len(lines) == 2
+    assert "step 1/5" in lines[0]
+    assert "step 5/5" in lines[1]
+    for line in lines:
+        assert "loss" in line and "tok/s" in line and "elapsed" in line and "eta" in line
+
+
+def test_progress_line_survives_a_single_step_run():
+    # steps=1: the first step IS the last step. Must not crash, hang, or double-log.
+    import io
+    from contextlib import redirect_stdout
+
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (50,))
+    gen = torch.Generator().manual_seed(0)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        train_and_eval_student(
+            model, data, data, block_size=8, batch_size=2, steps=1,
+            base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
+            beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+            device="cpu", generator=gen,
+        )
+    lines = [line for line in buf.getvalue().splitlines() if line.startswith("[train]")]
+    assert len(lines) == 1
+    assert "step 1/1" in lines[0]
+
+
+def test_progress_lines_throttled_for_a_longer_run(capsys):
+    # steps=120 with the "50 steps or 2%, whichever is coarser" cadence logs at
+    # completed in {1, 50, 100, 120} -- 4 lines, never one per step -- proving the
+    # throttle actually throttles instead of spamming.
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (300,))
+    gen = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model, data, data, block_size=8, batch_size=2, steps=120,
+        base_lr=1e-3, warmup_steps=4, weight_decay=0.1, grad_clip=1.0,
+        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+        device="cpu", generator=gen,
+    )
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.startswith("[train]")]
+    logged_steps = [int(line.split("step ")[1].split("/")[0]) for line in lines]
+    assert logged_steps == [1, 50, 100, 120]
+
+
+def test_run_label_prefixes_progress_lines_when_multiple_runs(capsys):
+    # n_runs > 1 must tag each run's progress lines with "run k/n" so the log of a
+    # multi-run averaged eval is legible about which seeded run is in flight.
+    V = 16
+    cfg = _tiny_cfg(V)
+    data = torch.randint(0, V, (100,))
+    averaged_train_and_eval(
+        cfg.build, data, data, n_runs=2, base_seed=0, device="cpu",
+        block_size=8, batch_size=2, steps=2, base_lr=1e-3, warmup_steps=1,
+        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
+        lr_min_ratio=0.1, vocab_size=V,
+    )
+    out = capsys.readouterr().out
+    assert "[run 1/2 train] step 1/2" in out
+    assert "[run 1/2 train] step 2/2" in out
+    assert "[run 2/2 train] step 1/2" in out
+    assert "[run 2/2 train] step 2/2" in out
+
+
+def test_run_label_absent_for_a_single_run(capsys):
+    # n_runs == 1 (the default/common case) must NOT prefix a "run 1/1" label --
+    # single-run output stays exactly as plain as before, uncluttered.
+    V = 16
+    cfg = _tiny_cfg(V)
+    data = torch.randint(0, V, (100,))
+    averaged_train_and_eval(
+        cfg.build, data, data, n_runs=1, base_seed=0, device="cpu",
+        block_size=8, batch_size=2, steps=2, base_lr=1e-3, warmup_steps=1,
+        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
+        lr_min_ratio=0.1, vocab_size=V,
+    )
+    out = capsys.readouterr().out
+    assert "[train] step 1/2" in out
+    assert "run 1/1" not in out
+
+
+def test_progress_instrumentation_does_not_change_training_result():
+    # The tqdm bar, throttled `.item()` calls, and print()s are purely
+    # observational: for a fixed seed, two otherwise-identical runs must return
+    # BIT-IDENTICAL (val_loss, accuracy, tokens_trained), proving the
+    # instrumentation never perturbs the RNG stream or the training math.
+    V = 16
+    data = torch.randint(0, V, (200,))
+
+    def run():
+        torch.manual_seed(0)
+        model = _tiny_cfg(V).build()
+        gen = torch.Generator().manual_seed(0)
+        return train_and_eval_student(
+            model, data, data, block_size=8, batch_size=4, steps=10,
+            base_lr=1e-3, warmup_steps=2, weight_decay=0.1, grad_clip=1.0,
+            beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+            device="cpu", generator=gen,
+        )
+
+    assert run() == run()

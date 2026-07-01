@@ -175,11 +175,19 @@ _NANOGPT_TRAIN_SCRIPT_TEMPLATE = r'''
 import sys
 sys.stderr = open('/workspace/stderr.txt', 'w')
 
-import json, math, os, subprocess
+import json, math, os, subprocess, time
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# tqdm drives the training progress bar/log lines (student_train.py); installed
+# on demand like tiktoken below, since the base image does not ship it.
+try:
+    from tqdm import tqdm
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "tqdm"], check=True)
+    from tqdm import tqdm
 
 # __PLAN_VAL_WINDOWS__  (replaced with the tested plan_val_windows source)
 
