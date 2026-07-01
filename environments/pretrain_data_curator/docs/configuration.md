@@ -75,6 +75,21 @@ support both the bash/Hugging Face discovery phase and CUDA PyTorch scoring.
 When no image is set, Modal uses
 `pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime`; the training script installs
 `tiktoken` on demand, and the harness bootstraps its own uv-script dependencies.
+That bare image does not include the Hugging Face `hf` CLI. Prime's default
+image may have the same gap.
+
+The shared agent prompt therefore starts its first discovery command with an
+idempotent `command -v hf` check and, only when needed, a quiet
+`pip install 'huggingface-hub>=0.34'`. The first `hf datasets ls`
+search runs in the same shell command, so a preinstalled CLI adds no extra
+turn. On a bare image the fallback is functional but slower, requires outbound
+package-index access, and consumes paid Modal GPU time while installing.
+
+For production, use a registry-hosted image containing the dependencies from
+`Dockerfile.runtime` and set it as `docker_image`. Modal can only pull a
+registry image through `ModalConfig`; it cannot build that Dockerfile. No
+prebuilt project image is currently published, so publishing and maintaining
+one remains an infrastructure TODO for an operator with registry credentials.
 
 Set `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` on the env-server. The loader
 validates both variables before constructing a Modal environment. The

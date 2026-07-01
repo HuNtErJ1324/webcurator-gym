@@ -57,6 +57,20 @@ reference image definition, based on
 installed. Use a `-devel` PyTorch base instead if custom CUDA compilation is
 required.
 
+The default Modal image is the bare upstream PyTorch image, and Prime defaults
+may likewise omit `hf`. The shared prompt defensively checks for `hf` in its
+first discovery command and quietly installs `huggingface-hub>=0.34` when
+missing before running the first search in that same turn. This fallback works
+without a custom registry image, but cold installation is slower, requires
+outbound package-index access, and is billed as part of the full Modal GPU
+rollout.
+
+The recommended production setup is to build `Dockerfile.runtime`, push the
+result to a registry Modal can pull, and configure that image explicitly.
+Verifiers' `ModalConfig` uses `modal.Image.from_registry`; it cannot build the
+local Dockerfile. This repository does not currently publish that image, so
+registry publication remains a known infrastructure TODO.
+
 Remote `docker_host=ssh://...` is outside this design: it would move the entire
 agent harness away from the rollout worker and reintroduce networking and
 credential concerns that the co-located single-pod path deliberately avoids.

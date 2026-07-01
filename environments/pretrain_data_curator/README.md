@@ -8,7 +8,7 @@ constant**, combined with cross-entropy performance, cost, and leakage terms.
 ## Overview
 
 - **Environment ID**: `pretrain-data-curator`
-- **Type**: toolless native verifiers v1 `CuratorTaskset` (`vf.Taskset`) — the agent discovers datasets using the preinstalled `hf` CLI in its own shell; no MCP tool server is exposed
+- **Type**: toolless native verifiers v1 `CuratorTaskset` (`vf.Taskset`) — the agent discovers datasets using the `hf` CLI in its own shell, installing it defensively when the runtime image omits it; no MCP tool server is exposed
 - **External service**: Hugging Face Hub API (search + streaming sampling)
 - **Required secret**: `HF_TOKEN` by default (checked lazily in the env-server, not at load time)
 - **Proxy-student training**: optional GPU training, off by default; selectable Prime GPU sandbox, a co-located harness-runtime Docker backend, **or Modal** (recommended for Hosted Training)
@@ -141,8 +141,9 @@ reward timeout.
 ## Agent interface
 
 `CuratorTaskset` deliberately exposes **no MCP tool server** (`Taskset.tools` is
-not overridden). The agent's interface is the preinstalled Hugging Face `hf` CLI
-in its own shell — there are no `curator_*` API commands.
+not overridden). The agent's interface is the Hugging Face `hf` CLI in its own
+shell, with a conditional first-command install when the image omits it — there
+are no `curator_*` API commands.
 
 | `hf` command | Purpose | Cost |
 | --- | --- | --- |
