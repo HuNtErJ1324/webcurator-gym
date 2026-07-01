@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import sys
 import time
 
 import torch
@@ -179,11 +180,15 @@ def train_and_eval_student(
     # and a tiny test-sized run doesn't spam one per step; the first and last
     # step always log regardless, so even steps<=1 gets at least one line.
     log_every = max(50, max(1, steps // 50))
-    ema_loss = None
+    ema_loss_tensor = None
     ema_decay = 0.9
     start_time = time.time()
     desc = f"{run_label}train" if run_label else "train"
-    pbar = tqdm(range(steps), total=steps, desc=desc, unit="step", leave=False)
+    # ``file=sys.stdout``: in the sandbox script (trainer.py) ``sys.stderr`` is
+    # redirected to a file, so a bar left on tqdm's stderr default would never
+    # surface; stdout is what's actually captured, so that's where the live bar
+    # (and the plain lines below, via ``pbar.write``) both go.
+    pbar = tqdm(range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout)
     for step in pbar:
         lr = lr_at_step(step, steps, warmup_steps, base_lr, lr_min_ratio)
         for group in opt.param_groups:
@@ -197,22 +202,27 @@ def train_and_eval_student(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
 
+        # Real per-step EMA, kept on-device as a tensor so this costs no new GPU
+        # sync (`.item()`) -- only converted to a Python float below, and only at
+        # the throttled logging cadence.
+        with torch.no_grad():
+            loss_detached = loss.detach()
+            ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
+                ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+            )
+
         completed = step + 1
         if step == 0 or completed == steps or completed % log_every == 0:
             # The only GPU sync (`.item()`) added for display; throttled to this
             # cadence, never on every step.
-            loss_val = loss.item()
-            ema_loss = loss_val if ema_loss is None else (
-                ema_decay * ema_loss + (1.0 - ema_decay) * loss_val
-            )
+            ema_loss = ema_loss_tensor.item()
             elapsed = time.time() - start_time
             tokens_per_sec = (completed * batch * block) / elapsed if elapsed > 0 else 0.0
             eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
             pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
-            print(
+            pbar.write(
                 f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
-                f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s",
-                flush=True,
+                f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
             )
     pbar.close()
 

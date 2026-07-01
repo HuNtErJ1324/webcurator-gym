@@ -5,4 +5,5 @@ FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
 RUN python -m pip install --no-cache-dir \
     "huggingface-hub>=0.34" \
     tiktoken \
+    tqdm \
     uv
