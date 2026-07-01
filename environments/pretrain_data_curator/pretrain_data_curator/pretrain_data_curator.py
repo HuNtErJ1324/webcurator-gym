@@ -5,9 +5,12 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import verifiers as legacy_vf
 import verifiers.v1 as vf
+from verifiers.v1.runtimes.modal import ModalConfig
 
 from .hosted_compat import Environment
+from .modal_backend import _modal_gpu_for
 from .models import ProxyStudentConfig
 from .taskset import SYSTEM_PROMPT, CuratorTasksetConfig
 
@@ -120,6 +123,23 @@ def load_environment(
         # Scoring includes corpus materialization, input writes, training, and
         # leakage computation. Keep the framework deadline above the trainer's
         # own multi-hour command deadline so the trainer can report/clean up.
+        timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
+    elif use_real_trainer and ps.trainer_backend == "modal":
+        legacy_vf.ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
+        # Intentionally do not set UV_REINSTALL_PACKAGE here. That workaround
+        # originated when the Docker trainer's bash harness ran on the env-server
+        # and could reuse its host-cached PEP 723 environment. ModalRuntime creates
+        # a fresh sandbox per rollout from the registry image and mounts no
+        # persistent Volume or snapshot, so its uv script environment cannot carry
+        # a stale pydantic-core extension across rollouts.
+        harness_runtime = ModalConfig(
+            image=ps.docker_image,
+            workdir="/workspace",
+            gpu=_modal_gpu_for(ps.modal_gpu),
+            cpu=float(ps.cpu_cores),
+            memory=float(ps.memory_gb),
+            disk=float(ps.disk_size_gb),
+        )
         timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
 
     return Environment(

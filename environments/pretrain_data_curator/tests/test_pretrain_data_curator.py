@@ -427,15 +427,6 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
     assert runtime.disk == 20.0
     assert docker_env.config.timeout.scoring == 2340.0
 
-    modal_env = load_environment(
-        use_real_trainer=True,
-        proxy_student={"trainer_backend": "modal"},
-    )
-    assert modal_env.harness.config.env == {}
-    assert isinstance(modal_env.harness.config.runtime, vf.SubprocessConfig)
-    assert modal_env.config.timeout.scoring is None
-
-
 def test_load_environment_rejects_remote_docker_host():
     with pytest.raises(ValueError, match="docker_host is not supported"):
         load_environment(
@@ -1657,6 +1648,8 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
     # prompt must teach both (and not reference the retired curator_* MCP tools).
     assert "hf datasets ls" in SYSTEM_PROMPT
     assert "hf datasets info" in SYSTEM_PROMPT
+    assert "command -v hf" in SYSTEM_PROMPT
+    assert "pip install -q 'huggingface-hub>=0.34'" in SYSTEM_PROMPT
     assert "--search" in SYSTEM_PROMPT
     assert "```json" in SYSTEM_PROMPT
     assert '"sources"' in SYSTEM_PROMPT
@@ -2669,16 +2662,22 @@ def test_system_prompt_scales_discovery_with_benchmark_budget():
     assert "fabricated id" in benchmark_prompt
 
 
-def test_system_prompt_forbids_pip_and_python_steers_to_hf_cli():
-    # deepseek-v4-flash burned its whole budget on `pip install huggingface_hub`
-    # (which dead-ends in the harness's uv-venv shell) and never emitted a manifest.
-    # The prompt must name the hf CLI as already installed + the only tool needed, and
-    # explicitly steer away from pip / writing python.
+def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
+    # Bare Modal/Prime images may not contain the CLI. The first command must
+    # self-heal and search in one turn, while prohibiting unproductive alias/import
+    # diagnosis and unrelated installs.
     low = SYSTEM_PROMPT.lower()
-    assert "already installed" in low          # hf CLI is preinstalled...
-    assert "only tool" in low                  # ...and is the only tool needed
-    assert "pip" in low and "do not" in low    # pip is named inside a prohibition
-    assert "huggingface_hub" in low            # the import that does NOT work in-shell
+    assert "already installed" not in low
+    assert "command -v hf" in low
+    assert "pip install -q 'huggingface-hub>=0.34'" in low
+    assert (
+        "fi; hf datasets ls" in low
+    )  # bootstrap and useful discovery share one turn
+    assert "do not spend turns diagnosing missing commands" in low
+    assert "do not try `huggingface-cli`" in low
+    assert "only installation step allowed" in low
+    assert "pip will only waste your turns" not in low
+    assert "no setup required" not in low
 
 
 # --- the PATH-shadow shim --------------------------------------------------

@@ -21,9 +21,8 @@ _MAX_TRAIN_TOKEN_BUDGET = 1_000_000_000  # generous H100/H200 upper bound
 _CHARS_PER_TOKEN = 4  # matches hf_access.estimate_tokens (chars // 4)
 _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
 _MAX_CORPUS_CHARS = 2_000_000_000  # absolute ceiling on the uploaded corpus blob
-# Sandbox lifetime derivation. 1440 == the Prime platform's maximum sandbox
-# lifetime: verifiers' PrimeRuntime pins ``timeout_minutes`` to ``24 * 60`` and
-# calls it "Maximum lifetime of any sandbox" (verifiers/v1/runtimes/prime.py).
+# Sandbox lifetime derivation. Prime and Modal v1 runtimes both cap a remote
+# sandbox at 24 hours.
 _MAX_SANDBOX_TIMEOUT_MINUTES = 1440
 _MIN_SANDBOX_TIMEOUT_MINUTES = 30  # historical default; floor keeps small budgets unchanged
 _SANDBOX_SETUP_MINUTES = 15  # image pull + pip(tiktoken) + uploads + val download
@@ -192,9 +191,7 @@ class ProxyStudentConfig(BaseModel):
     # the byte-identical historical path. ``'docker'`` places the rollout harness
     # and proxy-student training in one declarative v1 ``DockerRuntime`` on the
     # local/co-located Docker daemon (see ``docker_backend.py``).
-    # ``'modal'`` provisions a Modal GPU sandbox via ``modal.Sandbox.create``,
-    # which works from a CPU-only env-server in Hosted Training without a local
-    # Docker daemon or Prime account (see ``modal_backend.py``).
+    # ``'modal'`` places both phases in one declarative v1 ``ModalRuntime``.
     trainer_backend: Literal["prime", "docker", "modal"] = "prime"
     # Retained for config compatibility, but remote Docker is not supported by
     # the shared harness-runtime path. ``load_environment`` rejects a non-None
@@ -210,7 +207,7 @@ class ProxyStudentConfig(BaseModel):
     #
     # ``docker_image`` is the container image. For the PRIME backend it defaults to
     # the historical pytorch 2.3.1 / cuda 12.1 image (unchanged). For the DOCKER
-    # backend, if left unset, it defaults to ``_DEFAULT_DOCKER_TRAINER_IMAGE``
+    # and MODAL backends, if left unset, it defaults to ``_DEFAULT_DOCKER_TRAINER_IMAGE``
     # (pytorch 2.7 / cuda 12.6; see ``_default_docker_image_for_docker_backend``).
     # Either way the image MUST ship torch + CUDA (use a ``-devel`` tag for build
     # tooling / torch.compile nvcc).
@@ -305,6 +302,8 @@ class ProxyStudentConfig(BaseModel):
         )
         if self.trainer_backend == "prime":
             return min(_MAX_SANDBOX_TIMEOUT_MINUTES, derived)
+        if self.trainer_backend == "modal":
+            return min(_MAX_SANDBOX_TIMEOUT_MINUTES, derived)
         return derived
 
     @property
@@ -386,6 +385,15 @@ class ProxyStudentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _default_image_for_modal_backend(self) -> "ProxyStudentConfig":
+        if (
+            self.trainer_backend == "modal"
+            and "docker_image" not in self.model_fields_set
+        ):
+            self.docker_image = _DEFAULT_DOCKER_TRAINER_IMAGE
+        return self
+
+    @model_validator(mode="after")
     def _check_prime_timeout_ceiling(self) -> "ProxyStudentConfig":
         # The Prime platform pins any sandbox to a 24h lifetime, so an explicit
         # timeout above that is unschedulable on the prime backend — fail loud here
@@ -400,6 +408,19 @@ class ProxyStudentConfig(BaseModel):
                 f"timeout_minutes ({self.timeout_minutes}) exceeds the Prime 24h "
                 f"sandbox maximum ({_MAX_SANDBOX_TIMEOUT_MINUTES}); lower it or set "
                 "trainer_backend='docker'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_modal_timeout_ceiling(self) -> "ProxyStudentConfig":
+        if (
+            self.trainer_backend == "modal"
+            and self.timeout_minutes is not None
+            and self.timeout_minutes > _MAX_SANDBOX_TIMEOUT_MINUTES
+        ):
+            raise ValueError(
+                f"timeout_minutes ({self.timeout_minutes}) exceeds the Modal 24h "
+                f"sandbox maximum ({_MAX_SANDBOX_TIMEOUT_MINUTES}); lower it"
             )
         return self
 

@@ -100,6 +100,10 @@ class CuratorScorer:
                 return await self.trainer.train_and_eval(
                     corpus, self.config.proxy_student, runtime=runtime
                 )
+            if self.config.proxy_student.trainer_backend == "modal":
+                return await self.trainer.train_and_eval(
+                    corpus, self.config.proxy_student, runtime=runtime
+                )
             return await self.trainer.train_and_eval(corpus, self.config.proxy_student)
         except Exception as exc:  # noqa: BLE001 - surfaced as telemetry + sentinel
             stderr_tail = getattr(exc, "stderr_tail", "")
