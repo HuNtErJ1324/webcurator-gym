@@ -120,10 +120,7 @@ def load_environment(
         # Scoring includes corpus materialization, input writes, training, and
         # leakage computation. Keep the framework deadline above the trainer's
         # own multi-hour command deadline so the trainer can report/clean up.
-        scoring_margin = max(300.0, ps.upload_timeout_seconds * 4 + 60.0)
-        timeout = vf.TimeoutConfig(
-            scoring=ps.effective_timeout_minutes * 60 + scoring_margin
-        )
+        timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
 
     return Environment(
         vf.EnvConfig(

@@ -307,6 +307,12 @@ class ProxyStudentConfig(BaseModel):
             return min(_MAX_SANDBOX_TIMEOUT_MINUTES, derived)
         return derived
 
+    @property
+    def effective_scoring_timeout_seconds(self) -> float:
+        """Framework deadline for the full harness-runtime scoring phase."""
+        margin = max(300.0, self.upload_timeout_seconds * 4 + 60.0)
+        return self.effective_timeout_minutes * 60 + margin
+
     @model_validator(mode="after")
     def _check_student_dims(self) -> "ProxyStudentConfig":
         # The modern student (student_model.GPT) requires: n_embd divisible by

@@ -15,7 +15,7 @@ from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
-from pretrain_data_curator.trainer import TrainerError, TrainResult
+from pretrain_data_curator.trainer import HeuristicProxyTrainer, TrainerError, TrainResult
 
 
 def _corpus() -> CuratedCorpus:
@@ -42,8 +42,8 @@ def _result(
 
 
 class FakeRuntime:
-    def __init__(self, result=None) -> None:
-        self.config = SimpleNamespace(type="docker")
+    def __init__(self, result=None, runtime_type="docker") -> None:
+        self.config = SimpleNamespace(type=runtime_type)
         self.result = result or SimpleNamespace(
             stdout=_result(), stderr="", exit_code=0
         )
@@ -281,3 +281,80 @@ def test_docker_and_modal_backend_selection_remain_distinct():
         docker_taskset._build_real_trainer(), HarnessRuntimeProxyTrainer
     )
     assert isinstance(modal_taskset._build_real_trainer(), ModalProxyTrainer)
+
+
+def test_native_docker_tasks_declare_runtime_requirements_and_deadline():
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(
+            id="pretrain-data-curator",
+            use_real_trainer=True,
+            proxy_student={
+                "trainer_backend": "docker",
+                "docker_image": "pretrain-data-curator:gpu",
+                "gpu_count": 1,
+                "timeout_minutes": 45,
+            },
+        )
+    )
+
+    task = taskset.load_tasks()[0]
+
+    assert task.image == "pretrain-data-curator:gpu"
+    assert task.workdir == "/workspace"
+    assert task.resources.gpu == "1"
+    assert task.resources.cpu == 4.0
+    assert task.resources.memory == 16.0
+    assert task.timeout.scoring == 45 * 60 + 540
+
+
+def test_package_is_discoverable_as_a_native_v1_taskset():
+    from verifiers.v1.loaders import taskset_class
+
+    assert taskset_class("pretrain-data-curator") is CuratorTaskset
+
+
+@pytest.mark.asyncio
+async def test_taskset_setup_rejects_docker_trainer_on_subprocess_runtime():
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(
+            id="pretrain-data-curator",
+            use_real_trainer=True,
+            proxy_student={"trainer_backend": "docker"},
+        )
+    )
+
+    with pytest.raises(TrainerError, match="--harness.runtime.type docker"):
+        await taskset.setup(
+            taskset.load_tasks()[0],
+            FakeRuntime(runtime_type="subprocess"),
+        )
+
+
+class _FailingCorpusBuilder:
+    async def materialize(self, manifest, state):
+        RolloutStore.record_tool_error(state, "bad_config")
+        RolloutStore.set_external_failure(state, True)
+        return CuratedCorpus(sources=[])
+
+
+@pytest.mark.asyncio
+async def test_external_failure_metrics_wait_for_materialization():
+    config = CuratorConfig()
+    taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
+    taskset._scorer = CuratorScorer(
+        config,
+        _FailingCorpusBuilder(),
+        HeuristicProxyTrainer(),
+        _Leakage(),
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="owner/data")])
+    )
+    RolloutStore.set_finalized(state, True)
+    trace = vf.Trace(task=build_tasks("2024-12-31", 1_000_000)[0], state=state)
+
+    await taskset.score(trace, None)
+
+    assert trace.metrics["external_failure"] == 1.0
+    assert trace.metrics["tool_error_count"] == 1.0

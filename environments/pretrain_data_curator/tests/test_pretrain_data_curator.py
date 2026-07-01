@@ -326,6 +326,29 @@ def test_hf_client_auto_detects_text_columns_and_query_response(monkeypatch):
     ]
 
 
+def test_hf_client_resolves_missing_default_config_to_english(monkeypatch):
+    calls = []
+
+    def fake_load_dataset(dataset_id, *, name, **kwargs):
+        calls.append(name)
+        if name is None:
+            raise ValueError("Config name is missing. Please pick one.")
+        return iter([{"text": "configured document"}])
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        "datasets.get_dataset_config_names",
+        lambda dataset_id, token: ["20231101.ab", "20231101.en"],
+    )
+    client = object.__new__(HuggingFaceDatasetClient)
+    client._token = "test-token"
+
+    assert client.sample_documents("wikimedia/wikipedia", None, "train", None, 1) == [
+        "configured document"
+    ]
+    assert calls == [None, "20231101.en"]
+
+
 def test_source_defaults_to_auto_detected_text_field():
     assert Source(dataset_id="owner/name").text_field is None
 

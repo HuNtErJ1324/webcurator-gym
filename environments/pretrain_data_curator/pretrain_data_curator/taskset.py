@@ -39,6 +39,7 @@ import verifiers.v1 as vf
 from pydantic import ValidationError
 
 from .corpus import CorpusBuilder
+from .docker_network import DockerHostReachability
 from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
@@ -47,7 +48,12 @@ from .models import CuratorConfig, FilterSpec, Manifest, ProxyStudentConfig, Sam
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
 from .tasks import CuratorTask, build_tasks
-from .trainer import HeuristicProxyTrainer, ProxyStudentTrainer, SandboxProxyTrainer
+from .trainer import (
+    HeuristicProxyTrainer,
+    ProxyStudentTrainer,
+    SandboxProxyTrainer,
+    TrainerError,
+)
 from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
@@ -532,7 +538,28 @@ class CuratorTaskset(_TasksetBase):
     def load_tasks(self) -> list[CuratorTask]:
         tasks = build_tasks(self.curator.cutoff_date, self.curator.token_budget)
         system_prompt = self._system_prompt()
-        return [t.model_copy(update={"system_prompt": system_prompt}) for t in tasks]
+        updates: dict[str, Any] = {"system_prompt": system_prompt}
+        ps = self.curator.proxy_student
+        if self.curator.use_real_trainer and ps.trainer_backend == "docker":
+            # Native taskset runs do not call load_environment(), so declare the
+            # image, resources, and scoring deadline on each task. A task image
+            # also makes a subprocess runtime fail before rollout.
+            updates.update(
+                {
+                    "image": ps.docker_image,
+                    "workdir": "/workspace",
+                    "resources": vf.TaskResources(
+                        cpu=float(ps.cpu_cores),
+                        memory=float(ps.memory_gb),
+                        gpu=str(ps.gpu_count) if ps.gpu_count > 0 else None,
+                        disk=float(ps.disk_size_gb),
+                    ),
+                    "timeout": vf.TaskTimeout(
+                        scoring=ps.effective_scoring_timeout_seconds
+                    ),
+                }
+            )
+        return [task.model_copy(update=updates) for task in tasks]
 
     def _system_prompt(self) -> str:
         """Render the configured turn budget into the per-rollout prompt.
@@ -570,6 +597,20 @@ class CuratorTaskset(_TasksetBase):
     # `hf` CLI in its own shell, so the taskset exposes no MCP tool servers and
     # ``type(CuratorTaskset).tools is Taskset.tools`` holds. This is what lets the
     # non-MCP gate (env.py:239-247) pass for codex / kimi_code / bash harnesses.
+
+    async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:
+        """Reject a Docker trainer paired with a non-Docker rollout runtime."""
+        if (
+            self.curator.use_real_trainer
+            and self.curator.proxy_student.trainer_backend == "docker"
+            and runtime.type != "docker"
+        ):
+            raise TrainerError(
+                "trainer_backend='docker' requires the rollout harness to use a "
+                "Docker runtime; pass --harness.runtime.type docker"
+            )
+        if runtime.type == "docker":
+            DockerHostReachability.configure()
 
     @vf.stop
     async def max_turns_reached(self, trace: vf.Trace) -> bool:
@@ -773,11 +814,17 @@ class CuratorTaskset(_TasksetBase):
 
     # Diagnostics that separate "bad curation" from "external/HF/sandbox failure".
     @vf.metric
-    async def tool_error_count(self, trace: vf.Trace) -> float:
+    async def tool_error_count(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
         return float(RolloutStore.tool_error_count(trace.state))
 
     @vf.metric
-    async def external_failure(self, trace: vf.Trace) -> float:
+    async def external_failure(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
         return 1.0 if RolloutStore.has_external_failure(trace.state) else 0.0
 
     async def trainer_error_str(

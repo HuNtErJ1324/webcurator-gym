@@ -101,16 +101,33 @@ docker build -t pretrain-data-curator:gpu \
 `docker run --rm --gpus 1 pretrain-data-curator:gpu nvidia-smi`.
 
 ```bash
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"use_real_trainer": true, "proxy_student": {
-        "trainer_backend": "docker",
-        "docker_image": "pretrain-data-curator:gpu",
-        "gpu_count": 1}}'
+cd environments/pretrain_data_curator
+uv run eval pretrain-data-curator \
+  --harness.id bash \
+  --harness.runtime.type docker \
+  --harness.runtime.image pretrain-data-curator:gpu \
+  --harness.runtime.workdir /workspace \
+  --harness.runtime.gpu 1 \
+  --taskset.use-real-trainer true \
+  --taskset.token-budget 500000 \
+  --taskset.max-turns 12 \
+  --taskset.proxy-student \
+    '{"trainer_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":5000000,"gpu_count":1}' \
+  -m nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 -n 1 -r 1
 ```
+
+Use the native v1 taskset command above for local Docker runs. The currently
+released `prime eval run` wrapper has no `--harness.runtime.*` passthrough, so it
+cannot select this runtime. An owner-qualified target such as
+`hunterj/pretrain-data-curator` also resolves the published Hub version rather
+than this local checkout.
 
 SSH-remote `docker_host` orchestration is intentionally unsupported by this
 single-runtime path; `load_environment` rejects a configured `docker_host`.
 Leave it unset and do not set an ambient remote `DOCKER_HOST`.
+On Docker Desktop under WSL2, the environment automatically advertises the
+interception server on the WSL interface; `PDC_DOCKER_HOST_IP` can override the
+detected address if necessary.
 
 The proxy-student command retains its budget-derived deadline and structured
 exit/`RESULT_JSON` validation. Timeout or cancellation stops the shared runtime
@@ -156,6 +173,9 @@ Each source requires `id` (the Hugging Face dataset id) and `weight` (≥ 0).
 `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are
 optional. Supported filter kinds: `min_chars`, `max_chars`, `min_tokens`,
 `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, `dedup_exact`.
+When a multi-config dataset has no default and `config` is omitted, the
+materializer chooses a stable English/default config (for example `en` or a
+config ending in `.en`) before falling back to the first advertised config.
 
 See [`docs/tools.md`](docs/tools.md) for the full `hf` workflow, metering
 details, manifest schema, filter reference, and turn-budget guidance.
