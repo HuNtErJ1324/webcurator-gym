@@ -35,4 +35,5 @@ rollouts_per_example = 1
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "torch==2.7.0",
 ]

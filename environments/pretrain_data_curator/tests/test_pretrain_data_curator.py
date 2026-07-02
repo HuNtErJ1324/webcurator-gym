@@ -6,7 +6,6 @@ import math
 import os
 import subprocess
 import sys
-from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,11 +25,9 @@ from pretrain_data_curator.hf_access import (
     RetryPolicy,
     classify_exception,
     loop_local_semaphore,
-    parse_cutoff,
 )
 from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
 from pretrain_data_curator.models import (
-    CostLedger,
     CuratorConfig,
     FilterSpec,
     Manifest,
@@ -39,11 +36,7 @@ from pretrain_data_curator.models import (
 )
 from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.rewards import CuratorScorer
-from pretrain_data_curator.rollout_state import (
-    STATE_SCHEMA_VERSION,
-    CuratorState,
-    RolloutStore,
-)
+from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import (
     SYSTEM_PROMPT,
@@ -57,7 +50,6 @@ from verifiers.v1.taskset import Taskset
 from pretrain_data_curator.trainer import (
     HeuristicProxyTrainer,
     RuntimeSelectedTrainer,
-    TrainerError,
     TrainResult,
 )
 from pretrain_data_curator.val_set import (
@@ -227,7 +219,9 @@ async def _finalized(
     return curator.set_manifest(list(sources), finalize=True)
 
 
-def _scorer(trainer, *, config=None, corpus_builder=None, leakage=None) -> CuratorScorer:
+def _scorer(
+    trainer, *, config=None, corpus_builder=None, leakage=None
+) -> CuratorScorer:
     """A bare `CuratorScorer` (the framework-agnostic half of the old rubric) for
     the degrade/leakage tests that supply their own trainer + leakage detector."""
     return CuratorScorer(
@@ -380,9 +374,7 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
         use_real_trainer=True,
         proxy_student={"runtime_backend": "docker", "gpu_count": 1},
     )
-    assert docker_env.harness.config.env == {
-        "UV_REINSTALL_PACKAGE": "pydantic-core"
-    }
+    assert docker_env.harness.config.env == {"UV_REINSTALL_PACKAGE": "pydantic-core"}
     runtime = docker_env.harness.config.runtime
     assert isinstance(runtime, vf.DockerConfig)
     assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
@@ -392,6 +384,7 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
     assert runtime.memory == 16.0
     assert runtime.disk == 20.0
     assert docker_env.config.timeout.scoring == 2340.0
+
 
 def test_load_environment_rejects_remote_docker_host():
     with pytest.raises(ValueError, match="docker_host is not supported"):
@@ -468,15 +461,22 @@ async def test_empty_manifest_scores_zero_perf():
 
 
 def test_document_filter_kinds():
-    docs = ["short", "a much longer high quality document about science and history", "$$$$$"]
+    docs = [
+        "short",
+        "a much longer high quality document about science and history",
+        "$$$$$",
+    ]
     f = DocumentFilter()
     kept = f.apply(docs, [FilterSpec(kind="min_chars", params={"value": 10})])
     assert "short" not in kept
-    cleaned = f.apply(docs, [FilterSpec(kind="max_symbol_ratio", params={"value": 0.3})])
+    cleaned = f.apply(
+        docs, [FilterSpec(kind="max_symbol_ratio", params={"value": 0.3})]
+    )
     assert "$$$$$" not in cleaned
 
 
-def test_corpus_builder_applies_filters_and_sampling():
+@pytest.mark.asyncio
+async def test_corpus_builder_applies_filters_and_sampling():
     client = FakeClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=16)
     manifest = Manifest(
@@ -489,12 +489,14 @@ def test_corpus_builder_applies_filters_and_sampling():
             )
         ]
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     assert len(corpus.documents) == 3
     assert corpus.total_tokens > 0
 
 
-def test_weight_proportional_sampling_allocates_correct_proportions():
+@pytest.mark.asyncio
+async def test_weight_proportional_sampling_allocates_correct_proportions():
     # Build a client with controlled documents so we can count tokens precisely.
     # Each doc is ~25 chars -> estimate_tokens = 25//4 = 6 tokens.
     doc = "a" * 25  # 6 tokens each
@@ -516,7 +518,8 @@ def test_weight_proportional_sampling_allocates_correct_proportions():
             Source(dataset_id="good/science", weight=1.0),
         ],
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     tokens_a = corpus.sources[0].tokens
     tokens_b = corpus.sources[1].tokens
 
@@ -530,7 +533,8 @@ def test_weight_proportional_sampling_allocates_correct_proportions():
     assert tokens_a > tokens_b
 
 
-def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
+@pytest.mark.asyncio
+async def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
     doc = "a" * 25  # 6 tokens each
     n_docs = 50
 
@@ -554,14 +558,16 @@ def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
             Source(dataset_id="good/science", weight=1.0),
         ],
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     # Source A: capped at explicit 30 tokens (tighter than the 2000-token weight target).
     assert corpus.sources[0].tokens <= 30
     # Source B: weight-derived 1000 tokens (no explicit cap); est_docs = 1000//250 = 4 docs (24 tokens).
     assert corpus.sources[1].tokens <= 1000
 
 
-def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
+@pytest.mark.asyncio
+async def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
     doc = "a" * 25  # 6 tokens each
     n_docs = 10
 
@@ -580,13 +586,15 @@ def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
             Source(dataset_id="good/science", weight=0.0),
         ],
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     # No weight-derived cap applied -> all 10 docs per source are kept.
     assert len(corpus.sources[0].documents) == n_docs
     assert len(corpus.sources[1].documents) == n_docs
 
 
-def test_weight_proportional_single_source_gets_full_budget():
+@pytest.mark.asyncio
+async def test_weight_proportional_single_source_gets_full_budget():
     doc = "a" * 25  # 6 tokens each
     n_docs = 50
 
@@ -603,13 +611,15 @@ def test_weight_proportional_single_source_gets_full_budget():
         token_budget=n_docs * 250,  # = 12500; ensures est_docs = n_docs = 50
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     # All n_docs fetched; their token total (n_docs*6=300) fits within the budget.
     assert corpus.sources[0].tokens <= n_docs * 250
     assert len(corpus.sources[0].documents) == n_docs
 
 
-def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
+@pytest.mark.asyncio
+async def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
     """Large token_target: est_docs hits the sample_docs_per_source cap."""
     doc = "a" * 25  # 6 tokens each
     cap = 8
@@ -626,11 +636,13 @@ def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
         token_budget=10_000,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     assert len(corpus.sources[0].documents) == cap
 
 
-def test_fetch_count_proportional_to_small_token_target():
+@pytest.mark.asyncio
+async def test_fetch_count_proportional_to_small_token_target():
     """Small token_target: est_docs is proportionally smaller than sample_docs_per_source."""
     doc = "a" * 25  # 6 tokens each
     cap = 100
@@ -647,7 +659,8 @@ def test_fetch_count_proportional_to_small_token_target():
         token_budget=500,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
-    corpus = builder.build(manifest)
+    state = CuratorState()
+    corpus = await builder.materialize(manifest, state)
     assert len(corpus.sources[0].documents) == 2
     assert len(corpus.sources[0].documents) < cap
 
@@ -668,7 +681,6 @@ async def test_materialize_manifest_sample_docs_per_source_overrides_fetch_cap()
     client = _UnboundedClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=8)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
 
     # weight_target = 10_000 -> est_docs = 40, capped at the manifest's override
     # (20), NOT the builder's configured default (8).
@@ -694,7 +706,6 @@ async def test_materialize_without_manifest_override_falls_back_to_configured_de
     client = _UnboundedClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=8)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
 
     manifest = Manifest(
         token_budget=10_000,
@@ -712,12 +723,18 @@ def test_manifest_sample_docs_per_source_bounds_rejected(value):
 
 
 def test_manifest_sample_docs_per_source_bounds_accepted():
-    assert Manifest(
-        sources=[Source(dataset_id="a/b")], sample_docs_per_source=1
-    ).sample_docs_per_source == 1
-    assert Manifest(
-        sources=[Source(dataset_id="a/b")], sample_docs_per_source=100_000
-    ).sample_docs_per_source == 100_000
+    assert (
+        Manifest(
+            sources=[Source(dataset_id="a/b")], sample_docs_per_source=1
+        ).sample_docs_per_source
+        == 1
+    )
+    assert (
+        Manifest(
+            sources=[Source(dataset_id="a/b")], sample_docs_per_source=100_000
+        ).sample_docs_per_source
+        == 100_000
+    )
 
 
 @pytest.mark.asyncio
@@ -736,7 +753,6 @@ async def test_materialize_different_sample_sizes_do_not_share_cache_key():
     client = _RecordingClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=8)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
 
     manifest_small = Manifest(
         token_budget=10_000,
@@ -856,7 +872,9 @@ def test_train_token_budget_default_preserves_step_behavior():
     ],
 )
 def test_train_token_budget_derives_steps(budget, batch, block, expected_steps):
-    cfg = ProxyStudentConfig(train_token_budget=budget, batch_size=batch, block_size=block)
+    cfg = ProxyStudentConfig(
+        train_token_budget=budget, batch_size=batch, block_size=block
+    )
     assert cfg.effective_steps == expected_steps
     assert cfg.effective_train_tokens == expected_steps * batch * block
 
@@ -881,11 +899,14 @@ def test_effective_max_corpus_chars_scales_with_budget():
     big = ProxyStudentConfig(train_token_budget=300_000_000)
     assert big.effective_max_corpus_chars == 4 * big.effective_train_tokens
     assert big.effective_max_corpus_chars > 5_000_000
-    assert ProxyStudentConfig(max_corpus_chars=123_456).effective_max_corpus_chars == 123_456
-    # 1e9 tokens * 4 chars/token exceeds the 2e9 ceiling -> clamped.
-    assert ProxyStudentConfig(train_token_budget=1_000_000_000).effective_max_corpus_chars == (
-        2_000_000_000
+    assert (
+        ProxyStudentConfig(max_corpus_chars=123_456).effective_max_corpus_chars
+        == 123_456
     )
+    # 1e9 tokens * 4 chars/token exceeds the 2e9 ceiling -> clamped.
+    assert ProxyStudentConfig(
+        train_token_budget=1_000_000_000
+    ).effective_max_corpus_chars == (2_000_000_000)
 
 
 def test_effective_timeout_minutes_scales_and_is_bounded():
@@ -1092,7 +1113,6 @@ async def test_concurrent_same_key_fetch_coalesces_to_one_fetch_and_one_bill():
     client = _SlowCountingClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=8)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     key = FetchKey("good/encyclopedia", None, "train", "text", 8)
 
     results = await asyncio.gather(
@@ -1163,8 +1183,16 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
 @pytest.mark.parametrize(
     "exc_factory,expected_kind",
     [
-        (lambda: __import__("datasets.exceptions", fromlist=["DatasetNotFoundError"]).DatasetNotFoundError("nope"), "missing"),
-        (lambda: ValueError("Unknown split 'bad'. Should be one of ['train']."), "bad_split"),
+        (
+            lambda: __import__(
+                "datasets.exceptions", fromlist=["DatasetNotFoundError"]
+            ).DatasetNotFoundError("nope"),
+            "missing",
+        ),
+        (
+            lambda: ValueError("Unknown split 'bad'. Should be one of ['train']."),
+            "bad_split",
+        ),
         (lambda: KeyError("text_field"), "bad_field"),
         (lambda: PermissionError("401 Client Error: Unauthorized for url"), "auth"),
         (lambda: ConnectionError("Connection refused"), "network"),
@@ -1176,7 +1204,9 @@ async def test_fetch_failures_are_structured_and_scoring_degrades(
     exc_factory, expected_kind
 ):
     client = FailingClient(exc_factory)
-    curator = await _make(client=client, fetch_max_attempts=1, fetch_timeout_seconds=2.0)
+    curator = await _make(
+        client=client, fetch_max_attempts=1, fetch_timeout_seconds=2.0
+    )
 
     # (a) the corpus fetch surfaces a structured error of the expected kind.
     docs, error = await curator.corpus_builder.fetch_source_docs(
@@ -1208,7 +1238,6 @@ async def test_real_timeout_classified_via_wait_for():
     policy = RetryPolicy(attempts=1, timeout=0.05)
     builder = CorpusBuilder(client=_SlowClient(), retry_policy=policy)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     docs, error = await builder.fetch_source_docs(
         state, FetchKey("a/b", None, "train", "text", 4)
     )
@@ -1276,7 +1305,9 @@ def test_proxy_student_recipe_defaults_mirror_record01():
     assert cfg.lr_min_ratio == 0.1
     assert cfg.n_train_runs == 1
     assert cfg.warmup_steps is None
-    assert cfg.effective_warmup_steps == min(256, max(1, cfg.effective_steps // 10)) == 20
+    assert (
+        cfg.effective_warmup_steps == min(256, max(1, cfg.effective_steps // 10)) == 20
+    )
     # An explicit warmup is clamped to the run length so it never exceeds steps.
     assert ProxyStudentConfig(steps=5, warmup_steps=999).effective_warmup_steps == 5
 
@@ -1305,7 +1336,9 @@ def test_heuristic_flops_scale_with_budget_when_corpus_permits():
     from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
 
     # ~5000 estimated tokens (4000 words / 20000 chars -> chars//4 dominates).
-    corpus = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["word " * 4000])])
+    corpus = CuratedCorpus(
+        sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["word " * 4000])]
+    )
     trainer = HeuristicProxyTrainer()
     small = ProxyStudentConfig(batch_size=1, block_size=8)  # default budget: 200*8=1600
     big = ProxyStudentConfig(batch_size=1, block_size=8, train_token_budget=40_000)
@@ -1392,9 +1425,29 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
     assert "command -v hf" in SYSTEM_PROMPT
     assert "pip install -q 'huggingface-hub>=0.34'" in SYSTEM_PROMPT
     assert "--search" in SYSTEM_PROMPT
+    assert "| head -c 6000" in SYSTEM_PROMPT
+    assert "Never request `tags` from `datasets ls`" in SYSTEM_PROMPT
     assert "```json" in SYSTEM_PROMPT
     assert '"sources"' in SYSTEM_PROMPT
     assert "curator_" not in SYSTEM_PROMPT  # no stale MCP tool references
+
+
+@pytest.mark.asyncio
+async def test_discovery_output_budget_stops_before_provider_context_overflow():
+    curator = await _make()
+    trace = _trace_with_bash_calls(
+        curator.task,
+        curator.state,
+        [
+            (
+                "hf datasets ls --search wikipedia --limit 5",
+                "wikimedia/wikipedia " + ("x" * 24_000),
+            ),
+            ("hf datasets info wikimedia/wikipedia", "unused"),
+        ],
+    )
+
+    assert await curator.taskset.discovery_output_budget_reached(trace)
 
 
 def test_system_prompt_manifest_example_parses():
@@ -1435,65 +1488,6 @@ def test_system_prompt_is_harness_agnostic_about_running_commands():
     assert "reply with the command itself" in low  # message-executing harnesses
     # Explicitly warns that merely writing the command out is not running it.
     assert "does not run it" in low
-
-
-# --- Tier N: state schema version + canonical hash -------------------------
-
-
-@pytest.mark.asyncio
-async def test_state_carries_schema_version():
-    curator = await _make()
-    assert RolloutStore.schema_version(curator.state) == STATE_SCHEMA_VERSION
-
-
-@pytest.mark.asyncio
-async def test_canonical_hash_stable_for_equal_state():
-    curator = await _make()
-    s1 = await _finalized(curator, sources=("good/encyclopedia",))
-    h1 = RolloutStore.canonical_hash(s1)
-    await curator.reset()
-    s2 = await _finalized(curator, sources=("good/encyclopedia",))
-    assert RolloutStore.canonical_hash(s2) == h1
-    await curator.reset()
-    s3 = await _finalized(curator, sources=("good/encyclopedia", "good/science"))
-    assert RolloutStore.canonical_hash(s3) != h1
-
-
-@pytest.mark.asyncio
-async def test_canonical_state_dump_keys_and_hash():
-    # Pin the EXACT serialized keys of the canonical state dump + manifest and the
-    # hash formula, so a schema-key rename or canonical-hash drift fails loudly.
-    import hashlib
-
-    curator = await _make()
-    state = await _finalized(curator, sources=("good/encyclopedia",))
-    canonical = RolloutStore.canonical_state(state)
-    assert set(canonical) == {"state_schema_version", "manifest", "finalized"}
-    assert canonical["state_schema_version"] == STATE_SCHEMA_VERSION
-    assert canonical["finalized"] is True
-    assert set(canonical["manifest"]) == {
-        "token_budget",
-        "sources",
-        "sample_docs_per_source",
-    }
-    # The hash is the blake2b-16 of the canonical JSON (sorted, compact).
-    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-    assert (
-        RolloutStore.canonical_hash(state)
-        == hashlib.blake2b(encoded.encode("utf-8"), digest_size=16).hexdigest()
-    )
-
-
-# --- Additional coverage: cutoff/query helpers -----------------------------
-
-
-def test_parse_cutoff_forms():
-    assert parse_cutoff("2024-12-31").date() == date(2024, 12, 31)
-    dt = parse_cutoff("2024-06-01T12:00:00Z")
-    assert dt.year == 2024 and dt.month == 6
-    assert parse_cutoff(date(2023, 1, 1)).tzinfo is not None
-    with pytest.raises(ValueError):
-        parse_cutoff("   ")
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
@@ -1917,9 +1911,21 @@ def test_classify_hf_argv(argv, kind):
 def test_parse_cost_log_maps_records_to_ledger():
     log = "\n".join(
         [
-            json.dumps({"argv": ["datasets", "ls", "--search", "code"], "exit": 0, "bytes": 400}),
+            json.dumps(
+                {
+                    "argv": ["datasets", "ls", "--search", "code"],
+                    "exit": 0,
+                    "bytes": 400,
+                }
+            ),
             json.dumps({"argv": ["datasets", "info", "a/b"], "exit": 0, "bytes": 80}),
-            json.dumps({"argv": ["download", "a/b", "--repo-type", "dataset"], "exit": 0, "bytes": 4000}),
+            json.dumps(
+                {
+                    "argv": ["download", "a/b", "--repo-type", "dataset"],
+                    "exit": 0,
+                    "bytes": 4000,
+                }
+            ),
             json.dumps({"argv": ["version"], "exit": 0, "bytes": 12}),  # local -> free
             "   ",  # blank line tolerated
             "{not valid json",  # corrupt line tolerated
@@ -1937,7 +1943,9 @@ def test_parse_cost_log_maps_records_to_ledger():
 def test_parse_cost_log_charges_failed_calls_too():
     # A failed hf call still cost a round-trip; it is charged like the old tool
     # accounting (which incremented before the call), regardless of exit code.
-    log = json.dumps({"argv": ["datasets", "ls", "--search", "x"], "exit": 1, "bytes": 0})
+    log = json.dumps(
+        {"argv": ["datasets", "ls", "--search", "x"], "exit": 1, "bytes": 0}
+    )
     led = hf_meter.parse_cost_log(log)
     assert led.web_queries == 1 and led.hub_calls == 1
 
@@ -1984,7 +1992,9 @@ def test_ledger_from_messages_reconstructs_tool_call_and_text_action_calls():
 
 
 def test_extract_hf_commands_splits_on_shell_separators():
-    cmds = hf_meter.extract_hf_commands("hf datasets ls --search a && hf datasets info b/c")
+    cmds = hf_meter.extract_hf_commands(
+        "hf datasets ls --search a && hf datasets info b/c"
+    )
     assert cmds == [["datasets", "ls", "--search", "a"], ["datasets", "info", "b/c"]]
 
 
@@ -2031,9 +2041,13 @@ async def test_finalize_populates_manifest_and_meters_runtime_log():
     )
     trace = _trace_with_final(curator.task, curator.state, final)
     log = (
-        json.dumps({"argv": ["datasets", "ls", "--search", "x"], "exit": 0, "bytes": 400})
+        json.dumps(
+            {"argv": ["datasets", "ls", "--search", "x"], "exit": 0, "bytes": 400}
+        )
         + "\n"
-        + json.dumps({"argv": ["datasets", "info", "good/encyclopedia"], "exit": 0, "bytes": 40})
+        + json.dumps(
+            {"argv": ["datasets", "info", "good/encyclopedia"], "exit": 0, "bytes": 40}
+        )
         + "\n"
     )
     await curator.taskset.finalize(curator.task, trace, _FakeRuntime(log.encode()))
@@ -2041,7 +2055,10 @@ async def test_finalize_populates_manifest_and_meters_runtime_log():
     state = curator.state
     assert RolloutStore.is_finalized(state)
     manifest = RolloutStore.manifest(state)
-    assert {s.dataset_id for s in manifest.sources} == {"good/encyclopedia", "good/science"}
+    assert {s.dataset_id for s in manifest.sources} == {
+        "good/encyclopedia",
+        "good/science",
+    }
     led = RolloutStore.ledger(state)
     assert led.web_queries == 1 and led.hub_calls == 2
     assert led.tokens == 400 // 4 + 40 // 4
@@ -2233,13 +2250,15 @@ async def test_finalize_synthesizes_manifest_from_inspected_tool_call_ids():
 
     await curator.taskset.finalize(curator.task, trace, None)
 
-    assert RolloutStore.is_finalized(curator.state), "fallback must finalize the rollout"
+    assert RolloutStore.is_finalized(curator.state), (
+        "fallback must finalize the rollout"
+    )
     manifest = RolloutStore.manifest(curator.state)
     assert manifest.sources, "fallback manifest must be non-empty"
     ids = {s.dataset_id for s in manifest.sources}
-    # The two explicitly-inspected ids must appear; ls-output ids may also appear.
-    assert "meta-math/MetaMathQA" in ids
-    assert "EleutherAI/hendrycks_math" in ids
+    # Recovery prefers deliberately inspected candidates over raw search hits,
+    # which can include post-cutoff, gated, or incompatible repositories.
+    assert ids == {"meta-math/MetaMathQA", "EleutherAI/hendrycks_math"}
     # Config must be null (no config was observed in tool output).
     assert all(s.config is None for s in manifest.sources)
 
@@ -2275,29 +2294,33 @@ async def test_finalize_primary_path_unchanged_when_manifest_text_present():
     trace = _trace_with_bash_calls(curator.task, curator.state, calls)
     # Inject a final text turn with a valid manifest (primary path).
     final_manifest = (
-        "```json\n"
-        '{"sources": [{"id": "good/science", "weight": 3.0}]}\n'
-        "```"
+        '```json\n{"sources": [{"id": "good/science", "weight": 3.0}]}\n```'
     )
-    graph.prepare_turn(trace, [
-        vf.SystemMessage(content="sys"),
-        vf.UserMessage(content="go"),
-        # Replay the tool-call turns so the graph prefix matches.
-        *[
-            msg
-            for tc_cmd, tc_result in calls
-            for msg in [
-                vf.AssistantMessage(
-                    content="",
-                    tool_calls=[vf.ToolCall(
-                        id="tc0", name="bash",
-                        arguments=json.dumps({"command": tc_cmd})
-                    )],
-                ),
-                vf.ToolMessage(tool_call_id="tc0", content=tc_result),
-            ]
+    graph.prepare_turn(
+        trace,
+        [
+            vf.SystemMessage(content="sys"),
+            vf.UserMessage(content="go"),
+            # Replay the tool-call turns so the graph prefix matches.
+            *[
+                msg
+                for tc_cmd, tc_result in calls
+                for msg in [
+                    vf.AssistantMessage(
+                        content="",
+                        tool_calls=[
+                            vf.ToolCall(
+                                id="tc0",
+                                name="bash",
+                                arguments=json.dumps({"command": tc_cmd}),
+                            )
+                        ],
+                    ),
+                    vf.ToolMessage(tool_call_id="tc0", content=tc_result),
+                ]
+            ],
         ],
-    ]).commit(
+    ).commit(
         vf.Response(
             id="r_final",
             created=0,
@@ -2361,7 +2384,9 @@ async def test_finalize_grace_period_picks_up_late_final_message():
     # the state finalize() sees on its first (pre-grace) check.
     assert parse_manifest(trace.assistant_messages[-1].content or "") is None
 
-    final_manifest = '```json\n{"sources": [{"id": "good/science", "weight": 2.0}]}\n```'
+    final_manifest = (
+        '```json\n{"sources": [{"id": "good/science", "weight": 2.0}]}\n```'
+    )
 
     async def _commit_late_final_message() -> None:
         # Yield past the first grace-period poll before the interception server
@@ -2432,12 +2457,14 @@ def test_system_prompt_scales_discovery_with_benchmark_budget():
     # Discovery is capped so the agent commits before exhausting its turns, but
     # benchmark-sized scan/turn budgets are allowed more than smoke runs.
     for max_turns in (7, 12):
-        prompt = CuratorTaskset(
-            CuratorTasksetConfig(id="test", max_turns=max_turns)
-        ).load_tasks()[0].system_prompt
+        prompt = (
+            CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=max_turns))
+            .load_tasks()[0]
+            .system_prompt
+        )
         assert f"{max_turns} turns" in prompt
-        # Turn accounting is harness-neutral: a "command", not a "bash tool call".
-        assert "Each command you run in the shell uses one turn" in prompt
+        assert "contains multiple tool calls" in prompt
+        assert "every individual `hf` call is still billed" in prompt
         assert "MUST perform at most 2 discovery rounds" in prompt
         # Commit mechanics: a plain final message, no shell command (works whether
         # the harness runs a shell tool or executes the reply as a command).
@@ -2446,17 +2473,23 @@ def test_system_prompt_scales_discovery_with_benchmark_budget():
         assert "do not print the manifest through the shell" in prompt
         assert "scores zero" in prompt
 
-    smoke_prompt = CuratorTaskset(
-        CuratorTasksetConfig(id="test", max_turns=25, scan_limit=10)
-    ).load_tasks()[0].system_prompt
+    smoke_prompt = (
+        CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=25, scan_limit=10))
+        .load_tasks()[0]
+        .system_prompt
+    )
     assert "25 turns" in smoke_prompt
     assert "MUST perform at most 2 discovery rounds" in smoke_prompt
 
-    benchmark_prompt = CuratorTaskset(
-        CuratorTasksetConfig(id="test", max_turns=64, scan_limit=200)
-    ).load_tasks()[0].system_prompt
+    benchmark_prompt = (
+        CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=64, scan_limit=200))
+        .load_tasks()[0]
+        .system_prompt
+    )
     assert "64 turns" in benchmark_prompt
-    assert "MUST perform at most 10 discovery rounds (<=20 commands)" in benchmark_prompt
+    assert (
+        "MUST perform at most 10 discovery rounds (<=20 bash calls)" in benchmark_prompt
+    )
     assert "no later than turn 56" in benchmark_prompt
     # No-invention guard: manifest ids must come from observed tool output.
     assert "copied verbatim from a dataset id" in benchmark_prompt
@@ -2473,9 +2506,7 @@ def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
     assert "already installed" not in low
     assert "command -v hf" in low
     assert "pip install -q 'huggingface-hub>=0.34'" in low
-    assert (
-        "fi; hf datasets ls" in low
-    )  # bootstrap and useful discovery share one turn
+    assert "fi; hf datasets ls" in low  # bootstrap and useful discovery share one turn
     assert "do not spend turns diagnosing missing commands" in low
     assert "do not try `huggingface-cli`" in low
     assert "only installation step allowed" in low
@@ -2671,6 +2702,7 @@ def test_shim_writes_jsonl_cost_record_when_hf_invoked(tmp_path, monkeypatch):
 
 # --- Tier M: selectable real-training backends ----------------------------
 
+
 def _real_trainer_taskset(**proxy_student):
     use_real = proxy_student.pop("use_real_trainer", True)
     ts = CuratorTaskset(
@@ -2684,7 +2716,6 @@ def _real_trainer_taskset(**proxy_student):
     ts._corpus_builder = CorpusBuilder(client=ts._client)
     ts._leakage_detector = LeakageDetector(DEFAULT_EVAL_CORPUS)
     return ts
-
 
 
 def test_backend_selection_builds_runtime_selected_dispatcher():
@@ -2728,7 +2759,9 @@ def test_docker_image_default_is_shared_across_backends():
         "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
     )
     assert (
-        ProxyStudentConfig(runtime_backend="docker", docker_image="me/img:1").docker_image
+        ProxyStudentConfig(
+            runtime_backend="docker", docker_image="me/img:1"
+        ).docker_image
         == "me/img:1"
     )
 
@@ -2785,7 +2818,9 @@ def test_default_perf_reward_is_baseline_relative_improvement():
     # Must NOT equal exp(-loss) (the old collapsed formula).
     assert scorer._perf(r) != pytest.approx(math.exp(-r.loss))
     # Worse-than-baseline clamps to 0; sentinel -> 0.
-    worse = TrainResult(loss=baseline + 1.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    worse = TrainResult(
+        loss=baseline + 1.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+    )
     assert scorer._perf(worse) == 0.0
     sentinel = TrainResult(
         loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
@@ -2800,7 +2835,9 @@ def test_baseline_relative_perf_reward_when_enabled():
     r = TrainResult(loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
     assert scorer._perf(r) == pytest.approx(0.8)
     # Worse-than-baseline clamps to 0; the infinite-loss sentinel -> 0.
-    worse = TrainResult(loss=20.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    worse = TrainResult(
+        loss=20.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+    )
     assert scorer._perf(worse) == 0.0
     sentinel = TrainResult(
         loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"

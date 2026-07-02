@@ -43,7 +43,14 @@ from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
 from .leakage import LeakageDetector
-from .models import CuratorConfig, FilterSpec, Manifest, ProxyStudentConfig, Sampling, Source
+from .models import (
+    CuratorConfig,
+    FilterSpec,
+    Manifest,
+    ProxyStudentConfig,
+    Sampling,
+    Source,
+)
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
 from .tasks import CuratorTask, build_tasks
@@ -57,6 +64,8 @@ from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
+_MAX_DISCOVERY_OUTPUT_CHARS = 24_000
+
 SYSTEM_PROMPT = """IMPORTANT: Be extremely concise in every message, and work by RUNNING commands in your shell rather than describing them. On your very first step, actually run a command — no preamble, no plan, no explanation first. If your harness gives you a shell/terminal/exec tool, you MUST call that tool to run each command below; writing a command out as ordinary text without calling the tool does NOT run it and wastes the rollout. If instead your harness executes your reply directly as a shell command, just reply with the command itself. Bootstrap the hf CLI if needed and run a search in that same first command. If you must plan, keep it to one sentence, then immediately run a command.
 
 You are a pretraining-data curation agent. Your job is to assemble a dataset mixture that, when used to train a fixed small GPT-2-scale student (everything fixed but the data), maximizes the student's performance.
@@ -65,15 +74,16 @@ Domain context — target large-scale, diverse, high-quality text corpora for ge
 
 You have a normal bash shell. The Hugging Face `hf` CLI is the only tool you need, but some runtime images do not include it. Your FIRST command MUST defensively check and install it if missing, then continue directly to an `hf datasets ls` search in the SAME shell command (one turn total):
 
-`if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 10`
+`if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000`
 
 Do not spend turns diagnosing missing commands: do not try `huggingface-cli` or `python -m huggingface_hub`. The one conditional pip install above is the ONLY installation step allowed. After it, run the `hf` subcommands below directly in bash; do not write Python, create a virtualenv, import `huggingface_hub`/`datasets`, or install anything else. Use `hf` to discover and inspect candidates, then decide a weighted curation mixture. Only use Hugging Face datasets modified on or before the cutoff date.
 
 `hf` command cheat-sheet:
-  - Search datasets:   hf datasets ls --search "<query>" --sort downloads --limit 10
-  - Filter / quiet:    hf datasets ls --search "<query>" --filter text --limit 20 -q
-  - JSON output:        hf datasets ls --search "<query>" --format json --expand downloads,likes,lastModified,tags
-  - Inspect a dataset: hf datasets info <dataset_id> --expand downloads,likes,tags
+  - Search datasets:   hf datasets ls --search "<query>" --sort downloads --limit 5 | head -c 6000
+  - Filter / quiet:    hf datasets ls --search "<query>" --filter text --limit 10 -q | head -c 6000
+  - JSON output:        hf datasets ls --search "<query>" --limit 5 --format json --expand downloads,likes,lastModified | head -c 6000
+  - Inspect a dataset: hf datasets info <dataset_id> --expand downloads,likes,tags | head -c 6000
+Every `hf` command MUST end with `| head -c 6000`. Never request `tags` from `datasets ls`: multilingual repositories can return tens of thousands of tag characters and overflow your model context. Request tags only when inspecting one shortlisted dataset.
 Inspect a few candidates, prefer well-downloaded, clearly-licensed text datasets, and check each was last modified on or before the cutoff date.
 
 You are billed for live discovery: each search and each inspect/download call adds to the cost penalty, so be economical. Your reward is derived from proxy-student held-out cross-entropy loss, with penalties for cost and for leakage/contamination against a held-out evaluation set.
@@ -135,15 +145,49 @@ _HF_ID_RE = re.compile(
 # Namespace / name tokens that are path segments or field names, not HF ids.
 _NOT_HF_NAMESPACES = frozenset(
     {
-        "http", "https", "hf", "file", "s3", "gs", "az",
-        "usr", "var", "etc", "bin", "tmp", "opt", "home", "root",
-        "datasets", "models", "spaces", "api", "v1", "v2",
+        "http",
+        "https",
+        "hf",
+        "file",
+        "s3",
+        "gs",
+        "az",
+        "usr",
+        "var",
+        "etc",
+        "bin",
+        "tmp",
+        "opt",
+        "home",
+        "root",
+        "datasets",
+        "models",
+        "spaces",
+        "api",
+        "v1",
+        "v2",
     }
 )
 _NOT_HF_NAMES = frozenset({"train", "test", "validation", "valid", "dev", "split"})
 _FILE_EXTS = frozenset(
-    {"py", "json", "jsonl", "txt", "csv", "yaml", "yml", "toml", "sh",
-     "md", "rst", "log", "parquet", "arrow", "gz", "zip"}
+    {
+        "py",
+        "json",
+        "jsonl",
+        "txt",
+        "csv",
+        "yaml",
+        "yml",
+        "toml",
+        "sh",
+        "md",
+        "rst",
+        "log",
+        "parquet",
+        "arrow",
+        "gz",
+        "zip",
+    }
 )
 
 
@@ -165,22 +209,27 @@ def _looks_like_hf_id(s: str) -> bool:
 def _ids_from_trace(trace: vf.Trace) -> list[str]:
     """Dataset ids actually observed in the rollout's tool calls and outputs.
 
-    Two sources, in order of reliability:
+    Two tiers, in order of reliability:
     1. ``hf datasets info <id>`` command arguments — the agent explicitly
        inspected these ids, so they are definitive.
     2. Free-form text in bash tool-result messages — covers ids that appeared
        in ``hf datasets ls`` output but were never individually inspected.
 
-    Returns ids in first-observation order, deduplicated.  Used as the last-
-    resort fallback when no manifest text was emitted.
+    If the agent inspected any ids, only those ids are returned. Search-result
+    ids are used only when no inspection happened: blindly materializing every
+    search hit makes recovery select post-cutoff, gated, or incompatible
+    repositories the agent deliberately did not shortlist. Within a tier,
+    results preserve first-observation order and are deduplicated.
     """
-    seen: dict[str, None] = {}  # ordered-set via insertion-order dict
+    inspected: dict[str, None] = {}  # ordered-set via insertion-order dict
 
     # 1. Explicitly-inspected ids from assistant tool-call argument JSON.
     for msg in trace.assistant_messages:
         for tc in msg.tool_calls or []:
             try:
-                cmd = json.loads(getattr(tc, "arguments", "") or "{}").get("command", "")
+                cmd = json.loads(getattr(tc, "arguments", "") or "{}").get(
+                    "command", ""
+                )
             except (json.JSONDecodeError, AttributeError):
                 cmd = getattr(tc, "arguments", "") or ""
             for argv in extract_hf_commands(cmd):
@@ -192,17 +241,21 @@ def _ids_from_trace(trace: vf.Trace) -> list[str]:
                     and "/" in argv[2]
                     and not argv[2].startswith("-")
                 ):
-                    seen[argv[2]] = None
+                    inspected[argv[2]] = None
+
+    if inspected:
+        return list(inspected)
 
     # 2. Ids from bash tool-result text (hf datasets ls output, info summaries).
+    observed: dict[str, None] = {}
     for msg in getattr(trace, "tool_messages", []):
         text = _content_text(getattr(msg, "content", ""))
         for m in _HF_ID_RE.finditer(text):
             did = m.group(1)
             if _looks_like_hf_id(did):
-                seen.setdefault(did, None)
+                observed.setdefault(did, None)
 
-    return list(seen.keys())
+    return list(observed)
 
 
 def _iter_json_objects(s: str):
@@ -296,7 +349,11 @@ def _coerce_filters(raw: Any) -> list[FilterSpec]:
         if not isinstance(kind, str) or kind not in _SUPPORTED_FILTER_KINDS:
             continue
         params = f.get("params")
-        specs.append(FilterSpec(kind=kind, params=dict(params) if isinstance(params, dict) else {}))
+        specs.append(
+            FilterSpec(
+                kind=kind, params=dict(params) if isinstance(params, dict) else {}
+            )
+        )
     return specs
 
 
@@ -339,14 +396,18 @@ def _coerce_source(raw: Any) -> Source | None:
         except (TypeError, ValueError):
             return None
 
-    kwargs["sampling"] = Sampling(max_docs=_pos_int(max_docs), max_tokens=_pos_int(max_tokens))
+    kwargs["sampling"] = Sampling(
+        max_docs=_pos_int(max_docs), max_tokens=_pos_int(max_tokens)
+    )
     try:
         return Source(**kwargs)
     except ValidationError:
         return None
 
 
-def parse_manifest(text: str, default_token_budget: int | None = None) -> Manifest | None:
+def parse_manifest(
+    text: str, default_token_budget: int | None = None
+) -> Manifest | None:
     """Parse + validate the agent's final-message manifest.
 
     Returns a :class:`Manifest` with at least one source, or ``None`` when the
@@ -478,9 +539,7 @@ class CuratorTaskset(_TasksetBase):
         if self._scorer is not None:
             return self._scorer
         if self._client is None:
-            self._client = HuggingFaceDatasetClient(
-                token_env=self.config.hf_token_env
-            )
+            self._client = HuggingFaceDatasetClient(token_env=self.config.hf_token_env)
         if self._corpus_builder is None:
             self._corpus_builder = CorpusBuilder(
                 client=self._client,
@@ -592,16 +651,19 @@ class CuratorTaskset(_TasksetBase):
         agent commits a manifest before the turn cap.
         """
         max_turns = self.curator.max_turns
-        discovery_rounds = max(2, min(12, max_turns // 6, self.curator.scan_limit // 10))
+        discovery_rounds = max(
+            2, min(12, max_turns // 6, self.curator.scan_limit // 10)
+        )
         discovery_calls = discovery_rounds * 2
         commit_by = max(1, max_turns - max(3, max_turns // 8))
         return (
             f"{SYSTEM_PROMPT}\n\n"
-            f"You have {max_turns} turns total. Each command you run in the shell "
-            f"uses one turn. A discovery round = one `hf datasets ls` command + one "
-            f"`hf datasets info` command (2 turns). You MUST perform at most "
-            f"{discovery_rounds} discovery rounds (<={discovery_calls} commands). "
-            f"After your final discovery "
+            f"You have {max_turns} turns total (model turns). A response that invokes bash "
+            f"uses one model turn even if it contains multiple tool calls; every "
+            f"individual `hf` call is still billed, so run one command at a time. "
+            f"A discovery round = one `hf datasets ls` call + one `hf datasets info` "
+            f"call (2 turns). You MUST perform at most {discovery_rounds} discovery "
+            f"rounds (<={discovery_calls} bash calls). After your final discovery "
             f"round, and no later than turn "
             f"{commit_by} — you MUST commit your manifest.\n\n"
             f"HOW TO COMMIT: stop running commands and reply with a plain message "
@@ -649,6 +711,22 @@ class CuratorTaskset(_TasksetBase):
         naturally once the model emits a final answer with no tool calls)."""
         return trace.num_turns >= self.curator.max_turns
 
+    @vf.stop
+    async def discovery_output_budget_reached(self, trace: vf.Trace) -> bool:
+        """Stop before oversized CLI results can overflow the model context.
+
+        Finalization can still recover a manifest from dataset ids observed in
+        the trace, so this degrades to a scored fallback instead of a provider
+        error that skips finalization and scoring entirely.
+        """
+        return (
+            sum(
+                len(_content_text(getattr(message, "content", "")))
+                for message in trace.tool_messages
+            )
+            >= _MAX_DISCOVERY_OUTPUT_CHARS
+        )
+
     # -- finalize (runs before scoring, while the runtime is live) -------------
 
     @staticmethod
@@ -658,7 +736,9 @@ class CuratorTaskset(_TasksetBase):
             return ""
         return msgs[-1].content or ""
 
-    def _manifest_from_messages(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
+    def _manifest_from_messages(
+        self, task: CuratorTask, trace: vf.Trace
+    ) -> Manifest | None:
         """Tier 1: parse a fenced JSON manifest from any assistant text message,
         newest first."""
         manifest = parse_manifest(
@@ -674,7 +754,9 @@ class CuratorTaskset(_TasksetBase):
                 return manifest
         return None
 
-    def _manifest_from_trace_ids(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
+    def _manifest_from_trace_ids(
+        self, task: CuratorTask, trace: vf.Trace
+    ) -> Manifest | None:
         """Tier 2: synthesize from dataset ids actually observed in the rollout's
         bash tool calls / outputs. Uses only ids the agent genuinely discovered;
         never invents ids. ``config`` is ``null`` for all sources unless a config
@@ -694,7 +776,9 @@ class CuratorTaskset(_TasksetBase):
     _FINALIZE_GRACE_ATTEMPTS = 6
     _FINALIZE_GRACE_INTERVAL_SECONDS = 0.5
 
-    async def _await_final_manifest(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
+    async def _await_final_manifest(
+        self, task: CuratorTask, trace: vf.Trace
+    ) -> Manifest | None:
         """Poll briefly for the agent's final assistant message before giving up
         on the primary (message-parsed) manifest path.
 
@@ -814,15 +898,18 @@ class CuratorTaskset(_TasksetBase):
     async def cost_penalty(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
-        return -self.curator.lambda_cost * (await self._prepared(trace, runtime))["cost"]
+        return (
+            -self.curator.lambda_cost * (await self._prepared(trace, runtime))["cost"]
+        )
 
     @vf.reward(weight=1.0)
     async def leakage_penalty(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
-        return -self.curator.lambda_leakage * (
-            await self._prepared(trace, runtime)
-        )["leakage"]["overall"]
+        return (
+            -self.curator.lambda_leakage
+            * (await self._prepared(trace, runtime))["leakage"]["overall"]
+        )
 
     # -- zero-weight diagnostic metrics (recorded, not summed into reward) -----
 
@@ -926,4 +1013,10 @@ class CuratorTaskset(_TasksetBase):
         return 1.0 if await self.trainer_error_str(trace, runtime) else 0.0
 
 
-__all__ = ["CuratorTaskset", "SYSTEM_PROMPT", "_ids_from_trace", "parse_manifest", "extract_json_object"]
+__all__ = [
+    "CuratorTaskset",
+    "SYSTEM_PROMPT",
+    "_ids_from_trace",
+    "parse_manifest",
+    "extract_json_object",
+]

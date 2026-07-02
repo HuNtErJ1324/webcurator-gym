@@ -28,7 +28,7 @@ import tempfile
 import uuid
 import weakref
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -134,7 +134,9 @@ class SourceCorpus:
                 path = None
             source = cls(dataset_id, config, weight, path, doc_count, tokens)
             if owned_dir is not None:
-                weakref.finalize(source, shutil.rmtree, str(owned_dir), ignore_errors=True)
+                weakref.finalize(
+                    source, shutil.rmtree, str(owned_dir), ignore_errors=True
+                )
         except BaseException:
             if owned_dir is not None:
                 shutil.rmtree(owned_dir, ignore_errors=True)
@@ -145,14 +147,6 @@ class SourceCorpus:
 @dataclass
 class CuratedCorpus:
     sources: list[SourceCorpus]
-    # Owned scratch directory (only set by `CorpusBuilder.build`'s standalone,
-    # state-free path); `materialize`'s rollout-scoped corpora leave this `None`
-    # and rely on `RolloutStore.cleanup` instead. See `cleanup`.
-    _owned_dir: Path | None = field(default=None, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if self._owned_dir is not None:
-            weakref.finalize(self, shutil.rmtree, str(self._owned_dir), ignore_errors=True)
 
     def iter_documents(self) -> Iterator[str]:
         for source in self.sources:
@@ -197,17 +191,6 @@ class CuratedCorpus:
             if total >= cap:
                 break
         return "".join(parts)[:cap]
-
-    def cleanup(self) -> None:
-        """Remove this corpus's own scratch directory, if it created one.
-
-        No-op for rollout-scoped corpora produced by `materialize` (those share
-        the rollout's scratch dir, cleaned up by `RolloutStore.cleanup`
-        instead). Safe to call more than once.
-        """
-        if self._owned_dir is not None:
-            shutil.rmtree(self._owned_dir, ignore_errors=True)
-            self._owned_dir = None
 
 
 def _iter_sampling(
@@ -374,19 +357,6 @@ class CorpusBuilder:
             asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
         ] = weakref.WeakKeyDictionary()
 
-    def source_key(self, source: Source) -> FetchKey:
-        # Currently unused (dead) -- materialize() builds its own FetchKey inline
-        # so it can honor a per-rollout Manifest.sample_docs_per_source override;
-        # this always uses the builder's static default and is NOT override-aware.
-        # If a future caller adopts this, thread the effective cap through first.
-        return FetchKey(
-            dataset_id=source.dataset_id,
-            config=source.config,
-            split=source.split,
-            text_field=source.text_field,
-            n=self._sample_docs_per_source,
-        )
-
     def _fetch_lock(self, lock_key: str) -> asyncio.Lock:
         """Loop-local single-flight lock for `lock_key`, created on demand."""
         loop = asyncio.get_running_loop()
@@ -463,7 +433,9 @@ class CorpusBuilder:
         finally:
             self._discard_fetch_lock(lock_key)
 
-    async def materialize(self, manifest: Manifest, state: CuratorState) -> CuratedCorpus:
+    async def materialize(
+        self, manifest: Manifest, state: CuratorState
+    ) -> CuratedCorpus:
         """Cache-aware async corpus build; the single materialization per rollout.
 
         Each source's surviving (filtered + sampled) documents are streamed
@@ -486,8 +458,14 @@ class CorpusBuilder:
         cap = manifest.sample_docs_per_source or self._sample_docs_per_source
         dest_dir = RolloutStore.scratch_dir(state)
         for source in manifest.sources:
-            weight_target = _weight_token_target(source, manifest.token_budget, total_weight)
-            n = _est_fetch_docs(weight_target, cap) if weight_target is not None else cap
+            weight_target = _weight_token_target(
+                source, manifest.token_budget, total_weight
+            )
+            n = (
+                _est_fetch_docs(weight_target, cap)
+                if weight_target is not None
+                else cap
+            )
             key = FetchKey(
                 dataset_id=source.dataset_id,
                 config=source.config,
@@ -508,58 +486,3 @@ class CorpusBuilder:
                 )
             )
         return CuratedCorpus(sources=sources)
-
-    def build(self, manifest: Manifest) -> CuratedCorpus:
-        """Synchronous, cache-free build (direct client access; testing/fallback).
-
-        Not used by real scoring (``CuratorScorer.compute_scoring`` calls the
-        async ``materialize`` exclusively), so it intentionally does NOT honor
-        ``manifest.sample_docs_per_source`` -- that override is async-materialize-
-        only for now. Wire it through here too if this path ever becomes reachable
-        from scoring.
-
-        Has no rollout `state` to hang a scratch directory off of, so the
-        returned `CuratedCorpus` owns a private one (cleaned up via its
-        `cleanup()`, or best-effort via `weakref.finalize` once unreferenced).
-        The directory's creation itself is inside the `try`/`except` below
-        (not just the loop that follows it): if `mkdtemp` itself or any
-        source's fetch/write raises -- before a `CuratedCorpus` (and thus its
-        `weakref.finalize` registration) exists -- there would otherwise be
-        nothing left to ever clean it up.
-        """
-        sources: list[SourceCorpus] = []
-        total_weight = sum(s.weight for s in manifest.sources)
-        owned_dir: Path | None = None
-        try:
-            owned_dir = Path(tempfile.mkdtemp(prefix="pdc_build_"))
-            for source in manifest.sources:
-                sources.append(
-                    self._materialize_source(source, manifest.token_budget, total_weight, owned_dir)
-                )
-            return CuratedCorpus(sources=sources, _owned_dir=owned_dir)
-        except BaseException:
-            if owned_dir is not None:
-                shutil.rmtree(owned_dir, ignore_errors=True)
-            raise
-
-    def _materialize_source(
-        self, source: Source, token_budget: int, total_weight: float, dest_dir: Path
-    ) -> SourceCorpus:
-        weight_target = _weight_token_target(source, token_budget, total_weight)
-        n = (
-            _est_fetch_docs(weight_target, self._sample_docs_per_source)
-            if weight_target is not None
-            else self._sample_docs_per_source
-        )
-        raw = self._client.sample_documents(
-            source.dataset_id,
-            source.config,
-            source.split,
-            source.text_field,
-            n,
-        )
-        filtered = self._filter.apply_iter(raw, source.filters)
-        sampled = _iter_sampling(filtered, source, weight_target)
-        return SourceCorpus.from_iter(
-            source.dataset_id, source.config, source.weight, sampled, dest_dir=dest_dir
-        )

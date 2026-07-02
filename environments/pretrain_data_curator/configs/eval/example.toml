@@ -11,14 +11,13 @@
 # real-GPU-trainer (Docker/Modal) examples.
 #
 # Run with:
-#   prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-#     --config configs/eval/full-reference.toml
+#   prime eval run configs/eval/example.toml
 # or via the native v1 taskset command (see docs/configuration.md) for the
 # Docker/Modal harness-runtime paths, which this wrapper cannot select.
 
 [[eval]]
-name = "pretrain-data-curator-full-reference"
-env_id = "hunterj/pretrain-data-curator"
+name = "pretrain-data-curator-example"
+env_id = "pretrain-data-curator"
 model = "openai/gpt-4.1-mini"
 num_examples = 4
 rollouts_per_example = 1
@@ -39,7 +38,7 @@ lambda_cost = 0.1
 lambda_leakage = 1.0
 
 # --- baseline-relative Perf ---------------------------------------------------
-perf_baseline_loss = 10.826993292286894  # ln(50304): uniform-vocab no-info CE constant
+perf_baseline_loss = 10.825839875788878  # ln(50304): uniform-vocab no-info CE constant
 baseline_relative_perf = true            # Perf reward = bounded relative loss reduction vs baseline;
                                           # false uses exp(-loss) directly (only meaningful for tiny/toy loss)
 
@@ -50,7 +49,7 @@ fetch_timeout_seconds = 30.0
 fetch_max_attempts = 3
 
 # --- proxy-student trainer ----------------------------------------------------
-use_real_trainer = false            # false = deterministic CPU HeuristicProxyTrainer (no GPU, no Perf signal)
+use_real_trainer = false            # false = deterministic CPU heuristic (no GPU or measured CE signal)
 
 # eval_corpus overrides the built-in held-out leakage reference corpus (list[str]).
 # Left commented to use the built-in eval_corpus.py default set.
@@ -83,8 +82,9 @@ grad_clip = 1.0
 lr_min_ratio = 0.1
 n_train_runs = 1
 
-# backend selection: "docker" | "modal" (required when use_real_trainer=true; no default)
-runtime_backend = "modal"
+# backend selection: unset by default; "docker" | "modal" is required when
+# use_real_trainer=true.
+# runtime_backend = "modal"
 # docker_host = "ssh://user@gpu-host"  # rejected for runtime_backend="docker"; unused by modal
 modal_gpu = "L4"                     # only used by runtime_backend="modal": "L4" | "H100" | "H200" | "A100"
 docker_image = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"  # shared docker/modal default

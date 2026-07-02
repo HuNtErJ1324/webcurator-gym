@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import ast
 import inspect
-import json
 import logging
 import math
 import weakref
@@ -407,5 +406,4 @@ def __getattr__(name: str) -> Any:
     if name == "NANOGPT_TRAIN_SCRIPT":
         return _nanogpt_train_script()
     raise AttributeError(name)
-
 

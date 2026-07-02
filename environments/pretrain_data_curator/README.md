@@ -111,22 +111,26 @@ uv run eval pretrain-data-curator \
   --harness.runtime.workdir /workspace \
   --harness.runtime.gpu 1 \
   --taskset.use-real-trainer true \
-  --taskset.token-budget 500000 \
+  --taskset.token-budget 50000 \
+  --taskset.sample-docs-per-source 16 \
   --taskset.max-turns 12 \
   --taskset.proxy-student \
-    '{"runtime_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":5000000,"gpu_count":1}' \
-  -m nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 -n 1 -r 1
+    '{"runtime_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":8192,"gpu_count":1}' \
+  -m deepseek/deepseek-v4-flash -n 1 -r 1
 ```
 
 Use the native v1 taskset command above for local Docker runs. The currently
 released `prime eval run` wrapper has no `--harness.runtime.*` passthrough, so it
 cannot select this runtime. An owner-qualified target such as
 `hunterj/pretrain-data-curator` also resolves the published Hub version rather
-than this local checkout.
+than this local checkout. The small budgets above are an end-to-end smoke
+configuration; raise them deliberately for comparative data-quality work.
 
 SSH-remote `docker_host` orchestration is intentionally unsupported by this
 single-runtime path; `load_environment` rejects a configured `docker_host`.
-Leave it unset and do not set an ambient remote `DOCKER_HOST`.
+Leave it unset and do not set an ambient remote `DOCKER_HOST`. A local Unix
+socket is valid; Docker Desktop under WSL may require the proxy socket documented
+in [Troubleshooting](docs/troubleshooting.md#docker-desktop-uses-an-invalid-npipe-context).
 On Docker Desktop under WSL2, the environment automatically advertises the
 interception server on the WSL interface; `PDC_DOCKER_HOST_IP` can override the
 detected address if necessary.
@@ -148,9 +152,9 @@ are no `curator_*` API commands.
 
 | `hf` command | Purpose | Cost |
 | --- | --- | --- |
-| `hf datasets ls --search "<query>" --sort downloads --limit 10` | Search and rank dataset repositories. | `web_queries += 1`, `hub_calls += 1`, plus stdout bytes. |
-| `hf datasets ls --search "<q>" --format json --expand downloads,likes,lastModified,tags` | JSON-formatted search with metadata fields. | same as above |
-| `hf datasets info <dataset_id> --expand downloads,likes,tags` | Inspect repository metadata. | `hub_calls += 1`, plus stdout bytes. |
+| `hf datasets ls --search "<query>" --sort downloads --limit 5 \| head -c 6000` | Search and rank dataset repositories without flooding model context. | `web_queries += 1`, `hub_calls += 1`, plus stdout bytes. |
+| `hf datasets ls --search "<q>" --format json --expand downloads,likes,lastModified --limit 5 \| head -c 6000` | JSON-formatted search; deliberately omit high-volume `tags`. | same as above |
+| `hf datasets info <dataset_id> --expand downloads,likes,tags \| head -c 6000` | Inspect one shortlisted repository. | `hub_calls += 1`, plus stdout bytes. |
 | `hf version`, `hf env`, `hf auth`, `hf cache` | Local setup/status — no network. | none |
 | Final fenced ` ```json ` block | The agent's curation decision; parsed by `finalize()`. | none |
 
@@ -181,8 +185,22 @@ When a multi-config dataset has no default and `config` is omitted, the
 materializer chooses a stable English/default config (for example `en` or a
 config ending in `.en`) before falling back to the first advertised config.
 
-See [`docs/tools.md`](docs/tools.md) for the full `hf` workflow, metering
+See [`docs/agent-workflow.md`](docs/agent-workflow.md) for the full `hf` workflow, metering
 details, manifest schema, filter reference, and turn-budget guidance.
+
+## Documentation
+
+| Page | Use it for |
+| --- | --- |
+| [Documentation map](docs/README.md) | Choose the right guide. |
+| [Architecture](docs/architecture.md) | Follow a rollout from task loading through cleanup. |
+| [Agent workflow](docs/agent-workflow.md) | Understand shell discovery, metering, output limits, and manifest recovery. |
+| [Manifest and filtering](docs/manifest.md) | Author or audit the final JSON contract. |
+| [Configuration](docs/configuration.md) | Choose loader arguments, runtime resources, and eval commands. |
+| [Reward and metrics](docs/reward.md) | Interpret scores, costs, leakage, and failure signals. |
+| [Proxy student](docs/proxy-student.md) | Understand the heuristic and GPU training paths. |
+| [Troubleshooting](docs/troubleshooting.md) | Diagnose credentials, Docker/WSL, Modal, and zero rewards. |
+| [Development](docs/development.md) | Test and extend the package without duplicating execution paths. |
 
 ## Install And Eval
 

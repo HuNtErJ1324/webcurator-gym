@@ -33,14 +33,6 @@ def _bootstrap_verifiers_v1() -> None:
     ``Taskset``, ``State``, etc.) are initialized.
     """
     try:
-        print('[pretrain-data-curator] bootstrap starting', file=sys.stderr, flush=True)
-        print(f'[pretrain-data-curator] sys.path: {sys.path[:8]}', file=sys.stderr, flush=True)
-        if 'verifiers' in sys.modules:
-            _v = sys.modules['verifiers']
-            print(f'[pretrain-data-curator] cached verifiers version={getattr(_v, "__version__", "?")} path={list(getattr(_v, "__path__", []))[:3]}', file=sys.stderr, flush=True)
-        else:
-            print('[pretrain-data-curator] verifiers NOT in sys.modules', file=sys.stderr, flush=True)
-
         import verifiers
 
         v1 = sys.modules.get("verifiers.v1")
@@ -63,8 +55,6 @@ def _bootstrap_verifiers_v1() -> None:
                 full_v1_dir = candidate
                 break
 
-        print(f'[pretrain-data-curator] scan result: full_v1_dir={full_v1_dir}', file=sys.stderr, flush=True)
-
         if full_v1_dir is None:
             return  # full v1 not found — nothing we can do
 
@@ -81,30 +71,21 @@ def _bootstrap_verifiers_v1() -> None:
         ]:
             del sys.modules[name]
         importlib.import_module("verifiers.v1")
-        print(f'[pretrain-data-curator] bootstrap SUCCESS, verifiers.__path__={list(verifiers.__path__)[:3]}', file=sys.stderr, flush=True)
     except Exception as _bootstrap_exc:
         import traceback as _tb
-        print(f'[pretrain-data-curator] bootstrap EXCEPTION: {_bootstrap_exc}', file=sys.stderr, flush=True)
+
+        print(
+            f"[pretrain-data-curator] bootstrap EXCEPTION: {_bootstrap_exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         print(_tb.format_exc(), file=sys.stderr, flush=True)
 
 
 _bootstrap_verifiers_v1()
 # ─────────────────────────────────────────────────────────────────────────
 
-try:
-    from .pretrain_data_curator import load_environment
-except Exception as _ie:
-    import traceback as _tb2
-    print(f'[pretrain-data-curator] IMPORT pretrain_data_curator FAILED: {_ie}', file=sys.stderr, flush=True)
-    print(_tb2.format_exc(), file=sys.stderr, flush=True)
-    raise
-
-try:
-    from .taskset import CuratorTaskset
-except Exception as _ie2:
-    import traceback as _tb3
-    print(f'[pretrain-data-curator] IMPORT taskset FAILED: {_ie2}', file=sys.stderr, flush=True)
-    print(_tb3.format_exc(), file=sys.stderr, flush=True)
-    raise
+from .pretrain_data_curator import load_environment  # noqa: E402
+from .taskset import CuratorTaskset  # noqa: E402
 
 __all__ = ["CuratorTaskset", "load_environment"]

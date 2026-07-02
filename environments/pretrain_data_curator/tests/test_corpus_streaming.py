@@ -21,9 +21,14 @@ import pytest
 
 import verifiers.v1 as vf
 
-from pretrain_data_curator.corpus import CorpusBuilder, CuratedCorpus, DocumentFilter, SourceCorpus
+from pretrain_data_curator.corpus import (
+    CorpusBuilder,
+    CuratedCorpus,
+    DocumentFilter,
+    SourceCorpus,
+)
 from pretrain_data_curator.leakage import LeakageDetector
-from pretrain_data_curator.models import CostLedger, FilterSpec, Manifest, Source
+from pretrain_data_curator.models import FilterSpec, Manifest, Source
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
@@ -96,9 +101,9 @@ async def _materialize_peak_bytes(
     client = _UniqueDocsClient(doc_chars)
     builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs_per_source)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     manifest = Manifest(
-        token_budget=10**9,  # large enough that weight-derived caps never truncate the fetch
+        token_budget=10
+        ** 9,  # large enough that weight-derived caps never truncate the fetch
         sources=[
             Source(dataset_id=f"big/source{i}", weight=1.0) for i in range(n_sources)
         ],
@@ -181,7 +186,6 @@ async def test_materialize_dedup_exact_at_declared_production_scale():
     client = _FixedListClient(doubled)
     builder = CorpusBuilder(client=client, sample_docs_per_source=len(doubled))
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     manifest = Manifest(
         token_budget=10**9,
         sources=[
@@ -257,7 +261,6 @@ async def test_doc_cache_stores_file_paths_not_raw_document_text():
     client = _UniqueDocsClient(doc_chars=64)
     builder = CorpusBuilder(client=client, sample_docs_per_source=8)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     manifest = Manifest(sources=[Source(dataset_id="a/b", weight=1.0)])
 
     try:
@@ -277,7 +280,6 @@ def test_scratch_dir_cleaned_up_via_weakref_when_state_is_collected():
     `fetch_source_docs`/`materialize` calls, common in tests) that never route
     through `CuratorTaskset.score`'s deterministic cleanup."""
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     path = RolloutStore.scratch_dir(state)
     assert path.is_dir()
 
@@ -293,8 +295,6 @@ async def test_materialize_different_states_get_independent_scratch_dirs():
     builder = CorpusBuilder(client=client, sample_docs_per_source=4)
     state_a = CuratorState()
     state_b = CuratorState()
-    RolloutStore.init(state_a, Manifest(), CostLedger())
-    RolloutStore.init(state_b, Manifest(), CostLedger())
     manifest = Manifest(sources=[Source(dataset_id="a/b", weight=1.0)])
 
     try:
@@ -319,7 +319,9 @@ def test_source_corpus_from_iter_empty_docs_has_no_backing_file():
 def test_curated_corpus_is_empty_matches_zero_total_documents():
     empty = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, [])])
     assert empty.is_empty()
-    nonempty = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["doc"])])
+    nonempty = CuratedCorpus(
+        sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["doc"])]
+    )
     assert not nonempty.is_empty()
 
 
@@ -360,7 +362,9 @@ async def test_taskset_score_removes_rollout_scratch_directory():
 
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
     taskset._client = _FakeClient()
-    taskset._corpus_builder = CorpusBuilder(client=taskset._client, sample_docs_per_source=8)
+    taskset._corpus_builder = CorpusBuilder(
+        client=taskset._client, sample_docs_per_source=8
+    )
 
     state = CuratorState()
     RolloutStore.set_manifest(state, Manifest(sources=[Source(dataset_id="a/b")]))

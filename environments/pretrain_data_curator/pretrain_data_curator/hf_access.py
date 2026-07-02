@@ -16,7 +16,6 @@ import logging
 import os
 import weakref
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
 from typing import Any, Callable, Protocol, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -25,9 +24,7 @@ T = TypeVar("T")
 
 # Error kinds that are deterministic facts about the request and must NOT be
 # retried (the answer will not change); everything else is treated as transient.
-PERMANENT_KINDS = frozenset(
-    {"missing", "auth", "bad_split", "bad_config", "bad_field"}
-)
+PERMANENT_KINDS = frozenset({"missing", "auth", "bad_split", "bad_config", "bad_field"})
 
 
 class DatasetAccessError(RuntimeError):
@@ -66,7 +63,11 @@ def classify_exception(exc: BaseException) -> str:
         return "timeout"
     name = type(exc).__name__
     msg = str(exc).lower()
-    if name in {"DatasetNotFoundError", "RepositoryNotFoundError", "EntryNotFoundError"}:
+    if name in {
+        "DatasetNotFoundError",
+        "RepositoryNotFoundError",
+        "EntryNotFoundError",
+    }:
         return "missing"
     if name in {"GatedRepoError", "UnauthorizedError", "PaymentRequiredError"}:
         return "auth"
@@ -76,7 +77,12 @@ def classify_exception(exc: BaseException) -> str:
         return "auth"
     if "gated" in msg or "private" in msg or "access to this dataset" in msg:
         return "auth"
-    if "404" in msg or "not found" in msg or "doesn't exist" in msg or "does not exist" in msg:
+    if (
+        "404" in msg
+        or "not found" in msg
+        or "doesn't exist" in msg
+        or "does not exist" in msg
+    ):
         return "missing"
     if "split" in msg and ("unknown" in msg or "invalid" in msg or "not" in msg):
         return "bad_split"
@@ -138,9 +144,7 @@ class RetryPolicy:
 # Loop-local concurrency bound for Hub fetches. Semaphores are bound to the
 # running event loop on first use, so we key one per loop (a rare, explicitly
 # sanctioned process-level handle). Finished loops are dropped automatically.
-_FETCH_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
-    weakref.WeakKeyDictionary()
-)
+_FETCH_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
 
 
 def loop_local_semaphore(
@@ -257,9 +261,6 @@ class HuggingFaceDatasetClient:
                 "before the first Hub API use."
             )
 
-        from huggingface_hub import HfApi
-
-        self._api = HfApi(token=token)
         self._token = token
 
     def sample_documents(
@@ -359,25 +360,6 @@ class HuggingFaceDatasetClient:
             if config.endswith(".en") or config.startswith("en."):
                 return config
         return configs[0]
-
-
-def parse_cutoff(cutoff_date: str | date | datetime) -> datetime:
-    """Parse a cutoff into a UTC datetime; date-only values cover the whole day."""
-    if isinstance(cutoff_date, datetime):
-        parsed = cutoff_date
-    elif isinstance(cutoff_date, date):
-        parsed = datetime.combine(cutoff_date, time.max)
-    else:
-        raw = cutoff_date.strip()
-        if not raw:
-            raise ValueError("cutoff_date must not be empty")
-        if "T" in raw:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        else:
-            parsed = datetime.combine(date.fromisoformat(raw), time.max)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def estimate_tokens(text: str) -> int:

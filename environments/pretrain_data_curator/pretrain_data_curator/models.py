@@ -23,7 +23,9 @@ _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
 _MAX_CORPUS_CHARS = 2_000_000_000  # absolute ceiling on the uploaded corpus blob
 # Sandbox lifetime derivation. Modal v1 runtimes cap a remote sandbox at 24 hours.
 _MAX_SANDBOX_TIMEOUT_MINUTES = 1440
-_MIN_SANDBOX_TIMEOUT_MINUTES = 30  # historical default; floor keeps small budgets unchanged
+_MIN_SANDBOX_TIMEOUT_MINUTES = (
+    30  # historical default; floor keeps small budgets unchanged
+)
 _SANDBOX_SETUP_MINUTES = 15  # image pull + pip(tiktoken) + uploads + val download
 _SANDBOX_TOKENS_PER_MINUTE = 500_000  # conservative floor for benchmark-sized runs
 
@@ -64,9 +66,6 @@ class Source(BaseModel):
     filters: list[FilterSpec] = Field(default_factory=list)
     sampling: Sampling = Field(default_factory=Sampling)
 
-    def key(self) -> tuple[str, str | None]:
-        return (self.dataset_id, self.config)
-
 
 class Manifest(BaseModel):
     """The agent's deliverable: a weighted, filtered mixture of sources."""
@@ -79,18 +78,6 @@ class Manifest(BaseModel):
     # keeps the human-configured `CorpusBuilder.sample_docs_per_source`. Bounded
     # so an agent cannot make a rollout fetch unboundedly.
     sample_docs_per_source: int | None = Field(default=None, ge=1, le=100_000)
-
-    def upsert_source(self, source: Source) -> None:
-        for i, existing in enumerate(self.sources):
-            if existing.key() == source.key():
-                self.sources[i] = source
-                return
-        self.sources.append(source)
-
-    def remove_source(self, dataset_id: str, config: str | None = None) -> bool:
-        before = len(self.sources)
-        self.sources = [s for s in self.sources if s.key() != (dataset_id, config)]
-        return len(self.sources) < before
 
 
 class CostPrices(BaseModel):
@@ -148,7 +135,9 @@ class ProxyStudentConfig(BaseModel):
     # letting a run scale up to ~1e9 tokens for H100/H200. ``None`` (default) keeps
     # the historical ``steps``-driven behavior exactly — so default/CPU/heuristic
     # runs stay cheap and unchanged.
-    train_token_budget: int | None = Field(default=None, ge=1, le=_MAX_TRAIN_TOKEN_BUDGET)
+    train_token_budget: int | None = Field(
+        default=None, ge=1, le=_MAX_TRAIN_TOKEN_BUDGET
+    )
     learning_rate: float = Field(default=3e-4, gt=0.0, le=1.0)
     seed: int = Field(default=0, ge=0)
     val_fraction: float = Field(default=0.1, gt=0.0, lt=1.0)
@@ -346,7 +335,7 @@ class CuratorConfig(BaseModel):
     lambda_cost: float = Field(default=0.1, ge=0.0)
     lambda_leakage: float = Field(default=1.0, ge=0.0)
 
-    # --- baseline-relative Perf signal (additive; default-OFF) ----------------
+    # --- baseline-relative Perf signal (additive; default-on) -----------------
     # ``perf_baseline_loss`` is the reference val cross-entropy of a neutral
     # (untrained) student. It is a CHEAP CONSTANT — no second training run is ever
     # performed, so default runs do not pay for it. Default: the CE of a uniform
