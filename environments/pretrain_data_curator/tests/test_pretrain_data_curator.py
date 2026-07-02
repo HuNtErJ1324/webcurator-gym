@@ -56,7 +56,7 @@ from pretrain_data_curator import hf_meter
 from verifiers.v1.taskset import Taskset
 from pretrain_data_curator.trainer import (
     HeuristicProxyTrainer,
-    SandboxProxyTrainer,
+    RuntimeSelectedTrainer,
     TrainerError,
     TrainResult,
 )
@@ -101,6 +101,16 @@ class FakeClient:
     def sample_documents(self, dataset_id, config, split, text_field, n):
         self.sample_calls.append(dataset_id)
         return list(self._docs.get(dataset_id, []))[:n]
+
+
+@pytest.fixture(autouse=True)
+def _fast_finalize_grace_period(monkeypatch):
+    """`CuratorTaskset.finalize` polls for a late-arriving final message (see
+    `_await_final_manifest`) before falling back. Shrink the poll interval for
+    every test so genuine-fallback tests stay fast; the interval is still long
+    enough relative to a bare `asyncio.sleep(0)` for the race-simulation test to
+    land its delayed commit inside the grace window."""
+    monkeypatch.setattr(CuratorTaskset, "_FINALIZE_GRACE_INTERVAL_SECONDS", 0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +378,7 @@ def test_load_environment_returns_v1_environment(monkeypatch):
 def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
     docker_env = load_environment(
         use_real_trainer=True,
-        proxy_student={"trainer_backend": "docker", "gpu_count": 1},
+        proxy_student={"runtime_backend": "docker", "gpu_count": 1},
     )
     assert docker_env.harness.config.env == {
         "UV_REINSTALL_PACKAGE": "pydantic-core"
@@ -388,7 +398,7 @@ def test_load_environment_rejects_remote_docker_host():
         load_environment(
             use_real_trainer=True,
             proxy_student={
-                "trainer_backend": "docker",
+                "runtime_backend": "docker",
                 "docker_host": "ssh://user@gpu-host",
             },
         )
@@ -642,6 +652,112 @@ def test_fetch_count_proportional_to_small_token_target():
     assert len(corpus.sources[0].documents) < cap
 
 
+# --- manifest-level `sample_docs_per_source` override (async materialize path) ---
+
+
+@pytest.mark.asyncio
+async def test_materialize_manifest_sample_docs_per_source_overrides_fetch_cap():
+    """A manifest-level `sample_docs_per_source` wins over the human-configured
+    default for that rollout's fetch-count estimation in `materialize()`."""
+    doc = "a" * 25  # 6 tokens each
+
+    class _UnboundedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * n
+
+    client = _UnboundedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    state = CuratorState()
+    RolloutStore.init(state, Manifest(), CostLedger())
+
+    # weight_target = 10_000 -> est_docs = 40, capped at the manifest's override
+    # (20), NOT the builder's configured default (8).
+    manifest = Manifest(
+        token_budget=10_000,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+        sample_docs_per_source=20,
+    )
+    corpus = await builder.materialize(manifest, state)
+    assert len(corpus.sources[0].documents) == 20
+
+
+@pytest.mark.asyncio
+async def test_materialize_without_manifest_override_falls_back_to_configured_default():
+    """Backward compat: a manifest with `sample_docs_per_source=None` (the
+    default) leaves fetch-count estimation unchanged."""
+    doc = "a" * 25
+
+    class _UnboundedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * n
+
+    client = _UnboundedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    state = CuratorState()
+    RolloutStore.init(state, Manifest(), CostLedger())
+
+    manifest = Manifest(
+        token_budget=10_000,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+    )
+    assert manifest.sample_docs_per_source is None
+    corpus = await builder.materialize(manifest, state)
+    assert len(corpus.sources[0].documents) == 8
+
+
+@pytest.mark.parametrize("value", [0, -1, 100_001])
+def test_manifest_sample_docs_per_source_bounds_rejected(value):
+    with pytest.raises(ValidationError):
+        Manifest(sources=[Source(dataset_id="a/b")], sample_docs_per_source=value)
+
+
+def test_manifest_sample_docs_per_source_bounds_accepted():
+    assert Manifest(
+        sources=[Source(dataset_id="a/b")], sample_docs_per_source=1
+    ).sample_docs_per_source == 1
+    assert Manifest(
+        sources=[Source(dataset_id="a/b")], sample_docs_per_source=100_000
+    ).sample_docs_per_source == 100_000
+
+
+@pytest.mark.asyncio
+async def test_materialize_different_sample_sizes_do_not_share_cache_key():
+    """Two materializations over the same rollout state requesting different
+    `sample_docs_per_source` for the same source must each hit the client (the
+    `FetchKey.n` component must differ, so they cannot collide on one cache
+    entry and silently reuse the wrong-sized fetch)."""
+    call_ns: list[int] = []
+
+    class _RecordingClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            call_ns.append(n)
+            return ["a" * 25] * n
+
+    client = _RecordingClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    state = CuratorState()
+    RolloutStore.init(state, Manifest(), CostLedger())
+
+    manifest_small = Manifest(
+        token_budget=10_000,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+        sample_docs_per_source=5,
+    )
+    manifest_large = Manifest(
+        token_budget=10_000,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+        sample_docs_per_source=20,
+    )
+    corpus_small = await builder.materialize(manifest_small, state)
+    corpus_large = await builder.materialize(manifest_large, state)
+
+    # Both fetches actually hit the client -- neither was served from a cache
+    # entry keyed without the effective cap.
+    assert call_ns == [5, 20]
+    assert len(corpus_small.sources[0].documents) == 5
+    assert len(corpus_large.sources[0].documents) == 20
+
+
 def test_leakage_detects_exact_and_paraphrase():
     eval_docs = [
         "The mitochondrion is the powerhouse of the cell and provides energy.",
@@ -718,41 +834,6 @@ def test_proxy_student_config_rejects_invalid(kwargs):
         ProxyStudentConfig(**kwargs)
 
 
-# --- Tier D1: GPU-request correctness (config-level fail-loud guard) --------
-
-
-def test_proxy_student_gpu_defaults_are_a_valid_request():
-    # The default proxy student requests a real GPU sandbox: a concrete H100
-    # gpu_type and vm=True, so the prime_sandboxes validator (which needs ALL of
-    # gpu_count>0 + gpu_type + vm) is satisfied — the bug that shipped was an
-    # invalid request (gpu_type=None, no vm) that degraded every rollout to perf=0.
-    cfg = ProxyStudentConfig()
-    assert cfg.gpu_count == 1
-    assert cfg.gpu_type == "H100"
-    assert cfg.vm is True
-    # H200 is reachable via config, and CPU-only sandboxes are valid too.
-    assert ProxyStudentConfig(gpu_type="H200").gpu_type == "H200"
-    assert ProxyStudentConfig(gpu_count=0, gpu_type=None).gpu_count == 0
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"gpu_type": None},  # gpu_count default 1, no gpu_type -> invalid (the shipped bug)
-        {"gpu_type": ""},  # empty gpu_type is not a valid value
-        {"vm": False},  # gpu_count default 1 but vm not enabled -> invalid
-        {"gpu_count": 2, "gpu_type": None},
-        {"gpu_count": 0},  # gpu_type defaults to H100 -> requires gpu_count > 0
-    ],
-)
-def test_proxy_student_rejects_invalid_gpu_combo(kwargs):
-    # The fail-loud config validator rejects an unschedulable GPU request AT
-    # CONSTRUCTION, before any sandbox/SDK call, instead of letting the SDK raise
-    # a ValidationError that the rubric silently degrades to the perf=0 sentinel.
-    with pytest.raises(ValidationError):
-        ProxyStudentConfig(**kwargs)
-
-
 # --- Tier D2: adjustable token budget -> steps / corpus cap / timeout -------
 
 
@@ -809,14 +890,22 @@ def test_effective_max_corpus_chars_scales_with_budget():
 
 def test_effective_timeout_minutes_scales_and_is_bounded():
     # Default budget keeps the historical 30-minute timeout; a large budget grows
-    # it; it never exceeds the Prime 24h (1440-minute) platform max; an explicit
-    # value overrides; and the field itself rejects > 1440.
+    # it; an explicit value overrides. Modal caps the derived timeout at its 24h
+    # (1440-minute) platform sandbox limit and rejects an explicit value above
+    # it; docker (and no runtime_backend set) has no such ceiling.
     assert ProxyStudentConfig().effective_timeout_minutes == 30
     big = ProxyStudentConfig(train_token_budget=300_000_000)
     assert 30 < big.effective_timeout_minutes <= 1440
     assert ProxyStudentConfig(timeout_minutes=45).effective_timeout_minutes == 45
+    huge_docker = ProxyStudentConfig(train_token_budget=1_000_000_000)
+    assert huge_docker.effective_timeout_minutes > 1440
+    huge_modal = ProxyStudentConfig(
+        train_token_budget=1_000_000_000, runtime_backend="modal"
+    )
+    assert huge_modal.effective_timeout_minutes == 1440
+    assert ProxyStudentConfig(timeout_minutes=1441).effective_timeout_minutes == 1441
     with pytest.raises(ValidationError):
-        ProxyStudentConfig(timeout_minutes=1441)
+        ProxyStudentConfig(runtime_backend="modal", timeout_minutes=1441)
 
 
 # --- Tier B: process-stable hash for fuzzy leakage -------------------------
@@ -1176,204 +1265,6 @@ async def test_heavy_compute_is_offloaded(monkeypatch):
     assert "score" in offloaded  # LeakageDetector.score
 
 
-# --- Tier H: sandbox trainer lifecycle (mocked) ----------------------------
-
-
-def _corpus_with_text():
-    from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
-
-    return CuratedCorpus(
-        sources=[SourceCorpus("a/b", None, 1.0, ["hello world " * 30])]
-    )
-
-
-class _FakeSandbox:
-    id = "sandbox-1"
-
-
-class _FakeSandboxClient:
-    def __init__(self, mode):
-        self.mode = mode
-        self.deleted = False
-        self.delete_fails = False
-
-    async def create(self, request):
-        return _FakeSandbox()
-
-    async def wait_for_creation(self, sid):
-        return None
-
-    async def upload_bytes(self, sid, path, data, name):
-        return None
-
-    async def execute_command(self, sid, cmd, timeout):
-        if self.mode == "success":
-            payload = json.dumps(
-                {"loss": 2.5, "accuracy": 0.4, "flops": 1e9, "tokens_trained": 1000}
-            )
-            return SimpleNamespace(
-                stdout="RESULT_JSON " + payload, stderr="", exit_code=0
-            )
-        if self.mode == "fail":
-            return SimpleNamespace(
-                stdout="", stderr="Traceback ... CUDA out of memory boom", exit_code=1
-            )
-        if self.mode == "timeout":
-            raise asyncio.TimeoutError()
-        raise AssertionError(self.mode)
-
-    async def delete(self, sid):
-        self.deleted = True
-        if self.delete_fails:
-            raise RuntimeError("delete failed")
-
-
-def _sandbox_trainer(client):
-    return SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=lambda config, name: object(),
-    )
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_success():
-    client = _FakeSandboxClient("success")
-    result = await _sandbox_trainer(client).train_and_eval(
-        _corpus_with_text(), ProxyStudentConfig()
-    )
-    assert result.loss == 2.5
-    assert result.backend == "sandbox"
-    assert result.cleanup_error is None
-    assert client.deleted is True
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_nonzero_exit_surfaces_stderr_tail():
-    client = _FakeSandboxClient("fail")
-    with pytest.raises(TrainerError) as excinfo:
-        await _sandbox_trainer(client).train_and_eval(
-            _corpus_with_text(), ProxyStudentConfig()
-        )
-    assert "boom" in excinfo.value.stderr_tail
-    assert client.deleted is True  # cleanup still ran
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_timeout_surfaces():
-    client = _FakeSandboxClient("timeout")
-    with pytest.raises(TrainerError) as excinfo:
-        await _sandbox_trainer(client).train_and_eval(
-            _corpus_with_text(), ProxyStudentConfig()
-        )
-    assert "timed out" in str(excinfo.value)
-    assert client.deleted is True
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_cleanup_failure_is_surfaced():
-    client = _FakeSandboxClient("success")
-    client.delete_fails = True
-    result = await _sandbox_trainer(client).train_and_eval(
-        _corpus_with_text(), ProxyStudentConfig()
-    )
-    assert result.cleanup_error is not None
-    assert "delete failed" in result.cleanup_error
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_empty_corpus_short_circuits():
-    from pretrain_data_curator.corpus import CuratedCorpus
-
-    client = _FakeSandboxClient("success")
-    result = await _sandbox_trainer(client).train_and_eval(
-        CuratedCorpus(sources=[]), ProxyStudentConfig()
-    )
-    assert result.loss == float("inf")
-
-
-# --- Tier D3: the real CreateSandboxRequest passes the SDK validator --------
-# This is the gap that let the bug ship: the existing sandbox tests inject a fake
-# request via request_factory=lambda ...: object(), so the REAL request was never
-# validated. These build the actual SDK model from the config.
-
-
-def test_default_config_builds_a_real_valid_sandbox_request():
-    sandboxes = pytest.importorskip("prime_sandboxes")
-    # No request_factory -> SandboxProxyTrainer builds a REAL CreateSandboxRequest.
-    request = SandboxProxyTrainer()._make_request(ProxyStudentConfig(), "proxy-student")
-    assert isinstance(request, sandboxes.CreateSandboxRequest)
-    assert request.gpu_count == 1
-    assert request.gpu_type == "H100"
-    assert request.vm is True
-    assert request.timeout_minutes == 30
-
-
-def test_large_budget_h200_config_builds_a_real_valid_sandbox_request():
-    sandboxes = pytest.importorskip("prime_sandboxes")
-    cfg = ProxyStudentConfig(gpu_type="H200", train_token_budget=300_000_000)
-    request = SandboxProxyTrainer()._make_request(cfg, "proxy-student")
-    assert isinstance(request, sandboxes.CreateSandboxRequest)
-    assert request.gpu_type == "H200"
-    # The budget-derived timeout flows into the request and stays under the cap.
-    assert request.timeout_minutes == cfg.effective_timeout_minutes
-    assert 30 < request.timeout_minutes <= 1440
-
-
-def test_sdk_rejects_the_originally_shipped_broken_request():
-    # The original trainer built CreateSandboxRequest(gpu_count=1, gpu_type=None)
-    # with no vm — the SDK validator rejects exactly that, which is why every real
-    # rollout silently degraded to the infinite-loss sentinel. Our config validator
-    # now stops this combo one layer earlier (test above), but pin the SDK behavior.
-    sandboxes = pytest.importorskip("prime_sandboxes")
-    with pytest.raises(ValidationError):
-        sandboxes.CreateSandboxRequest(
-            name="x", docker_image="img", gpu_count=1, gpu_type=None
-        )
-
-
-@pytest.mark.asyncio
-async def test_sandbox_payload_steps_follow_train_token_budget():
-    # The budget-derived training length must reach the sandbox: the script reads
-    # cfg["steps"] and bills FLOPs off steps*batch*block, so this is what scales
-    # tokens_trained and FLOP cost with the budget.
-    client = _RecordingSandboxClient("success")
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=lambda config, name: object(),
-    )
-    cfg = ProxyStudentConfig(train_token_budget=300_000_000)
-    await trainer.train_and_eval(_corpus_with_text(), cfg)
-    uploaded = json.loads(client.uploads["/workspace/config.json"].decode("utf-8"))
-    assert uploaded["steps"] == cfg.effective_steps == 73_243
-
-
-@pytest.mark.asyncio
-async def test_sandbox_payload_carries_record01_recipe_fields():
-    # The record_01 optimizer schedule + regularization + averaging knobs must reach
-    # the sandbox: the script reads them to build AdamW(betas, eps, weight_decay),
-    # the warmup+cosine LR schedule, the grad clip, and the n_train_runs averaging.
-    client = _RecordingSandboxClient("success")
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=lambda config, name: object(),
-    )
-    cfg = ProxyStudentConfig(
-        n_train_runs=3, weight_decay=0.05, grad_clip=2.0, warmup_steps=7,
-        lr_min_ratio=0.2, adam_beta1=0.8, adam_beta2=0.99, adam_eps=1e-9,
-    )
-    await trainer.train_and_eval(_corpus_with_text(), cfg)
-    payload = json.loads(client.uploads["/workspace/config.json"].decode("utf-8"))
-    assert payload["n_train_runs"] == 3
-    assert payload["weight_decay"] == 0.05
-    assert payload["grad_clip"] == 2.0
-    assert payload["lr_min_ratio"] == 0.2
-    assert payload["adam_beta1"] == 0.8
-    assert payload["adam_beta2"] == 0.99
-    assert payload["adam_eps"] == 1e-9
-    # warmup_steps is the budget-aware EFFECTIVE value (explicit 7, clamped to steps).
-    assert payload["warmup_steps"] == cfg.effective_warmup_steps == 7
-
-
 def test_proxy_student_recipe_defaults_mirror_record01():
     # The record_01 recipe defaults: AdamW(betas=(0.9,0.95), eps=1e-8), weight_decay
     # 0.1, grad_clip 1.0, cosine floor 0.1, single run (cost/calibration unchanged),
@@ -1414,7 +1305,7 @@ def test_heuristic_flops_scale_with_budget_when_corpus_permits():
     from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
 
     # ~5000 estimated tokens (4000 words / 20000 chars -> chars//4 dominates).
-    corpus = CuratedCorpus(sources=[SourceCorpus("a/b", None, 1.0, ["word " * 4000])])
+    corpus = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["word " * 4000])])
     trainer = HeuristicProxyTrainer()
     small = ProxyStudentConfig(batch_size=1, block_size=8)  # default budget: 200*8=1600
     big = ProxyStudentConfig(batch_size=1, block_size=8, train_token_budget=40_000)
@@ -1427,112 +1318,6 @@ def test_heuristic_flops_scale_with_budget_when_corpus_permits():
     assert res_small.tokens_trained == 1_600
     assert res_big.tokens_trained == 5_000  # min(corpus 5000, target 40000)
     assert res_big.flops > res_small.flops
-
-
-# --- Tier D4: end-to-end proof the budget-derived cap/timeout actually bite -
-
-
-_OLD_CORPUS_CHAR_CAP = 5_000_000
-
-
-@pytest.mark.asyncio
-async def test_large_budget_uploads_corpus_beyond_old_5m_cap():
-    # Prove the derived cap TRUNCATES LESS (uploads more) end to end, not just
-    # that the property returns a bigger number: a corpus longer than the old 5M
-    # cap is truncated to 5M under the default budget, but uploaded in FULL under
-    # a large budget whose effective_max_corpus_chars exceeds the corpus length.
-    from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
-
-    long_doc = "a" * (_OLD_CORPUS_CHAR_CAP + 1_000_000)  # 6,000,000 ASCII chars
-    corpus = CuratedCorpus(sources=[SourceCorpus("a/b", None, 1.0, [long_doc])])
-
-    # Default budget: the historical 5M cap still truncates the extra material.
-    default_client = _RecordingSandboxClient("success")
-    default_trainer = SandboxProxyTrainer(
-        client_factory=lambda: default_client,
-        request_factory=lambda config, name: object(),
-    )
-    await default_trainer.train_and_eval(corpus, ProxyStudentConfig())
-    assert len(default_client.uploads["/workspace/corpus.txt"]) == _OLD_CORPUS_CHAR_CAP
-
-    # Large budget: the derived cap exceeds the corpus, so the FULL 6M chars are
-    # genuinely uploaded — the ~1M chars past the old cap are NOT silently dropped.
-    big_cfg = ProxyStudentConfig(train_token_budget=300_000_000)
-    assert big_cfg.effective_max_corpus_chars > len(long_doc)
-    big_client = _RecordingSandboxClient("success")
-    big_trainer = SandboxProxyTrainer(
-        client_factory=lambda: big_client,
-        request_factory=lambda config, name: object(),
-    )
-    await big_trainer.train_and_eval(corpus, big_cfg)
-    uploaded = len(big_client.uploads["/workspace/corpus.txt"])
-    assert uploaded == len(long_doc)  # full corpus, untruncated
-    assert uploaded > _OLD_CORPUS_CHAR_CAP  # genuinely beyond the old 5M cap
-
-
-class _ExecTimeoutRecordingClient(_FakeSandboxClient):
-    """Records the per-command timeout train_and_eval passes to execute_command."""
-
-    def __init__(self, mode="success"):
-        super().__init__(mode)
-        self.execute_timeout = None
-
-    async def execute_command(self, sid, cmd, timeout):
-        self.execute_timeout = timeout
-        return await super().execute_command(sid, cmd, timeout)
-
-
-@pytest.mark.asyncio
-async def test_command_timeout_uses_budget_derived_effective_timeout(monkeypatch):
-    # The training command's wall-clock timeout must be the budget-DERIVED
-    # effective timeout (seconds), not the now-None raw timeout_minutes nor the
-    # historical 30-min default. budget 300M -> effective_steps=73243 ->
-    # effective_train_tokens=300,003,328 -> 15 + ceil(.../500k) = 616 minutes.
-    cfg = ProxyStudentConfig(train_token_budget=300_000_000)
-    assert cfg.timeout_minutes is None  # derived, never set explicitly
-    assert cfg.effective_timeout_minutes == 616
-
-    monkeypatch.setattr(
-        "pretrain_data_curator.trainer._nanogpt_train_script",
-        lambda: "print('stub train script')",
-    )
-    client = _ExecTimeoutRecordingClient("success")
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=lambda config, name: object(),
-    )
-    await trainer.train_and_eval(_corpus_with_text(), cfg)
-    # execute_command was given the derived command timeout (effective * 60s); the
-    # outer asyncio.wait_for uses this same value + the documented 30s slack.
-    assert client.execute_timeout == cfg.effective_timeout_minutes * 60 == 36_960
-
-    # The same derived timeout also flows into the REAL sandbox request.
-    sandboxes = pytest.importorskip("prime_sandboxes")
-    request = SandboxProxyTrainer()._make_request(cfg, "proxy-student")
-    assert isinstance(request, sandboxes.CreateSandboxRequest)
-    assert request.timeout_minutes == cfg.effective_timeout_minutes == 616
-
-
-def test_sdk_rejects_gpu_count_with_vm_disabled():
-    # Pins the SDK precondition our _check_gpu_request mirrors: gpu_count > 0 with
-    # vm=False is rejected (prime_sandboxes/models.py:110-111). A future SDK that
-    # dropped this would fail here, flagging our validator as stale.
-    sandboxes = pytest.importorskip("prime_sandboxes")
-    with pytest.raises(ValidationError):
-        sandboxes.CreateSandboxRequest(
-            name="x", docker_image="img", gpu_count=1, gpu_type="H100", vm=False
-        )
-
-
-def test_sdk_rejects_gpu_type_without_gpu_count():
-    # Pins the other precondition: gpu_type set with gpu_count == 0 is rejected
-    # (prime_sandboxes/models.py:112-113), mirrored by our gpu_count==0 -> gpu_type
-    # must be None rule.
-    sandboxes = pytest.importorskip("prime_sandboxes")
-    with pytest.raises(ValidationError):
-        sandboxes.CreateSandboxRequest(
-            name="x", docker_image="img", gpu_count=0, gpu_type="H100"
-        )
 
 
 # --- Tier J/K: zero-weight telemetry metrics do not affect reward ----------
@@ -1621,6 +1406,37 @@ def test_system_prompt_manifest_example_parses():
     assert manifest.sources[0].text_field is None
 
 
+def test_system_prompt_sample_docs_per_source_example_is_not_a_bare_literal():
+    # Regression: a live eval showed an agent anchoring on a literal example
+    # value (copying "sample_docs_per_source": 64 verbatim instead of computing
+    # its own number from token_budget). The example's shown value must not be
+    # a bare copy-pasteable integer -- match the existing `id` field's
+    # placeholder-string convention so it reads as "fill this in", not a
+    # literal answer -- while the field name itself still appears (so the agent
+    # sees it's a real, expected top-level key) and the prose still documents
+    # bounds/behavior.
+    assert '"sample_docs_per_source"' in SYSTEM_PROMPT
+    assert '"sample_docs_per_source": 64' not in SYSTEM_PROMPT
+    assert "1-100000" in SYSTEM_PROMPT
+    assert "compute" in SYSTEM_PROMPT.lower()
+
+
+def test_system_prompt_is_harness_agnostic_about_running_commands():
+    # Regression: with a tool-calling CLI harness (e.g. codex) the agent must be
+    # told to CALL its shell tool, not to "respond with a bash command" — the latter
+    # made models emit the command as prose and stop after a single turn, never
+    # running discovery (finalized=0, reward=0). The prompt must drive command
+    # execution in a way that works for BOTH message-executing harnesses (bash,
+    # kimi_code, default) and tool-calling ones (codex, ...), with no response-format
+    # wording that assumes the message itself is the command.
+    low = SYSTEM_PROMPT.lower()
+    assert "your first response must be a bash command" not in low
+    assert "call that tool to run each command" in low  # tool-calling harnesses
+    assert "reply with the command itself" in low  # message-executing harnesses
+    # Explicitly warns that merely writing the command out is not running it.
+    assert "does not run it" in low
+
+
 # --- Tier N: state schema version + canonical hash -------------------------
 
 
@@ -1655,7 +1471,11 @@ async def test_canonical_state_dump_keys_and_hash():
     assert set(canonical) == {"state_schema_version", "manifest", "finalized"}
     assert canonical["state_schema_version"] == STATE_SCHEMA_VERSION
     assert canonical["finalized"] is True
-    assert set(canonical["manifest"]) == {"token_budget", "sources"}
+    assert set(canonical["manifest"]) == {
+        "token_budget",
+        "sources",
+        "sample_docs_per_source",
+    }
     # The hash is the blake2b-16 of the canonical JSON (sorted, compact).
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     assert (
@@ -1817,124 +1637,6 @@ async def test_val_loader_fetch_failure_raises_typed_error(tmp_path):
     with pytest.raises(DatasetAccessError) as excinfo:
         await loader.load()
     assert excinfo.value.kind == "network"
-
-
-class _RecordingSandboxClient(_FakeSandboxClient):
-    """Records uploaded files and counts sandbox creations."""
-
-    def __init__(self, mode="success"):
-        super().__init__(mode)
-        self.uploads = {}
-        self.creates = 0
-
-    async def create(self, request):
-        self.creates += 1
-        return await super().create(request)
-
-    async def upload_bytes(self, sid, path, data, name):
-        self.uploads[path] = data
-        return None
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_uploads_exactly_first_n_val_tokens(tmp_path):
-    client = _RecordingSandboxClient("success")
-    loader = ValTokenLoader(
-        ValidationSetConfig(val_tokens=16),
-        download_fn=_shard_download_fn(tmp_path, list(range(100))),
-    )
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=lambda config, name: object(),
-        val_loader=loader,
-    )
-    result = await trainer.train_and_eval(_corpus_with_text(), ProxyStudentConfig())
-    assert result.backend == "sandbox"
-    # The held-out val tokens were uploaded as header-free uint16 = first N tokens.
-    assert "/workspace/val.bin" in client.uploads
-    expected = np.asarray(range(16), dtype="<u2").tobytes()
-    assert client.uploads["/workspace/val.bin"] == expected
-    # The student is told to use the GPT-2 BPE tokenizer of the held-out set.
-    cfg = json.loads(client.uploads["/workspace/config.json"].decode("utf-8"))
-    assert cfg["tokenizer"] == "gpt2"
-
-
-@pytest.mark.asyncio
-async def test_sandbox_trainer_val_fetch_failure_skips_sandbox():
-    client = _RecordingSandboxClient("success")
-
-    def boom(dataset_id, filename, repo_type):
-        raise ConnectionError("hub down")
-
-    loader = ValTokenLoader(
-        ValidationSetConfig(),
-        download_fn=boom,
-        retry_policy=RetryPolicy(attempts=1, timeout=2.0),
-    )
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: client,
-        request_factory=lambda config, name: object(),
-        val_loader=loader,
-    )
-    # The val set is resolved before any GPU sandbox is provisioned: a fetch
-    # failure raises (no sandbox created) rather than wasting a sandbox.
-    with pytest.raises(DatasetAccessError):
-        await trainer.train_and_eval(_corpus_with_text(), ProxyStudentConfig())
-    assert client.creates == 0
-
-
-@pytest.mark.asyncio
-async def test_scorer_degrades_val_fetch_failure_to_sentinel():
-    # End-to-end degrade: a held-out val-set fetch failure on the real-trainer
-    # path collapses to the infinite-loss sentinel (Perf -> 0), not a crash.
-    def boom(dataset_id, filename, repo_type):
-        raise ConnectionError("hub down")
-
-    loader = ValTokenLoader(
-        ValidationSetConfig(),
-        download_fn=boom,
-        retry_policy=RetryPolicy(attempts=1, timeout=2.0),
-    )
-    trainer = SandboxProxyTrainer(
-        client_factory=lambda: _RecordingSandboxClient("success"),
-        request_factory=lambda config, name: object(),
-        val_loader=loader,
-    )
-    scorer = _scorer(trainer)
-    state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
-    result = await scorer._train(_corpus_with_text(), state)
-    assert result.loss == float("inf")
-    assert result.backend == "error"
-    assert RolloutStore.has_external_failure(state)
-
-
-@pytest.mark.asyncio
-async def test_scorer_degrades_sandbox_trainer_error_to_sentinel():
-    # Sibling to the val-FETCH degrade above, for the OTHER degrade path the CE
-    # fix relies on: a sandbox TrainerError (the nonzero exit produced when the
-    # in-sandbox plan_val_windows raises on a degenerate <=1-token val set) must
-    # ALSO collapse to the infinite-loss sentinel in the scorer, not crash or
-    # yield a bogus good loss.
-    trainer = SandboxProxyTrainer(
-        # "fail" mode returns a nonzero exit -> SandboxProxyTrainer raises a
-        # TrainerError carrying the sandbox stderr tail.
-        client_factory=lambda: _FakeSandboxClient("fail"),
-        request_factory=lambda config, name: object(),
-        val_loader=None,
-    )
-    scorer = _scorer(trainer)
-    state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
-    result = await scorer._train(_corpus_with_text(), state)
-    assert result.loss == float("inf")
-    assert result.backend == "error"
-    assert RolloutStore.has_external_failure(state)
-    assert RolloutStore.tool_error_count(state) >= 1
-    # The degrade preserved the sandbox failure detail (the stderr tail is only
-    # attached on the TrainerError path), proving it was the trainer-error degrade
-    # rather than a silently-swallowed good loss.
-    assert "boom" in (RolloutStore.trainer_error(state) or "")
 
 
 @pytest.mark.asyncio
@@ -2136,6 +1838,53 @@ def test_parse_manifest_coerces_source_fields():
     assert s0.sampling.max_docs == 10 and s0.sampling.max_tokens == 2000
     assert m.sources[1].weight == 1.0  # default
     assert m.sources[2].weight == 0.0  # clamped
+
+
+def test_parse_manifest_reads_sample_docs_per_source():
+    text = json.dumps({"sources": [{"id": "a/b"}], "sample_docs_per_source": 500})
+    m = parse_manifest(text)
+    assert m is not None
+    assert m.sample_docs_per_source == 500
+
+
+def test_parse_manifest_missing_sample_docs_per_source_defaults_to_none():
+    text = json.dumps({"sources": [{"id": "a/b"}]})
+    m = parse_manifest(text)
+    assert m is not None
+    assert m.sample_docs_per_source is None
+
+
+def test_parse_manifest_non_numeric_sample_docs_per_source_tolerated_as_none():
+    text = json.dumps({"sources": [{"id": "a/b"}], "sample_docs_per_source": "lots"})
+    m = parse_manifest(text)
+    assert m is not None
+    assert m.sample_docs_per_source is None
+
+
+def test_parse_manifest_out_of_bounds_sample_docs_per_source_rejects_manifest():
+    # Consistent with the existing token_budget precedent: a top-level field
+    # that fails Manifest's own bounds check invalidates the whole manifest
+    # (graceful zero score), rather than silently clamping a cost-relevant knob.
+    text = json.dumps({"sources": [{"id": "a/b"}], "sample_docs_per_source": 500_000})
+    assert parse_manifest(text) is None
+
+
+def test_parse_manifest_overflow_sample_docs_per_source_tolerated_as_none():
+    # `1e309` is valid JSON and parses to `float("inf")`; `int(float("inf"))`
+    # raises OverflowError (not TypeError/ValueError), so this must be caught
+    # and treated like any other malformed value -- falling back to None -- not
+    # propagate and blow up manifest parsing.
+    text = '{"sources": [{"id": "a/b"}], "sample_docs_per_source": 1e309}'
+    m = parse_manifest(text)
+    assert m is not None
+    assert m.sample_docs_per_source is None
+
+
+def test_parse_manifest_overflow_token_budget_falls_back_to_default():
+    text = '{"sources": [{"id": "a/b"}], "token_budget": 1e309}'
+    m = parse_manifest(text, default_token_budget=42)
+    assert m is not None
+    assert m.token_budget == 42
 
 
 def test_extract_json_object_handles_braces_in_strings():
@@ -2568,6 +2317,102 @@ async def test_finalize_primary_path_unchanged_when_manifest_text_present():
     assert manifest.sources[0].weight == 3.0
 
 
+# --- finalize: grace-period race with the verifiers interception server ----
+
+
+@pytest.mark.asyncio
+async def test_finalize_grace_period_picks_up_late_final_message():
+    """Reproduces the confirmed upstream race: `verifiers`' interception server
+    commits the agent's real final assistant message to `trace.nodes` AFTER the
+    rollout pool has already unregistered the rollout and `finalize()` has begun.
+    At the moment `finalize()` first checks, only a tool-call turn (fallback
+    fodder) is present; the true manifest lands a beat later, inside the grace
+    window. The grace-period poll (`_await_final_manifest`) must pick up the real
+    manifest instead of prematurely synthesizing one from trace-discovered ids."""
+    curator = await _make()
+    trace = vf.Trace(task=curator.task, state=curator.state)
+    prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
+
+    # Turn 0: a bash tool call that discovers a real id but carries no manifest --
+    # exactly what the tier-2 fallback would synthesize from if the grace period
+    # were skipped.
+    tc = vf.ToolCall(
+        id="tc0",
+        name="bash",
+        arguments=json.dumps({"command": "hf datasets info good/encyclopedia"}),
+    )
+    graph.prepare_turn(trace, prompt).commit(
+        vf.Response(
+            id="r0",
+            created=0,
+            model="m",
+            message=vf.AssistantMessage(content="", tool_calls=[tc]),
+            finish_reason="tool_calls",
+            usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
+        )
+    )
+    conversation = [
+        *prompt,
+        vf.AssistantMessage(content="", tool_calls=[tc]),
+        vf.ToolMessage(tool_call_id="tc0", content="Dataset: good/encyclopedia"),
+    ]
+
+    # Precondition: as of right now, the trace has no usable manifest -- this is
+    # the state finalize() sees on its first (pre-grace) check.
+    assert parse_manifest(trace.assistant_messages[-1].content or "") is None
+
+    final_manifest = '```json\n{"sources": [{"id": "good/science", "weight": 2.0}]}\n```'
+
+    async def _commit_late_final_message() -> None:
+        # Yield past the first grace-period poll before the interception server
+        # "finishes" committing the agent's real final message.
+        await asyncio.sleep(curator.taskset._FINALIZE_GRACE_INTERVAL_SECONDS * 2)
+        graph.prepare_turn(trace, conversation).commit(
+            vf.Response(
+                id="r1",
+                created=0,
+                model="m",
+                message=vf.AssistantMessage(content=final_manifest),
+                finish_reason="stop",
+                usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
+            )
+        )
+
+    late_commit = asyncio.create_task(_commit_late_final_message())
+    await curator.taskset.finalize(curator.task, trace, None)
+    await late_commit
+
+    assert RolloutStore.is_finalized(curator.state)
+    manifest = RolloutStore.manifest(curator.state)
+    # The REAL agent-submitted manifest won, not the trace-discovered-ids
+    # fallback (which would have synthesized good/encyclopedia instead).
+    assert [s.dataset_id for s in manifest.sources] == ["good/science"]
+    assert manifest.sources[0].weight == 2.0
+
+
+@pytest.mark.asyncio
+async def test_finalize_falls_back_when_final_message_never_arrives():
+    """Companion to the grace-period test above: when the final message truly
+    never arrives (no race, just an agent that never submits a manifest), the
+    grace period must still expire and the existing trace-discovered-ids
+    fallback must still fire exactly as before."""
+    curator = await _make()
+    calls = [
+        (
+            "hf datasets info meta-math/MetaMathQA --expand downloads",
+            "Dataset: meta-math/MetaMathQA\ndownloads: 456789",
+        ),
+    ]
+    trace = _trace_with_bash_calls(curator.task, curator.state, calls)
+
+    await curator.taskset.finalize(curator.task, trace, None)
+
+    assert RolloutStore.is_finalized(curator.state)
+    manifest = RolloutStore.manifest(curator.state)
+    assert [s.dataset_id for s in manifest.sources] == ["meta-math/MetaMathQA"]
+    assert manifest.sources[0].config is None
+
+
 def test_system_prompt_includes_configured_turn_budget():
     # The per-rollout system prompt must spell out the ACTUAL configured max_turns so
     # the agent stops calling `hf` and emits its final manifest before the cap trips.
@@ -2591,12 +2436,14 @@ def test_system_prompt_scales_discovery_with_benchmark_budget():
             CuratorTasksetConfig(id="test", max_turns=max_turns)
         ).load_tasks()[0].system_prompt
         assert f"{max_turns} turns" in prompt
-        assert "Each bash tool call uses one turn" in prompt
+        # Turn accounting is harness-neutral: a "command", not a "bash tool call".
+        assert "Each command you run in the shell uses one turn" in prompt
         assert "MUST perform at most 2 discovery rounds" in prompt
-        # Commit mechanics: plain text, no bash call.
+        # Commit mechanics: a plain final message, no shell command (works whether
+        # the harness runs a shell tool or executes the reply as a command).
         assert "HOW TO COMMIT" in prompt
-        assert "plain text response (NO bash tool call)" in prompt
-        assert "Do not call bash to print the manifest" in prompt
+        assert "stop running commands and reply with a plain message" in prompt
+        assert "do not print the manifest through the shell" in prompt
         assert "scores zero" in prompt
 
     smoke_prompt = CuratorTaskset(
@@ -2609,7 +2456,7 @@ def test_system_prompt_scales_discovery_with_benchmark_budget():
         CuratorTasksetConfig(id="test", max_turns=64, scan_limit=200)
     ).load_tasks()[0].system_prompt
     assert "64 turns" in benchmark_prompt
-    assert "MUST perform at most 10 discovery rounds (<=20 bash calls)" in benchmark_prompt
+    assert "MUST perform at most 10 discovery rounds (<=20 commands)" in benchmark_prompt
     assert "no later than turn 56" in benchmark_prompt
     # No-invention guard: manifest ids must come from observed tool output.
     assert "copied verbatim from a dataset id" in benchmark_prompt
@@ -2840,64 +2687,48 @@ def _real_trainer_taskset(**proxy_student):
 
 
 
-def test_backend_selection_prime_uses_prime_path_unchanged():
-    ts = _real_trainer_taskset()  # default trainer_backend == "prime"
+def test_backend_selection_builds_runtime_selected_dispatcher():
+    # _build_real_trainer() always returns a RuntimeSelectedTrainer covering both
+    # concrete backends; which one trains is decided at score time from the live
+    # harness runtime's type, never from runtime_backend.
+    ts = _real_trainer_taskset()
     ts._ensure()
     trainer = ts._trainer
-    assert isinstance(trainer, SandboxProxyTrainer)
-    # No factories => the prime path (prime_sandboxes is imported lazily on use).
-    assert trainer._client_factory is None
-    assert trainer._request_factory is None
-    assert ts.curator.proxy_student.trainer_backend == "prime"
+    assert isinstance(trainer, RuntimeSelectedTrainer)
+    assert set(trainer._trainers_by_runtime_type) == {"docker", "modal"}
 
 
-def test_backend_default_is_heuristic_and_prime_selector():
-    # The default selector is "prime" and the default (use_real_trainer False) path
-    # still yields the heuristic trainer — both unchanged.
-    assert CuratorConfig().proxy_student.trainer_backend == "prime"
-    assert ProxyStudentConfig().trainer_backend == "prime"
+def test_backend_default_is_heuristic_and_no_runtime_backend_selector():
+    # There is no default runtime_backend selector, and the default
+    # (use_real_trainer False) path still yields the heuristic trainer.
+    assert CuratorConfig().proxy_student.runtime_backend is None
+    assert ProxyStudentConfig().runtime_backend is None
     ts = _real_trainer_taskset(use_real_trainer=False)
     ts._ensure()
     assert isinstance(ts._trainer, HeuristicProxyTrainer)
 
 
-def test_docker_backend_relaxes_prime_only_guards():
-    # A docker config the PRIME validator would reject is ACCEPTED: vm=False with a
-    # GPU and an explicit > 24h timeout (a self-hosted host has neither limit).
-    cfg = ProxyStudentConfig(trainer_backend="docker", vm=False, timeout_minutes=5000)
-    assert cfg.trainer_backend == "docker"
-    assert cfg.vm is False
+def test_docker_runtime_backend_construction_has_no_platform_timeout_ceiling():
+    # No more vm/gpu_type fields to set at all; an explicit > 24h timeout
+    # constructs cleanly on docker (only modal has a platform ceiling).
+    cfg = ProxyStudentConfig(runtime_backend="docker", timeout_minutes=5000)
+    assert cfg.runtime_backend == "docker"
     assert cfg.timeout_minutes == 5000
     assert cfg.effective_timeout_minutes == 5000  # not clamped to 1440
-    # gpu_type=None alongside a GPU is fine too (docker ignores gpu_type).
-    cfg2 = ProxyStudentConfig(
-        trainer_backend="docker", gpu_count=1, gpu_type=None, vm=False
-    )
-    assert cfg2.gpu_count == 1 and cfg2.gpu_type is None
 
 
-def test_prime_backend_guards_still_enforced():
-    # The same combos remain rejected on the (default) prime backend.
-    with pytest.raises(ValidationError):
-        ProxyStudentConfig(vm=False)  # default prime, gpu_count=1
-    with pytest.raises(ValidationError):
-        ProxyStudentConfig(timeout_minutes=1441)  # default prime, > 24h
-    with pytest.raises(ValidationError):
-        ProxyStudentConfig(trainer_backend="prime", gpu_count=1, gpu_type=None)
-
-
-def test_docker_image_default_is_backend_aware():
-    # Prime keeps the historical image default (byte-identical); docker defaults to
-    # the torch 2.7 / cuda 12.6 image; an explicit image wins on either backend.
+def test_docker_image_default_is_shared_across_backends():
+    # There is a single shared docker_image default now (no more prime/docker
+    # split); an explicit image wins regardless of runtime_backend.
     assert (
         ProxyStudentConfig().docker_image
-        == "pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime"
+        == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
     )
-    assert ProxyStudentConfig(trainer_backend="docker").docker_image == (
+    assert ProxyStudentConfig(runtime_backend="docker").docker_image == (
         "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
     )
     assert (
-        ProxyStudentConfig(trainer_backend="docker", docker_image="me/img:1").docker_image
+        ProxyStudentConfig(runtime_backend="docker", docker_image="me/img:1").docker_image
         == "me/img:1"
     )
 

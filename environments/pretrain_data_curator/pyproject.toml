@@ -2,7 +2,7 @@
 name = "pretrain-data-curator"
 description = "Agent curates an LLM pretraining corpus from the pre-cutoff Hugging Face universe, scored by proxy-student cross-entropy plus cost and leakage penalties."
 tags = ["huggingface", "datasets", "data-curation", "pretraining", "tool-use", "multi-turn", "train", "eval"]
-version = "0.4.2"
+version = "0.4.3"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "verifiers==0.1.15.dev376",
@@ -14,11 +14,6 @@ dependencies = [
     "tqdm>=4.66.0",
 ]
 
-[project.optional-dependencies]
-# Only required for the real GPU sandbox trainer (use_real_trainer=True);
-# imported lazily on that path so the default heuristic backend has no GPU/
-# sandbox dependency.
-sandbox = ["prime-sandboxes"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

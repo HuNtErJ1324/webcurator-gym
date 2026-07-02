@@ -16,6 +16,6 @@ baseline_relative_perf = true
 use_real_trainer = true
 
 [eval.args.proxy_student]
-trainer_backend = "docker"
+runtime_backend = "docker"
 gpu_count = 1
 train_token_budget = 400000000

@@ -21,28 +21,17 @@ _MAX_TRAIN_TOKEN_BUDGET = 1_000_000_000  # generous H100/H200 upper bound
 _CHARS_PER_TOKEN = 4  # matches hf_access.estimate_tokens (chars // 4)
 _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
 _MAX_CORPUS_CHARS = 2_000_000_000  # absolute ceiling on the uploaded corpus blob
-# Sandbox lifetime derivation. Prime and Modal v1 runtimes both cap a remote
-# sandbox at 24 hours.
+# Sandbox lifetime derivation. Modal v1 runtimes cap a remote sandbox at 24 hours.
 _MAX_SANDBOX_TIMEOUT_MINUTES = 1440
 _MIN_SANDBOX_TIMEOUT_MINUTES = 30  # historical default; floor keeps small budgets unchanged
 _SANDBOX_SETUP_MINUTES = 15  # image pull + pip(tiktoken) + uploads + val download
 _SANDBOX_TOKENS_PER_MINUTE = 500_000  # conservative floor for benchmark-sized runs
 
-# Default container image for the DOCKER trainer backend (the prime backend keeps
-# its historical ``docker_image`` default, below, for byte-identical behavior). It
+# Default container image for the real-trainer backends (docker or modal). It
 # MUST ship torch + CUDA; this is the runtime image — switch to the matching
 # ``-devel`` tag if a run needs build tooling (e.g. nvcc for torch.compile/custom
 # kernels). torch 2.7 / CUDA 12.6 matches recent H100/H200 driver stacks.
 _DEFAULT_DOCKER_TRAINER_IMAGE = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
-
-# The installed ``prime_sandboxes`` SDK validates ``gpu_type`` only as a non-empty
-# string (``Optional[str]``; no enum/Literal — see prime_sandboxes/models.py), so
-# there is no discoverable allow-list. The verifiers+Prime ecosystem documents
-# bare type names like "A100"/"H100" (verifiers/v1/task.py, runtimes/prime.py),
-# passed straight through to the SDK. We default to H100 and keep the field a free
-# ``str`` so other/future types (e.g. "H200") stay reachable via config.
-GPU_TYPE_H100 = "H100"
-GPU_TYPE_H200 = "H200"
 
 
 class FilterSpec(BaseModel):
@@ -84,6 +73,12 @@ class Manifest(BaseModel):
 
     token_budget: int = Field(default=1_000_000, gt=0)
     sources: list[Source] = Field(default_factory=list)
+    # Agent-chosen override for how many documents are fetched per source from
+    # the Hub (the pre-filter fetch cap, distinct from the post-fetch
+    # `Sampling.max_docs`/`max_tokens` truncation on `Source`). `None` (default)
+    # keeps the human-configured `CorpusBuilder.sample_docs_per_source`. Bounded
+    # so an agent cannot make a rollout fetch unboundedly.
+    sample_docs_per_source: int | None = Field(default=None, ge=1, le=100_000)
 
     def upsert_source(self, source: Source) -> None:
         for i, existing in enumerate(self.sources):
@@ -186,40 +181,26 @@ class ProxyStudentConfig(BaseModel):
     # runs, so cost accounting bills every run).
     n_train_runs: int = Field(default=1, ge=1, le=64)
     # --- real-trainer backend selection (only used when use_real_trainer) -----
-    # Which backend runs the real proxy-student training. ``'prime'`` (default)
-    # provisions a Prime GPU sandbox via ``prime_sandboxes`` exactly as before —
-    # the byte-identical historical path. ``'docker'`` places the rollout harness
-    # and proxy-student training in one declarative v1 ``DockerRuntime`` on the
-    # local/co-located Docker daemon (see ``docker_backend.py``).
-    # ``'modal'`` places both phases in one declarative v1 ``ModalRuntime``.
-    trainer_backend: Literal["prime", "docker", "modal"] = "prime"
+    # Static, pre-runtime hint only: shapes ``load_environment``'s harness.runtime
+    # and ``load_tasks()``'s task image/resources/timeout declarations, and gates
+    # the Modal timeout ceiling check below. It is NEVER read when selecting which
+    # trainer actually runs at score time -- that is driven purely by the live
+    # harness runtime's ``type`` via ``trainer.RuntimeSelectedTrainer``. No default:
+    # a real-trainer run must explicitly pick ``'docker'`` or ``'modal'``.
+    runtime_backend: Literal["docker", "modal"] | None = None
     # Retained for config compatibility, but remote Docker is not supported by
     # the shared harness-runtime path. ``load_environment`` rejects a non-None
-    # value for the docker backend. Ignored by prime and modal.
+    # value for the docker backend. Ignored by modal.
     docker_host: str | None = None
     # Modal GPU type for the modal backend. Maps to a Modal GPU specifier string:
     # ``"H100"`` → ``"H100"``, ``"H200"`` → ``"H200"``, ``"A100"`` → ``"A100-80GB"``,
     # anything else → ``"L4"`` (default, cheapest; adequate for the 55M-param default
     # student). L4 billing is ~$0.80/hr per-second; the default 200-step run takes
-    # ~50s ≈ $0.011. Ignored by the prime and docker backends.
+    # ~50s ≈ $0.011. Ignored by the docker backend.
     modal_gpu: str = Field(default="L4", min_length=1)
     # Sandbox/container backend settings (used by both real-trainer backends).
-    #
-    # ``docker_image`` is the container image. For the PRIME backend it defaults to
-    # the historical pytorch 2.3.1 / cuda 12.1 image (unchanged). For the DOCKER
-    # and MODAL backends, if left unset, it defaults to ``_DEFAULT_DOCKER_TRAINER_IMAGE``
-    # (pytorch 2.7 / cuda 12.6; see ``_default_docker_image_for_docker_backend``).
-    # Either way the image MUST ship torch + CUDA (use a ``-devel`` tag for build
-    # tooling / torch.compile nvcc).
-    docker_image: str = Field(
-        default="pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime", min_length=1
-    )
+    docker_image: str = Field(default=_DEFAULT_DOCKER_TRAINER_IMAGE, min_length=1)
     gpu_count: int = Field(default=1, ge=0, le=8)
-    # Concrete H100 default (configurable; "H200" reachable). See the GPU_TYPE_*
-    # note above on why this is a free str and not an enum.
-    gpu_type: str | None = GPU_TYPE_H100
-    # VM mode: the Prime SDK requires vm=True whenever gpu_count > 0.
-    vm: bool = True
     cpu_cores: int = Field(default=4, ge=1, le=256)
     memory_gb: int = Field(default=16, ge=1, le=2048)
     disk_size_gb: int = Field(default=20, ge=1, le=10_000)
@@ -228,13 +209,11 @@ class ProxyStudentConfig(BaseModel):
     # the historical ~1.25M-unique-token corpus); an explicit value overrides.
     max_corpus_chars: int | None = Field(default=None, ge=1, le=_MAX_CORPUS_CHARS)
     # Sandbox/container lifetime / command timeout (minutes). ``None`` (default)
-    # derives a budget-sized timeout (floored at the historical 30). The Prime 24h
-    # ceiling is enforced backend-awarely in ``_check_prime_timeout_ceiling`` (the
-    # prime backend rejects > 24h; the self-hosted docker backend has no such cap),
-    # so the static field bound is just the lower bound.
+    # derives a budget-sized timeout (floored at the historical 30). The Modal 24h
+    # ceiling is enforced in ``_check_modal_timeout_ceiling`` (the self-hosted
+    # docker backend has no such cap), so the static field bound is just the lower
+    # bound.
     timeout_minutes: int | None = Field(default=None, ge=1)
-    # Hard wall-clock bounds (seconds) on individual sandbox lifecycle steps.
-    create_timeout_seconds: float = Field(default=300.0, gt=0.0)
     upload_timeout_seconds: float = Field(default=120.0, gt=0.0)
 
     @property
@@ -288,10 +267,10 @@ class ProxyStudentConfig(BaseModel):
         """Sandbox lifetime / command timeout (minutes).
 
         An explicit ``timeout_minutes`` wins; otherwise derived from the budget
-        (setup overhead + tokens / throughput), floored at the historical 30. The
-        prime backend additionally clamps the derived value to the Prime
-        ``_MAX_SANDBOX_TIMEOUT_MINUTES`` (24h) platform max; the self-hosted docker
-        backend has no such ceiling, so its derived timeout is left uncapped.
+        (setup overhead + tokens / throughput), floored at the historical 30.
+        Modal additionally clamps the derived value to the
+        ``_MAX_SANDBOX_TIMEOUT_MINUTES`` (24h) platform max via this property;
+        Docker has no such ceiling, so its derived timeout is left uncapped.
         """
         if self.timeout_minutes is not None:
             return self.timeout_minutes
@@ -300,9 +279,7 @@ class ProxyStudentConfig(BaseModel):
             _SANDBOX_SETUP_MINUTES
             + math.ceil(self.effective_train_tokens / _SANDBOX_TOKENS_PER_MINUTE),
         )
-        if self.trainer_backend == "prime":
-            return min(_MAX_SANDBOX_TIMEOUT_MINUTES, derived)
-        if self.trainer_backend == "modal":
+        if self.runtime_backend == "modal":
             return min(_MAX_SANDBOX_TIMEOUT_MINUTES, derived)
         return derived
 
@@ -336,85 +313,9 @@ class ProxyStudentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_gpu_request(self) -> "ProxyStudentConfig":
-        # These preconditions are Prime-sandbox-specific (the SDK's
-        # validate_gpu_fields). The docker backend maps gpu_count -> ``--gpus N``
-        # and ignores gpu_type/vm entirely, and a self-hosted host has none of
-        # Prime's vm/gpu_type requirements — so only constrain the prime backend
-        # here (a valid docker config with vm=False must NOT be rejected).
-        if self.trainer_backend != "prime":
-            return self
-        # Mirror the prime_sandboxes CreateSandboxRequest GPU precondition AT
-        # CONFIG TIME, so a misconfigured GPU request fails LOUDLY here instead of
-        # raising a ValidationError deep in the SDK that the rubric silently
-        # degrades to the infinite-loss sentinel (every rollout scoring perf=0).
-        # SDK rule (prime_sandboxes/models.py:106-114, validate_gpu_fields):
-        #   gpu_count > 0  -> gpu_type required (non-empty) AND vm must be True
-        #   gpu_count == 0 -> gpu_type must be None
-        if self.gpu_count > 0:
-            if not self.gpu_type or not self.gpu_type.strip():
-                raise ValueError(
-                    f"gpu_type is required when gpu_count ({self.gpu_count}) > 0 "
-                    f"(e.g. {GPU_TYPE_H100!r} or {GPU_TYPE_H200!r})"
-                )
-            if not self.vm:
-                raise ValueError(
-                    f"vm must be True when gpu_count ({self.gpu_count}) > 0 "
-                    "(Prime GPU sandboxes require VM mode)"
-                )
-        elif self.gpu_type is not None:
-            raise ValueError(
-                f"gpu_type ({self.gpu_type!r}) requires gpu_count > 0; raise "
-                "gpu_count or set gpu_type=None"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _default_docker_image_for_docker_backend(self) -> "ProxyStudentConfig":
-        # The shared ``docker_image`` default is the historical prime image, kept
-        # byte-identical for the prime path. When the docker backend is selected
-        # and the user did NOT pin an image, default to the torch 2.7 / cuda 12.6
-        # image instead. ``model_fields_set`` distinguishes an explicit value from
-        # the field default; assignment here does not re-run validators
-        # (validate_assignment is off), so there is no recursion.
-        if (
-            self.trainer_backend == "docker"
-            and "docker_image" not in self.model_fields_set
-        ):
-            self.docker_image = _DEFAULT_DOCKER_TRAINER_IMAGE
-        return self
-
-    @model_validator(mode="after")
-    def _default_image_for_modal_backend(self) -> "ProxyStudentConfig":
-        if (
-            self.trainer_backend == "modal"
-            and "docker_image" not in self.model_fields_set
-        ):
-            self.docker_image = _DEFAULT_DOCKER_TRAINER_IMAGE
-        return self
-
-    @model_validator(mode="after")
-    def _check_prime_timeout_ceiling(self) -> "ProxyStudentConfig":
-        # The Prime platform pins any sandbox to a 24h lifetime, so an explicit
-        # timeout above that is unschedulable on the prime backend — fail loud here
-        # (as the GPU-request guard does) rather than deep in the SDK. The docker
-        # backend runs on a self-hosted host with no such cap, so it is unbounded.
-        if (
-            self.trainer_backend == "prime"
-            and self.timeout_minutes is not None
-            and self.timeout_minutes > _MAX_SANDBOX_TIMEOUT_MINUTES
-        ):
-            raise ValueError(
-                f"timeout_minutes ({self.timeout_minutes}) exceeds the Prime 24h "
-                f"sandbox maximum ({_MAX_SANDBOX_TIMEOUT_MINUTES}); lower it or set "
-                "trainer_backend='docker'"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _check_modal_timeout_ceiling(self) -> "ProxyStudentConfig":
         if (
-            self.trainer_backend == "modal"
+            self.runtime_backend == "modal"
             and self.timeout_minutes is not None
             and self.timeout_minutes > _MAX_SANDBOX_TIMEOUT_MINUTES
         ):

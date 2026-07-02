@@ -50,14 +50,14 @@ from .tasks import CuratorTask, build_tasks
 from .trainer import (
     HeuristicProxyTrainer,
     ProxyStudentTrainer,
-    SandboxProxyTrainer,
+    RuntimeSelectedTrainer,
     TrainerError,
 )
 from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """IMPORTANT: Be extremely concise in every message. Your first response MUST be a bash command — no preamble, no plan, no explanation. Bootstrap the hf CLI if needed and immediately run a search in that same command. If you want to plan, do it in one sentence max, then immediately run a command.
+SYSTEM_PROMPT = """IMPORTANT: Be extremely concise in every message, and work by RUNNING commands in your shell rather than describing them. On your very first step, actually run a command — no preamble, no plan, no explanation first. If your harness gives you a shell/terminal/exec tool, you MUST call that tool to run each command below; writing a command out as ordinary text without calling the tool does NOT run it and wastes the rollout. If instead your harness executes your reply directly as a shell command, just reply with the command itself. Bootstrap the hf CLI if needed and run a search in that same first command. If you must plan, keep it to one sentence, then immediately run a command.
 
 You are a pretraining-data curation agent. Your job is to assemble a dataset mixture that, when used to train a fixed small GPT-2-scale student (everything fixed but the data), maximizes the student's performance.
 
@@ -87,6 +87,7 @@ When you are done, emit your decision as your FINAL message: a single fenced ```
 ```json
 {
   "token_budget": 1000000,
+  "sample_docs_per_source": "<int, 1-100000; compute from your own token_budget, do not copy this>",
   "sources": [
     {
       "id": "<huggingface dataset id, e.g. HuggingFaceFW/fineweb>",
@@ -102,7 +103,9 @@ When you are done, emit your decision as your FINAL message: a single fenced ```
 }
 ```
 
-Each source REQUIRES `id` (the Hugging Face dataset id) and `weight` (>= 0, relative mixing weight). `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are optional. Supported filter kinds: min_chars, max_chars, min_tokens, max_symbol_ratio, min_alpha_ratio, drop_regex, keep_regex, dedup_exact. Always emit a non-empty `sources` list — an empty or missing manifest scores zero."""
+Each source REQUIRES `id` (the Hugging Face dataset id) and `weight` (>= 0, relative mixing weight). `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are optional. Supported filter kinds: min_chars, max_chars, min_tokens, max_symbol_ratio, min_alpha_ratio, drop_regex, keep_regex, dedup_exact. Always emit a non-empty `sources` list — an empty or missing manifest scores zero.
+
+Optional top-level `sample_docs_per_source` (integer, 1-100000) controls how many documents are fetched PER SOURCE from the Hub for this rollout — it is the fetch cap itself, not a post-fetch truncation like `max_docs`/`max_tokens`. Omit it (or set it to null) to use the environment's configured default. Fetching more documents lets the student train on more unique tokens (useful for a large `token_budget`), but also raises `cost_penalty`, since every fetched token is billed. You MUST compute this number yourself from your actual `token_budget` and number of sources — roughly `token_budget / (num_sources * 250)` tokens-per-doc, capped at 100000 — rather than reusing the schema example's placeholder verbatim."""
 
 
 # --------------------------------------------------------------------------- #
@@ -363,10 +366,20 @@ def parse_manifest(text: str, default_token_budget: int | None = None) -> Manife
     if data.get("token_budget") is not None:
         try:
             token_budget = int(data["token_budget"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
+    sample_docs_per_source: int | None = None
+    if data.get("sample_docs_per_source") is not None:
+        try:
+            sample_docs_per_source = int(data["sample_docs_per_source"])
+        except (TypeError, ValueError, OverflowError):
+            sample_docs_per_source = None
     try:
-        return Manifest(token_budget=token_budget, sources=sources)
+        return Manifest(
+            token_budget=token_budget,
+            sources=sources,
+            sample_docs_per_source=sample_docs_per_source,
+        )
     except ValidationError:
         return None
 
@@ -500,37 +513,30 @@ class CuratorTaskset(_TasksetBase):
         return self._scorer
 
     def _build_real_trainer(self) -> ProxyStudentTrainer:
-        """Construct the real (GPU) proxy-student trainer for the selected backend.
+        """Construct the real (GPU) proxy-student trainer.
 
-        ``trainer_backend='prime'`` (default) builds the trainer EXACTLY as before
-        — no factories, so ``SandboxProxyTrainer`` imports ``prime_sandboxes`` and
-        provisions a Prime GPU sandbox. ``'docker'`` trains directly in the live
-        declarative Docker runtime owned by the rollout.
-        ``'modal'`` trains directly in the live declarative Modal runtime owned
-        by the rollout.
+        Both concrete backends are built eagerly (cheap, no I/O): which one
+        actually trains is decided at SCORE time from the live harness
+        runtime's ``type`` (docker -> ``HarnessRuntimeProxyTrainer``, modal ->
+        ``ModalProxyTrainer``), via ``RuntimeSelectedTrainer``.
+        ``proxy_student.runtime_backend`` is never read here -- it only shapes
+        the static task/harness declarations built ahead of any live runtime
+        (see ``load_tasks`` and ``load_environment``).
         """
-        ps = self.curator.proxy_student
+        from .docker_backend import HarnessRuntimeProxyTrainer
+        from .modal_backend import ModalProxyTrainer
 
-        if ps.trainer_backend == "modal":
-            from .modal_backend import ModalProxyTrainer
-
-            return ModalProxyTrainer(
-                concurrency_limit=self.curator.max_concurrent_training,
-                val_loader=self._val_loader,
-            )
-
-        if ps.trainer_backend == "docker":
-            from .docker_backend import HarnessRuntimeProxyTrainer
-
-            return HarnessRuntimeProxyTrainer(
-                concurrency_limit=self.curator.max_concurrent_training,
-                val_loader=self._val_loader,
-            )
-
-        # prime backend (default): unchanged — no factories => prime_sandboxes.
-        return SandboxProxyTrainer(
-            concurrency_limit=self.curator.max_concurrent_training,
-            val_loader=self._val_loader,
+        return RuntimeSelectedTrainer(
+            {
+                "docker": HarnessRuntimeProxyTrainer(
+                    concurrency_limit=self.curator.max_concurrent_training,
+                    val_loader=self._val_loader,
+                ),
+                "modal": ModalProxyTrainer(
+                    concurrency_limit=self.curator.max_concurrent_training,
+                    val_loader=self._val_loader,
+                ),
+            }
         )
 
     # -- taskset surface -------------------------------------------------------
@@ -540,7 +546,7 @@ class CuratorTaskset(_TasksetBase):
         system_prompt = self._system_prompt()
         updates: dict[str, Any] = {"system_prompt": system_prompt}
         ps = self.curator.proxy_student
-        if self.curator.use_real_trainer and ps.trainer_backend == "docker":
+        if self.curator.use_real_trainer and ps.runtime_backend == "docker":
             # Native taskset runs do not call load_environment(), so declare the
             # image, resources, and scoring deadline on each task. A task image
             # also makes a subprocess runtime fail before rollout.
@@ -559,7 +565,7 @@ class CuratorTaskset(_TasksetBase):
                     ),
                 }
             )
-        elif self.curator.use_real_trainer and ps.trainer_backend == "modal":
+        elif self.curator.use_real_trainer and ps.runtime_backend == "modal":
             from .modal_backend import _modal_gpu_for
 
             updates.update(
@@ -591,22 +597,24 @@ class CuratorTaskset(_TasksetBase):
         commit_by = max(1, max_turns - max(3, max_turns // 8))
         return (
             f"{SYSTEM_PROMPT}\n\n"
-            f"You have {max_turns} turns total. Each bash tool call uses one turn. "
-            f"A discovery round = one `hf datasets ls` call + one `hf datasets info` "
-            f"call (2 turns). You MUST perform at most {discovery_rounds} discovery "
-            f"rounds (<={discovery_calls} bash calls). After your final discovery "
+            f"You have {max_turns} turns total. Each command you run in the shell "
+            f"uses one turn. A discovery round = one `hf datasets ls` command + one "
+            f"`hf datasets info` command (2 turns). You MUST perform at most "
+            f"{discovery_rounds} discovery rounds (<={discovery_calls} commands). "
+            f"After your final discovery "
             f"round, and no later than turn "
             f"{commit_by} — you MUST commit your manifest.\n\n"
-            f"HOW TO COMMIT: send a plain text response (NO bash tool call) containing "
-            f"ONLY the fenced ```json block. Do not call bash to print the manifest. "
-            f"Do not add any text after the closing ``` fence. If you still have bash "
-            f"calls available but you have enough evidence to pick sources, commit "
+            f"HOW TO COMMIT: stop running commands and reply with a plain message "
+            f"containing ONLY the fenced ```json block — do not run any shell command "
+            f"in that step, and do not print the manifest through the shell. "
+            f"Do not add any text after the closing ``` fence. If you still have "
+            f"commands available but you have enough evidence to pick sources, commit "
             f"immediately — do not fill remaining turns with more searches.\n\n"
             f"CRITICAL — no invented sources: every `id` in your manifest MUST be "
             f"copied verbatim from a dataset id that appeared in your `hf datasets ls` "
             f"or `hf datasets info` output during this rollout. Do NOT invent or guess "
             f"dataset ids or config names. If a `config` was not explicitly listed in "
-            f"tool output, set `config` to null. A manifest with a fabricated id or "
+            f"command output, set `config` to null. A manifest with a fabricated id or "
             f"config materializes zero tokens and scores zero. An empty or missing "
             f"manifest also scores zero."
         )
@@ -617,24 +625,20 @@ class CuratorTaskset(_TasksetBase):
     # non-MCP gate (env.py:239-247) pass for codex / kimi_code / bash harnesses.
 
     async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:
-        """Reject harness-runtime trainers paired with the wrong runtime."""
-        if (
-            self.curator.use_real_trainer
-            and self.curator.proxy_student.trainer_backend == "docker"
-            and runtime.type != "docker"
-        ):
+        """Require a Docker or Modal harness runtime when the real trainer is on.
+
+        Trainer selection itself is decided entirely by the live
+        ``runtime.type`` (see ``RuntimeSelectedTrainer``); this only guards
+        against forgetting to configure a container/sandbox harness runtime at
+        all -- Prime sandboxes are no longer supported, and the subprocess
+        runtime cannot host GPU training.
+        """
+        if self.curator.use_real_trainer and runtime.type not in ("docker", "modal"):
             raise TrainerError(
-                "trainer_backend='docker' requires the rollout harness to use a "
-                "Docker runtime; pass --harness.runtime.type docker"
-            )
-        if (
-            self.curator.use_real_trainer
-            and self.curator.proxy_student.trainer_backend == "modal"
-            and runtime.type != "modal"
-        ):
-            raise TrainerError(
-                "trainer_backend='modal' requires the rollout harness to use a "
-                "Modal runtime; pass --harness.runtime.type modal"
+                "use_real_trainer=True requires a Docker or Modal harness runtime "
+                f"(got {runtime.type!r}); pass --harness.runtime.type docker or "
+                "modal (or the load_environment equivalent) -- Prime sandboxes are "
+                "no longer supported"
             )
         if runtime.type == "docker":
             DockerHostReachability.configure()
@@ -654,19 +658,9 @@ class CuratorTaskset(_TasksetBase):
             return ""
         return msgs[-1].content or ""
 
-    def _finalize_manifest(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
-        """Return the most recent usable manifest across assistant turns.
-
-        Two-tier lookup — each tier is tried only if the previous produced nothing:
-
-        1. **Parse** a fenced JSON manifest from any assistant text message (newest
-           first).  This is the primary path.
-        2. **Trace fallback** — synthesize from dataset ids actually observed in the
-           rollout's bash tool calls / outputs.  Uses only ids the agent genuinely
-           discovered; never invents ids.  ``config`` is set to ``null`` for all
-           sources unless a config was explicitly shown in tool output.
-        """
-        # Tier 1: parse manifest from assistant message text.
+    def _manifest_from_messages(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
+        """Tier 1: parse a fenced JSON manifest from any assistant text message,
+        newest first."""
         manifest = parse_manifest(
             self._final_message_text(trace), default_token_budget=task.token_budget
         )
@@ -678,17 +672,54 @@ class CuratorTaskset(_TasksetBase):
             )
             if manifest is not None and manifest.sources:
                 return manifest
+        return None
 
-        # Tier 2: synthesize from ids observed in bash tool calls / outputs.
+    def _manifest_from_trace_ids(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
+        """Tier 2: synthesize from dataset ids actually observed in the rollout's
+        bash tool calls / outputs. Uses only ids the agent genuinely discovered;
+        never invents ids. ``config`` is ``null`` for all sources unless a config
+        was explicitly shown in tool output."""
         observed = _ids_from_trace(trace)
-        if observed:
-            limit = self.curator.candidate_limit
-            sources = [
-                Source(dataset_id=did, config=None, weight=1.0)
-                for did in observed[:limit]
-            ]
-            return Manifest(token_budget=task.token_budget, sources=sources)
+        if not observed:
+            return None
+        limit = self.curator.candidate_limit
+        sources = [
+            Source(dataset_id=did, config=None, weight=1.0) for did in observed[:limit]
+        ]
+        return Manifest(token_budget=task.token_budget, sources=sources)
 
+    # Grace-period bound for `_await_final_manifest` (see its docstring): total
+    # worst-case wait is attempts * interval seconds, and it only ever runs on the
+    # race/fallback path -- never on a rollout whose final message already landed.
+    _FINALIZE_GRACE_ATTEMPTS = 6
+    _FINALIZE_GRACE_INTERVAL_SECONDS = 0.5
+
+    async def _await_final_manifest(self, task: CuratorTask, trace: vf.Trace) -> Manifest | None:
+        """Poll briefly for the agent's final assistant message before giving up
+        on the primary (message-parsed) manifest path.
+
+        WHY THIS EXISTS: the `verifiers` interception server (pinned third-party
+        dependency, `verifiers==0.1.15.dev376` -- not something we control or may
+        edit) streams the agent's final assistant message and commits it into
+        `trace.nodes` asynchronously, and can do so AFTER the rollout pool has
+        already unregistered this rollout and invoked our `finalize()`. When that
+        race is lost, `_manifest_from_messages` sees a trace that is one message
+        short of the agent's real, already-submitted manifest, and would otherwise
+        fall straight through to the lossy trace-discovered-ids fallback (whose
+        synthesized manifest always has `sample_docs_per_source=None`, silently
+        defaulting away whatever the agent actually requested). `trace.nodes` is a
+        plain list the interception server appends to in place, and
+        `trace.assistant_messages` is a live property over it (not a cached
+        snapshot), so yielding the event loop a few times via short sleeps is
+        enough for the pending append to land. Bounded to a handful of short
+        sleeps so a rollout that genuinely never submits a manifest still falls
+        through to the fallback promptly.
+        """
+        for _ in range(self._FINALIZE_GRACE_ATTEMPTS):
+            await asyncio.sleep(self._FINALIZE_GRACE_INTERVAL_SECONDS)
+            manifest = self._manifest_from_messages(task, trace)
+            if manifest is not None:
+                return manifest
         return None
 
     async def finalize(self, task: CuratorTask, trace: vf.Trace, runtime: Any) -> None:
@@ -697,14 +728,20 @@ class CuratorTaskset(_TasksetBase):
         Positional signature as invoked at ``verifiers/v1/rollout.py:241``; runs
         after generation and before ``score``. Assistant turns are scanned most
         recent first, so the final-message behavior is preserved while a manifest
-        emitted before trailing `hf` calls still finalizes at the turn cap. Tolerant
-        of a missing/garbled rollout (no manifest anywhere -> "not finalized" -> the
-        scorer returns the zero sentinel). The discovery cost ledger is computed here
-        and persisted; the scorer still adds ``train_flops`` and the materialization
-        cost on top.
+        emitted before trailing `hf` calls still finalizes at the turn cap. If the
+        final message hasn't landed in the trace yet (see `_await_final_manifest`),
+        a short grace-period poll gives the upstream race a chance to resolve
+        before falling back. Tolerant of a missing/garbled rollout (no manifest
+        anywhere -> "not finalized" -> the scorer returns the zero sentinel). The
+        discovery cost ledger is computed here and persisted; the scorer still adds
+        ``train_flops`` and the materialization cost on top.
         """
         state = trace.state
-        manifest = self._finalize_manifest(task, trace)
+        manifest = self._manifest_from_messages(task, trace)
+        if manifest is None:
+            manifest = await self._await_final_manifest(task, trace)
+        if manifest is None:
+            manifest = self._manifest_from_trace_ids(task, trace)
         if manifest is not None and manifest.sources:
             RolloutStore.set_manifest(state, manifest)
             RolloutStore.set_finalized(state, True)
@@ -747,6 +784,23 @@ class CuratorTaskset(_TasksetBase):
         # Safe to drop: later callers short-circuit on the populated cache above.
         self._scoring_locks.pop(trace.id, None)
         return scoring
+
+    async def score(self, trace: vf.Trace, runtime: vf.Runtime | None) -> None:
+        """Score the trace, then remove its scratch directory (raw fetch cache +
+        materialized corpus files under `RolloutStore.scratch_dir`).
+
+        By the time `Taskset.score` returns, every `@vf.reward`/`@vf.metric` has
+        resolved -- including the single cached `_prepared`/`compute_scoring`
+        pass, so nothing still needs the on-disk corpus. Cleaning up here (rather
+        than relying solely on the `weakref.finalize` safety net registered when
+        the directory was created) makes disk cleanup deterministic for the real
+        rollout lifecycle, matching how `doc_cache`/materialized corpus files are
+        kept off the long-lived `CuratorState` in the first place.
+        """
+        try:
+            await super().score(trace, runtime)
+        finally:
+            RolloutStore.cleanup(trace.state)
 
     # -- rewards (weighted contributions; coefficients folded in) --------------
 

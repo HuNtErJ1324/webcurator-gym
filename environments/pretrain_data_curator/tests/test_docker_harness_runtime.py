@@ -9,18 +9,22 @@ import verifiers.v1 as vf
 
 from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
 from pretrain_data_curator.docker_backend import HarnessRuntimeProxyTrainer
-from pretrain_data_curator.modal_backend import ModalProxyTrainer
 from pretrain_data_curator.models import CuratorConfig, Manifest, ProxyStudentConfig, Source
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
-from pretrain_data_curator.trainer import HeuristicProxyTrainer, TrainerError, TrainResult
+from pretrain_data_curator.trainer import (
+    HeuristicProxyTrainer,
+    RuntimeSelectedTrainer,
+    TrainerError,
+    TrainResult,
+)
 
 
 def _corpus() -> CuratedCorpus:
     return CuratedCorpus(
-        sources=[SourceCorpus("owner/data", None, 1.0, ["hello world " * 30])]
+        sources=[SourceCorpus.from_iter("owner/data", None, 1.0, ["hello world " * 30])]
     )
 
 
@@ -72,7 +76,7 @@ async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
     trainer = HarnessRuntimeProxyTrainer()
 
     result = await trainer.train_and_eval(
-        _corpus(), ProxyStudentConfig(trainer_backend="docker"), runtime=runtime
+        _corpus(), ProxyStudentConfig(runtime_backend="docker"), runtime=runtime
     )
 
     assert result.backend == "docker"
@@ -123,14 +127,14 @@ class _RecordingTrainer:
 async def test_reward_threads_injected_runtime_through_scoring_chain():
     config = CuratorConfig(
         use_real_trainer=True,
-        proxy_student=ProxyStudentConfig(trainer_backend="docker"),
+        proxy_student=ProxyStudentConfig(runtime_backend="docker"),
     )
     trainer = _RecordingTrainer()
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="test",
             use_real_trainer=True,
-            proxy_student={"trainer_backend": "docker"},
+            proxy_student={"runtime_backend": "docker"},
         )
     )
     taskset._scorer = CuratorScorer(
@@ -167,7 +171,7 @@ async def test_training_timeout_stops_runtime_without_hanging(monkeypatch):
         await asyncio.wait_for(
             HarnessRuntimeProxyTrainer().train_and_eval(
                 _corpus(),
-                ProxyStudentConfig(trainer_backend="docker"),
+                ProxyStudentConfig(runtime_backend="docker"),
                 runtime=runtime,
             ),
             timeout=1.0,
@@ -186,7 +190,7 @@ async def test_cancelled_training_stops_runtime():
     task = asyncio.create_task(
         HarnessRuntimeProxyTrainer().train_and_eval(
             _corpus(),
-            ProxyStudentConfig(trainer_backend="docker"),
+            ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
         )
     )
@@ -214,7 +218,7 @@ async def test_training_semaphore_bounds_runtime_commands():
             finally:
                 active -= 1
 
-    config = ProxyStudentConfig(trainer_backend="docker")
+    config = ProxyStudentConfig(runtime_backend="docker")
     await asyncio.gather(
         HarnessRuntimeProxyTrainer(concurrency_limit=1).train_and_eval(
             _corpus(), config, runtime=ConcurrentRuntime()
@@ -253,7 +257,7 @@ async def test_runtime_failures_raise_clear_trainer_errors(result, message):
     with pytest.raises(TrainerError, match=message) as excinfo:
         await HarnessRuntimeProxyTrainer().train_and_eval(
             _corpus(),
-            ProxyStudentConfig(trainer_backend="docker"),
+            ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
         )
 
@@ -261,26 +265,33 @@ async def test_runtime_failures_raise_clear_trainer_errors(result, message):
     assert excinfo.value.stderr_tail in {"CUDA exploded", "parse context", "missing"}
 
 
-def test_docker_and_modal_backend_selection_remain_distinct():
-    docker_taskset = CuratorTaskset(
-        CuratorTasksetConfig(
-            id="docker",
-            use_real_trainer=True,
-            proxy_student={"trainer_backend": "docker"},
-        )
+@pytest.mark.asyncio
+async def test_build_real_trainer_dispatches_by_runtime_type():
+    # _build_real_trainer() always builds ONE RuntimeSelectedTrainer regardless
+    # of runtime_backend; which concrete trainer actually runs is decided
+    # ENTIRELY by the live runtime.type passed to train_and_eval at score time.
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(id="test", use_real_trainer=True)
     )
-    modal_taskset = CuratorTaskset(
-        CuratorTasksetConfig(
-            id="modal",
-            use_real_trainer=True,
-            proxy_student={"trainer_backend": "modal"},
-        )
-    )
+    trainer = taskset._build_real_trainer()
+    assert isinstance(trainer, RuntimeSelectedTrainer)
 
-    assert isinstance(
-        docker_taskset._build_real_trainer(), HarnessRuntimeProxyTrainer
+    docker_result = await trainer.train_and_eval(
+        _corpus(), ProxyStudentConfig(), runtime=FakeRuntime(runtime_type="docker")
     )
-    assert isinstance(modal_taskset._build_real_trainer(), ModalProxyTrainer)
+    assert docker_result.backend == "docker"
+
+    modal_result = await trainer.train_and_eval(
+        _corpus(), ProxyStudentConfig(), runtime=FakeRuntime(runtime_type="modal")
+    )
+    assert modal_result.backend == "modal"
+
+    with pytest.raises(TrainerError, match="docker or modal harness runtime"):
+        await trainer.train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(),
+            runtime=FakeRuntime(runtime_type="subprocess"),
+        )
 
 
 def test_native_docker_tasks_declare_runtime_requirements_and_deadline():
@@ -289,7 +300,7 @@ def test_native_docker_tasks_declare_runtime_requirements_and_deadline():
             id="pretrain-data-curator",
             use_real_trainer=True,
             proxy_student={
-                "trainer_backend": "docker",
+                "runtime_backend": "docker",
                 "docker_image": "pretrain-data-curator:gpu",
                 "gpu_count": 1,
                 "timeout_minutes": 45,
@@ -319,11 +330,11 @@ async def test_taskset_setup_rejects_docker_trainer_on_subprocess_runtime():
         CuratorTasksetConfig(
             id="pretrain-data-curator",
             use_real_trainer=True,
-            proxy_student={"trainer_backend": "docker"},
+            proxy_student={"runtime_backend": "docker"},
         )
     )
 
-    with pytest.raises(TrainerError, match="--harness.runtime.type docker"):
+    with pytest.raises(TrainerError, match="Docker or Modal harness runtime"):
         await taskset.setup(
             taskset.load_tasks()[0],
             FakeRuntime(runtime_type="subprocess"),

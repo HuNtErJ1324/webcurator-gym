@@ -66,7 +66,10 @@ class HarnessRuntimeProxyTrainer:
             if self._max_corpus_chars is not None
             else config.effective_max_corpus_chars
         )
-        text = "\n\n".join(corpus.documents)[:cap]
+        # Streams docs off disk and stops once `cap` is reached, instead of
+        # joining the (potentially huge) full corpus into memory first (see
+        # `CuratedCorpus.joined_text`).
+        text = corpus.joined_text(cap)
         if not text.strip():
             return TrainResult(
                 loss=float("inf"),

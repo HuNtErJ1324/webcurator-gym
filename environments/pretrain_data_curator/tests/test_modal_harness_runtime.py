@@ -27,7 +27,7 @@ from pretrain_data_curator.trainer import TrainResult, TrainerError
 
 def _corpus() -> CuratedCorpus:
     return CuratedCorpus(
-        sources=[SourceCorpus("owner/data", None, 1.0, ["hello world " * 30])]
+        sources=[SourceCorpus.from_iter("owner/data", None, 1.0, ["hello world " * 30])]
     )
 
 
@@ -78,7 +78,7 @@ async def test_modal_trainer_writes_and_runs_on_supplied_harness_runtime():
     runtime = FakeRuntime()
 
     result = await ModalProxyTrainer().train_and_eval(
-        _corpus(), ProxyStudentConfig(trainer_backend="modal"), runtime=runtime
+        _corpus(), ProxyStudentConfig(runtime_backend="modal"), runtime=runtime
     )
 
     assert result.backend == "modal"
@@ -128,14 +128,14 @@ class _RecordingTrainer:
 async def test_modal_reward_threads_runtime_through_scoring_chain():
     config = CuratorConfig(
         use_real_trainer=True,
-        proxy_student=ProxyStudentConfig(trainer_backend="modal"),
+        proxy_student=ProxyStudentConfig(runtime_backend="modal"),
     )
     trainer = _RecordingTrainer()
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="test",
             use_real_trainer=True,
-            proxy_student={"trainer_backend": "modal"},
+            proxy_student={"runtime_backend": "modal"},
         )
     )
     taskset._scorer = CuratorScorer(config, _CorpusBuilder(), trainer, _Leakage())
@@ -170,7 +170,7 @@ async def test_modal_training_timeout_stops_runtime_without_hanging(monkeypatch)
         await asyncio.wait_for(
             ModalProxyTrainer().train_and_eval(
                 _corpus(),
-                ProxyStudentConfig(trainer_backend="modal"),
+                ProxyStudentConfig(runtime_backend="modal"),
                 runtime=runtime,
             ),
             timeout=1.0,
@@ -189,7 +189,7 @@ async def test_cancelled_modal_training_stops_runtime():
     task = asyncio.create_task(
         ModalProxyTrainer().train_and_eval(
             _corpus(),
-            ProxyStudentConfig(trainer_backend="modal"),
+            ProxyStudentConfig(runtime_backend="modal"),
             runtime=runtime,
         )
     )
@@ -219,7 +219,7 @@ async def test_swallowed_wait_for_cancellation_is_reraised(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await ModalProxyTrainer().train_and_eval(
             _corpus(),
-            ProxyStudentConfig(trainer_backend="modal"),
+            ProxyStudentConfig(runtime_backend="modal"),
             runtime=runtime,
         )
 
@@ -243,7 +243,7 @@ async def test_modal_training_semaphore_bounds_runtime_commands():
             finally:
                 active -= 1
 
-    config = ProxyStudentConfig(trainer_backend="modal")
+    config = ProxyStudentConfig(runtime_backend="modal")
     await asyncio.gather(
         ModalProxyTrainer(concurrency_limit=1).train_and_eval(
             _corpus(), config, runtime=ConcurrentRuntime()
@@ -282,7 +282,7 @@ async def test_modal_runtime_failures_raise_clear_trainer_errors(result, message
     with pytest.raises(TrainerError, match=message) as excinfo:
         await ModalProxyTrainer().train_and_eval(
             _corpus(),
-            ProxyStudentConfig(trainer_backend="modal"),
+            ProxyStudentConfig(runtime_backend="modal"),
             runtime=runtime,
         )
 
@@ -297,7 +297,7 @@ def test_load_environment_uses_modal_config_and_gpu_mapping(monkeypatch):
     env = load_environment(
         use_real_trainer=True,
         proxy_student={
-            "trainer_backend": "modal",
+            "runtime_backend": "modal",
             "modal_gpu": "A100",
             "cpu_cores": 8,
             "memory_gb": 32,
@@ -328,7 +328,7 @@ def test_load_environment_requires_modal_credentials(monkeypatch):
     with pytest.raises(ValueError, match="MODAL_TOKEN_ID, MODAL_TOKEN_SECRET"):
         load_environment(
             use_real_trainer=True,
-            proxy_student={"trainer_backend": "modal"},
+            proxy_student={"runtime_backend": "modal"},
         )
 
 
@@ -338,7 +338,7 @@ def test_native_modal_tasks_declare_runtime_requirements_and_deadline():
             id="pretrain-data-curator",
             use_real_trainer=True,
             proxy_student={
-                "trainer_backend": "modal",
+                "runtime_backend": "modal",
                 "docker_image": "registry.example/curator:gpu",
                 "modal_gpu": "H200",
                 "timeout_minutes": 45,
@@ -358,7 +358,7 @@ def test_native_modal_tasks_declare_runtime_requirements_and_deadline():
 
 def test_modal_timeout_cannot_exceed_runtime_lifetime():
     with pytest.raises(ValidationError, match="Modal 24h sandbox maximum"):
-        ProxyStudentConfig(trainer_backend="modal", timeout_minutes=1441)
+        ProxyStudentConfig(runtime_backend="modal", timeout_minutes=1441)
 
 
 @pytest.mark.asyncio
@@ -367,11 +367,11 @@ async def test_taskset_setup_rejects_modal_trainer_on_other_runtime():
         CuratorTasksetConfig(
             id="pretrain-data-curator",
             use_real_trainer=True,
-            proxy_student={"trainer_backend": "modal"},
+            proxy_student={"runtime_backend": "modal"},
         )
     )
 
-    with pytest.raises(TrainerError, match="--harness.runtime.type modal"):
+    with pytest.raises(TrainerError, match="Docker or Modal harness runtime"):
         await taskset.setup(
             taskset.load_tasks()[0],
             FakeRuntime(runtime_type="subprocess"),

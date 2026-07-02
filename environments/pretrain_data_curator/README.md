@@ -11,7 +11,7 @@ constant**, combined with cross-entropy performance, cost, and leakage terms.
 - **Type**: toolless native verifiers v1 `CuratorTaskset` (`vf.Taskset`) — the agent discovers datasets using the `hf` CLI in its own shell, installing it defensively when the runtime image omits it; no MCP tool server is exposed
 - **External service**: Hugging Face Hub API (search + streaming sampling)
 - **Required secret**: `HF_TOKEN` by default (checked lazily in the env-server, not at load time)
-- **Proxy-student training**: optional GPU training, off by default; selectable Prime GPU sandbox, a co-located harness-runtime Docker backend, **or Modal** (recommended for Hosted Training)
+- **Proxy-student training**: optional GPU training, off by default; selectable co-located harness-runtime Docker backend **or Modal** (recommended for Hosted Training)
 
 The agent searches Hugging Face for datasets at or before a cutoff date,
 inspects them, assembles a weighted and filtered **manifest** `M`, previews
@@ -49,26 +49,27 @@ external/infrastructure failure (a flaky Hub or sandbox). See
   validation set and is unaffected by `validation_set`.
 - **Real proxy-student training** (`use_real_trainer=true`): the path that yields a
   **meaningful** `Perf`. It actually trains a fixed small GPT (config in
-  `ProxyStudentConfig`), GPT-2-BPE-tokenized, in a Prime GPU sandbox on the
-  materialized corpus and scores it against a **fixed held-out validation token
-  stream** — by default the **NanoGPT speedrun** set (FineWeb `sample-10BT` GPT-2
-  val tokens, `kjj0/fineweb10B-gpt2`, the first `10_485_760` tokens), reporting
-  cross-entropy in nats/token, next-token accuracy, and FLOPs (see
-  `ValidationSetConfig` / `validation_set`). Only the training corpus varies
-  between rollouts. Its lifecycle is hardened (per-step timeouts, exit-code
-  checks, stderr-tail preservation) and `prime_sandboxes` is an optional extra
-  (`sandbox`) imported only on this path.
+  `ProxyStudentConfig`), GPT-2-BPE-tokenized, in the live Docker or Modal harness
+  runtime hosting the rollout, on the materialized corpus, and scores it against
+  a **fixed held-out validation token stream** — by default the **NanoGPT
+  speedrun** set (FineWeb `sample-10BT` GPT-2 val tokens, `kjj0/fineweb10B-gpt2`,
+  the first `10_485_760` tokens), reporting cross-entropy in nats/token,
+  next-token accuracy, and FLOPs (see `ValidationSetConfig` / `validation_set`).
+  Only the training corpus varies between rollouts. Its lifecycle is hardened
+  (per-step timeouts, exit-code checks, stderr-tail preservation).
 
 Measured/estimated training FLOPs are charged back onto the cost ledger.
 
-#### Real-trainer backends: Prime, Docker, and Modal
+#### Real-trainer backends: Docker and Modal
 
-When `use_real_trainer=true`, proxy training uses one of three **selectable**
-backends, chosen by `proxy_student.trainer_backend`:
+When `use_real_trainer=true`, proxy training uses one of two **selectable**
+backends, chosen by `proxy_student.runtime_backend` (required — no default).
+This field is a static, pre-runtime hint only: it shapes the harness runtime and
+task declarations built before any rollout exists. Which trainer actually runs
+is decided entirely by the live harness runtime's type at score time, via a
+`RuntimeSelectedTrainer` dispatcher — so `runtime_backend` and the harness
+runtime you actually configure must agree.
 
-- **`prime`** (default): provisions a Prime GPU sandbox via `prime_sandboxes`.
-  GPU-request guards (`vm=true`, a non-empty `gpu_type`) and the Prime 24h
-  timeout ceiling apply.
 - **`docker`**: declares a GPU-capable v1 `DockerConfig` on the bash harness.
   Dataset discovery, the agent loop, finalization, and proxy-student scoring all
   use the same rollout-owned container on a Docker daemon co-located with the
@@ -82,9 +83,9 @@ backends, chosen by `proxy_student.trainer_backend`:
   to choose the GPU type. Because the GPU sandbox now hosts the full rollout,
   Modal billing covers discovery through scoring, not only the training phase.
 
-The Docker backend lifts the Prime-specific config rules: `vm` and `gpu_type` are
-ignored (Docker maps `gpu_count` → `--gpus <count>`), so `vm=false` is allowed,
-and the 24h timeout ceiling is relaxed (a self-hosted host has no such cap). The
+Docker maps `gpu_count` → `--gpus <count>`; there is no VM-mode or named-GPU-type
+config to satisfy for either real-trainer backend, and Docker has no 24h timeout
+ceiling (a self-hosted host has no such cap — only Modal enforces one). The
 single runtime image must ship both sets of dependencies: bash plus the `hf`
 dataset-discovery CLI, and Python plus CUDA PyTorch for training. The included
 [`Dockerfile.runtime`](Dockerfile.runtime) derives such an image from the
@@ -113,7 +114,7 @@ uv run eval pretrain-data-curator \
   --taskset.token-budget 500000 \
   --taskset.max-turns 12 \
   --taskset.proxy-student \
-    '{"trainer_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":5000000,"gpu_count":1}' \
+    '{"runtime_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":5000000,"gpu_count":1}' \
   -m nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 -n 1 -r 1
 ```
 
@@ -190,19 +191,18 @@ prime env install pretrain-data-curator -p ./environments
 prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1
 ```
 
-Enable real GPU proxy-student training (requires Prime Sandboxes access). The
-GPU request defaults are already valid (`gpu_count=1`, `gpu_type="H100"`,
-`vm=true`), so a bare `use_real_trainer` works; override `gpu_type` for H200 and
-`train_token_budget` to scale the run (up to ~1e9 tokens):
+Enable real GPU proxy-student training via Modal (requires `MODAL_TOKEN_ID` /
+`MODAL_TOKEN_SECRET`; see [`docs/configuration.md`](docs/configuration.md) for
+the Docker alternative, which needs a local GPU host instead).
+`proxy_student.runtime_backend` is required (no default) whenever
+`use_real_trainer=true`; set `modal_gpu` to choose the GPU type (default
+`"L4"`; also `"H100"`, `"H200"`, `"A100"`) and `train_token_budget` to scale
+the run (up to ~1e9 tokens):
 
 ```bash
 prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"use_real_trainer": true, "max_turns": 64, "scan_limit": 200, "sample_docs_per_source": 50000, "proxy_student": {"train_token_budget": 400000000, "gpu_type": "H200"}}'
+  -a '{"use_real_trainer": true, "max_turns": 64, "scan_limit": 200, "sample_docs_per_source": 50000, "proxy_student": {"runtime_backend": "modal", "train_token_budget": 400000000, "modal_gpu": "H200"}}'
 ```
-
-The installed `prime_sandboxes` SDK validates `gpu_type` as a non-empty string,
-not an enum, so confirm the exact accepted value (`"H100"`, `"H200"`, etc.)
-against the user's Prime account before relying on a non-default GPU type.
 
 ## Required Environment Variables
 
@@ -232,7 +232,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `fetch_timeout_seconds` | float | `30.0` | Per-attempt timeout for external HF calls. |
 | `fetch_max_attempts` | int | `3` | Max attempts (retry/backoff) for transient HF failures. |
 | `use_real_trainer` | bool | `false` | Use the GPU sandbox proxy-student instead of the heuristic. |
-| `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, GPU request: `gpu_count`/`gpu_type`/`vm`, etc.). GPU defaults (`gpu_count=1`, `gpu_type="H100"`, `vm=true`) form a valid Prime request; `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `trainer_backend` (`"prime"` default / `"docker"` / `"modal"`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`) and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
+| `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, `gpu_count`, etc.). `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `runtime_backend` (`"docker"` / `"modal"`; required, no default, whenever `use_real_trainer=true`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`; also `"H100"`/`"H200"`/`"A100"`) and `gpu_count`, and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
 | `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set: FineWeb GPT-2 val tokens, first `10_485_760`). Real-trainer only. |
 | `eval_corpus` | list[str] | built-in | Held-out reference corpus for the leakage term. |
 
@@ -247,7 +247,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 - `corpus.py` — `CorpusBuilder` + `DocumentFilter` (materialize manifest into documents).
 - `leakage.py` — `LeakageDetector` (exact/fuzzy/semantic contamination).
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
-- `trainer.py` — `ProxyStudentTrainer` interface, heuristic + GPU-sandbox backends.
+- `trainer.py` — `ProxyStudentTrainer` interface, the heuristic backend, and `RuntimeSelectedTrainer` (dispatches to the docker/modal backend matching the live harness runtime's type).
 - `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
 - `docker_network.py` — `DockerHostReachability`: binds the host interception server to the WSL interface (instead of localhost) so containers started by Docker Desktop's WSL2 VM can reach it; a no-op outside WSL.
 - `modal_backend.py` — proxy-student execution on the rollout-owned v1 Modal runtime, including GPU mapping, training limits, timeout/cancellation teardown, and structured result parsing.

@@ -3,14 +3,33 @@
 `CorpusBuilder` turns a `Manifest` into concrete documents by sampling each
 source through the `DatasetSearchClient`, applying its filters, and honoring
 per-source sampling caps. `DocumentFilter` owns the supported filter kinds.
+
+Fetched-and-filtered document TEXT is streamed to per-rollout scratch files on
+disk as it is produced rather than accumulated in Python lists: `SourceCorpus`/
+`CuratedCorpus` hold file paths + lightweight counts (doc/token counts), not the
+text itself, so peak host memory for a rollout's corpus stays bounded to one
+source's transient fetch+filter pass instead of growing with every source and
+document fetched over the rollout's lifetime. See `rollout_state.RolloutStore
+.scratch_dir` for the backing directory and its cleanup, and `SourceCorpus
+.documents`/`CuratedCorpus.documents` for the (materializing, test/debug-only)
+convenience accessors -- production consumers (reward scoring, the proxy-student
+trainer, the docker/modal upload) use the streaming `iter_documents()`/
+`joined_text()` instead.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
+import shutil
+import tempfile
+import uuid
 import weakref
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .hf_access import (
@@ -26,72 +45,250 @@ from .models import FilterSpec, Manifest, Source
 from .rollout_state import CuratorState, RolloutStore
 
 
+def _write_jsonl(path: Path, docs: Iterable[str]) -> tuple[int, int]:
+    """Stream `docs` to `path` (one JSON-encoded string per line).
+
+    Returns `(doc_count, token_count)`, accumulated as each doc is written so
+    the caller never needs the full text again to know these counts.
+    """
+    doc_count = 0
+    token_count = 0
+    with path.open("w", encoding="utf-8") as fh:
+        for doc in docs:
+            fh.write(json.dumps(doc))
+            fh.write("\n")
+            doc_count += 1
+            token_count += estimate_tokens(doc)
+    return doc_count, token_count
+
+
+def _iter_jsonl(path: Path | None) -> Iterator[str]:
+    if path is None:
+        return
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            yield json.loads(line)
+
+
 @dataclass
 class SourceCorpus:
     dataset_id: str
     config: str | None
     weight: float
-    documents: list[str]
+    # The surviving (post-filter, post-sampling) documents, JSONL-encoded on
+    # disk; `None` when the source contributed no documents.
+    path: Path | None
+    doc_count: int = 0
+    tokens: int = 0
+
+    def iter_documents(self) -> Iterator[str]:
+        yield from _iter_jsonl(self.path)
 
     @property
-    def tokens(self) -> int:
-        return sum(estimate_tokens(doc) for doc in self.documents)
+    def documents(self) -> list[str]:
+        """Materializes every document into memory.
+
+        Convenience for small fixture corpora and tests; production consumers
+        (leakage scoring, the trainer, the docker/modal upload) must use
+        `iter_documents()` instead so peak memory does not scale with corpus
+        size.
+        """
+        return list(self.iter_documents())
+
+    @classmethod
+    def from_iter(
+        cls,
+        dataset_id: str,
+        config: str | None,
+        weight: float,
+        docs: Iterable[str],
+        *,
+        dest_dir: Path | None = None,
+    ) -> "SourceCorpus":
+        """Stream `docs` to a scratch file and return the resulting corpus.
+
+        `dest_dir` is normally a rollout's shared scratch directory (see
+        `RolloutStore.scratch_dir`), whose cleanup the caller owns. When
+        omitted (standalone/test construction), a private temp directory is
+        created and registered for best-effort cleanup via `weakref.finalize`
+        on the returned object.
+
+        The owned directory's creation, and the `weakref.finalize`
+        registration that guards its eventual cleanup, are BOTH inside the
+        `try`/`except` below (not just the write in between): if `mkdtemp`,
+        `_write_jsonl`, or even `weakref.finalize` itself raises before this
+        function returns, there would otherwise be nothing left to ever clean
+        the directory up -- so a raise anywhere in this block removes it
+        synchronously instead of leaking it.
+        """
+        owned_dir: Path | None = None
+        try:
+            directory = dest_dir
+            if directory is None:
+                owned_dir = Path(tempfile.mkdtemp(prefix="pdc_src_"))
+                directory = owned_dir
+            path = directory / f"src_{uuid.uuid4().hex}.jsonl"
+            doc_count, tokens = _write_jsonl(path, docs)
+            if doc_count == 0:
+                path.unlink(missing_ok=True)
+                path = None
+            source = cls(dataset_id, config, weight, path, doc_count, tokens)
+            if owned_dir is not None:
+                weakref.finalize(source, shutil.rmtree, str(owned_dir), ignore_errors=True)
+        except BaseException:
+            if owned_dir is not None:
+                shutil.rmtree(owned_dir, ignore_errors=True)
+            raise
+        return source
 
 
 @dataclass
 class CuratedCorpus:
     sources: list[SourceCorpus]
+    # Owned scratch directory (only set by `CorpusBuilder.build`'s standalone,
+    # state-free path); `materialize`'s rollout-scoped corpora leave this `None`
+    # and rely on `RolloutStore.cleanup` instead. See `cleanup`.
+    _owned_dir: Path | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._owned_dir is not None:
+            weakref.finalize(self, shutil.rmtree, str(self._owned_dir), ignore_errors=True)
+
+    def iter_documents(self) -> Iterator[str]:
+        for source in self.sources:
+            yield from source.iter_documents()
 
     @property
     def documents(self) -> list[str]:
-        return [doc for source in self.sources for doc in source.documents]
+        """Materializes every document across every source into memory.
+
+        Convenience for small fixture corpora and tests; production consumers
+        must use `iter_documents()`/`joined_text()` instead (see `SourceCorpus
+        .documents`).
+        """
+        return list(self.iter_documents())
 
     @property
     def total_tokens(self) -> int:
         return sum(source.tokens for source in self.sources)
 
     def is_empty(self) -> bool:
-        return all(not source.documents for source in self.sources)
+        return all(source.doc_count == 0 for source in self.sources)
+
+    def joined_text(self, cap: int) -> str:
+        """Streaming-truncated equivalent of ``"\\n\\n".join(all_docs)[:cap]``.
+
+        Reads documents off disk in order and stops as soon as the accumulated
+        length reaches `cap`, instead of joining the full (potentially huge)
+        corpus into one string first and slicing it -- so building the capped
+        upload blob costs at most ``O(cap)``, not ``O(total corpus size)``.
+        Byte-identical to the eager join+slice for the documents actually
+        consumed, since a slice's first `cap` characters never depend on what
+        comes after it in the joined string.
+        """
+        parts: list[str] = []
+        total = 0
+        first = True
+        for doc in self.iter_documents():
+            piece = doc if first else "\n\n" + doc
+            first = False
+            parts.append(piece)
+            total += len(piece)
+            if total >= cap:
+                break
+        return "".join(parts)[:cap]
+
+    def cleanup(self) -> None:
+        """Remove this corpus's own scratch directory, if it created one.
+
+        No-op for rollout-scoped corpora produced by `materialize` (those share
+        the rollout's scratch dir, cleaned up by `RolloutStore.cleanup`
+        instead). Safe to call more than once.
+        """
+        if self._owned_dir is not None:
+            shutil.rmtree(self._owned_dir, ignore_errors=True)
+            self._owned_dir = None
+
+
+def _iter_sampling(
+    docs: Iterable[str], source: Source, weight_target: int | None
+) -> Iterator[str]:
+    """Streaming equivalent of the old list-based `_apply_sampling`.
+
+    Applies `Sampling.max_docs` (stop after N documents) and the effective
+    token cap (`weight_target`, tightened by `Sampling.max_tokens` if set; stop
+    at the first document that would exceed the remaining budget) in the same
+    order/semantics as before, but as an early-stopping generator over
+    `docs` -- so a caller consuming this can also stop pulling from upstream
+    (the filter pipeline, ultimately the raw fetched list) as soon as the caps
+    are hit, rather than filtering/sampling documents that would be discarded
+    anyway.
+    """
+    max_docs = source.sampling.max_docs
+    token_cap = weight_target
+    if source.sampling.max_tokens is not None:
+        token_cap = (
+            min(token_cap, source.sampling.max_tokens)
+            if token_cap is not None
+            else source.sampling.max_tokens
+        )
+    budget = token_cap
+    count = 0
+    for doc in docs:
+        if max_docs is not None and count >= max_docs:
+            break
+        if token_cap is not None:
+            cost = estimate_tokens(doc)
+            if cost > budget:
+                break
+            budget -= cost
+        yield doc
+        count += 1
 
 
 class DocumentFilter:
-    """Applies an ordered list of `FilterSpec` to a list of documents."""
+    """Applies an ordered list of `FilterSpec` to a stream of documents."""
 
     def apply(self, docs: list[str], filters: list[FilterSpec]) -> list[str]:
-        result = list(docs)
-        for spec in filters:
-            result = self._apply_one(result, spec)
-        return result
+        return list(self.apply_iter(docs, filters))
 
-    def _apply_one(self, docs: list[str], spec: FilterSpec) -> list[str]:
+    def apply_iter(
+        self, docs: Iterable[str], filters: list[FilterSpec]
+    ) -> Iterator[str]:
+        stream: Iterable[str] = docs
+        for spec in filters:
+            stream = self._apply_one_iter(stream, spec)
+        return iter(stream)
+
+    def _apply_one_iter(self, docs: Iterable[str], spec: FilterSpec) -> Iterator[str]:
         kind = spec.kind
         params = spec.params
         if kind == "min_chars":
             threshold = int(params.get("value", 0))
-            return [d for d in docs if len(d) >= threshold]
+            return (d for d in docs if len(d) >= threshold)
         if kind == "max_chars":
             threshold = int(params.get("value", 10**9))
-            return [d for d in docs if len(d) <= threshold]
+            return (d for d in docs if len(d) <= threshold)
         if kind == "min_tokens":
             threshold = int(params.get("value", 0))
-            return [d for d in docs if estimate_tokens(d) >= threshold]
+            return (d for d in docs if estimate_tokens(d) >= threshold)
         if kind == "max_symbol_ratio":
             threshold = float(params.get("value", 1.0))
-            return [d for d in docs if _symbol_ratio(d) <= threshold]
+            return (d for d in docs if _symbol_ratio(d) <= threshold)
         if kind == "min_alpha_ratio":
             threshold = float(params.get("value", 0.0))
-            return [d for d in docs if _alpha_ratio(d) >= threshold]
+            return (d for d in docs if _alpha_ratio(d) >= threshold)
         if kind == "drop_regex":
             pattern = re.compile(str(params.get("pattern", "")))
-            return [d for d in docs if not pattern.search(d)]
+            return (d for d in docs if not pattern.search(d))
         if kind == "keep_regex":
             pattern = re.compile(str(params.get("pattern", "")))
-            return [d for d in docs if pattern.search(d)]
+            return (d for d in docs if pattern.search(d))
         if kind == "dedup_exact":
-            return _dedup_exact(docs)
+            return _dedup_exact_iter(docs)
         # Unknown filter kinds are ignored rather than raising, so an agent's
         # experimentation never hard-fails the rollout.
-        return docs
+        return iter(docs)
 
 
 def _symbol_ratio(text: str) -> float:
@@ -107,16 +304,22 @@ def _alpha_ratio(text: str) -> float:
     return sum(1 for c in text if c.isalpha()) / len(text)
 
 
-def _dedup_exact(docs: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
+def _dedup_exact_iter(docs: Iterable[str]) -> Iterator[str]:
+    """Streaming `dedup_exact`: a running set of fixed-size digests, not the
+    full document list (nor the full stripped text -- a `set[str]` of
+    stripped documents would itself be a second complete copy of every
+    surviving document's text), is all that is needed to detect duplicates.
+    Collision probability at SHA-256 is astronomically below any realistic
+    corpus size, so this is exact in practice, matching the previous
+    full-text-equality semantics.
+    """
+    seen: set[bytes] = set()
     for doc in docs:
-        key = doc.strip()
-        if key in seen:
+        digest = hashlib.sha256(doc.strip().encode("utf-8")).digest()
+        if digest in seen:
             continue
-        seen.add(key)
-        result.append(doc)
-    return result
+        seen.add(digest)
+        yield doc
 
 
 def _weight_token_target(
@@ -172,6 +375,10 @@ class CorpusBuilder:
         ] = weakref.WeakKeyDictionary()
 
     def source_key(self, source: Source) -> FetchKey:
+        # Currently unused (dead) -- materialize() builds its own FetchKey inline
+        # so it can honor a per-rollout Manifest.sample_docs_per_source override;
+        # this always uses the builder's static default and is NOT override-aware.
+        # If a future caller adopts this, thread the effective cap through first.
         return FetchKey(
             dataset_id=source.dataset_id,
             config=source.config,
@@ -257,16 +464,30 @@ class CorpusBuilder:
             self._discard_fetch_lock(lock_key)
 
     async def materialize(self, manifest: Manifest, state: CuratorState) -> CuratedCorpus:
-        """Cache-aware async corpus build; the single materialization per rollout."""
+        """Cache-aware async corpus build; the single materialization per rollout.
+
+        Each source's surviving (filtered + sampled) documents are streamed
+        straight to a file under the rollout's shared scratch directory (see
+        `RolloutStore.scratch_dir`) as they are produced, instead of being
+        accumulated into a Python list kept alive for the corpus's lifetime --
+        so peak memory is bounded by one source's fetch, not by the sum of every
+        source's docs across the whole rollout.
+        """
         sources: list[SourceCorpus] = []
         total_weight = sum(s.weight for s in manifest.sources)
+        # The agent's manifest may request its own per-rollout fetch cap (bounded
+        # 1-100_000 by `Manifest.sample_docs_per_source`); it wins over the
+        # human-configured default when set. `n` (derived from this cap) feeds
+        # directly into `FetchKey.n` below, so two calls that land on different
+        # *effective fetch counts* get distinct cache entries; two different caps
+        # that happen to estimate the same `n` (e.g. both are well above a small
+        # weight-derived token target) correctly share one cache entry, since the
+        # underlying fetch parameters are then identical.
+        cap = manifest.sample_docs_per_source or self._sample_docs_per_source
+        dest_dir = RolloutStore.scratch_dir(state)
         for source in manifest.sources:
             weight_target = _weight_token_target(source, manifest.token_budget, total_weight)
-            n = (
-                _est_fetch_docs(weight_target, self._sample_docs_per_source)
-                if weight_target is not None
-                else self._sample_docs_per_source
-            )
+            n = _est_fetch_docs(weight_target, cap) if weight_target is not None else cap
             key = FetchKey(
                 dataset_id=source.dataset_id,
                 config=source.config,
@@ -275,37 +496,55 @@ class CorpusBuilder:
                 n=n,
             )
             raw, _error = await self.fetch_source_docs(state, key)
-            filtered = self._filter.apply(raw, source.filters)
-            documents = self._apply_sampling(filtered, source, weight_target)
+            filtered = self._filter.apply_iter(raw, source.filters)
+            sampled = _iter_sampling(filtered, source, weight_target)
             sources.append(
-                SourceCorpus(
-                    dataset_id=source.dataset_id,
-                    config=source.config,
-                    weight=source.weight,
-                    documents=documents,
+                SourceCorpus.from_iter(
+                    source.dataset_id,
+                    source.config,
+                    source.weight,
+                    sampled,
+                    dest_dir=dest_dir,
                 )
             )
         return CuratedCorpus(sources=sources)
 
     def build(self, manifest: Manifest) -> CuratedCorpus:
-        """Synchronous, cache-free build (direct client access; testing/fallback)."""
+        """Synchronous, cache-free build (direct client access; testing/fallback).
+
+        Not used by real scoring (``CuratorScorer.compute_scoring`` calls the
+        async ``materialize`` exclusively), so it intentionally does NOT honor
+        ``manifest.sample_docs_per_source`` -- that override is async-materialize-
+        only for now. Wire it through here too if this path ever becomes reachable
+        from scoring.
+
+        Has no rollout `state` to hang a scratch directory off of, so the
+        returned `CuratedCorpus` owns a private one (cleaned up via its
+        `cleanup()`, or best-effort via `weakref.finalize` once unreferenced).
+        The directory's creation itself is inside the `try`/`except` below
+        (not just the loop that follows it): if `mkdtemp` itself or any
+        source's fetch/write raises -- before a `CuratedCorpus` (and thus its
+        `weakref.finalize` registration) exists -- there would otherwise be
+        nothing left to ever clean it up.
+        """
         sources: list[SourceCorpus] = []
         total_weight = sum(s.weight for s in manifest.sources)
-        for source in manifest.sources:
-            documents = self._materialize_source(source, manifest.token_budget, total_weight)
-            sources.append(
-                SourceCorpus(
-                    dataset_id=source.dataset_id,
-                    config=source.config,
-                    weight=source.weight,
-                    documents=documents,
+        owned_dir: Path | None = None
+        try:
+            owned_dir = Path(tempfile.mkdtemp(prefix="pdc_build_"))
+            for source in manifest.sources:
+                sources.append(
+                    self._materialize_source(source, manifest.token_budget, total_weight, owned_dir)
                 )
-            )
-        return CuratedCorpus(sources=sources)
+            return CuratedCorpus(sources=sources, _owned_dir=owned_dir)
+        except BaseException:
+            if owned_dir is not None:
+                shutil.rmtree(owned_dir, ignore_errors=True)
+            raise
 
     def _materialize_source(
-        self, source: Source, token_budget: int, total_weight: float
-    ) -> list[str]:
+        self, source: Source, token_budget: int, total_weight: float, dest_dir: Path
+    ) -> SourceCorpus:
         weight_target = _weight_token_target(source, token_budget, total_weight)
         n = (
             _est_fetch_docs(weight_target, self._sample_docs_per_source)
@@ -319,31 +558,8 @@ class CorpusBuilder:
             source.text_field,
             n,
         )
-        filtered = self._filter.apply(raw, source.filters)
-        return self._apply_sampling(filtered, source, weight_target)
-
-    def _apply_sampling(
-        self, docs: list[str], source: Source, weight_target: int | None = None
-    ) -> list[str]:
-        capped = docs
-        if source.sampling.max_docs is not None:
-            capped = capped[: source.sampling.max_docs]
-        # Effective token cap: weight-derived target, tightened by explicit cap if set.
-        token_cap = weight_target
-        if source.sampling.max_tokens is not None:
-            token_cap = (
-                min(token_cap, source.sampling.max_tokens)
-                if token_cap is not None
-                else source.sampling.max_tokens
-            )
-        if token_cap is not None:
-            limited: list[str] = []
-            budget = token_cap
-            for doc in capped:
-                cost = estimate_tokens(doc)
-                if cost > budget:
-                    break
-                limited.append(doc)
-                budget -= cost
-            capped = limited
-        return capped
+        filtered = self._filter.apply_iter(raw, source.filters)
+        sampled = _iter_sampling(filtered, source, weight_target)
+        return SourceCorpus.from_iter(
+            source.dataset_id, source.config, source.weight, sampled, dest_dir=dest_dir
+        )

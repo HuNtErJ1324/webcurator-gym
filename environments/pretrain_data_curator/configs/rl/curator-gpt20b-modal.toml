@@ -29,8 +29,7 @@ args.max_concurrent_fetches    = 16
 args.fetch_timeout_seconds     = 120.0
 args.fetch_max_attempts        = 5
 
-args.proxy_student.trainer_backend        = "modal"
+args.proxy_student.runtime_backend        = "modal"
 args.proxy_student.modal_gpu              = "H100"
 args.proxy_student.train_token_budget     = 400_000_000
-args.proxy_student.create_timeout_seconds = 600.0
 args.proxy_student.upload_timeout_seconds = 1800.0

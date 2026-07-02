@@ -23,7 +23,7 @@ args.token_budget              = 500_000
 args.candidate_limit           = 8
 args.scan_limit                = 10
 
-args.proxy_student.trainer_backend    = "modal"
+args.proxy_student.runtime_backend    = "modal"
 args.proxy_student.modal_gpu          = "L4"
 # Keep hosted smoke cheap while forcing a positive student-training schedule.
 args.proxy_student.train_token_budget = 40_000

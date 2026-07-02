@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -96,20 +97,32 @@ class LeakageDetector:
         ) if eval_docs else np.empty((0, num_perm), dtype=np.uint64)
         self._trigram_index, self._eval_vectors = self._build_vectors(eval_docs)
 
-    def score(self, docs: list[str]) -> LeakageScores:
-        if not docs:
+    def score(self, docs: Iterable[str]) -> LeakageScores:
+        """Score `docs` (any iterable, e.g. a streaming `CuratedCorpus.iter_documents()`)
+        against the eval set in a SINGLE pass, so a one-shot generator works: each of
+        the three signals is independent per-document, so exact/fuzzy/semantic hits are
+        all tallied together against a running document count, rather than requiring
+        three separate passes over (and thus a fully materialized) document list.
+        """
+        has_exact = bool(self._eval_hashes)
+        has_fuzzy = self._eval_minhashes.shape[0] > 0
+        has_semantic = self._eval_vectors.shape[0] > 0 and bool(self._trigram_index)
+        exact_hits = fuzzy_hits = semantic_hits = count = 0
+        for doc in docs:
+            count += 1
+            if has_exact and _doc_hash(doc) in self._eval_hashes:
+                exact_hits += 1
+            if has_fuzzy and self._is_fuzzy_hit(doc):
+                fuzzy_hits += 1
+            if has_semantic and self._is_semantic_hit(doc):
+                semantic_hits += 1
+        if count == 0:
             return LeakageScores(0.0, 0.0, 0.0, 0.0)
-        exact = self._exact_fraction(docs)
-        fuzzy = self._fuzzy_fraction(docs)
-        semantic = self._semantic_fraction(docs)
+        exact = exact_hits / count if has_exact else 0.0
+        fuzzy = fuzzy_hits / count if has_fuzzy else 0.0
+        semantic = semantic_hits / count if has_semantic else 0.0
         overall = max(exact, fuzzy, semantic)
         return LeakageScores(exact, fuzzy, semantic, overall)
-
-    def _exact_fraction(self, docs: list[str]) -> float:
-        if not self._eval_hashes:
-            return 0.0
-        hits = sum(1 for d in docs if _doc_hash(d) in self._eval_hashes)
-        return hits / len(docs)
 
     def _minhash(self, text: str) -> np.ndarray:
         shingles = _word_shingles(text, self._shingle_k)
@@ -120,16 +133,10 @@ class LeakageDetector:
         hashed = (self._a[:, None] * arr[None, :] + self._b[:, None]) % self._prime
         return hashed.min(axis=1)
 
-    def _fuzzy_fraction(self, docs: list[str]) -> float:
-        if self._eval_minhashes.shape[0] == 0:
-            return 0.0
-        hits = 0
-        for doc in docs:
-            sig = self._minhash(doc)
-            equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
-            if equal.max() >= self._fuzzy_threshold:
-                hits += 1
-        return hits / len(docs)
+    def _is_fuzzy_hit(self, doc: str) -> bool:
+        sig = self._minhash(doc)
+        equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
+        return bool(equal.max() >= self._fuzzy_threshold)
 
     def _build_vectors(
         self, docs: list[str]
@@ -147,18 +154,12 @@ class LeakageDetector:
         vectors = _l2_normalize(vectors)
         return index, vectors
 
-    def _semantic_fraction(self, docs: list[str]) -> float:
-        if self._eval_vectors.shape[0] == 0 or not self._trigram_index:
-            return 0.0
-        hits = 0
-        for doc in docs:
-            vec = self._vectorize(doc)
-            if vec is None:
-                continue
-            sims = self._eval_vectors @ vec
-            if sims.size and sims.max() >= self._semantic_threshold:
-                hits += 1
-        return hits / len(docs)
+    def _is_semantic_hit(self, doc: str) -> bool:
+        vec = self._vectorize(doc)
+        if vec is None:
+            return False
+        sims = self._eval_vectors @ vec
+        return bool(sims.size and sims.max() >= self._semantic_threshold)
 
     def _vectorize(self, doc: str) -> np.ndarray | None:
         vec = np.zeros(len(self._trigram_index), dtype=np.float64)

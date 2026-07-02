@@ -100,7 +100,12 @@ def load_environment(
     harness_runtime: vf.RuntimeConfig = vf.SubprocessConfig()
     timeout = vf.TimeoutConfig()
     ps = ProxyStudentConfig(**config.proxy_student)
-    if use_real_trainer and ps.trainer_backend == "docker":
+    if use_real_trainer and ps.runtime_backend is None:
+        raise ValueError(
+            "use_real_trainer=True requires proxy_student.runtime_backend to be "
+            "'docker' or 'modal' (Prime sandboxes are no longer supported)"
+        )
+    if use_real_trainer and ps.runtime_backend == "docker":
         if ps.docker_host is not None:
             raise ValueError(
                 "proxy_student.docker_host is not supported by the shared harness "
@@ -124,7 +129,7 @@ def load_environment(
         # leakage computation. Keep the framework deadline above the trainer's
         # own multi-hour command deadline so the trainer can report/clean up.
         timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
-    elif use_real_trainer and ps.trainer_backend == "modal":
+    elif use_real_trainer and ps.runtime_backend == "modal":
         legacy_vf.ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
         # Intentionally do not set UV_REINSTALL_PACKAGE here. That workaround
         # originated when the Docker trainer's bash harness ran on the env-server

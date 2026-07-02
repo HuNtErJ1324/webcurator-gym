@@ -1429,11 +1429,6 @@ dependencies = [
     { name = "verifiers" },
 ]
 
-[package.optional-dependencies]
-sandbox = [
-    { name = "prime-sandboxes" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -1446,12 +1441,10 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.24.0" },
     { name = "modal", specifier = ">=0.73" },
     { name = "numpy", specifier = ">=1.24.0" },
-    { name = "prime-sandboxes", marker = "extra == 'sandbox'" },
     { name = "renderers", specifier = "==0.1.8.dev49" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "verifiers", specifier = "==0.1.15.dev376" },
 ]
-provides-extras = ["sandbox"]
 
 [package.metadata.requires-dev]
 dev = [

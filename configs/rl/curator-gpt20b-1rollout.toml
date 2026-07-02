@@ -33,7 +33,7 @@ args.candidate_limit = 3
 args.scan_limit = 10
 
 # Modal GPU trainer — L4 is cheapest and sufficient for the 55M-param student
-args.proxy_student.trainer_backend = "modal"
+args.proxy_student.runtime_backend = "modal"
 args.proxy_student.modal_gpu = "L4"
 # Keep hosted smoke cheap while forcing a positive student-training schedule.
 args.proxy_student.train_token_budget = 40_000

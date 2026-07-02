@@ -63,8 +63,12 @@ class CuratorScorer:
         # Token cost was already charged once per unique fetch in materialize.
         RolloutStore.set_ledger(state, ledger)
 
-        # Heavy CPU MinHash leakage work stays off the event loop.
-        leakage = await asyncio.to_thread(self.leakage_detector.score, corpus.documents)
+        # Heavy CPU MinHash leakage work stays off the event loop. `iter_documents()`
+        # streams from the on-disk corpus in a single pass rather than materializing
+        # the full corpus text (see `LeakageDetector.score`).
+        leakage = await asyncio.to_thread(
+            self.leakage_detector.score, corpus.iter_documents()
+        )
 
         return {
             "perf": self._perf(train_result),
@@ -74,7 +78,7 @@ class CuratorScorer:
             "accuracy": float(train_result.accuracy or 0.0),
             "flops": train_result.flops,
             "tokens": corpus.total_tokens,
-            "num_sources": len([s for s in corpus.sources if s.documents]),
+            "num_sources": len([s for s in corpus.sources if s.doc_count]),
             # Always-on baseline-relative diagnostics (zero-weight; never summed
             # into the reward). ``perf_vs_baseline`` is the relative val-loss
             # reduction over ``perf_baseline_loss`` -- a sharper, scale-anchored
@@ -96,11 +100,7 @@ class CuratorScorer:
         completes and scoring stays deterministic rather than crashing.
         """
         try:
-            if self.config.proxy_student.trainer_backend == "docker":
-                return await self.trainer.train_and_eval(
-                    corpus, self.config.proxy_student, runtime=runtime
-                )
-            if self.config.proxy_student.trainer_backend == "modal":
+            if self.config.use_real_trainer:
                 return await self.trainer.train_and_eval(
                     corpus, self.config.proxy_student, runtime=runtime
                 )
