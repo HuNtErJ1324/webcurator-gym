@@ -50,10 +50,6 @@ class CuratedCorpus:
     def total_tokens(self) -> int:
         return sum(source.tokens for source in self.sources)
 
-    def is_empty(self) -> bool:
-        return all(not source.documents for source in self.sources)
-
-
 class DocumentFilter:
     """Applies an ordered list of `FilterSpec` to a list of documents."""
 
@@ -139,13 +135,11 @@ def _est_fetch_docs(token_target: int, cap: int) -> int:
 class CorpusBuilder:
     """Builds a `CuratedCorpus` from a `Manifest` using a search client.
 
-    The async `materialize` path is the one used by the environment and reward:
-    it fetches each source's documents through a per-rollout deterministic cache
-    (so a preview and final scoring observe identical docs and cost is charged
-    exactly once), offloads the blocking fetch off the event loop, bounds
-    concurrency, and degrades a failed source to an empty slice (recording the
-    error in state) rather than raising. The synchronous `build` is retained for
-    direct, cache-free use (e.g. unit tests of filtering/sampling).
+    ``materialize`` fetches each source through a per-rollout deterministic
+    cache, offloads blocking Hub work from the event loop, bounds concurrency,
+    and degrades a failed source to an empty slice while recording the error.
+    Tests use this same path so filtering, sampling, billing, and cache behavior
+    cannot drift behind a separate synchronous implementation.
     """
 
     def __init__(
@@ -170,15 +164,6 @@ class CorpusBuilder:
         self._fetch_locks: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
         ] = weakref.WeakKeyDictionary()
-
-    def source_key(self, source: Source) -> FetchKey:
-        return FetchKey(
-            dataset_id=source.dataset_id,
-            config=source.config,
-            split=source.split,
-            text_field=source.text_field,
-            n=self._sample_docs_per_source,
-        )
 
     def _fetch_lock(self, lock_key: str) -> asyncio.Lock:
         """Loop-local single-flight lock for `lock_key`, created on demand."""
@@ -286,41 +271,6 @@ class CorpusBuilder:
                 )
             )
         return CuratedCorpus(sources=sources)
-
-    def build(self, manifest: Manifest) -> CuratedCorpus:
-        """Synchronous, cache-free build (direct client access; testing/fallback)."""
-        sources: list[SourceCorpus] = []
-        total_weight = sum(s.weight for s in manifest.sources)
-        for source in manifest.sources:
-            documents = self._materialize_source(source, manifest.token_budget, total_weight)
-            sources.append(
-                SourceCorpus(
-                    dataset_id=source.dataset_id,
-                    config=source.config,
-                    weight=source.weight,
-                    documents=documents,
-                )
-            )
-        return CuratedCorpus(sources=sources)
-
-    def _materialize_source(
-        self, source: Source, token_budget: int, total_weight: float
-    ) -> list[str]:
-        weight_target = _weight_token_target(source, token_budget, total_weight)
-        n = (
-            _est_fetch_docs(weight_target, self._sample_docs_per_source)
-            if weight_target is not None
-            else self._sample_docs_per_source
-        )
-        raw = self._client.sample_documents(
-            source.dataset_id,
-            source.config,
-            source.split,
-            source.text_field,
-            n,
-        )
-        filtered = self._filter.apply(raw, source.filters)
-        return self._apply_sampling(filtered, source, weight_target)
 
     def _apply_sampling(
         self, docs: list[str], source: Source, weight_target: int | None = None

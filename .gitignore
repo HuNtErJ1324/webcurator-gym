@@ -28,6 +28,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 /environments/*/docs/
+!/environments/pretrain_data_curator/docs/
+!/environments/pretrain_data_curator/docs/*.md
 /environments/pretrain_data_curator/scripts/
 /environments/nanogpt_speedrun/
 secrets.env

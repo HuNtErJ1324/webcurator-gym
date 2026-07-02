@@ -75,28 +75,11 @@ class Source(BaseModel):
     filters: list[FilterSpec] = Field(default_factory=list)
     sampling: Sampling = Field(default_factory=Sampling)
 
-    def key(self) -> tuple[str, str | None]:
-        return (self.dataset_id, self.config)
-
-
 class Manifest(BaseModel):
     """The agent's deliverable: a weighted, filtered mixture of sources."""
 
     token_budget: int = Field(default=1_000_000, gt=0)
     sources: list[Source] = Field(default_factory=list)
-
-    def upsert_source(self, source: Source) -> None:
-        for i, existing in enumerate(self.sources):
-            if existing.key() == source.key():
-                self.sources[i] = source
-                return
-        self.sources.append(source)
-
-    def remove_source(self, dataset_id: str, config: str | None = None) -> bool:
-        before = len(self.sources)
-        self.sources = [s for s in self.sources if s.key() != (dataset_id, config)]
-        return len(self.sources) < before
-
 
 class CostPrices(BaseModel):
     """Per-unit prices charged on the single cost ledger."""

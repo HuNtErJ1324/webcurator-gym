@@ -57,6 +57,8 @@ from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
+_MAX_DISCOVERY_OUTPUT_CHARS = 24_000
+
 SYSTEM_PROMPT = """IMPORTANT: Be extremely concise in every message. Your first response MUST be a bash command — no preamble, no plan, no explanation. Bootstrap the hf CLI if needed and immediately run a search in that same command. If you want to plan, do it in one sentence max, then immediately run a command.
 
 You are a pretraining-data curation agent. Your job is to assemble a dataset mixture that, when used to train a fixed small GPT-2-scale student (everything fixed but the data), maximizes the student's performance.
@@ -65,15 +67,16 @@ Domain context — target large-scale, diverse, high-quality text corpora for ge
 
 You have a normal bash shell. The Hugging Face `hf` CLI is the only tool you need, but some runtime images do not include it. Your FIRST command MUST defensively check and install it if missing, then continue directly to an `hf datasets ls` search in the SAME shell command (one turn total):
 
-`if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 10`
+`if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000`
 
 Do not spend turns diagnosing missing commands: do not try `huggingface-cli` or `python -m huggingface_hub`. The one conditional pip install above is the ONLY installation step allowed. After it, run the `hf` subcommands below directly in bash; do not write Python, create a virtualenv, import `huggingface_hub`/`datasets`, or install anything else. Use `hf` to discover and inspect candidates, then decide a weighted curation mixture. Only use Hugging Face datasets modified on or before the cutoff date.
 
 `hf` command cheat-sheet:
-  - Search datasets:   hf datasets ls --search "<query>" --sort downloads --limit 10
-  - Filter / quiet:    hf datasets ls --search "<query>" --filter text --limit 20 -q
-  - JSON output:        hf datasets ls --search "<query>" --format json --expand downloads,likes,lastModified,tags
-  - Inspect a dataset: hf datasets info <dataset_id> --expand downloads,likes,tags
+  - Search datasets:   hf datasets ls --search "<query>" --sort downloads --limit 5 | head -c 6000
+  - Filter / quiet:    hf datasets ls --search "<query>" --filter text --limit 10 -q | head -c 6000
+  - JSON output:        hf datasets ls --search "<query>" --limit 5 --format json --expand downloads,likes,lastModified | head -c 6000
+  - Inspect a dataset: hf datasets info <dataset_id> --expand downloads,likes,tags | head -c 6000
+Every `hf` command MUST end with `| head -c 6000`. Never request `tags` from `datasets ls`: multilingual repositories can return tens of thousands of tag characters and overflow your model context. Request tags only when inspecting one shortlisted dataset.
 Inspect a few candidates, prefer well-downloaded, clearly-licensed text datasets, and check each was last modified on or before the cutoff date.
 
 You are billed for live discovery: each search and each inspect/download call adds to the cost penalty, so be economical. Your reward is derived from proxy-student held-out cross-entropy loss, with penalties for cost and for leakage/contamination against a held-out evaluation set.
@@ -591,7 +594,9 @@ class CuratorTaskset(_TasksetBase):
         commit_by = max(1, max_turns - max(3, max_turns // 8))
         return (
             f"{SYSTEM_PROMPT}\n\n"
-            f"You have {max_turns} turns total. Each bash tool call uses one turn. "
+            f"You have {max_turns} turns total (model turns). A response that invokes bash "
+            f"uses one model turn even if it contains multiple tool calls; every "
+            f"individual `hf` call is still billed, so run one command at a time. "
             f"A discovery round = one `hf datasets ls` call + one `hf datasets info` "
             f"call (2 turns). You MUST perform at most {discovery_rounds} discovery "
             f"rounds (<={discovery_calls} bash calls). After your final discovery "
@@ -644,6 +649,22 @@ class CuratorTaskset(_TasksetBase):
         """Cap the rollout at ``max_turns`` model turns (the harness also stops
         naturally once the model emits a final answer with no tool calls)."""
         return trace.num_turns >= self.curator.max_turns
+
+    @vf.stop
+    async def discovery_output_budget_reached(self, trace: vf.Trace) -> bool:
+        """Stop before oversized CLI results can overflow the model context.
+
+        Finalization can still recover a manifest from dataset ids observed in
+        the trace, so this degrades to a scored fallback instead of a provider
+        error that skips finalization and scoring entirely.
+        """
+        return (
+            sum(
+                len(_content_text(getattr(message, "content", "")))
+                for message in trace.tool_messages
+            )
+            >= _MAX_DISCOVERY_OUTPUT_CHARS
+        )
 
     # -- finalize (runs before scoring, while the runtime is live) -------------
 

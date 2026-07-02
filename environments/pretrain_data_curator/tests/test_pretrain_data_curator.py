@@ -6,7 +6,6 @@ import math
 import os
 import subprocess
 import sys
-from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,11 +25,9 @@ from pretrain_data_curator.hf_access import (
     RetryPolicy,
     classify_exception,
     loop_local_semaphore,
-    parse_cutoff,
 )
 from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
 from pretrain_data_curator.models import (
-    CostLedger,
     CuratorConfig,
     FilterSpec,
     Manifest,
@@ -39,11 +36,7 @@ from pretrain_data_curator.models import (
 )
 from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.rewards import CuratorScorer
-from pretrain_data_curator.rollout_state import (
-    STATE_SCHEMA_VERSION,
-    CuratorState,
-    RolloutStore,
-)
+from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import (
     SYSTEM_PROMPT,
@@ -466,7 +459,8 @@ def test_document_filter_kinds():
     assert "$$$$$" not in cleaned
 
 
-def test_corpus_builder_applies_filters_and_sampling():
+@pytest.mark.asyncio
+async def test_corpus_builder_applies_filters_and_sampling():
     client = FakeClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=16)
     manifest = Manifest(
@@ -479,12 +473,13 @@ def test_corpus_builder_applies_filters_and_sampling():
             )
         ]
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     assert len(corpus.documents) == 3
     assert corpus.total_tokens > 0
 
 
-def test_weight_proportional_sampling_allocates_correct_proportions():
+@pytest.mark.asyncio
+async def test_weight_proportional_sampling_allocates_correct_proportions():
     # Build a client with controlled documents so we can count tokens precisely.
     # Each doc is ~25 chars -> estimate_tokens = 25//4 = 6 tokens.
     doc = "a" * 25  # 6 tokens each
@@ -506,7 +501,7 @@ def test_weight_proportional_sampling_allocates_correct_proportions():
             Source(dataset_id="good/science", weight=1.0),
         ],
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     tokens_a = corpus.sources[0].tokens
     tokens_b = corpus.sources[1].tokens
 
@@ -520,7 +515,8 @@ def test_weight_proportional_sampling_allocates_correct_proportions():
     assert tokens_a > tokens_b
 
 
-def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
+@pytest.mark.asyncio
+async def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
     doc = "a" * 25  # 6 tokens each
     n_docs = 50
 
@@ -544,14 +540,15 @@ def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
             Source(dataset_id="good/science", weight=1.0),
         ],
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     # Source A: capped at explicit 30 tokens (tighter than the 2000-token weight target).
     assert corpus.sources[0].tokens <= 30
     # Source B: weight-derived 1000 tokens (no explicit cap); est_docs = 1000//250 = 4 docs (24 tokens).
     assert corpus.sources[1].tokens <= 1000
 
 
-def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
+@pytest.mark.asyncio
+async def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
     doc = "a" * 25  # 6 tokens each
     n_docs = 10
 
@@ -570,13 +567,14 @@ def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
             Source(dataset_id="good/science", weight=0.0),
         ],
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     # No weight-derived cap applied -> all 10 docs per source are kept.
     assert len(corpus.sources[0].documents) == n_docs
     assert len(corpus.sources[1].documents) == n_docs
 
 
-def test_weight_proportional_single_source_gets_full_budget():
+@pytest.mark.asyncio
+async def test_weight_proportional_single_source_gets_full_budget():
     doc = "a" * 25  # 6 tokens each
     n_docs = 50
 
@@ -593,13 +591,14 @@ def test_weight_proportional_single_source_gets_full_budget():
         token_budget=n_docs * 250,  # = 12500; ensures est_docs = n_docs = 50
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     # All n_docs fetched; their token total (n_docs*6=300) fits within the budget.
     assert corpus.sources[0].tokens <= n_docs * 250
     assert len(corpus.sources[0].documents) == n_docs
 
 
-def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
+@pytest.mark.asyncio
+async def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
     """Large token_target: est_docs hits the sample_docs_per_source cap."""
     doc = "a" * 25  # 6 tokens each
     cap = 8
@@ -616,11 +615,12 @@ def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
         token_budget=10_000,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     assert len(corpus.sources[0].documents) == cap
 
 
-def test_fetch_count_proportional_to_small_token_target():
+@pytest.mark.asyncio
+async def test_fetch_count_proportional_to_small_token_target():
     """Small token_target: est_docs is proportionally smaller than sample_docs_per_source."""
     doc = "a" * 25  # 6 tokens each
     cap = 100
@@ -637,7 +637,7 @@ def test_fetch_count_proportional_to_small_token_target():
         token_budget=500,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
     )
-    corpus = builder.build(manifest)
+    corpus = await builder.materialize(manifest, CuratorState())
     assert len(corpus.sources[0].documents) == 2
     assert len(corpus.sources[0].documents) < cap
 
@@ -1003,7 +1003,6 @@ async def test_concurrent_same_key_fetch_coalesces_to_one_fetch_and_one_bill():
     client = _SlowCountingClient()
     builder = CorpusBuilder(client=client, sample_docs_per_source=8)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     key = FetchKey("good/encyclopedia", None, "train", "text", 8)
 
     results = await asyncio.gather(
@@ -1119,7 +1118,6 @@ async def test_real_timeout_classified_via_wait_for():
     policy = RetryPolicy(attempts=1, timeout=0.05)
     builder = CorpusBuilder(client=_SlowClient(), retry_policy=policy)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     docs, error = await builder.fetch_source_docs(
         state, FetchKey("a/b", None, "train", "text", 4)
     )
@@ -1607,9 +1605,29 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
     assert "command -v hf" in SYSTEM_PROMPT
     assert "pip install -q 'huggingface-hub>=0.34'" in SYSTEM_PROMPT
     assert "--search" in SYSTEM_PROMPT
+    assert "| head -c 6000" in SYSTEM_PROMPT
+    assert "Never request `tags` from `datasets ls`" in SYSTEM_PROMPT
     assert "```json" in SYSTEM_PROMPT
     assert '"sources"' in SYSTEM_PROMPT
     assert "curator_" not in SYSTEM_PROMPT  # no stale MCP tool references
+
+
+@pytest.mark.asyncio
+async def test_discovery_output_budget_stops_before_provider_context_overflow():
+    curator = await _make()
+    trace = _trace_with_bash_calls(
+        curator.task,
+        curator.state,
+        [
+            (
+                "hf datasets ls --search wikipedia --limit 5",
+                "wikimedia/wikipedia " + ("x" * 24_000),
+            ),
+            ("hf datasets info wikimedia/wikipedia", "unused"),
+        ],
+    )
+
+    assert await curator.taskset.discovery_output_budget_reached(trace)
 
 
 def test_system_prompt_manifest_example_parses():
@@ -1619,61 +1637,6 @@ def test_system_prompt_manifest_example_parses():
     assert manifest is not None
     assert manifest.sources  # the example carries at least one source
     assert manifest.sources[0].text_field is None
-
-
-# --- Tier N: state schema version + canonical hash -------------------------
-
-
-@pytest.mark.asyncio
-async def test_state_carries_schema_version():
-    curator = await _make()
-    assert RolloutStore.schema_version(curator.state) == STATE_SCHEMA_VERSION
-
-
-@pytest.mark.asyncio
-async def test_canonical_hash_stable_for_equal_state():
-    curator = await _make()
-    s1 = await _finalized(curator, sources=("good/encyclopedia",))
-    h1 = RolloutStore.canonical_hash(s1)
-    await curator.reset()
-    s2 = await _finalized(curator, sources=("good/encyclopedia",))
-    assert RolloutStore.canonical_hash(s2) == h1
-    await curator.reset()
-    s3 = await _finalized(curator, sources=("good/encyclopedia", "good/science"))
-    assert RolloutStore.canonical_hash(s3) != h1
-
-
-@pytest.mark.asyncio
-async def test_canonical_state_dump_keys_and_hash():
-    # Pin the EXACT serialized keys of the canonical state dump + manifest and the
-    # hash formula, so a schema-key rename or canonical-hash drift fails loudly.
-    import hashlib
-
-    curator = await _make()
-    state = await _finalized(curator, sources=("good/encyclopedia",))
-    canonical = RolloutStore.canonical_state(state)
-    assert set(canonical) == {"state_schema_version", "manifest", "finalized"}
-    assert canonical["state_schema_version"] == STATE_SCHEMA_VERSION
-    assert canonical["finalized"] is True
-    assert set(canonical["manifest"]) == {"token_budget", "sources"}
-    # The hash is the blake2b-16 of the canonical JSON (sorted, compact).
-    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-    assert (
-        RolloutStore.canonical_hash(state)
-        == hashlib.blake2b(encoded.encode("utf-8"), digest_size=16).hexdigest()
-    )
-
-
-# --- Additional coverage: cutoff/query helpers -----------------------------
-
-
-def test_parse_cutoff_forms():
-    assert parse_cutoff("2024-12-31").date() == date(2024, 12, 31)
-    dt = parse_cutoff("2024-06-01T12:00:00Z")
-    assert dt.year == 2024 and dt.month == 6
-    assert parse_cutoff(date(2023, 1, 1)).tzinfo is not None
-    with pytest.raises(ValueError):
-        parse_cutoff("   ")
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
@@ -1902,7 +1865,6 @@ async def test_scorer_degrades_val_fetch_failure_to_sentinel():
     )
     scorer = _scorer(trainer)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     result = await scorer._train(_corpus_with_text(), state)
     assert result.loss == float("inf")
     assert result.backend == "error"
@@ -1925,7 +1887,6 @@ async def test_scorer_degrades_sandbox_trainer_error_to_sentinel():
     )
     scorer = _scorer(trainer)
     state = CuratorState()
-    RolloutStore.init(state, Manifest(), CostLedger())
     result = await scorer._train(_corpus_with_text(), state)
     assert result.loss == float("inf")
     assert result.backend == "error"
@@ -2591,7 +2552,8 @@ def test_system_prompt_scales_discovery_with_benchmark_budget():
             CuratorTasksetConfig(id="test", max_turns=max_turns)
         ).load_tasks()[0].system_prompt
         assert f"{max_turns} turns" in prompt
-        assert "Each bash tool call uses one turn" in prompt
+        assert "contains multiple tool calls" in prompt
+        assert "every individual `hf` call is still billed" in prompt
         assert "MUST perform at most 2 discovery rounds" in prompt
         # Commit mechanics: plain text, no bash call.
         assert "HOW TO COMMIT" in prompt

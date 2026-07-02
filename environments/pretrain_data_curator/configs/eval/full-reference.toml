@@ -11,14 +11,13 @@
 # real-GPU-trainer (Docker/Modal/Prime) examples.
 #
 # Run with:
-#   prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-#     --config configs/eval/full-reference.toml
+#   prime eval run configs/eval/full-reference.toml
 # or via the native v1 taskset command (see docs/configuration.md) for the
 # Docker/Modal harness-runtime paths, which this wrapper cannot select.
 
 [[eval]]
 name = "pretrain-data-curator-full-reference"
-env_id = "hunterj/pretrain-data-curator"
+env_id = "pretrain-data-curator"
 model = "openai/gpt-4.1-mini"
 num_examples = 4
 rollouts_per_example = 1
@@ -39,7 +38,7 @@ lambda_cost = 0.1
 lambda_leakage = 1.0
 
 # --- baseline-relative Perf ---------------------------------------------------
-perf_baseline_loss = 10.826993292286894  # ln(50304): uniform-vocab no-info CE constant
+perf_baseline_loss = 10.825839875788878  # ln(50304): uniform-vocab no-info CE constant
 baseline_relative_perf = true            # Perf reward = bounded relative loss reduction vs baseline;
                                           # false uses exp(-loss) directly (only meaningful for tiny/toy loss)
 

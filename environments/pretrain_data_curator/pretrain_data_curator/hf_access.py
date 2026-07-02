@@ -16,7 +16,6 @@ import logging
 import os
 import weakref
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
 from typing import Any, Callable, Protocol, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -257,9 +256,6 @@ class HuggingFaceDatasetClient:
                 "before the first Hub API use."
             )
 
-        from huggingface_hub import HfApi
-
-        self._api = HfApi(token=token)
         self._token = token
 
     def sample_documents(
@@ -359,25 +355,6 @@ class HuggingFaceDatasetClient:
             if config.endswith(".en") or config.startswith("en."):
                 return config
         return configs[0]
-
-
-def parse_cutoff(cutoff_date: str | date | datetime) -> datetime:
-    """Parse a cutoff into a UTC datetime; date-only values cover the whole day."""
-    if isinstance(cutoff_date, datetime):
-        parsed = cutoff_date
-    elif isinstance(cutoff_date, date):
-        parsed = datetime.combine(cutoff_date, time.max)
-    else:
-        raw = cutoff_date.strip()
-        if not raw:
-            raise ValueError("cutoff_date must not be empty")
-        if "T" in raw:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        else:
-            parsed = datetime.combine(date.fromisoformat(raw), time.max)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def estimate_tokens(text: str) -> int:
