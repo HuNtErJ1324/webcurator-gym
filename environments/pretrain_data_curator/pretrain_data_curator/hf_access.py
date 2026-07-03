@@ -24,14 +24,23 @@ T = TypeVar("T")
 
 # Error kinds that are deterministic facts about the request and must NOT be
 # retried (the answer will not change); everything else is treated as transient.
-PERMANENT_KINDS = frozenset({"missing", "auth", "bad_split", "bad_config", "bad_field"})
+PERMANENT_KINDS = frozenset(
+    {
+        "missing",
+        "auth",
+        "bad_split",
+        "bad_config",
+        "bad_field",
+        "script_dataset",
+    }
+)
 
 
 class DatasetAccessError(RuntimeError):
     """A classified, structured failure accessing the Hugging Face Hub.
 
     `kind` is one of: ``missing``, ``auth``, ``bad_split``, ``bad_config``,
-    ``bad_field``, ``network``, ``timeout``, ``unknown``.
+    ``bad_field``, ``script_dataset``, ``network``, ``timeout``, ``unknown``.
     """
 
     def __init__(
@@ -63,6 +72,8 @@ def classify_exception(exc: BaseException) -> str:
         return "timeout"
     name = type(exc).__name__
     msg = str(exc).lower()
+    if "dataset scripts are no longer supported" in msg:
+        return "script_dataset"
     if name in {
         "DatasetNotFoundError",
         "RepositoryNotFoundError",
@@ -262,7 +273,11 @@ class HuggingFaceDatasetClient:
     """Live Hugging Face Hub client (streaming document sampling)."""
 
     def __init__(
-        self, token: str | None = None, *, token_env: str = "HF_TOKEN"
+        self,
+        token: str | None = None,
+        *,
+        token_env: str = "HF_TOKEN",
+        allow_script_datasets: bool = False,
     ) -> None:
         token = token or os.environ.get(token_env)
         if not token:
@@ -273,6 +288,47 @@ class HuggingFaceDatasetClient:
             )
 
         self._token = token
+        self._allow_script_datasets = allow_script_datasets
+
+    def _is_script_dataset(self, dataset_id: str) -> bool:
+        """Check for the Hub convention ``{dataset_name}.py`` with one API call."""
+        from huggingface_hub import HfApi
+
+        dataset_name = dataset_id.rsplit("/", 1)[-1]
+        return HfApi(token=self._token).file_exists(
+            repo_id=dataset_id,
+            filename=f"{dataset_name}.py",
+            repo_type="dataset",
+        )
+
+    @staticmethod
+    def _supports_script_datasets(datasets_version: str) -> bool:
+        try:
+            return int(datasets_version.split(".", 1)[0]) < 3
+        except (TypeError, ValueError):
+            return False
+
+    def _reject_unsupported_script_dataset(
+        self, dataset_id: str, datasets_version: str
+    ) -> None:
+        if not self._allow_script_datasets:
+            raise DatasetAccessError(
+                f"{dataset_id} is a script-based Hugging Face dataset; remote "
+                "dataset code is disabled by allow_script_datasets=False. Set "
+                "allow_script_datasets=True only in a trusted container with a "
+                "datasets 2.x runtime.",
+                kind="script_dataset",
+                dataset_id=dataset_id,
+            )
+        if not self._supports_script_datasets(datasets_version):
+            raise DatasetAccessError(
+                f"{dataset_id} is a script-based Hugging Face dataset, but "
+                f"installed datasets=={datasets_version} cannot load dataset "
+                "scripts. Use a data-only export, or run with datasets 2.x and "
+                "allow_script_datasets=True.",
+                kind="script_dataset",
+                dataset_id=dataset_id,
+            )
 
     def sample_documents(
         self,
@@ -282,7 +338,13 @@ class HuggingFaceDatasetClient:
         text_field: str | None,
         n: int,
     ) -> list[str]:
+        import datasets
         from datasets import get_dataset_config_names, load_dataset
+
+        if self._is_script_dataset(dataset_id):
+            self._reject_unsupported_script_dataset(
+                dataset_id, datasets.__version__
+            )
 
         try:
             stream = load_dataset(

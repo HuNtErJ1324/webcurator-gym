@@ -471,6 +471,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     candidate_limit: int = 8
     scan_limit: int = 50
     sample_docs_per_source: int = 64
+    allow_script_datasets: bool = False
     max_turns: int = 12
     alpha_perf: float = 1.0
     lambda_cost: float = 0.1
@@ -528,6 +529,7 @@ class CuratorTaskset(_TasksetBase):
             candidate_limit=config.candidate_limit,
             scan_limit=config.scan_limit,
             sample_docs_per_source=config.sample_docs_per_source,
+            allow_script_datasets=config.allow_script_datasets,
             max_turns=config.max_turns,
             alpha_perf=config.alpha_perf,
             lambda_cost=config.lambda_cost,
@@ -558,7 +560,10 @@ class CuratorTaskset(_TasksetBase):
         if self._scorer is not None:
             return self._scorer
         if self._client is None:
-            self._client = HuggingFaceDatasetClient(token_env=self.config.hf_token_env)
+            self._client = HuggingFaceDatasetClient(
+                token_env=self.config.hf_token_env,
+                allow_script_datasets=self.curator.allow_script_datasets,
+            )
         if self._corpus_builder is None:
             self._corpus_builder = CorpusBuilder(
                 client=self._client,

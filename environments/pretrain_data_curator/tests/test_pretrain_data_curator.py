@@ -29,6 +29,7 @@ from pretrain_data_curator.hf_access import (
     RetryPolicy,
     classify_exception,
     loop_local_semaphore,
+    run_blocking_with_retry,
 )
 from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
 from pretrain_data_curator.models import (
@@ -251,6 +252,7 @@ def test_hf_client_accepts_explicit_token_without_environment(monkeypatch):
     client = HuggingFaceDatasetClient(token="test-token")
 
     assert client._token == "test-token"
+    assert client._allow_script_datasets is False
 
 
 def test_fetch_key_serializes_auto_text_field_stably():
@@ -274,8 +276,14 @@ def test_hf_client_auto_detects_text_columns_and_query_response(monkeypatch):
         "datasets.load_dataset",
         lambda *args, **kwargs: iter(rows),
     )
+    monkeypatch.setattr(
+        HuggingFaceDatasetClient,
+        "_is_script_dataset",
+        lambda self, dataset_id: False,
+    )
     client = object.__new__(HuggingFaceDatasetClient)
     client._token = "test-token"
+    client._allow_script_datasets = False
 
     assert client.sample_documents("owner/name", None, "train", None, 4) == [
         "content document",
@@ -305,8 +313,14 @@ def test_hf_client_resolves_missing_default_config_to_english(monkeypatch):
         "datasets.get_dataset_config_names",
         lambda dataset_id, token: ["20231101.ab", "20231101.en"],
     )
+    monkeypatch.setattr(
+        HuggingFaceDatasetClient,
+        "_is_script_dataset",
+        lambda self, dataset_id: False,
+    )
     client = object.__new__(HuggingFaceDatasetClient)
     client._token = "test-token"
+    client._allow_script_datasets = False
 
     assert client.sample_documents("wikimedia/wikipedia", None, "train", None, 1) == [
         "configured document"
@@ -372,6 +386,16 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.harness.config.id == "bash"
     assert env.harness.config.env == {}
     assert env.taskset.load_tasks()
+
+
+def test_load_environment_plumbs_allow_script_datasets(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+
+    env = load_environment(allow_script_datasets=True)
+
+    assert env.taskset.config.allow_script_datasets is True
+    assert env.taskset.curator.allow_script_datasets is True
+    assert env.env_args["allow_script_datasets"] is True
 
 
 def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
@@ -1320,6 +1344,12 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
         ),
         (lambda: KeyError("text_field"), "bad_field"),
         (lambda: PermissionError("401 Client Error: Unauthorized for url"), "auth"),
+        (
+            lambda: RuntimeError(
+                "Dataset scripts are no longer supported, but found legacy.py"
+            ),
+            "script_dataset",
+        ),
         (lambda: ConnectionError("Connection refused"), "network"),
         (lambda: TimeoutError("timed out"), "timeout"),
     ],
@@ -1382,7 +1412,125 @@ def test_classify_exception_kinds():
     assert classify_exception(KeyError("col")) == "bad_field"
     assert classify_exception(ConnectionError("boom")) == "network"
     assert classify_exception(TimeoutError("t")) == "timeout"
+    assert (
+        classify_exception(
+            RuntimeError(
+                "Dataset scripts are no longer supported, but found legacy.py"
+            )
+        )
+        == "script_dataset"
+    )
     assert classify_exception(RuntimeError("something weird")) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_script_dataset_runtime_error_is_permanent_without_retry():
+    calls = 0
+
+    def fail():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(
+            "Dataset scripts are no longer supported, but found legacy.py"
+        )
+
+    with pytest.raises(DatasetAccessError) as excinfo:
+        await run_blocking_with_retry(
+            fail,
+            policy=RetryPolicy(attempts=3, timeout=1.0),
+            semaphore=asyncio.Semaphore(1),
+            dataset_id="owner/legacy",
+        )
+
+    assert calls == 1
+    assert excinfo.value.kind == "script_dataset"
+
+
+def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
+    calls = []
+    load_calls = []
+
+    class FakeHfApi:
+        def __init__(self, *, token):
+            assert token == "test-token"
+
+        def file_exists(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
+    monkeypatch.setattr(
+        "datasets.load_dataset",
+        lambda *args, **kwargs: load_calls.append((args, kwargs)),
+    )
+    client = HuggingFaceDatasetClient(
+        token="test-token", allow_script_datasets=False
+    )
+
+    with pytest.raises(DatasetAccessError) as excinfo:
+        client.sample_documents("owner/legacy", None, "train", None, 1)
+
+    assert excinfo.value.kind == "script_dataset"
+    assert "allow_script_datasets=True" in str(excinfo.value)
+    assert calls == [
+        {
+            "repo_id": "owner/legacy",
+            "filename": "legacy.py",
+            "repo_type": "dataset",
+        }
+    ]
+    assert load_calls == []
+
+
+def test_script_dataset_probe_blocks_when_datasets_runtime_is_unsupported(
+    monkeypatch,
+):
+    class FakeHfApi:
+        def __init__(self, *, token):
+            pass
+
+        def file_exists(self, **kwargs):
+            return True
+
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
+    monkeypatch.setattr("datasets.__version__", "4.6.1")
+    client = HuggingFaceDatasetClient(
+        token="test-token", allow_script_datasets=True
+    )
+
+    with pytest.raises(DatasetAccessError) as excinfo:
+        client.sample_documents("owner/legacy", None, "train", None, 1)
+
+    assert excinfo.value.kind == "script_dataset"
+    assert "datasets==4.6.1" in str(excinfo.value)
+    assert "allow_script_datasets=True" in str(excinfo.value)
+
+
+def test_non_script_dataset_load_does_not_pass_trust_remote_code(monkeypatch):
+    class FakeHfApi:
+        def __init__(self, *, token):
+            pass
+
+        def file_exists(self, **kwargs):
+            return False
+
+    load_calls = []
+
+    def fake_load_dataset(dataset_id, **kwargs):
+        load_calls.append((dataset_id, kwargs))
+        return iter([{"text": "data-only document"}])
+
+    monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    client = HuggingFaceDatasetClient(
+        token="test-token", allow_script_datasets=False
+    )
+
+    assert client.sample_documents("owner/data", None, "train", None, 1) == [
+        "data-only document"
+    ]
+    assert len(load_calls) == 1
+    assert "trust_remote_code" not in load_calls[0][1]
 
 
 @pytest.mark.asyncio
