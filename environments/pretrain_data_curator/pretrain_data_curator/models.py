@@ -7,11 +7,16 @@ here so the manifest, cost ledger, and configuration have one strict home.
 from __future__ import annotations
 
 import math
+from pathlib import PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from .val_set import ValidationSetConfig
+
+_RESERVED_WORKSPACE_FILES = frozenset(
+    {"corpus.txt", "config.json", "train.py", "val.bin", ".vf_hf_cost.jsonl"}
+)
 
 # --- proxy-student budget / sandbox derivation constants -------------------
 # The real (sandbox) trainer's training length, corpus cap, and sandbox lifetime
@@ -56,15 +61,42 @@ class Sampling(BaseModel):
 
 
 class Source(BaseModel):
-    """One Hugging Face dataset slice contributing to the mixture."""
+    """One Hugging Face or runtime-local dataset slice in the mixture."""
 
     dataset_id: str
+    kind: Literal["hf", "local"] = "hf"
+    local_path: str | None = None
+    local_format: Literal["auto", "jsonl", "txt"] = "auto"
     config: str | None = None
     split: str = "train"
     text_field: str | None = None
     weight: float = Field(default=1.0, ge=0.0)
     filters: list[FilterSpec] = Field(default_factory=list)
     sampling: Sampling = Field(default_factory=Sampling)
+
+    @model_validator(mode="after")
+    def _check_local(self) -> "Source":
+        if self.kind != "local":
+            return self
+        if not self.local_path or not self.local_path.strip():
+            raise ValueError("local source requires a non-empty local_path")
+        path = PurePosixPath(self.local_path)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("local_path must be workspace-relative, no '..'")
+        if path.name in _RESERVED_WORKSPACE_FILES:
+            raise ValueError(
+                f"local_path may not reference reserved file {path.name!r}"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.kind == "hf":
+            data.pop("kind", None)
+            data.pop("local_path", None)
+            data.pop("local_format", None)
+        return data
 
 
 class Manifest(BaseModel):
@@ -332,6 +364,10 @@ class CuratorConfig(BaseModel):
     # Script datasets execute Python supplied by the dataset repository. Disabled
     # by default; datasets >=3 cannot execute scripts regardless of this setting.
     allow_script_datasets: bool = False
+    allow_local_sources: bool = True
+    max_local_source_bytes: int = Field(
+        default=33_554_432, ge=1, le=1_073_741_824
+    )
 
     # Reward coefficients: R = a1*CEPerf - l1*Cost - l2*Leakage
     alpha_perf: float = Field(default=1.0, ge=0.0)

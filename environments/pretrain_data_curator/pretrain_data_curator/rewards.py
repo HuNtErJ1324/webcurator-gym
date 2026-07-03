@@ -55,7 +55,9 @@ class CuratorScorer:
         if not finalized or not manifest.sources:
             return self._empty_scoring(state)
 
-        corpus = await self.corpus_builder.materialize(manifest, state)
+        corpus = await self.corpus_builder.materialize(
+            manifest, state, runtime=runtime
+        )
         train_result = await self._train(corpus, state, runtime)
 
         ledger = RolloutStore.ledger(state)

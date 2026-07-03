@@ -57,6 +57,10 @@ class CuratorState(vf.State):
     budget_fill_ratio: float = 0.0
     source_doc_counts: list[int] = Field(default_factory=list)
     source_token_counts: list[int] = Field(default_factory=list)
+    local_source_bytes: int = 0
+    local_source_count: int = 0
+    local_source_truncated: bool = False
+    val_set_access: bool = False
 
 
 class RolloutStore:
@@ -177,6 +181,35 @@ class RolloutStore:
     @classmethod
     def tool_error_count(cls, state: CuratorState) -> int:
         return sum(int(v) for v in state.tool_errors.values())
+
+    # ---- local-source provenance and validation-set access telemetry ---------
+    @classmethod
+    def add_local_source(
+        cls, state: CuratorState, *, bytes_pulled: int, truncated: bool
+    ) -> None:
+        state.local_source_count += 1
+        state.local_source_bytes += int(bytes_pulled)
+        state.local_source_truncated = state.local_source_truncated or bool(truncated)
+
+    @classmethod
+    def local_source_count(cls, state: CuratorState) -> int:
+        return int(state.local_source_count)
+
+    @classmethod
+    def local_source_bytes(cls, state: CuratorState) -> int:
+        return int(state.local_source_bytes)
+
+    @classmethod
+    def local_source_truncated(cls, state: CuratorState) -> bool:
+        return bool(state.local_source_truncated)
+
+    @classmethod
+    def set_val_set_access(cls, state: CuratorState, value: bool) -> None:
+        state.val_set_access = bool(value)
+
+    @classmethod
+    def val_set_access(cls, state: CuratorState) -> bool:
+        return bool(state.val_set_access)
 
     @classmethod
     def set_external_failure(cls, state: CuratorState, value: bool = True) -> None:
