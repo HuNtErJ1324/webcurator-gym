@@ -164,7 +164,8 @@ The scorer:
 
 Hub access uses per-attempt timeout, bounded exponential backoff, and classified
 `DatasetAccessError` values. Permanent errors such as authentication, missing
-datasets, invalid configs/splits, and bad fields are not retried.
+datasets, script-backed datasets that cannot be executed, invalid configs/splits,
+and bad fields are not retried.
 
 A source fetch failure becomes an empty source and records error telemetry. A
 trainer exception becomes an infinite-loss `TrainResult` with backend `error`.
