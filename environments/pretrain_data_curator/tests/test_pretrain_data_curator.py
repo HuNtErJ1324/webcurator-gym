@@ -18,7 +18,9 @@ from verifiers.v1.decorators import discover_decorated
 
 from pretrain_data_curator.corpus import (
     CorpusBuilder,
+    CuratedCorpus,
     DocumentFilter,
+    SourceCorpus,
     _iter_sampling,
 )
 from pretrain_data_curator.eval_corpus import DEFAULT_EVAL_CORPUS
@@ -32,6 +34,7 @@ from pretrain_data_curator.hf_access import (
     run_blocking_with_retry,
 )
 from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
+from pretrain_data_curator.leakage_reference import LeakageReferenceLoader
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
@@ -61,6 +64,7 @@ from pretrain_data_curator.val_set import (
     NANOGPT_VAL_DATASET_ID,
     NANOGPT_VAL_FILENAME,
     NANOGPT_VAL_TOKENS,
+    HeldOutValSet,
     SHARD_HEADER_INTS,
     SHARD_MAGIC,
     SHARD_VERSION,
@@ -1924,6 +1928,155 @@ async def test_val_loader_fetch_failure_raises_typed_error(tmp_path):
     with pytest.raises(DatasetAccessError) as excinfo:
         await loader.load()
     assert excinfo.value.kind == "network"
+
+
+def _word_decoder_factory(calls=None):
+    def factory(tokenizer):
+        if calls is not None:
+            calls.append(tokenizer)
+
+        def decode(token_ids):
+            return " ".join(f"word{token_id}" for token_id in token_ids)
+
+        return decode
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_builds_from_fake_tokenized_val_source(tmp_path):
+    tokens = list(range(1, 129))
+    loader = ValTokenLoader(
+        ValidationSetConfig(val_tokens=len(tokens)),
+        download_fn=_shard_download_fn(tmp_path, tokens),
+    )
+    decoder_calls = []
+    reference = await LeakageReferenceLoader(
+        loader,
+        decoder_factory=_word_decoder_factory(decoder_calls),
+        sample_count=4,
+        chunk_tokens=16,
+    ).load()
+
+    assert reference.source == "real"
+    assert len(reference.documents) == 4
+    assert reference.sampled_tokens == 64
+    assert decoder_calls == ["gpt2"]
+    assert all(document.startswith("word") for document in reference.documents)
+
+
+@pytest.mark.asyncio
+async def test_real_val_reference_detects_copied_chunk_exact_and_fuzzy(tmp_path):
+    tokens = list(range(1, 129))
+    reference_loader = LeakageReferenceLoader(
+        ValTokenLoader(
+            ValidationSetConfig(val_tokens=len(tokens)),
+            download_fn=_shard_download_fn(tmp_path, tokens),
+        ),
+        decoder_factory=_word_decoder_factory(),
+        sample_count=4,
+        chunk_tokens=16,
+    )
+    reference = await reference_loader.load()
+    copied = reference.documents[0]
+    altered = f"{copied} one harmless appended phrase"
+
+    class CopiedCorpusBuilder:
+        async def materialize(self, manifest, state):
+            return CuratedCorpus(
+                sources=[
+                    SourceCorpus.from_iter(
+                        "fake/train", None, 1.0, [copied, altered]
+                    )
+                ]
+            )
+
+    scorer = CuratorScorer(
+        CuratorConfig(),
+        CopiedCorpusBuilder(),
+        HeuristicProxyTrainer(),
+        None,
+        reference_loader,
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="fake/train")])
+    )
+    RolloutStore.set_finalized(state, True)
+    scoring = await scorer.compute_scoring(state)
+
+    assert scoring["leakage"]["exact"] == 0.5
+    assert scoring["leakage"]["fuzzy"] == 1.0
+    assert scoring["leakage"]["overall"] > 0.0
+    assert state.leakage_reference == "real"
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_cache_reuses_decoded_detector():
+    class CountingValLoader:
+        def __init__(self):
+            self.calls = 0
+
+        async def load(self):
+            self.calls += 1
+            tokens = np.arange(1, 65, dtype="<u2")
+            return HeldOutValSet("fake/val", "val.bin", "gpt2", tokens, len(tokens))
+
+    val_loader = CountingValLoader()
+    decoder_calls = []
+    loader = LeakageReferenceLoader(
+        val_loader,
+        decoder_factory=_word_decoder_factory(decoder_calls),
+        sample_count=2,
+        chunk_tokens=16,
+    )
+
+    first = await loader.load()
+    second = await loader.load()
+
+    assert first is second
+    assert val_loader.calls == 1
+    assert decoder_calls == ["gpt2"]
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_offline_falls_back_loudly_and_sets_state_flag(
+    caplog,
+):
+    class UnavailableValLoader:
+        async def load(self):
+            raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
+
+    class StaticCorpusBuilder:
+        async def materialize(self, manifest, state):
+            return CuratedCorpus(
+                sources=[
+                    SourceCorpus.from_iter(
+                        "fake/train", None, 1.0, [DEFAULT_EVAL_CORPUS[0]]
+                    )
+                ]
+            )
+
+    reference_loader = LeakageReferenceLoader(UnavailableValLoader())
+    scorer = CuratorScorer(
+        CuratorConfig(),
+        StaticCorpusBuilder(),
+        HeuristicProxyTrainer(),
+        None,
+        reference_loader,
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="fake/train")])
+    )
+    RolloutStore.set_finalized(state, True)
+
+    with caplog.at_level("WARNING"):
+        scoring = await scorer.compute_scoring(state)
+
+    assert scoring["leakage"]["exact"] == 1.0
+    assert state.leakage_reference == "stub"
+    assert "leakage_reference=stub" in caplog.text
 
 
 @pytest.mark.asyncio

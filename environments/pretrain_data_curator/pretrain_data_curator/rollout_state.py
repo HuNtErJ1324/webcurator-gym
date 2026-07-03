@@ -20,7 +20,7 @@ import tempfile
 import uuid
 import weakref
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import verifiers.v1 as vf
 from pydantic import Field
@@ -54,6 +54,7 @@ class CuratorState(vf.State):
     external_failure: bool = False
     manifest_finalized: bool = False
     trainer_error: str | None = None
+    leakage_reference: Literal["unresolved", "real", "stub", "custom"] = "unresolved"
     budget_fill_ratio: float = 0.0
     source_doc_counts: list[int] = Field(default_factory=list)
     source_token_counts: list[int] = Field(default_factory=list)
@@ -193,3 +194,11 @@ class RolloutStore:
     @classmethod
     def trainer_error(cls, state: CuratorState) -> str | None:
         return state.trainer_error
+
+    @classmethod
+    def set_leakage_reference(
+        cls,
+        state: CuratorState,
+        source: Literal["unresolved", "real", "stub", "custom"],
+    ) -> None:
+        state.leakage_reference = source

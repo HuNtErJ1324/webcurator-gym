@@ -44,6 +44,7 @@ from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
 from .leakage import LeakageDetector
+from .leakage_reference import LeakageReferenceLoader
 from .models import (
     CuratorConfig,
     FilterSpec,
@@ -514,6 +515,7 @@ class CuratorTaskset(_TasksetBase):
         self._corpus_builder: CorpusBuilder | None = None
         self._trainer: ProxyStudentTrainer | None = None
         self._leakage_detector: LeakageDetector | None = None
+        self._leakage_reference_loader: LeakageReferenceLoader | None = None
         self._val_loader: ValTokenLoader | None = None
         self._scorer: CuratorScorer | None = None
         # Per-rollout scoring cache + locks, keyed by trace id: the heavy prepare
@@ -571,15 +573,18 @@ class CuratorTaskset(_TasksetBase):
                 retry_policy=self._fetch_policy(),
                 fetch_limit=self.curator.max_concurrent_fetches,
             )
-        if self._leakage_detector is None:
-            self._leakage_detector = LeakageDetector(
-                self.config.eval_corpus or DEFAULT_EVAL_CORPUS
-            )
         if self._val_loader is None:
             self._val_loader = ValTokenLoader(
                 self.curator.validation_set,
                 retry_policy=self._fetch_policy(),
                 fetch_limit=self.curator.max_concurrent_fetches,
+            )
+        if self._leakage_detector is None and self.config.eval_corpus:
+            self._leakage_detector = LeakageDetector(self.config.eval_corpus)
+        if self._leakage_detector is None and self._leakage_reference_loader is None:
+            self._leakage_reference_loader = LeakageReferenceLoader(
+                self._val_loader,
+                fallback_docs=DEFAULT_EVAL_CORPUS,
             )
         if self._trainer is None:
             self._trainer = (
@@ -592,6 +597,7 @@ class CuratorTaskset(_TasksetBase):
             self._corpus_builder,
             self._trainer,
             self._leakage_detector,
+            self._leakage_reference_loader,
         )
         return self._scorer
 

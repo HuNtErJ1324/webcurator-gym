@@ -80,11 +80,18 @@ class LeakageDetector:
         fuzzy_threshold: float = 0.5,
         semantic_threshold: float = 0.8,
         seed: int = 0,
+        max_semantic_features: int | None = None,
     ) -> None:
+        if max_semantic_features is not None and max_semantic_features < 1:
+            raise ValueError(
+                "max_semantic_features must be >= 1 when set, "
+                f"got {max_semantic_features}"
+            )
         self._num_perm = num_perm
         self._shingle_k = shingle_k
         self._fuzzy_threshold = fuzzy_threshold
         self._semantic_threshold = semantic_threshold
+        self._max_semantic_features = max_semantic_features
         rng = np.random.default_rng(seed)
         mask = (1 << 32) - 1
         self._a = rng.integers(1, mask, size=num_perm, dtype=np.uint64)
@@ -144,6 +151,12 @@ class LeakageDetector:
         index: dict[str, int] = {}
         for doc in docs:
             for tri in self._trigrams(doc):
+                if (
+                    tri not in index
+                    and self._max_semantic_features is not None
+                    and len(index) >= self._max_semantic_features
+                ):
+                    continue
                 index.setdefault(tri, len(index))
         if not docs or not index:
             return index, np.empty((0, len(index)), dtype=np.float64)
