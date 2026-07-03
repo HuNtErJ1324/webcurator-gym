@@ -79,6 +79,7 @@ class CuratorScorer:
             "flops": train_result.flops,
             "tokens": corpus.total_tokens,
             "num_sources": len([s for s in corpus.sources if s.doc_count]),
+            "budget_fill_ratio": state.budget_fill_ratio,
             # Always-on baseline-relative diagnostics (zero-weight; never summed
             # into the reward). ``perf_vs_baseline`` is the relative val-loss
             # reduction over ``perf_baseline_loss`` -- a sharper, scale-anchored
@@ -133,6 +134,7 @@ class CuratorScorer:
             "flops": 0.0,
             "tokens": 0,
             "num_sources": 0,
+            "budget_fill_ratio": 0.0,
             "perf_vs_baseline": 0.0,
             "perf_baseline_loss": self.config.perf_baseline_loss,
         }

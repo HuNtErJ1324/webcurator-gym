@@ -38,7 +38,7 @@ from typing import Any
 import verifiers.v1 as vf
 from pydantic import ValidationError
 
-from .corpus import CorpusBuilder
+from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .docker_network import DockerHostReachability
 from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
@@ -864,6 +864,21 @@ class CuratorTaskset(_TasksetBase):
         if manifest is None:
             manifest = self._manifest_from_trace_ids(task, trace)
         if manifest is not None and manifest.sources:
+            fetch_cap = (
+                manifest.sample_docs_per_source or self.curator.sample_docs_per_source
+            )
+            reachable_tokens = len(manifest.sources) * fetch_cap * EST_TOKENS_PER_DOC
+            if manifest.token_budget > reachable_tokens:
+                logger.warning(
+                    "TOKEN BUDGET IS NOT REACHABLE with the configured fetch cap: "
+                    "token_budget=%d sources=%d fetch_cap=%d "
+                    "estimated_tokens_per_doc=%d estimated_max_tokens=%d",
+                    manifest.token_budget,
+                    len(manifest.sources),
+                    fetch_cap,
+                    EST_TOKENS_PER_DOC,
+                    reachable_tokens,
+                )
             RolloutStore.set_manifest(state, manifest)
             RolloutStore.set_finalized(state, True)
         else:
@@ -982,6 +997,12 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
         return float((await self._prepared(trace, runtime))["tokens"])
+
+    @vf.metric
+    async def budget_fill_ratio(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return float((await self._prepared(trace, runtime))["budget_fill_ratio"])
 
     @vf.metric
     async def num_sources(

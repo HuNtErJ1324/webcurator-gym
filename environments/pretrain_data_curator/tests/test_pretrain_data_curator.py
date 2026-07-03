@@ -16,7 +16,11 @@ from pydantic import ValidationError
 from verifiers.v1 import graph
 from verifiers.v1.decorators import discover_decorated
 
-from pretrain_data_curator.corpus import CorpusBuilder, DocumentFilter
+from pretrain_data_curator.corpus import (
+    CorpusBuilder,
+    DocumentFilter,
+    _iter_sampling,
+)
 from pretrain_data_curator.eval_corpus import DEFAULT_EVAL_CORPUS
 from pretrain_data_curator.hf_access import (
     DatasetAccessError,
@@ -441,9 +445,7 @@ def test_taskset_exposes_no_tools_so_non_mcp_gate_passes():
 async def test_taskset_setup_fails_fast_when_hf_token_is_not_exported(monkeypatch):
     token_env = "PDC_TEST_HF_TOKEN"
     monkeypatch.delenv(token_env, raising=False)
-    taskset = CuratorTaskset(
-        CuratorTasksetConfig(id="test", hf_token_env=token_env)
-    )
+    taskset = CuratorTaskset(CuratorTasksetConfig(id="test", hf_token_env=token_env))
 
     with pytest.raises(
         RuntimeError,
@@ -609,6 +611,110 @@ async def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
     # No weight-derived cap applied -> all 10 docs per source are kept.
     assert len(corpus.sources[0].documents) == n_docs
     assert len(corpus.sources[1].documents) == n_docs
+
+
+@pytest.mark.asyncio
+async def test_zero_weight_source_is_not_fetched_when_other_weights_are_positive():
+    client = FakeClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=10)
+    manifest = Manifest(
+        token_budget=1_000,
+        sources=[
+            Source(dataset_id="good/encyclopedia", weight=0.0),
+            Source(dataset_id="good/science", weight=1.0),
+        ],
+    )
+
+    corpus = await builder.materialize(manifest, CuratorState())
+
+    assert client.sample_calls == ["good/science"]
+    assert corpus.sources[0].doc_count == 0
+    assert corpus.sources[1].doc_count > 0
+
+
+def test_sampling_continues_after_document_that_exceeds_remaining_budget():
+    source = Source(dataset_id="a/b")
+    oversized = "x" * 80  # 20 estimated tokens
+    fitting = "y" * 16  # 4 estimated tokens
+
+    sampled = list(_iter_sampling([oversized, fitting], source, weight_target=5))
+
+    assert sampled == [fitting]
+
+
+@pytest.mark.asyncio
+async def test_materialize_backfills_unused_budget_from_cached_surplus():
+    docs = {
+        "filtered/out": ["x" * 1_200, "y" * 1_200],
+        "has/surplus": ["a" * 1_200, "b" * 1_200],
+    }
+
+    class _BackfillClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            self.sample_calls.append(dataset_id)
+            return docs[dataset_id][:n]
+
+    client = _BackfillClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=10)
+    manifest = Manifest(
+        token_budget=1_000,
+        sources=[
+            Source(
+                dataset_id="filtered/out",
+                weight=1.0,
+                filters=[FilterSpec(kind="min_chars", params={"value": 2_000})],
+            ),
+            Source(dataset_id="has/surplus", weight=1.0),
+        ],
+    )
+    state = CuratorState()
+
+    corpus = await builder.materialize(manifest, state)
+
+    assert sorted(client.sample_calls) == ["filtered/out", "has/surplus"]
+    assert len(client.sample_calls) == 2  # the backfill made no additional fetch
+    assert corpus.sources[0].doc_count == 0
+    assert corpus.sources[1].doc_count == 2
+    assert corpus.total_tokens == 600
+    assert state.budget_fill_ratio == pytest.approx(0.6)
+    assert state.source_doc_counts == [0, 2]
+    assert state.source_token_counts == [0, 600]
+
+
+@pytest.mark.asyncio
+async def test_materialize_fetches_sources_concurrently():
+    import threading
+    import time
+
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class _ConcurrentClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return ["x" * 100]
+
+    manifest = Manifest(
+        token_budget=1_000,
+        sources=[
+            Source(dataset_id="one/source", weight=1.0),
+            Source(dataset_id="two/source", weight=1.0),
+        ],
+    )
+
+    await CorpusBuilder(client=_ConcurrentClient()).materialize(
+        manifest,
+        CuratorState(),
+    )
+
+    assert max_active == 2
 
 
 @pytest.mark.asyncio
@@ -1189,7 +1295,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 17  # 3 rewards + 14 diagnostic metrics
+    assert len(funcs) == 18  # 3 rewards + 15 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -1381,7 +1487,7 @@ def test_telemetry_metrics_are_zero_weight():
     taskset = _Curator().taskset
     reward_names = {f.__name__ for f in discover_decorated(taskset, "reward")}
     metric_names = {f.__name__ for f in discover_decorated(taskset, "metric")}
-    for name in ("tool_error_count", "external_failure"):
+    for name in ("tool_error_count", "external_failure", "budget_fill_ratio"):
         assert name in metric_names
         assert name not in reward_names
 
@@ -1402,6 +1508,9 @@ async def test_reward_unaffected_by_recorded_errors():
     assert trace.reward == pytest.approx(baseline)
     assert trace.metrics["tool_error_count"] == 1.0
     assert trace.metrics["external_failure"] == 1.0
+    assert trace.metrics["budget_fill_ratio"] == pytest.approx(
+        curator.state.budget_fill_ratio
+    )
 
 
 # --- Tier L: reward surface is CE performance minus penalties ---------------
@@ -2083,6 +2192,21 @@ def _trace_with_final(task, state, final_text):
         )
     )
     return trace
+
+
+@pytest.mark.asyncio
+async def test_finalize_warns_when_fetch_cap_cannot_reach_token_budget(caplog):
+    curator = await _make(sample_docs_per_source=2)
+    trace = _trace_with_final(
+        curator.task,
+        curator.state,
+        '```json\n{"token_budget": 1000, "sources": [{"id": "a/b"}]}\n```',
+    )
+
+    with caplog.at_level("WARNING"):
+        await curator.taskset.finalize(curator.task, trace, None)
+
+    assert "TOKEN BUDGET IS NOT REACHABLE" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -99,7 +99,14 @@ async def _materialize_peak_bytes(
     `tracemalloc` peak observed during that single call, plus the resulting
     corpus/state (caller owns `RolloutStore.cleanup(state)`)."""
     client = _UniqueDocsClient(doc_chars)
-    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs_per_source)
+    # Isolate the disk-streaming property from the separately tested parallel
+    # fetch fan-out: with one in-flight raw fetch, source count itself must not
+    # increase retained corpus memory.
+    builder = CorpusBuilder(
+        client=client,
+        sample_docs_per_source=n_docs_per_source,
+        fetch_limit=1,
+    )
     state = CuratorState()
     manifest = Manifest(
         token_budget=10

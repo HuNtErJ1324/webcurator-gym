@@ -8,8 +8,9 @@ Fetched-and-filtered document TEXT is streamed to per-rollout scratch files on
 disk as it is produced rather than accumulated in Python lists: `SourceCorpus`/
 `CuratedCorpus` hold file paths + lightweight counts (doc/token counts), not the
 text itself, so peak host memory for a rollout's corpus stays bounded to one
-source's transient fetch+filter pass instead of growing with every source and
-document fetched over the rollout's lifetime. See `rollout_state.RolloutStore
+transient fetch+filter pass per allowed concurrent fetch instead of growing with
+every source and document retained over the rollout's lifetime. See
+`rollout_state.RolloutStore
 .scratch_dir` for the backing directory and its cleanup, and `SourceCorpus
 .documents`/`CuratedCorpus.documents` for the (materializing, test/debug-only)
 convenience accessors -- production consumers (reward scoring, the proxy-student
@@ -22,11 +23,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import shutil
 import tempfile
 import uuid
 import weakref
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +46,11 @@ from .hf_access import (
 )
 from .models import FilterSpec, Manifest, Source
 from .rollout_state import CuratorState, RolloutStore
+
+logger = logging.getLogger(__name__)
+
+EST_TOKENS_PER_DOC = 250
+_LOW_BUDGET_FILL_RATIO = 0.5
 
 
 def _write_jsonl(path: Path, docs: Iterable[str]) -> tuple[int, int]:
@@ -143,6 +151,25 @@ class SourceCorpus:
             raise
         return source
 
+    def append_iter(self, docs: Iterable[str], *, dest_dir: Path) -> tuple[int, int]:
+        """Append sampled documents and return their ``(doc_count, tokens)``."""
+        path = self.path or dest_dir / f"src_{uuid.uuid4().hex}.jsonl"
+        added_docs = 0
+        added_tokens = 0
+        with path.open("a", encoding="utf-8") as fh:
+            for doc in docs:
+                fh.write(json.dumps(doc))
+                fh.write("\n")
+                added_docs += 1
+                added_tokens += estimate_tokens(doc)
+        if added_docs:
+            self.path = path
+            self.doc_count += added_docs
+            self.tokens += added_tokens
+        elif self.path is None:
+            path.unlink(missing_ok=True)
+        return added_docs, added_tokens
+
 
 @dataclass
 class CuratedCorpus:
@@ -194,36 +221,42 @@ class CuratedCorpus:
 
 
 def _iter_sampling(
-    docs: Iterable[str], source: Source, weight_target: int | None
+    docs: Iterable[str],
+    source: Source,
+    weight_target: int | None,
+    *,
+    already_docs: int = 0,
+    already_tokens: int = 0,
 ) -> Iterator[str]:
     """Streaming equivalent of the old list-based `_apply_sampling`.
 
     Applies `Sampling.max_docs` (stop after N documents) and the effective
-    token cap (`weight_target`, tightened by `Sampling.max_tokens` if set; stop
-    at the first document that would exceed the remaining budget) in the same
-    order/semantics as before, but as an early-stopping generator over
-    `docs` -- so a caller consuming this can also stop pulling from upstream
-    (the filter pipeline, ultimately the raw fetched list) as soon as the caps
-    are hit, rather than filtering/sampling documents that would be discarded
-    anyway.
+    token cap (`weight_target`, tightened by `Sampling.max_tokens` if set).
+    Documents that do not fit the remaining token budget are skipped so a later
+    smaller document can still be selected. The generator stops pulling from
+    upstream as soon as the document cap is hit.
     """
     max_docs = source.sampling.max_docs
     token_cap = weight_target
     if source.sampling.max_tokens is not None:
+        remaining_source_tokens = max(
+            source.sampling.max_tokens - already_tokens,
+            0,
+        )
         token_cap = (
-            min(token_cap, source.sampling.max_tokens)
+            min(token_cap, remaining_source_tokens)
             if token_cap is not None
-            else source.sampling.max_tokens
+            else remaining_source_tokens
         )
     budget = token_cap
-    count = 0
+    count = already_docs
     for doc in docs:
         if max_docs is not None and count >= max_docs:
             break
         if token_cap is not None:
             cost = estimate_tokens(doc)
             if cost > budget:
-                break
+                continue
             budget -= cost
         yield doc
         count += 1
@@ -309,8 +342,10 @@ def _weight_token_target(
     source: Source, token_budget: int, total_weight: float
 ) -> int | None:
     """Return the weight-proportional token target for `source`, or None if uncapped."""
-    if total_weight <= 0 or source.weight <= 0:
+    if total_weight <= 0:
         return None
+    if source.weight == 0:
+        return 0
     return int((source.weight / total_weight) * token_budget)
 
 
@@ -319,7 +354,27 @@ def _est_fetch_docs(token_target: int, cap: int) -> int:
 
     Capped at `cap` (sample_docs_per_source) so we never over-fetch.
     """
-    return min(max(token_target // 250, 1), cap)
+    return min(max(token_target // EST_TOKENS_PER_DOC, 1), cap)
+
+
+def _iter_unsampled(
+    docs: Iterable[str],
+    sampled_docs: Iterable[str],
+) -> Iterator[str]:
+    """Yield documents not already selected by the first sampling pass."""
+    sampled = Counter(
+        hashlib.sha256(doc.encode("utf-8")).digest() for doc in sampled_docs
+    )
+    for doc in docs:
+        digest = hashlib.sha256(doc.encode("utf-8")).digest()
+        remaining = sampled.get(digest, 0)
+        if remaining:
+            if remaining == 1:
+                del sampled[digest]
+            else:
+                sampled[digest] = remaining - 1
+            continue
+        yield doc
 
 
 class CorpusBuilder:
@@ -442,10 +497,9 @@ class CorpusBuilder:
         straight to a file under the rollout's shared scratch directory (see
         `RolloutStore.scratch_dir`) as they are produced, instead of being
         accumulated into a Python list kept alive for the corpus's lifetime --
-        so peak memory is bounded by one source's fetch, not by the sum of every
-        source's docs across the whole rollout.
+        so retained memory is bounded by in-flight fetch concurrency, not by the
+        sum of every source's docs across the whole rollout.
         """
-        sources: list[SourceCorpus] = []
         total_weight = sum(s.weight for s in manifest.sources)
         # The agent's manifest may request its own per-rollout fetch cap (bounded
         # 1-100_000 by `Manifest.sample_docs_per_source`); it wins over the
@@ -457,10 +511,24 @@ class CorpusBuilder:
         # underlying fetch parameters are then identical.
         cap = manifest.sample_docs_per_source or self._sample_docs_per_source
         dest_dir = RolloutStore.scratch_dir(state)
-        for source in manifest.sources:
+
+        async def materialize_source(
+            source: Source,
+        ) -> tuple[SourceCorpus, FetchKey | None, dict[str, Any] | None, bool]:
             weight_target = _weight_token_target(
                 source, manifest.token_budget, total_weight
             )
+            if total_weight > 0 and source.weight == 0:
+                return (
+                    SourceCorpus(source.dataset_id, source.config, source.weight, None),
+                    None,
+                    {
+                        "error": "zero-weight source skipped without fetching",
+                        "error_kind": "zero_weight",
+                        "dataset_id": source.dataset_id,
+                    },
+                    False,
+                )
             n = (
                 _est_fetch_docs(weight_target, cap)
                 if weight_target is not None
@@ -473,16 +541,101 @@ class CorpusBuilder:
                 text_field=source.text_field,
                 n=n,
             )
-            raw, _error = await self.fetch_source_docs(state, key)
-            filtered = self._filter.apply_iter(raw, source.filters)
+            raw, error = await self.fetch_source_docs(state, key)
+            filtered_count = 0
+            filtered_exhausted = False
+
+            def tracked_filtered() -> Iterator[str]:
+                nonlocal filtered_count, filtered_exhausted
+                for doc in self._filter.apply_iter(raw, source.filters):
+                    filtered_count += 1
+                    yield doc
+                filtered_exhausted = True
+
+            filtered = tracked_filtered()
             sampled = _iter_sampling(filtered, source, weight_target)
-            sources.append(
-                SourceCorpus.from_iter(
-                    source.dataset_id,
-                    source.config,
-                    source.weight,
-                    sampled,
+            corpus = SourceCorpus.from_iter(
+                source.dataset_id,
+                source.config,
+                source.weight,
+                sampled,
+                dest_dir=dest_dir,
+            )
+            return (
+                corpus,
+                key,
+                error,
+                not filtered_exhausted or filtered_count > corpus.doc_count,
+            )
+
+        materialized = await asyncio.gather(
+            *(materialize_source(source) for source in manifest.sources)
+        )
+        sources = [result[0] for result in materialized]
+
+        # Redistribute unused weighted budget to already-fetched documents that
+        # survived filtering but were not selected in the first pass. Re-reading
+        # the rollout's on-disk raw cache avoids additional Hub calls.
+        if total_weight > 0:
+            remaining_budget = max(
+                manifest.token_budget - sum(source.tokens for source in sources),
+                0,
+            )
+            for source, corpus, (_, key, _, has_surplus) in zip(
+                manifest.sources,
+                sources,
+                materialized,
+                strict=True,
+            ):
+                if remaining_budget <= 0:
+                    break
+                if key is None or not has_surplus:
+                    continue
+                raw = RolloutStore.cached_docs(state, key.as_str())
+                if raw is None:
+                    continue
+                filtered = self._filter.apply_iter(raw, source.filters)
+                surplus = _iter_unsampled(filtered, corpus.iter_documents())
+                _, added_tokens = corpus.append_iter(
+                    _iter_sampling(
+                        surplus,
+                        source,
+                        remaining_budget,
+                        already_docs=corpus.doc_count,
+                        already_tokens=corpus.tokens,
+                    ),
                     dest_dir=dest_dir,
                 )
+                remaining_budget -= added_tokens
+
+        for source, corpus, (_, _, error, _) in zip(
+            manifest.sources,
+            sources,
+            materialized,
+            strict=True,
+        ):
+            if corpus.doc_count == 0:
+                logger.warning(
+                    "source materialized empty: dataset_id=%s config=%r error=%s",
+                    source.dataset_id,
+                    source.config,
+                    error,
+                )
+
+        corpus = CuratedCorpus(sources=sources)
+        fill_ratio = corpus.total_tokens / manifest.token_budget
+        RolloutStore.set_materialization_stats(
+            state,
+            budget_fill_ratio=fill_ratio,
+            source_doc_counts=[source.doc_count for source in sources],
+            source_token_counts=[source.tokens for source in sources],
+        )
+        if fill_ratio < _LOW_BUDGET_FILL_RATIO:
+            logger.warning(
+                "corpus severely undershot token budget: total_tokens=%d "
+                "token_budget=%d budget_fill_ratio=%.3f",
+                corpus.total_tokens,
+                manifest.token_budget,
+                fill_ratio,
             )
-        return CuratedCorpus(sources=sources)
+        return corpus

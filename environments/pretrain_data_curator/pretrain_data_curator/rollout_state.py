@@ -54,6 +54,9 @@ class CuratorState(vf.State):
     external_failure: bool = False
     manifest_finalized: bool = False
     trainer_error: str | None = None
+    budget_fill_ratio: float = 0.0
+    source_doc_counts: list[int] = Field(default_factory=list)
+    source_token_counts: list[int] = Field(default_factory=list)
 
 
 class RolloutStore:
@@ -74,6 +77,19 @@ class RolloutStore:
     @classmethod
     def set_ledger(cls, state: CuratorState, ledger: CostLedger) -> None:
         state.cost_ledger = ledger.model_dump()
+
+    @classmethod
+    def set_materialization_stats(
+        cls,
+        state: CuratorState,
+        *,
+        budget_fill_ratio: float,
+        source_doc_counts: list[int],
+        source_token_counts: list[int],
+    ) -> None:
+        state.budget_fill_ratio = float(budget_fill_ratio)
+        state.source_doc_counts = list(source_doc_counts)
+        state.source_token_counts = list(source_token_counts)
 
     @classmethod
     def is_finalized(cls, state: CuratorState) -> bool:
