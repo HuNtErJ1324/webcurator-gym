@@ -94,6 +94,14 @@ You are billed for live discovery: each search and each inspect/download call ad
 
 Reliable starter datasets: HuggingFaceFW/fineweb (text_field: "text"), roneneldan/TinyStories (text_field: "text"), wikimedia/wikipedia (config: "20231101.en", text_field: "text"), allenai/c4 (config: "en", text_field: "text"), Salesforce/wikitext (config: "wikitext-103-v1", text_field: "text").
 
+**Building a source yourself (local sources).** Some useful datasets are script-based and cannot be streamed by the environment. When `hf datasets info` shows a dataset you want but streaming is unavailable, you may download or derive its data in this same shell. For example, use `curl`/`wget` for a raw file or `hf download <id> <file> --repo-type dataset`, then decompress or transform it into plain text or JSONL under your working directory:
+
+`hf download allenai/dolma data/v1.7/sample.json.gz --repo-type dataset --local-dir ./dl && gunzip -c ./dl/data/v1.7/sample.json.gz | head -c 20000000 > data/dolma.jsonl`
+
+Reference that file with a local source such as `{"kind":"local","local_path":"data/dolma.jsonl","local_format":"jsonl","text_field":"text","weight":1.0,"filters":[{"kind":"min_chars","params":{"value":200}},{"kind":"dedup_exact"}]}`.
+
+Local-source rules: `local_path` must be a relative path inside your working directory, with no leading `/` and no `..`. JSONL reads one JSON object or string per line and uses `text_field` (auto-detected when null); plain text is split into documents on blank lines, so one-document-per-line data must use JSONL. Files are read only up to a configured size cap. Local tokens are billed exactly like fetched tokens, so downloading data is not free and counts against the cost penalty. Only reference data genuinely downloaded from a real, pre-cutoff dataset. Do NOT fabricate text, generate documents from your own knowledge, or copy held-out, validation, or evaluation text. Contamination is measured and penalized, and local pulls are logged for audit.
+
 When you are done, emit your decision as your FINAL message: a single fenced ```json block (and nothing else after it) with this exact schema:
 
 ```json
@@ -103,6 +111,9 @@ When you are done, emit your decision as your FINAL message: a single fenced ```
   "sources": [
     {
       "id": "<huggingface dataset id, e.g. HuggingFaceFW/fineweb>",
+      "kind": "hf",
+      "local_path": null,
+      "local_format": "auto",
       "weight": 1.0,
       "config": null,
       "split": "train",
@@ -115,7 +126,7 @@ When you are done, emit your decision as your FINAL message: a single fenced ```
 }
 ```
 
-Each source REQUIRES `id` (the Hugging Face dataset id) and `weight` (>= 0, relative mixing weight). `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are optional. Supported filter kinds: min_chars, max_chars, min_tokens, max_symbol_ratio, min_alpha_ratio, drop_regex, keep_regex, dedup_exact. Always emit a non-empty `sources` list — an empty or missing manifest scores zero.
+Each Hugging Face source REQUIRES `id` (the Hugging Face dataset id); a local source may use its `local_path` as its generated label. Every source accepts `weight` (>= 0, relative mixing weight). `kind` defaults to `"hf"`; set it to `"local"` with `local_path` and optional `local_format` (`"auto"`, `"jsonl"`, or `"txt"`) for a file you created in this workspace. `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are optional. Supported filter kinds: min_chars, max_chars, min_tokens, max_symbol_ratio, min_alpha_ratio, drop_regex, keep_regex, dedup_exact. Always emit a non-empty `sources` list — an empty or missing manifest scores zero.
 
 Optional top-level `sample_docs_per_source` (integer, 1-100000) controls how many documents are fetched PER SOURCE from the Hub for this rollout — it is the fetch cap itself, not a post-fetch truncation like `max_docs`/`max_tokens`. Omit it (or set it to null) to use the environment's configured default. Fetching more documents lets the student train on more unique tokens (useful for a large `token_budget`), but also raises `cost_penalty`, since every fetched token is billed. You MUST compute this number yourself from your actual `token_budget` and number of sources — roughly `token_budget / (num_sources * 250)` tokens-per-doc, capped at 100000 — rather than reusing the schema example's placeholder verbatim."""
 
@@ -379,6 +390,8 @@ def _coerce_source(raw: Any) -> Source | None:
         return Source(dataset_id=raw.strip()) if raw.strip() else None
     if not isinstance(raw, dict):
         return None
+    local_path = raw.get("local_path")
+    is_local = raw.get("kind") == "local" or local_path is not None
     dataset_id = (
         raw.get("dataset_id")
         or raw.get("id")
@@ -386,9 +399,21 @@ def _coerce_source(raw: Any) -> Source | None:
         or raw.get("repo_id")
         or raw.get("name")
     )
+    if (
+        (not isinstance(dataset_id, str) or not dataset_id.strip())
+        and is_local
+        and isinstance(local_path, str)
+        and local_path.strip()
+    ):
+        dataset_id = f"local:{local_path.strip()}"
     if not isinstance(dataset_id, str) or not dataset_id.strip():
         return None
     kwargs: dict[str, Any] = {"dataset_id": dataset_id.strip()}
+    if is_local:
+        kwargs["kind"] = "local"
+        kwargs["local_path"] = local_path
+        if raw.get("local_format") is not None:
+            kwargs["local_format"] = raw["local_format"]
     if raw.get("config"):
         kwargs["config"] = str(raw["config"])
     if raw.get("split"):
@@ -472,6 +497,8 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     scan_limit: int = 50
     sample_docs_per_source: int = 64
     allow_script_datasets: bool = False
+    allow_local_sources: bool = True
+    max_local_source_bytes: int = 33_554_432
     max_turns: int = 12
     alpha_perf: float = 1.0
     lambda_cost: float = 0.1
@@ -530,6 +557,8 @@ class CuratorTaskset(_TasksetBase):
             scan_limit=config.scan_limit,
             sample_docs_per_source=config.sample_docs_per_source,
             allow_script_datasets=config.allow_script_datasets,
+            allow_local_sources=config.allow_local_sources,
+            max_local_source_bytes=config.max_local_source_bytes,
             max_turns=config.max_turns,
             alpha_perf=config.alpha_perf,
             lambda_cost=config.lambda_cost,
@@ -570,6 +599,8 @@ class CuratorTaskset(_TasksetBase):
                 sample_docs_per_source=self.curator.sample_docs_per_source,
                 retry_policy=self._fetch_policy(),
                 fetch_limit=self.curator.max_concurrent_fetches,
+                allow_local_sources=self.curator.allow_local_sources,
+                max_local_source_bytes=self.curator.max_local_source_bytes,
             )
         if self._leakage_detector is None:
             self._leakage_detector = LeakageDetector(
@@ -677,6 +708,11 @@ class CuratorTaskset(_TasksetBase):
         max_turns = self.curator.max_turns
         discovery_rounds, discovery_calls = self._discovery_budget()
         commit_by = max(1, max_turns - max(3, max_turns // 8))
+        local_source_status = (
+            ""
+            if self.curator.allow_local_sources
+            else "\n\nLocal sources are disabled for this run; use only Hugging Face sources."
+        )
         return (
             f"{SYSTEM_PROMPT}\n\n"
             f"You have {max_turns} turns total (model turns). A response that invokes bash "
@@ -700,6 +736,7 @@ class CuratorTaskset(_TasksetBase):
             f"command output, set `config` to null. A manifest with a fabricated id or "
             f"config materializes zero tokens and scores zero. An empty or missing "
             f"manifest also scores zero."
+            f"{local_source_status}"
         )
 
     def _discovery_budget(self) -> tuple[int, int]:
@@ -896,6 +933,24 @@ class CuratorTaskset(_TasksetBase):
         except Exception:  # noqa: BLE001 - metering must never fail the rollout
             ledger = RolloutStore.ledger(state)
         RolloutStore.set_ledger(state, ledger)
+        validation_id = self.curator.validation_set.dataset_id
+        accessed_validation_set = False
+        for message in trace.assistant_messages:
+            if validation_id in _content_text(getattr(message, "content", "")):
+                accessed_validation_set = True
+                break
+            for tool_call in message.tool_calls or []:
+                arguments = getattr(tool_call, "arguments", "") or ""
+                try:
+                    command = json.loads(arguments).get("command", "")
+                except (json.JSONDecodeError, AttributeError):
+                    command = arguments
+                if validation_id in str(command):
+                    accessed_validation_set = True
+                    break
+            if accessed_validation_set:
+                break
+        RolloutStore.set_val_set_access(state, accessed_validation_set)
 
     # -- prepared scoring (run once per rollout) -------------------------------
 
@@ -1019,6 +1074,34 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
         return float((await self._prepared(trace, runtime))["num_sources"])
+
+    @vf.metric
+    async def local_source_count(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
+        return float(RolloutStore.local_source_count(trace.state))
+
+    @vf.metric
+    async def local_source_bytes(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
+        return float(RolloutStore.local_source_bytes(trace.state))
+
+    @vf.metric
+    async def local_source_truncated(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
+        return 1.0 if RolloutStore.local_source_truncated(trace.state) else 0.0
+
+    @vf.metric
+    async def val_set_access(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
+        return 1.0 if RolloutStore.val_set_access(trace.state) else 0.0
 
     @vf.metric
     async def leakage_exact(

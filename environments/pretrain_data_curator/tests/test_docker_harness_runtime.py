@@ -92,7 +92,7 @@ async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
 
 
 class _CorpusBuilder:
-    async def materialize(self, manifest, state):
+    async def materialize(self, manifest, state, *, runtime=None):
         return _corpus()
 
 
@@ -343,7 +343,7 @@ async def test_taskset_setup_rejects_docker_trainer_on_subprocess_runtime(monkey
 
 
 class _FailingCorpusBuilder:
-    async def materialize(self, manifest, state):
+    async def materialize(self, manifest, state, *, runtime=None):
         RolloutStore.record_tool_error(state, "bad_config")
         RolloutStore.set_external_failure(state, True)
         return CuratedCorpus(sources=[])

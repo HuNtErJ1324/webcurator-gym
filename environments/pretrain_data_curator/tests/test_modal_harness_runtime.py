@@ -93,7 +93,7 @@ async def test_modal_trainer_writes_and_runs_on_supplied_harness_runtime():
 
 
 class _CorpusBuilder:
-    async def materialize(self, manifest, state):
+    async def materialize(self, manifest, state, *, runtime=None):
         return _corpus()
 
 
