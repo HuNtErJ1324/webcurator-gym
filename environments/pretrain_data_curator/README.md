@@ -247,7 +247,8 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `lambda_cost` / `lambda_leakage` | float | `0.1` / `1.0` | Penalty weights. |
 | `max_concurrent_fetches` | int | `8` | Bound on concurrent HF fetches (also the corpus-builder fetch limit). |
 | `max_concurrent_training` | int | `1` | Bound on concurrent sandbox-training jobs (real trainer). |
-| `fetch_timeout_seconds` | float | `30.0` | Per-attempt timeout for external HF calls. |
+| `fetch_timeout_seconds` | float | `30.0` | Base per-attempt timeout for external HF calls. |
+| `fetch_timeout_per_doc_seconds` | float | `0.25` | Additional per-document timeout for streaming dataset fetches. |
 | `fetch_max_attempts` | int | `3` | Max attempts (retry/backoff) for transient HF failures. |
 | `use_real_trainer` | bool | `false` | Use the GPU sandbox proxy-student instead of the heuristic. |
 | `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, `gpu_count`, etc.). `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `runtime_backend` (`"docker"` / `"modal"`; required, no default, whenever `use_real_trainer=true`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`; also `"H100"`/`"H200"`/`"A100"`) and `gpu_count`, and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |

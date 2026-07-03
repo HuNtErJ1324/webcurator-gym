@@ -383,3 +383,5 @@ async def test_taskset_score_removes_rollout_scratch_directory():
 
     assert state.scratch_dir is None
     assert not state.doc_cache
+    assert trace.id not in taskset._scoring_cache
+    assert trace.id not in taskset._scoring_locks

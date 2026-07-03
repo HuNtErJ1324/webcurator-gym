@@ -40,6 +40,7 @@ def load_environment(
     proxy_student: dict[str, Any] | None = None,
     validation_set: dict[str, Any] | None = None,
     eval_corpus: list[str] | None = None,
+    fetch_timeout_per_doc_seconds: float = 0.25,
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -69,6 +70,7 @@ def load_environment(
         max_concurrent_fetches=max_concurrent_fetches,
         max_concurrent_training=max_concurrent_training,
         fetch_timeout_seconds=fetch_timeout_seconds,
+        fetch_timeout_per_doc_seconds=fetch_timeout_per_doc_seconds,
         fetch_max_attempts=fetch_max_attempts,
         use_real_trainer=use_real_trainer,
         proxy_student=proxy_student or {},
@@ -91,6 +93,7 @@ def load_environment(
         "max_concurrent_fetches": max_concurrent_fetches,
         "max_concurrent_training": max_concurrent_training,
         "fetch_timeout_seconds": fetch_timeout_seconds,
+        "fetch_timeout_per_doc_seconds": fetch_timeout_per_doc_seconds,
         "fetch_max_attempts": fetch_max_attempts,
         "use_real_trainer": use_real_trainer,
         "proxy_student": proxy_student,

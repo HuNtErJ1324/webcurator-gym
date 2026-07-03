@@ -139,6 +139,11 @@ class RetryPolicy:
     base_delay: float = 0.05
     max_delay: float = 2.0
     timeout: float = 30.0
+    per_doc_seconds: float = 0.25
+
+    def timeout_for_documents(self, n: int) -> float:
+        """Scale a streaming fetch attempt by the requested document count."""
+        return self.timeout + max(n, 0) * self.per_doc_seconds
 
 
 # Loop-local concurrency bound for Hub fetches. Semaphores are bound to the
@@ -175,6 +180,7 @@ async def run_blocking_with_retry(
     policy: RetryPolicy,
     semaphore: asyncio.Semaphore,
     dataset_id: str | None = None,
+    timeout: float | None = None,
 ) -> T:
     """Run a blocking callable off the event loop with bound+timeout+retry.
 
@@ -183,16 +189,17 @@ async def run_blocking_with_retry(
     raises a classified `DatasetAccessError` on permanent failure or exhaustion.
     """
     last: DatasetAccessError | None = None
+    attempt_timeout = policy.timeout if timeout is None else timeout
     for attempt in range(1, policy.attempts + 1):
         try:
             async with semaphore:
                 return await asyncio.wait_for(
-                    asyncio.to_thread(fn), timeout=policy.timeout
+                    asyncio.to_thread(fn), timeout=attempt_timeout
                 )
         except (asyncio.TimeoutError, TimeoutError):
             last = DatasetAccessError(
                 f"access to {dataset_id or 'dataset'} timed out after "
-                f"{policy.timeout}s",
+                f"{attempt_timeout}s",
                 kind="timeout",
                 dataset_id=dataset_id,
             )
@@ -232,7 +239,11 @@ async def fetch_documents(
         )
 
     return await run_blocking_with_retry(
-        _call, policy=policy, semaphore=semaphore, dataset_id=key.dataset_id
+        _call,
+        policy=policy,
+        semaphore=semaphore,
+        dataset_id=key.dataset_id,
+        timeout=policy.timeout_for_documents(key.n),
     )
 
 

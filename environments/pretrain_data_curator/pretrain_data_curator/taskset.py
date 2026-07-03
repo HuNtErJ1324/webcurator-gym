@@ -484,6 +484,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     max_concurrent_fetches: int = 8
     max_concurrent_training: int = 1
     fetch_timeout_seconds: float = 30.0
+    fetch_timeout_per_doc_seconds: float = 0.25
     fetch_max_attempts: int = 3
     use_real_trainer: bool = False
     proxy_student: dict[str, Any] = {}
@@ -536,6 +537,7 @@ class CuratorTaskset(_TasksetBase):
             max_concurrent_fetches=config.max_concurrent_fetches,
             max_concurrent_training=config.max_concurrent_training,
             fetch_timeout_seconds=config.fetch_timeout_seconds,
+            fetch_timeout_per_doc_seconds=config.fetch_timeout_per_doc_seconds,
             fetch_max_attempts=config.fetch_max_attempts,
             use_real_trainer=config.use_real_trainer,
             proxy_student=ProxyStudentConfig(**(config.proxy_student or {})),
@@ -548,6 +550,7 @@ class CuratorTaskset(_TasksetBase):
         return RetryPolicy(
             attempts=self.curator.fetch_max_attempts,
             timeout=self.curator.fetch_timeout_seconds,
+            per_doc_seconds=self.curator.fetch_timeout_per_doc_seconds,
         )
 
     def _ensure(self) -> CuratorScorer:
@@ -936,6 +939,8 @@ class CuratorTaskset(_TasksetBase):
         try:
             await super().score(trace, runtime)
         finally:
+            self._scoring_cache.pop(trace.id, None)
+            self._scoring_locks.pop(trace.id, None)
             RolloutStore.cleanup(trace.state)
 
     # -- rewards (weighted contributions; coefficients folded in) --------------

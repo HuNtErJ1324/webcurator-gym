@@ -355,6 +355,7 @@ class CuratorConfig(BaseModel):
     max_concurrent_fetches: int = Field(default=8, ge=1, le=1024)
     max_concurrent_training: int = Field(default=1, ge=1, le=256)
     fetch_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    fetch_timeout_per_doc_seconds: float = Field(default=0.25, ge=0.0)
     fetch_max_attempts: int = Field(default=3, ge=1, le=20)
 
     prices: CostPrices = Field(default_factory=CostPrices)

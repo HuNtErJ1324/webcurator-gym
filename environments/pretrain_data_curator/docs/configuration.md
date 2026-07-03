@@ -37,7 +37,8 @@ prompt/recovery controls; the agent still chooses actual `hf --limit` values.
 | --- | ---: | --- |
 | `max_concurrent_fetches` | `8` | Loop-local bound on active Hub fetches |
 | `max_concurrent_training` | `1` | Loop-local bound on active GPU training commands |
-| `fetch_timeout_seconds` | `30.0` | Timeout for each external fetch attempt |
+| `fetch_timeout_seconds` | `30.0` | Base timeout for each external fetch attempt |
+| `fetch_timeout_per_doc_seconds` | `0.25` | Additional timeout per requested streaming document |
 | `fetch_max_attempts` | `3` | Maximum attempts for transient failures |
 
 ### Trainer selection

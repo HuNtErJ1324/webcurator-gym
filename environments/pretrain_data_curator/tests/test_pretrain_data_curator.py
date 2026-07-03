@@ -157,6 +157,7 @@ class _Curator:
             retry_policy=RetryPolicy(
                 attempts=self.config.fetch_max_attempts,
                 timeout=self.config.fetch_timeout_seconds,
+                per_doc_seconds=self.config.fetch_timeout_per_doc_seconds,
             ),
             fetch_limit=self.config.max_concurrent_fetches,
         )
@@ -1359,7 +1360,7 @@ async def test_real_timeout_classified_via_wait_for():
             _time.sleep(0.3)
             return ["doc"]
 
-    policy = RetryPolicy(attempts=1, timeout=0.05)
+    policy = RetryPolicy(attempts=1, timeout=0.05, per_doc_seconds=0.0)
     builder = CorpusBuilder(client=_SlowClient(), retry_policy=policy)
     state = CuratorState()
     docs, error = await builder.fetch_source_docs(
@@ -1367,6 +1368,13 @@ async def test_real_timeout_classified_via_wait_for():
     )
     assert docs == []
     assert error["error_kind"] == "timeout"
+
+
+def test_fetch_timeout_scales_with_requested_document_count():
+    policy = RetryPolicy(timeout=30.0, per_doc_seconds=0.25)
+
+    assert policy.timeout_for_documents(0) == pytest.approx(30.0)
+    assert policy.timeout_for_documents(40) == pytest.approx(40.0)
 
 
 def test_classify_exception_kinds():
