@@ -79,11 +79,11 @@ Default unit prices:
 | GFLOP | `1e-6` |
 
 The defaults mean a search adds both a zero-priced web-query count and a priced
-Hub call. `code_calls` exists in the ledger but the current `hf`-only agent
-workflow does not add code calls.
+Hub call. Each unique successful local-source pull adds one `code_call`.
 
 Token accounting includes recognized `hf` output and documents fetched for
-materialization. Real/heuristic trainer FLOPs are added after training.
+materialization. Parsed local-source documents are billed by the same token
+estimator. Real/heuristic trainer FLOPs are added after training.
 
 Cost is not normalized. The configured `lambda_cost` directly scales the priced
 sum.
@@ -113,6 +113,11 @@ processes.
 The "semantic" detector is lexical character-trigram similarity, not a neural
 embedding model. It is fast and reproducible but should not be interpreted as a
 general semantic-contamination detector.
+
+Local-source audit telemetry supplements, but does not replace, these leakage
+detectors. `val_set_access` flags bash commands containing the configured
+validation repository ID. It is intentionally a conservative command-provenance
+signal; it does not prove which bytes entered the corpus.
 
 ## Empty and unfinalized rollouts
 
@@ -161,6 +166,10 @@ data, or the infrastructure can fail before that data is evaluated.
 | `train_flops` | Estimated/measured training FLOPs |
 | `corpus_tokens` | Estimated materialized corpus tokens |
 | `num_sources` | Sources with at least one retained document |
+| `local_source_count` | Unique successful local pulls |
+| `local_source_bytes` | Bytes transferred by capped local pulls |
+| `local_source_truncated` | `1.0` when any local source exceeded its cap |
+| `val_set_access` | `1.0` when a bash command named the validation repository |
 | `leakage_exact` | Exact-match document fraction |
 | `leakage_fuzzy` | MinHash-match document fraction |
 | `leakage_semantic` | Character-trigram-match document fraction |
@@ -179,7 +188,7 @@ A practical order is:
 
 1. Check `finalized`.
 2. Check `external_failure`, `tool_error_count`, and `trainer_error_msg`.
-3. Check `num_sources` and `corpus_tokens`.
+3. Check `num_sources`, `corpus_tokens`, and local-source provenance metrics.
 4. Compare `perf_loss` and `perf_vs_baseline`.
 5. Inspect all three leakage metrics.
 6. Decompose the final reward into the three named reward components.

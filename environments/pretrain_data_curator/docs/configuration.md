@@ -16,6 +16,8 @@ fields raise `TypeError` instead of being silently ignored.
 | `scan_limit` | `int` | `50` | Input to the prompt's suggested discovery-round count |
 | `sample_docs_per_source` | `int` | `64` | Hard upper bound on rows requested from each source |
 | `allow_script_datasets` | `bool` | `false` | Allow remote dataset scripts only on a compatible `datasets` 2.x runtime |
+| `allow_local_sources` | `bool` | `true` | Permit manifests to pull workspace-local text/JSONL files at scoring time |
+| `max_local_source_bytes` | `int` | `33_554_432` | Per-local-source transfer cap; valid range 1 byte through 1 GiB |
 | `max_turns` | `int` | `12` | Agent-loop turn cap |
 
 `scan_limit` must be at least `candidate_limit`. Both are configuration and
@@ -28,6 +30,10 @@ Verifiers dependency requires `datasets>=3`, which removed script execution, so
 `allow_script_datasets=true` is not sufficient in this release; use a data-only
 export. The explicit default is `false` so existing manifests still parse while
 remote repository code remains blocked.
+
+`allow_local_sources=false` makes local entries fail soft with a typed empty
+source while leaving Hub entries unchanged. The byte cap is enforced by
+`head -c` in the live harness runtime before stdout crosses the runtime boundary.
 
 ### Reward
 

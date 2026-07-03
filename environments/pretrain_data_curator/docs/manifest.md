@@ -1,8 +1,8 @@
 # Manifest and filtering
 
 The manifest is the agent's only curation deliverable. It describes what to
-stream from Hugging Face and how to turn those rows into a bounded training
-corpus.
+stream from Hugging Face or pull from files created in the agent's live bash
+workspace, and how to turn those rows into a bounded training corpus.
 
 ## Canonical shape
 
@@ -51,7 +51,10 @@ can all reduce the result.
 
 | Field | Default | Behavior |
 | --- | --- | --- |
-| `id` | required | Hugging Face dataset repository ID |
+| `id` | required for HF; generated from `local_path` for local | Hugging Face repository ID or local provenance label |
+| `kind` | `"hf"` | Source transport: `"hf"` or `"local"` |
+| `local_path` | `null` | Workspace-relative file path; required for local sources |
+| `local_format` | `"auto"` | Local parser: `"auto"`, `"jsonl"`, or `"txt"` |
 | `weight` | `1.0` | Nonnegative relative allocation weight |
 | `config` | `null` | Dataset configuration/name |
 | `split` | `"train"` | Dataset split |
@@ -67,6 +70,42 @@ top-level forms.
 
 Invalid weights fall back to `1.0`; negative weights clamp to zero. Invalid or
 nonpositive caps become `null`. Unsupported filter entries are dropped.
+
+## Local sources
+
+A local source references a text file the agent genuinely downloaded or derived
+in its own bash workspace:
+
+```json
+{
+  "kind": "local",
+  "local_path": "data/dolma.jsonl",
+  "local_format": "jsonl",
+  "text_field": "text",
+  "weight": 1.0,
+  "filters": [{"kind": "min_chars", "params": {"value": 200}}]
+}
+```
+
+`local_path` must be relative, must not contain a `..` component, and cannot
+name trainer/runtime files (`corpus.txt`, `config.json`, `train.py`, `val.bin`,
+or `.vf_hf_cost.jsonl`). Absolute and traversal paths are rejected during
+manifest validation.
+
+With `local_format="auto"`, `.jsonl`, `.ndjson`, and `.json` use the JSONL
+parser; other extensions use the text parser. JSONL is read one non-empty line
+at a time. JSON objects use the same `text_field` auto-detection as Hub rows,
+bare JSON strings are documents, and malformed JSON lines are retained as raw
+text. Plain text is split on blank lines; one-document-per-line data therefore
+must use JSONL.
+
+At scoring time the materializer probes the file size and runs `head -c` inside
+the live runtime before transferring any content. The pull is capped by
+`max_local_source_bytes` (32 MiB by default), and truncation is recorded.
+Parsed local documents then use the same filters, weighted sampling, caps, raw
+cache, surplus backfill, leakage checks, and trainer path as Hub documents.
+Without a live runtime, a local source records `local_no_runtime` and
+materializes empty; Hub sources in the same manifest are unaffected.
 
 ## Weight allocation
 
