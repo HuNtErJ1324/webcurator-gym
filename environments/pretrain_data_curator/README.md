@@ -242,6 +242,7 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `candidate_limit` | int | `8` | Max candidates returned per search. |
 | `scan_limit` | int | `50` | Discovery budget input; benchmark configs raise it so the prompt allows more discovery rounds. |
 | `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
+| `allow_script_datasets` | bool | `false` | Permit script-backed repositories only when the installed `datasets` runtime supports them. The current `datasets>=3` runtime still rejects them permanently. |
 | `max_turns` | int | `12` | Max agent turns; benchmark configs raise it for longer discovery and curation. |
 | `alpha_perf` | float | `1.0` | Positive cross-entropy performance weight. |
 | `lambda_cost` / `lambda_leakage` | float | `0.1` / `1.0` | Penalty weights. |
@@ -254,6 +255,14 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, `gpu_count`, etc.). `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `runtime_backend` (`"docker"` / `"modal"`; required, no default, whenever `use_real_trainer=true`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`; also `"H100"`/`"H200"`/`"A100"`) and `gpu_count`, and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
 | `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set: FineWeb GPT-2 val tokens, first `10_485_760`). Real-trainer only. |
 | `eval_corpus` | list[str] | built-in | Held-out reference corpus for the leakage term. |
+
+Before streaming a source, the materializer checks for the Hugging Face
+`{dataset_name}.py` convention. Script-backed sources fail once with
+`error_kind="script_dataset"` when `allow_script_datasets=false` or the installed
+`datasets` version cannot execute scripts; they are not retried. Setting the knob
+to `true` never bypasses the runtime capability check. Script execution remains
+unavailable in this release because the pinned Verifiers package requires
+`datasets>=3`.
 
 ## Module Layout
 
