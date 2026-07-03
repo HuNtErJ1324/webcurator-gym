@@ -1,0 +1,21 @@
+[[eval]]
+name = "pretrain-data-curator-deepseek-v4-flash-smoke"
+env_id = "hunterj/pretrain-data-curator"
+model = "deepseek/deepseek-v4-flash"
+num_examples = 1
+rollouts_per_example = 1
+
+[eval.args]
+token_budget = 10000000
+max_turns = 24
+candidate_limit = 64
+scan_limit = 100
+sample_docs_per_source = 50000
+lambda_cost = 0.0
+baseline_relative_perf = true
+use_real_trainer = true
+
+[eval.args.proxy_student]
+runtime_backend = "docker"
+gpu_count = 1
+train_token_budget = 10000000
