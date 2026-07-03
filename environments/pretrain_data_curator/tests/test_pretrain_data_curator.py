@@ -438,6 +438,24 @@ def test_taskset_exposes_no_tools_so_non_mcp_gate_passes():
 
 
 @pytest.mark.asyncio
+async def test_taskset_setup_fails_fast_when_hf_token_is_not_exported(monkeypatch):
+    token_env = "PDC_TEST_HF_TOKEN"
+    monkeypatch.delenv(token_env, raising=False)
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(id="test", hf_token_env=token_env)
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"source secrets\.env.*without `export` or `set -a`",
+    ):
+        await taskset.setup(
+            taskset.load_tasks()[0],
+            SimpleNamespace(type="subprocess"),
+        )
+
+
+@pytest.mark.asyncio
 async def test_finalize_then_reward_aggregation():
     curator = await _make()
     state = curator.set_manifest(["good/encyclopedia", "good/science"], finalize=True)
@@ -1435,19 +1453,29 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
 @pytest.mark.asyncio
 async def test_discovery_output_budget_stops_before_provider_context_overflow():
     curator = await _make()
+    budget = curator.taskset._discovery_output_budget_chars()
     trace = _trace_with_bash_calls(
         curator.task,
         curator.state,
         [
             (
                 "hf datasets ls --search wikipedia --limit 5",
-                "wikimedia/wikipedia " + ("x" * 24_000),
+                "wikimedia/wikipedia " + ("x" * budget),
             ),
             ("hf datasets info wikimedia/wikipedia", "unused"),
         ],
     )
 
     assert await curator.taskset.discovery_output_budget_reached(trace)
+
+
+def test_discovery_output_budget_derives_from_prompt_call_allowance():
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(id="test", max_turns=1000, scan_limit=1000)
+    )
+    _, calls = taskset._discovery_budget()
+    assert calls == 24
+    assert taskset._discovery_output_budget_chars() > calls * 6_000
 
 
 def test_system_prompt_manifest_example_parses():
@@ -1832,6 +1860,33 @@ def test_parse_manifest_coerces_source_fields():
     assert s0.sampling.max_docs == 10 and s0.sampling.max_tokens == 2000
     assert m.sources[1].weight == 1.0  # default
     assert m.sources[2].weight == 0.0  # clamped
+
+
+def test_parse_manifest_drops_filters_with_invalid_params():
+    text = json.dumps(
+        {
+            "sources": [
+                {
+                    "id": "a/b",
+                    "filters": [
+                        {"kind": "min_chars", "params": {"value": "200"}},
+                        {"kind": "min_tokens", "params": {"value": "many"}},
+                        {"kind": "max_symbol_ratio", "params": {"value": "nan"}},
+                        {"kind": "drop_regex", "params": {"pattern": "["}},
+                        {"kind": "keep_regex", "params": {"pattern": "^valid$"}},
+                    ],
+                }
+            ]
+        }
+    )
+
+    manifest = parse_manifest(text)
+
+    assert manifest is not None
+    assert [(spec.kind, spec.params) for spec in manifest.sources[0].filters] == [
+        ("min_chars", {"value": 200}),
+        ("keep_regex", {"pattern": "^valid$"}),
+    ]
 
 
 def test_parse_manifest_reads_sample_docs_per_source():

@@ -46,8 +46,9 @@ def load_environment(
     The agent curates via the ``hf`` CLI in its own shell rather than MCP tools,
     so there is no tool server to inject a client into; scoring collaborators are
     injected on the taskset directly in tests. Hugging Face credentials are
-    checked lazily at first Hub API use during a rollout, so constructing the
-    environment does not require ``HF_TOKEN`` in the orchestrator process.
+    checked in taskset setup before a rollout starts (and again lazily at first
+    Hub API use), so constructing the environment itself does not require
+    ``HF_TOKEN`` in the orchestrator process.
     Unsupported keywords are rejected by Python with a clear ``TypeError`` rather
     than being silently dropped, so a misspelled or stale eval arg fails loudly.
     """

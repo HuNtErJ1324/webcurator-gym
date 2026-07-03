@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 from typing import Any
 
@@ -64,7 +65,8 @@ from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
-_MAX_DISCOVERY_OUTPUT_CHARS = 24_000
+_DISCOVERY_OUTPUT_CHARS_PER_CALL = 6_000
+_DISCOVERY_OUTPUT_MARGIN = 1.1
 
 SYSTEM_PROMPT = """IMPORTANT: Be extremely concise in every message, and work by RUNNING commands in your shell rather than describing them. On your very first step, actually run a command — no preamble, no plan, no explanation first. If your harness gives you a shell/terminal/exec tool, you MUST call that tool to run each command below; writing a command out as ordinary text without calling the tool does NOT run it and wastes the rollout. If instead your harness executes your reply directly as a shell command, just reply with the command itself. Bootstrap the hf CLI if needed and run a search in that same first command. If you must plan, keep it to one sentence, then immediately run a command.
 
@@ -348,12 +350,26 @@ def _coerce_filters(raw: Any) -> list[FilterSpec]:
         kind = f.get("kind")
         if not isinstance(kind, str) or kind not in _SUPPORTED_FILTER_KINDS:
             continue
-        params = f.get("params")
-        specs.append(
-            FilterSpec(
-                kind=kind, params=dict(params) if isinstance(params, dict) else {}
-            )
-        )
+        raw_params = f.get("params")
+        params = dict(raw_params) if isinstance(raw_params, dict) else {}
+        try:
+            if kind in {"min_chars", "max_chars", "min_tokens"} and "value" in params:
+                params["value"] = int(params["value"])
+            elif kind in {"max_symbol_ratio", "min_alpha_ratio"} and "value" in params:
+                value = float(params["value"])
+                if not math.isfinite(value):
+                    continue
+                params["value"] = value
+            elif kind in {"drop_regex", "keep_regex"}:
+                pattern = str(params.get("pattern", ""))
+                re.compile(pattern)
+                params["pattern"] = pattern
+        except (TypeError, ValueError, OverflowError, re.error):
+            # Agent-supplied filters are best-effort. Invalid params follow the
+            # same tolerant policy as unknown kinds: discard the spec rather than
+            # failing the scoring pass later in DocumentFilter.
+            continue
+        specs.append(FilterSpec(kind=kind, params=params))
     return specs
 
 
@@ -651,10 +667,7 @@ class CuratorTaskset(_TasksetBase):
         agent commits a manifest before the turn cap.
         """
         max_turns = self.curator.max_turns
-        discovery_rounds = max(
-            2, min(12, max_turns // 6, self.curator.scan_limit // 10)
-        )
-        discovery_calls = discovery_rounds * 2
+        discovery_rounds, discovery_calls = self._discovery_budget()
         commit_by = max(1, max_turns - max(3, max_turns // 8))
         return (
             f"{SYSTEM_PROMPT}\n\n"
@@ -681,6 +694,21 @@ class CuratorTaskset(_TasksetBase):
             f"manifest also scores zero."
         )
 
+    def _discovery_budget(self) -> tuple[int, int]:
+        """Return the configured ``(rounds, calls)`` discovery allowance."""
+        rounds = max(
+            2,
+            min(12, self.curator.max_turns // 6, self.curator.scan_limit // 10),
+        )
+        return rounds, rounds * 2
+
+    def _discovery_output_budget_chars(self) -> int:
+        """Match the stop budget to the prompt's per-call output contract."""
+        _, calls = self._discovery_budget()
+        return math.ceil(
+            calls * _DISCOVERY_OUTPUT_CHARS_PER_CALL * _DISCOVERY_OUTPUT_MARGIN
+        )
+
     # NOTE: deliberately no ``tools(...)`` override — the agent curates via the
     # `hf` CLI in its own shell, so the taskset exposes no MCP tool servers and
     # ``type(CuratorTaskset).tools is Taskset.tools`` holds. This is what lets the
@@ -695,6 +723,15 @@ class CuratorTaskset(_TasksetBase):
         all -- Prime sandboxes are no longer supported, and the subprocess
         runtime cannot host GPU training.
         """
+        token_env = self.config.hf_token_env
+        if not os.environ.get(token_env):
+            raise RuntimeError(
+                f"Hugging Face token environment variable {token_env!r} is required "
+                "before starting a rollout. Export it into the env-server process "
+                "(for example, `set -a; source secrets.env; set +a`). Running "
+                "`source secrets.env` without `export` or `set -a` does not "
+                "propagate the token to the env-server."
+            )
         if self.curator.use_real_trainer and runtime.type not in ("docker", "modal"):
             raise TrainerError(
                 "use_real_trainer=True requires a Docker or Modal harness runtime "
@@ -724,7 +761,7 @@ class CuratorTaskset(_TasksetBase):
                 len(_content_text(getattr(message, "content", "")))
                 for message in trace.tool_messages
             )
-            >= _MAX_DISCOVERY_OUTPUT_CHARS
+            >= self._discovery_output_budget_chars()
         )
 
     # -- finalize (runs before scoring, while the runtime is live) -------------

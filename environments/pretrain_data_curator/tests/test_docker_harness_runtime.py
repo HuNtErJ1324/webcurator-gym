@@ -325,7 +325,8 @@ def test_package_is_discoverable_as_a_native_v1_taskset():
 
 
 @pytest.mark.asyncio
-async def test_taskset_setup_rejects_docker_trainer_on_subprocess_runtime():
+async def test_taskset_setup_rejects_docker_trainer_on_subprocess_runtime(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "test-token")
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="pretrain-data-curator",

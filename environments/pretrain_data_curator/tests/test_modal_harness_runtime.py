@@ -362,7 +362,8 @@ def test_modal_timeout_cannot_exceed_runtime_lifetime():
 
 
 @pytest.mark.asyncio
-async def test_taskset_setup_rejects_modal_trainer_on_other_runtime():
+async def test_taskset_setup_rejects_modal_trainer_on_other_runtime(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "test-token")
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="pretrain-data-curator",
