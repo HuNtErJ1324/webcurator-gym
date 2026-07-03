@@ -939,6 +939,45 @@ def test_leakage_detects_exact_and_paraphrase():
     assert contaminated.exact == 1.0
 
 
+def test_leakage_semantic_build_vectors_handles_trigram_cap():
+    docs = [
+        "abc def ghi jkl mno pqr stu vwx yzA BCD EFG HIJ KLM NOP QRS "
+        "TUV WXY Z01 234 567 890 123 456 789 ABC DEF GHI JKL MNO PQR"
+    ]
+    detector = LeakageDetector(docs, max_semantic_features=2, seed=0)
+    scores = detector.score(docs)
+    assert scores.exact == 1.0
+
+
+def test_leakage_trigram_cap_exceeded_no_keyerror():
+    docs_with_many_trigrams = [
+        " ".join(f"word{i:04d}" for i in range(200))
+        for _ in range(5)
+    ]
+    detector = LeakageDetector(docs_with_many_trigrams, max_semantic_features=4, seed=0)
+    scores = detector.score(docs_with_many_trigrams)
+    assert scores.fuzzy == 1.0
+
+
+def test_leakage_fuzzy_chunking_detects_embedded_reference():
+    eval_ref = "The mitochondrion is the powerhouse of the cell and provides energy."
+    filler = "unrelated text " * 5_000
+    large_doc = f"{filler} {eval_ref} {filler}"
+
+    detector_whole = LeakageDetector(
+        [eval_ref], fuzzy_threshold=0.5, fuzzy_chunk_words=0, seed=0
+    )
+    detector_chunked = LeakageDetector(
+        [eval_ref], fuzzy_threshold=0.5, fuzzy_chunk_words=100, seed=0
+    )
+
+    scores_whole = detector_whole.score([large_doc])
+    scores_chunked = detector_chunked.score([large_doc])
+
+    assert scores_chunked.fuzzy > 0.0
+    assert scores_whole.fuzzy < scores_chunked.fuzzy
+
+
 # ---------------------------------------------------------------------------
 # Shared fakes for the robustness/concurrency tests.
 # ---------------------------------------------------------------------------
@@ -1324,7 +1363,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 18  # 3 rewards + 15 diagnostic metrics
+    assert len(funcs) == 19  # 3 rewards + 16 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -2077,6 +2116,71 @@ async def test_leakage_reference_offline_falls_back_loudly_and_sets_state_flag(
     assert scoring["leakage"]["exact"] == 1.0
     assert state.leakage_reference == "stub"
     assert "leakage_reference=stub" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_stub_not_cached_retry_succeeds(tmp_path):
+    tokens = list(range(1, 65))
+    calls = []
+
+    class _FlipFlopValLoader:
+        def __init__(self):
+            self._attempt = 0
+
+        async def load(self):
+            self._attempt += 1
+            calls.append(self._attempt)
+            if self._attempt == 1:
+                raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
+            return HeldOutValSet(
+                "kjj0/fineweb10B-gpt2",
+                "fineweb_val_000000.bin",
+                "gpt2",
+                np.array(tokens, dtype="<u2"),
+                len(tokens),
+            )
+
+    reference_loader = LeakageReferenceLoader(
+        _FlipFlopValLoader(),
+        decoder_factory=_word_decoder_factory(),
+        sample_count=4,
+        chunk_tokens=16,
+    )
+
+    first = await reference_loader.load()
+    assert first.source == "stub"
+    assert calls == [1]
+
+    second = await reference_loader.load()
+    assert second.source == "real"
+    assert calls == [1, 2]
+    assert first is not second
+
+
+@pytest.mark.asyncio
+async def test_default_taskset_path_produces_leakage_reference_via_ensure():
+    """Integration: the DEFAULT taskset path (no injected detector, no injected
+    loader) builds the val-based reference through CuratorTaskset._ensure()."""
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(
+            id="test",
+            eval_corpus=None,
+        )
+    )
+    tokens = np.arange(1, 65, dtype="<u2")
+
+    class _FixedValLoader:
+        async def load(self):
+            return HeldOutValSet("fake/val", "val.bin", "gpt2", tokens, len(tokens))
+
+    taskset._val_loader = _FixedValLoader()
+    taskset._client = FakeClient()
+    taskset._corpus_builder = CorpusBuilder(client=taskset._client)
+    taskset._trainer = HeuristicProxyTrainer()
+
+    taskset._ensure()
+    assert taskset._leakage_reference_loader is not None
+    assert taskset._leakage_detector is None
 
 
 @pytest.mark.asyncio

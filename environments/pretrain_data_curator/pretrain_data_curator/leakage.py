@@ -81,6 +81,7 @@ class LeakageDetector:
         semantic_threshold: float = 0.8,
         seed: int = 0,
         max_semantic_features: int | None = None,
+        fuzzy_chunk_words: int = 0,
     ) -> None:
         if max_semantic_features is not None and max_semantic_features < 1:
             raise ValueError(
@@ -92,6 +93,7 @@ class LeakageDetector:
         self._fuzzy_threshold = fuzzy_threshold
         self._semantic_threshold = semantic_threshold
         self._max_semantic_features = max_semantic_features
+        self._fuzzy_chunk_words = fuzzy_chunk_words
         rng = np.random.default_rng(seed)
         mask = (1 << 32) - 1
         self._a = rng.integers(1, mask, size=num_perm, dtype=np.uint64)
@@ -141,6 +143,16 @@ class LeakageDetector:
         return hashed.min(axis=1)
 
     def _is_fuzzy_hit(self, doc: str) -> bool:
+        if self._fuzzy_chunk_words > 0:
+            words = _WORD_RE.findall(doc.lower())
+            chunk_size = self._fuzzy_chunk_words
+            for i in range(0, max(len(words), 1), chunk_size):
+                chunk = " ".join(words[i : i + chunk_size])
+                sig = self._minhash(chunk)
+                equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
+                if bool(equal.max() >= self._fuzzy_threshold):
+                    return True
+            return False
         sig = self._minhash(doc)
         equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
         return bool(equal.max() >= self._fuzzy_threshold)
@@ -163,7 +175,9 @@ class LeakageDetector:
         vectors = np.zeros((len(docs), len(index)), dtype=np.float64)
         for row, doc in enumerate(docs):
             for tri in self._trigrams(doc):
-                vectors[row, index[tri]] += 1.0
+                col = index.get(tri)
+                if col is not None:
+                    vectors[row, col] += 1.0
         vectors = _l2_normalize(vectors)
         return index, vectors
 

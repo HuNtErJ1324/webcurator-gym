@@ -74,7 +74,7 @@ class LeakageReferenceLoader:
         ] = weakref.WeakKeyDictionary()
 
     async def load(self) -> LeakageReference:
-        """Return one cached real reference, or a loud cached stub fallback."""
+        """Cache the real reference once built; always retry on stub fallback."""
         if self._cached is not None:
             return self._cached
         lock = self._lock()
@@ -84,6 +84,7 @@ class LeakageReferenceLoader:
             try:
                 val_set = await self._val_loader.load()
                 reference = await asyncio.to_thread(self._build_real, val_set)
+                self._cached = reference
             except Exception as exc:  # noqa: BLE001 - fallback is explicit telemetry
                 logger.warning(
                     "[curator] leakage_reference=stub: real validation reference "
@@ -98,7 +99,6 @@ class LeakageReferenceLoader:
                     documents=docs,
                     sampled_tokens=0,
                 )
-            self._cached = reference
             return reference
 
     def _lock(self) -> asyncio.Lock:
