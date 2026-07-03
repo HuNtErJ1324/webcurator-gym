@@ -1086,6 +1086,15 @@ class CuratorTaskset(_TasksetBase):
         """Whether a trainer error occurred. Zero-weight diagnostic."""
         return 1.0 if await self.trainer_error_str(trace, runtime) else 0.0
 
+    @vf.metric
+    async def leakage_reference(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        await self._prepared(trace, runtime)
+        return {"unresolved": 0.0, "stub": 1.0, "real": 2.0, "custom": 3.0}.get(
+            str(trace.state.leakage_reference), 0.0
+        )
+
 
 __all__ = [
     "CuratorTaskset",

@@ -56,6 +56,8 @@ class CuratorScorer:
         manifest = RolloutStore.manifest(state)
         finalized = RolloutStore.is_finalized(state)
         if not finalized or not manifest.sources:
+            _, leakage_reference = await self._leakage_reference()
+            RolloutStore.set_leakage_reference(state, leakage_reference)
             return self._empty_scoring(state)
 
         corpus = await self.corpus_builder.materialize(manifest, state)
