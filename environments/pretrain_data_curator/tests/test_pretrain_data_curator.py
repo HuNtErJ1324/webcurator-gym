@@ -2085,7 +2085,7 @@ async def test_real_val_reference_detects_copied_chunk_exact_and_fuzzy(tmp_path)
     altered = f"{copied} one harmless appended phrase"
 
     class CopiedCorpusBuilder:
-        async def materialize(self, manifest, state):
+        async def materialize(self, manifest, state, *, runtime=None):
             return CuratedCorpus(
                 sources=[
                     SourceCorpus.from_iter(
@@ -2151,7 +2151,7 @@ async def test_leakage_reference_offline_falls_back_loudly_and_sets_state_flag(
             raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
 
     class StaticCorpusBuilder:
-        async def materialize(self, manifest, state):
+        async def materialize(self, manifest, state, *, runtime=None):
             return CuratedCorpus(
                 sources=[
                     SourceCorpus.from_iter(
