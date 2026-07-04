@@ -497,7 +497,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     candidate_limit: int = 8
     scan_limit: int = 50
     sample_docs_per_source: int = 64
-    allow_script_datasets: bool = False
     allow_local_sources: bool = True
     max_local_source_bytes: int = 33_554_432
     max_turns: int = 12
@@ -558,7 +557,6 @@ class CuratorTaskset(_TasksetBase):
             candidate_limit=config.candidate_limit,
             scan_limit=config.scan_limit,
             sample_docs_per_source=config.sample_docs_per_source,
-            allow_script_datasets=config.allow_script_datasets,
             allow_local_sources=config.allow_local_sources,
             max_local_source_bytes=config.max_local_source_bytes,
             max_turns=config.max_turns,
@@ -593,7 +591,6 @@ class CuratorTaskset(_TasksetBase):
         if self._client is None:
             self._client = HuggingFaceDatasetClient(
                 token_env=self.config.hf_token_env,
-                allow_script_datasets=self.curator.allow_script_datasets,
             )
         if self._corpus_builder is None:
             self._corpus_builder = CorpusBuilder(

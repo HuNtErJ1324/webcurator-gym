@@ -361,9 +361,6 @@ class CuratorConfig(BaseModel):
     candidate_limit: int = Field(default=8, ge=1, le=1000)
     scan_limit: int = Field(default=50, ge=1, le=100_000)
     sample_docs_per_source: int = Field(default=64, ge=1, le=100_000)
-    # Script datasets execute Python supplied by the dataset repository. Disabled
-    # by default; datasets >=3 cannot execute scripts regardless of this setting.
-    allow_script_datasets: bool = False
     allow_local_sources: bool = True
     max_local_source_bytes: int = Field(
         default=33_554_432, ge=1, le=1_073_741_824

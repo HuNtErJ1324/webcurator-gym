@@ -30,7 +30,6 @@ hf_token_env = "HF_TOKEN"           # env var checked lazily at first Hub use
 candidate_limit = 8                 # trace-recovery fallback cap on synthesized sources
 scan_limit = 50                     # discovery-round budget input (prompt-only; must be >= candidate_limit)
 sample_docs_per_source = 64         # docs sampled per source for scoring
-allow_script_datasets = false       # remote dataset scripts stay blocked
 max_turns = 12                      # agent turn cap
 
 # --- reward weights ----------------------------------------------------------

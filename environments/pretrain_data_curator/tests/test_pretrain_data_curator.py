@@ -256,7 +256,6 @@ def test_hf_client_accepts_explicit_token_without_environment(monkeypatch):
     client = HuggingFaceDatasetClient(token="test-token")
 
     assert client._token == "test-token"
-    assert client._allow_script_datasets is False
 
 
 def test_fetch_key_serializes_auto_text_field_stably():
@@ -287,7 +286,6 @@ def test_hf_client_auto_detects_text_columns_and_query_response(monkeypatch):
     )
     client = object.__new__(HuggingFaceDatasetClient)
     client._token = "test-token"
-    client._allow_script_datasets = False
 
     assert client.sample_documents("owner/name", None, "train", None, 4) == [
         "content document",
@@ -324,7 +322,6 @@ def test_hf_client_resolves_missing_default_config_to_english(monkeypatch):
     )
     client = object.__new__(HuggingFaceDatasetClient)
     client._token = "test-token"
-    client._allow_script_datasets = False
 
     assert client.sample_documents("wikimedia/wikipedia", None, "train", None, 1) == [
         "configured document"
@@ -418,16 +415,6 @@ def test_load_environment_rejects_unknown_harness():
         ),
     ):
         load_environment(harness_id="unknown")
-
-
-def test_load_environment_plumbs_allow_script_datasets(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "test-token")
-
-    env = load_environment(allow_script_datasets=True)
-
-    assert env.taskset.config.allow_script_datasets is True
-    assert env.taskset.curator.allow_script_datasets is True
-    assert env.env_args["allow_script_datasets"] is True
 
 
 def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
@@ -1581,7 +1568,7 @@ async def test_script_dataset_runtime_error_is_permanent_without_retry():
     assert excinfo.value.kind == "script_dataset"
 
 
-def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
+def test_script_dataset_probe_blocks_unconditionally(monkeypatch):
     calls = []
     load_calls = []
 
@@ -1598,15 +1585,13 @@ def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
         "datasets.load_dataset",
         lambda *args, **kwargs: load_calls.append((args, kwargs)),
     )
-    client = HuggingFaceDatasetClient(
-        token="test-token", allow_script_datasets=False
-    )
+    client = HuggingFaceDatasetClient(token="test-token")
 
     with pytest.raises(DatasetAccessError) as excinfo:
         client.sample_documents("owner/legacy", None, "train", None, 1)
 
     assert excinfo.value.kind == "script_dataset"
-    assert "allow_script_datasets=True" in str(excinfo.value)
+    assert "cannot load dataset scripts" in str(excinfo.value)
     assert calls == [
         {
             "repo_id": "owner/legacy",
@@ -1615,32 +1600,6 @@ def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
         }
     ]
     assert load_calls == []
-
-
-def test_script_dataset_probe_blocks_when_datasets_runtime_is_unsupported(
-    monkeypatch,
-):
-    class FakeHfApi:
-        def __init__(self, *, token):
-            pass
-
-        def file_exists(self, **kwargs):
-            return True
-
-    monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
-    monkeypatch.setattr("datasets.__version__", "4.6.1")
-    client = HuggingFaceDatasetClient(
-        token="test-token", allow_script_datasets=True
-    )
-
-    with pytest.raises(DatasetAccessError) as excinfo:
-        client.sample_documents("owner/legacy", None, "train", None, 1)
-
-    assert excinfo.value.kind == "script_dataset"
-    assert "datasets==4.6.1" in str(excinfo.value)
-    assert "allow_script_datasets=True" in str(excinfo.value)
-
-
 def test_non_script_dataset_load_does_not_pass_trust_remote_code(monkeypatch):
     class FakeHfApi:
         def __init__(self, *, token):
@@ -1657,9 +1616,7 @@ def test_non_script_dataset_load_does_not_pass_trust_remote_code(monkeypatch):
 
     monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
     monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
-    client = HuggingFaceDatasetClient(
-        token="test-token", allow_script_datasets=False
-    )
+    client = HuggingFaceDatasetClient(token="test-token")
 
     assert client.sample_documents("owner/data", None, "train", None, 1) == [
         "data-only document"
