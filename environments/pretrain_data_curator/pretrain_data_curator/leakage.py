@@ -12,11 +12,14 @@ light; it can be swapped for a real embedding model later.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"\w+")
 
@@ -104,6 +107,7 @@ class LeakageDetector:
         self._eval_minhashes = np.array(
             [self._minhash(d) for d in eval_docs], dtype=np.uint64
         ) if eval_docs else np.empty((0, num_perm), dtype=np.uint64)
+        self._eval_shingle_sets = [_word_shingles(d, self._shingle_k) for d in eval_docs]
         self._trigram_index, self._eval_vectors = self._build_vectors(eval_docs)
 
     def score(self, docs: Iterable[str]) -> LeakageScores:
@@ -145,13 +149,29 @@ class LeakageDetector:
     def _is_fuzzy_hit(self, doc: str) -> bool:
         if self._fuzzy_chunk_words > 0:
             words = _WORD_RE.findall(doc.lower())
+            if not words:
+                return False
             chunk_size = self._fuzzy_chunk_words
-            for i in range(0, max(len(words), 1), chunk_size):
+            stride = max(1, chunk_size // 2)
+            i = 0
+            while i < len(words):
                 chunk = " ".join(words[i : i + chunk_size])
                 sig = self._minhash(chunk)
                 equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
                 if bool(equal.max() >= self._fuzzy_threshold):
                     return True
+                if self._eval_shingle_sets:
+                    chunk_shingles = _word_shingles(chunk, self._shingle_k)
+                    if chunk_shingles:
+                        for eval_shingles in self._eval_shingle_sets:
+                            if not eval_shingles:
+                                continue
+                            containment = len(chunk_shingles & eval_shingles) / len(
+                                chunk_shingles
+                            )
+                            if containment >= self._fuzzy_threshold:
+                                return True
+                i += stride
             return False
         sig = self._minhash(doc)
         equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
@@ -161,6 +181,7 @@ class LeakageDetector:
         self, docs: list[str]
     ) -> tuple[dict[str, int], np.ndarray]:
         index: dict[str, int] = {}
+        _truncation_warned = False
         for doc in docs:
             for tri in self._trigrams(doc):
                 if (
@@ -168,6 +189,14 @@ class LeakageDetector:
                     and self._max_semantic_features is not None
                     and len(index) >= self._max_semantic_features
                 ):
+                    if not _truncation_warned:
+                        logger.warning(
+                            "[curator] max_semantic_features=%d reached: "
+                            "semantic trigram index truncated "
+                            "(unique trigrams exceed cap)",
+                            self._max_semantic_features,
+                        )
+                        _truncation_warned = True
                     continue
                 index.setdefault(tri, len(index))
         if not docs or not index:

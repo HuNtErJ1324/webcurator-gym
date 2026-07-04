@@ -44,7 +44,7 @@ from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
 from .leakage import LeakageDetector
-from .leakage_reference import LeakageReferenceLoader
+from .leakage_reference import FUZZY_CHUNK_WORDS, LeakageReferenceLoader
 from .models import (
     CuratorConfig,
     FilterSpec,
@@ -580,7 +580,9 @@ class CuratorTaskset(_TasksetBase):
                 fetch_limit=self.curator.max_concurrent_fetches,
             )
         if self._leakage_detector is None and self.config.eval_corpus:
-            self._leakage_detector = LeakageDetector(self.config.eval_corpus)
+            self._leakage_detector = LeakageDetector(
+                self.config.eval_corpus, fuzzy_chunk_words=FUZZY_CHUNK_WORDS
+            )
         if self._leakage_detector is None and self._leakage_reference_loader is None:
             self._leakage_reference_loader = LeakageReferenceLoader(
                 self._val_loader,
@@ -1090,6 +1092,11 @@ class CuratorTaskset(_TasksetBase):
     async def leakage_reference(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
+        """Leakage-reference provenance encoded as float:
+        0.0 = unresolved, 1.0 = stub, 2.0 = real, 3.0 = custom.
+        The aggregate mean across rollouts is NOT meaningful; the
+        fraction where value==1.0 (stub-rate) is the diagnostic that
+        signals how often the real val-set was unavailable."""
         await self._prepared(trace, runtime)
         return {"unresolved": 0.0, "stub": 1.0, "real": 2.0, "custom": 3.0}.get(
             str(trace.state.leakage_reference), 0.0
