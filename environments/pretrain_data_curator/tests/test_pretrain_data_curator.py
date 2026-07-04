@@ -389,7 +389,35 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.taskset.config.candidate_limit == 3
     assert env.harness.config.id == "bash"
     assert env.harness.config.env == {}
+    assert env.env_args["harness_id"] == "bash"
     assert env.taskset.load_tasks()
+
+
+def test_load_environment_selects_codex_harness(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+
+    env = load_environment(harness_id="codex")
+
+    assert env.harness.config.id == "codex"
+    assert type(env.harness.config).__name__ == "CodexHarnessConfig"
+    assert env.harness.config.env == {}
+    assert env.env_args["harness_id"] == "codex"
+
+    task = env.taskset.load_tasks()[0]
+    system_prompt, prompt = env.harness.resolve_prompt(task)
+    assert system_prompt is None
+    assert prompt == f"{task.system_prompt}\n\n{task.prompt}"
+
+
+def test_load_environment_rejects_unknown_harness():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "unknown harness_id 'unknown'; valid harness ids: "
+            "bash, codex, default, kimi_code, mini_swe_agent, rlm, terminus_2"
+        ),
+    ):
+        load_environment(harness_id="unknown")
 
 
 def test_load_environment_plumbs_allow_script_datasets(monkeypatch):

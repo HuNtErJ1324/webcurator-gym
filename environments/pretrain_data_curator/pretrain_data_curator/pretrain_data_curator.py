@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+import pkgutil
 from typing import Any
 
 import verifiers as legacy_vf
 import verifiers.v1 as vf
+import verifiers.v1.harnesses as vf_harnesses
 from verifiers.v1.runtimes.modal import ModalConfig
 
 from .hosted_compat import Environment
@@ -44,6 +46,7 @@ def load_environment(
     validation_set: dict[str, Any] | None = None,
     eval_corpus: list[str] | None = None,
     fetch_timeout_per_doc_seconds: float = 0.25,
+    harness_id: str = "bash",
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -53,9 +56,20 @@ def load_environment(
     checked in taskset setup before a rollout starts (and again lazily at first
     Hub API use), so constructing the environment itself does not require
     ``HF_TOKEN`` in the orchestrator process.
+    ``harness_id`` selects one of the harnesses bundled with the installed
+    Verifiers package.
     Unsupported keywords are rejected by Python with a clear ``TypeError`` rather
     than being silently dropped, so a misspelled or stale eval arg fails loudly.
     """
+    valid_harness_ids = sorted(
+        module.name for module in pkgutil.iter_modules(vf_harnesses.__path__)
+    )
+    if harness_id not in valid_harness_ids:
+        raise ValueError(
+            f"unknown harness_id {harness_id!r}; valid harness ids: "
+            f"{', '.join(valid_harness_ids)}"
+        )
+
     config = CuratorTasksetConfig(
         id=TASKSET_ID,
         cutoff_date=cutoff_date,
@@ -91,6 +105,7 @@ def load_environment(
         "scan_limit": scan_limit,
         "sample_docs_per_source": sample_docs_per_source,
         "allow_script_datasets": allow_script_datasets,
+        "harness_id": harness_id,
         "allow_local_sources": allow_local_sources,
         "max_local_source_bytes": max_local_source_bytes,
         "max_turns": max_turns,
@@ -165,7 +180,7 @@ def load_environment(
             taskset=config,
             max_turns=max_turns,
             harness=vf.HarnessConfig(
-                id="bash", env=harness_env, runtime=harness_runtime
+                id=harness_id, env=harness_env, runtime=harness_runtime
             ),
             timeout=timeout,
         ),
