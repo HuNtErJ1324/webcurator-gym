@@ -42,7 +42,7 @@ Produce the manifest that gives the fixed proxy student the strongest held-out p
 1. Use only datasets modified on or before {cutoff_date}.
 2. Do not use, copy, or derive data from the environment's fixed held-out validation set or evaluation corpus; those are reserved exclusively for scoring.
 3. There will be no user interaction. Operate autonomously.
-4. Commit no later than turn {commit_by}, before the turn limit: stop running commands and return only the fenced JSON manifest as a plain response. Do not print it through the shell.
+4. When you have enough evidence, commit immediately; do not fill remaining turns with more discovery. Commit no later than turn {commit_by}, before the turn limit: stop running commands and return only the fenced JSON manifest as a plain response. Do not print it through the shell.
 
 Remember: the source choices are yours. Explore economically and commit the best manifest you can support with observed evidence."""
 

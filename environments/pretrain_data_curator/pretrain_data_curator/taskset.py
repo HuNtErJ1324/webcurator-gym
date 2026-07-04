@@ -79,10 +79,10 @@ Useful candidates to inspect include `wikimedia/wikipedia`, `HuggingFaceFW/finew
 ## Autonomy & Exploration
 You have complete freedom in source choice, mixture design, filtering, and how you spend the discovery budget. Iteration is encouraged: search, inspect enough candidates to make a defensible choice, and commit as soon as further calls are unlikely to improve it.
 
-You have a normal bash shell. Execute commands rather than merely describing them. If your interface provides a shell or execution tool, call it; if it executes replies directly as shell commands, reply with the command itself.
+You have a normal bash shell. Execute commands rather than merely describing them. If your interface provides a shell or execution tool, call it: writing a command out as ordinary text without calling your shell tool does NOT run it—you must invoke the tool. If your interface executes replies directly as shell commands, reply with the command itself.
 
 ## Information on the Setup
-The Hugging Face `hf` CLI is the primary discovery tool. Begin with one shell action that installs it only if missing and continues directly to a useful search:
+The Hugging Face `hf` CLI is the primary discovery tool. Your FIRST response must run a shell command, not present a plan. Use one shell action that installs the CLI only if missing and continues directly to a useful search:
 
 `if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000`
 
@@ -93,7 +93,7 @@ Do not diagnose aliases such as `huggingface-cli` or `python -m huggingface_hub`
 - `hf datasets ls --search "<query>" --limit 5 --format json --expand downloads,likes,lastModified | head -c 6000`
 - `hf datasets info <dataset_id> --expand downloads,likes,tags | head -c 6000`
 
-End every `hf` discovery command with `| head -c 6000`. Never request `tags` from `datasets ls`; request them only for a shortlisted dataset with `datasets info`. Check downloads, license, last modification, splits, configs, and text fields. `"text_field": null` enables auto-detection across common text columns and query/response pairs; set it explicitly only when inspection establishes the column.
+End every `hf` discovery command with `| head -c 6000`. Never request `tags` from `datasets ls`; request them only for a shortlisted dataset with `datasets info`. Check downloads, license, last modification, splits, configs, and text fields. `"text_field": null` auto-detects `text`, `content`, `passage`, `abstract`, and query/response pairs; set it explicitly only when inspection establishes the column.
 
 Some script-based datasets cannot be streamed by the environment. Download their raw files with `hf download <repo> --repo-type dataset`, `curl`, or `wget`; decompress or convert them to plain text or JSONL inside the working directory; then declare a local source. For example:
 
@@ -102,15 +102,15 @@ Some script-based datasets cannot be streamed by the environment. Download their
 JSONL contains one JSON object or string per line and uses `text_field`, which may be null for auto-detection. Plain text is split into documents on blank lines, so one-document-per-line data must use JSONL. Local files are read only to the configured byte cap, logged for audit, and billed like fetched tokens.
 
 ## Manifest Contract
-Your final answer is one fenced `json` block with a non-empty `sources` list and nothing after the closing fence:
+Your final answer is one fenced `json` block with a non-empty `sources` list. Include no text after the closing ``` fence.
 
 ```json
 {
-  "token_budget": "<task token budget>",
+  "token_budget": 10000000,
   "sample_docs_per_source": "<int, 1-100000; compute for this mixture>",
   "sources": [
     {
-      "id": "<Hugging Face dataset id>",
+      "id": "wikimedia/wikipedia",
       "kind": "hf",
       "local_path": null,
       "local_format": "auto",
@@ -134,12 +134,12 @@ Your final answer is one fenced `json` block with a non-empty `sources` list and
 }
 ```
 
-An `hf` source requires `id`; `kind` defaults to `"hf"`. A local source requires `kind: "local"` and `local_path`, and accepts `local_format` as `"auto"`, `"jsonl"`, or `"txt"`. Every source accepts a nonnegative `weight`; weights are relative and determine proportional token allocations. Optional source fields are `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens`; the two caps may instead be nested under `sampling`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
+Set `token_budget` to the task's stated token budget. An `hf` source requires `id`; `kind` defaults to `"hf"`. A local source requires `kind: "local"` and `local_path`, and accepts `local_format` as `"auto"`, `"jsonl"`, or `"txt"`. Every source accepts a nonnegative `weight`; weights are relative and determine proportional token allocations. Optional source fields are `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens`; the two caps may instead be nested under `sampling`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
 
 Top-level `sample_docs_per_source` is the pre-filter fetch cap per source, not the post-filter `max_docs` or `max_tokens` cap. Omit it to use the environment default, or estimate it from `token_budget / (number of sources * 250 tokens per document)`, capped at 100000. Every search, inspection, download, and fetched token contributes to the cost penalty.
 
 ## Rules
-1. Every Hugging Face `id` and non-null `config` must be copied exactly from `hf` output observed in this rollout; invented values and empty manifests score zero.
+1. Every Hugging Face `id` and non-null `config` must be copied exactly from `hf` output observed in this rollout. If a `config` was not explicitly observed, set `config` to null. A fabricated id or config materializes zero tokens; an empty manifest scores zero.
 2. Use only genuine downloaded data. Never fabricate documents, generate them from your own knowledge, or use held-out validation or evaluation text. Leakage is measured and penalized.
 3. A `local_path` must be relative to the working directory, with no leading `/` and no `..`.
 4. Commit the manifest as a plain final response, not through the shell.

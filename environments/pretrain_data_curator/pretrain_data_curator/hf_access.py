@@ -347,7 +347,9 @@ class HuggingFaceDatasetClient:
             "your shell with `hf download <repo> --repo-type dataset` or `curl`, "
             "then convert them to plain text or JSONL in your workspace. Cite the "
             'result in the manifest as a source with `kind: "local"` and '
-            '`local_path: "<relative-path>"`.',
+            '`local_path: "<relative-path>"`. Set `local_format` to `"auto"`, '
+            '`"jsonl"`, or `"txt"`, and set `text_field` to the document text '
+            "column or `null` for auto-detection.",
             kind="script_dataset",
             dataset_id=dataset_id,
         )

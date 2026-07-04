@@ -1605,6 +1605,8 @@ async def test_script_dataset_probe_blocks_unconditionally_with_guidance(monkeyp
     assert "`hf download <repo> --repo-type dataset` or `curl`" in error["error"]
     assert '`kind: "local"`' in error["error"]
     assert '`local_path: "<relative-path>"`' in error["error"]
+    assert "`local_format`" in error["error"]
+    assert "`text_field`" in error["error"]
     assert RolloutStore.tool_error_count(state) == 1
     assert calls == [
         {
@@ -1818,6 +1820,16 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
     assert "Never request `tags` from `datasets ls`" in SYSTEM_PROMPT
     assert "```json" in SYSTEM_PROMPT
     assert '"sources"' in SYSTEM_PROMPT
+    assert (
+        "If a `config` was not explicitly observed, set `config` to null."
+        in SYSTEM_PROMPT
+    )
+    assert "fabricated id or config materializes zero tokens" in SYSTEM_PROMPT
+    assert "Include no text after the closing ``` fence." in SYSTEM_PROMPT
+    assert (
+        "`text`, `content`, `passage`, `abstract`, and query/response pairs"
+        in SYSTEM_PROMPT
+    )
     assert "curator_" not in SYSTEM_PROMPT  # no stale MCP tool references
 
 
@@ -1855,7 +1867,10 @@ def test_system_prompt_manifest_example_parses():
     manifest = parse_manifest(SYSTEM_PROMPT, default_token_budget=1_000_000)
     assert manifest is not None
     assert manifest.sources  # the example carries at least one source
+    assert manifest.token_budget == 10_000_000
+    assert manifest.sources[0].dataset_id == "wikimedia/wikipedia"
     assert manifest.sources[0].text_field is None
+    assert "Set `token_budget` to the task's stated token budget." in SYSTEM_PROMPT
 
 
 def test_system_prompt_sample_docs_per_source_example_is_not_a_bare_literal():
@@ -1884,6 +1899,8 @@ def test_system_prompt_is_harness_agnostic_about_running_commands():
     low = SYSTEM_PROMPT.lower()
     assert "your first response must be a bash command" not in low
     assert "provides a shell or execution tool, call it" in low
+    assert "does NOT run it" in SYSTEM_PROMPT
+    assert "you must invoke the tool" in low
     assert "executes replies directly as shell commands" in low
     assert "bash harness" not in low
     assert "codex" not in low
@@ -3188,6 +3205,7 @@ def test_task_prompt_scales_discovery_with_benchmark_budget():
         assert "contains multiple tool calls" in prompt
         assert "every individual `hf` call is still billed" in prompt
         assert "use at most 2 rounds (<=4 shell calls)" in prompt
+        assert "commit immediately; do not fill remaining turns" in prompt
         assert "stop running commands and return only the fenced JSON manifest" in prompt
         assert "Do not print it through the shell" in prompt
 
@@ -3208,7 +3226,9 @@ def test_task_prompt_scales_discovery_with_benchmark_budget():
     assert "use at most 10 rounds (<=20 shell calls)" in benchmark_prompt
     assert "Commit no later than turn 56" in benchmark_prompt
     assert "must be copied exactly from `hf` output" in benchmark_task.system_prompt
-    assert "invented values" in benchmark_task.system_prompt
+    assert "fabricated id or config materializes zero tokens" in (
+        benchmark_task.system_prompt
+    )
 
 
 def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
@@ -3220,8 +3240,9 @@ def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
     assert "command -v hf" in low
     assert "pip install -q 'huggingface-hub>=0.34'" in low
     assert "fi; hf datasets ls" in low  # bootstrap and useful discovery share one turn
+    assert "your first response must run a shell command, not present a plan" in low
     assert "do not diagnose aliases such as `huggingface-cli`" in low
-    assert "installs it only if missing" in low
+    assert "installs the cli only if missing" in low
     assert "install unrelated packages" in low
     assert "pip will only waste your turns" not in low
     assert "no setup required" not in low
