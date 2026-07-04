@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import shutil
 import tempfile
 import uuid
@@ -35,12 +36,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import verifiers.v1 as vf
+
 from .hf_access import (
     DatasetAccessError,
     DatasetSearchClient,
     FetchKey,
     RetryPolicy,
     estimate_tokens,
+    extract_text_from_row,
     fetch_documents,
     hf_fetch_semaphore,
 )
@@ -76,6 +80,44 @@ def _iter_jsonl(path: Path | None) -> Iterator[str]:
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             yield json.loads(line)
+
+
+def _iter_local_documents(
+    path: Path, fmt: str, text_field: str | None
+) -> Iterator[str]:
+    """Yield documents from a bounded runtime-local text or JSONL file."""
+    resolved_format = fmt
+    if resolved_format == "auto":
+        resolved_format = (
+            "jsonl"
+            if path.suffix.lower() in {".jsonl", ".ndjson", ".json"}
+            else "txt"
+        )
+
+    if resolved_format == "jsonl":
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    value = json.loads(raw)
+                except json.JSONDecodeError:
+                    yield raw
+                    continue
+                if isinstance(value, dict):
+                    text = extract_text_from_row(value, text_field)
+                    if text is not None:
+                        yield text
+                elif isinstance(value, str) and value.strip():
+                    yield value
+        return
+
+    content = path.read_text(encoding="utf-8", errors="replace")
+    for chunk in re.split(r"\n\s*\n", content):
+        text = chunk.strip()
+        if text:
+            yield text
 
 
 @dataclass
@@ -396,12 +438,16 @@ class CorpusBuilder:
         document_filter: DocumentFilter | None = None,
         retry_policy: RetryPolicy | None = None,
         fetch_limit: int = 8,
+        allow_local_sources: bool = True,
+        max_local_source_bytes: int = 33_554_432,
     ) -> None:
         self._client = client
         self._sample_docs_per_source = sample_docs_per_source
         self._filter = document_filter or DocumentFilter()
         self._retry = retry_policy or RetryPolicy()
         self._fetch_limit = fetch_limit
+        self._allow_local_sources = allow_local_sources
+        self._max_local_source_bytes = max_local_source_bytes
         # Loop-local single-flight guard: concurrent fetches sharing one
         # (rollout, source key) coalesce onto a single Hub fetch + a single
         # billing event. Locks bind to their running loop, and the rollout
@@ -488,8 +534,128 @@ class CorpusBuilder:
         finally:
             self._discard_fetch_lock(lock_key)
 
+    def _local_fetch_key(self, source: Source) -> FetchKey:
+        return FetchKey(
+            dataset_id=f"local:{source.local_path}",
+            config=source.local_format,
+            split="local",
+            text_field=source.text_field,
+            n=self._max_local_source_bytes,
+        )
+
+    async def fetch_local_docs(
+        self,
+        state: CuratorState,
+        source: Source,
+        runtime: vf.Runtime | None,
+    ) -> tuple[list[str], dict[str, Any] | None]:
+        """Pull, parse, cache, and meter one bounded runtime-local source."""
+        key = self._local_fetch_key(source)
+        cache_key = key.as_str()
+
+        def failure(kind: str, message: str) -> tuple[list[str], dict[str, Any]]:
+            RolloutStore.record_tool_error(state, kind)
+            RolloutStore.set_external_failure(state, True)
+            return (
+                [],
+                {
+                    "error": message,
+                    "error_kind": kind,
+                    "dataset_id": source.dataset_id,
+                },
+            )
+
+        if not self._allow_local_sources:
+            return failure("local_disabled", "local sources are disabled")
+        if runtime is None:
+            return failure(
+                "local_no_runtime",
+                "local source cannot be read without a live runtime",
+            )
+
+        cached = RolloutStore.cached_docs(state, cache_key)
+        if cached is not None:
+            return cached, None
+
+        token = str(id(state))
+        lock_key = f"{token}\x00{cache_key}"
+        lock = self._fetch_lock(lock_key)
+        try:
+            async with lock:
+                cached = RolloutStore.cached_docs(state, cache_key)
+                if cached is not None:
+                    return cached, None
+
+                path = source.local_path
+                assert path is not None  # validated by Source
+                quoted_path = shlex.quote(path)
+                try:
+                    probe = await runtime.run(
+                        ["sh", "-c", f"wc -c < {quoted_path}"], {}
+                    )
+                except Exception as exc:  # noqa: BLE001 - typed soft failure
+                    return failure("local_probe_failed", str(exc))
+                if probe.exit_code != 0:
+                    message = probe.stderr.strip() or "local source size probe failed"
+                    return failure("local_probe_failed", message)
+                try:
+                    size = int(probe.stdout.strip())
+                except ValueError:
+                    return failure(
+                        "local_probe_failed",
+                        f"invalid byte count {probe.stdout.strip()!r}",
+                    )
+                if size < 0:
+                    return failure("local_probe_failed", f"invalid byte count {size}")
+
+                cap = self._max_local_source_bytes
+                try:
+                    pulled = await runtime.run(
+                        ["sh", "-c", f"head -c {cap} -- {quoted_path}"], {}
+                    )
+                except Exception as exc:  # noqa: BLE001 - typed soft failure
+                    return failure("local_pull_failed", str(exc))
+                if pulled.exit_code != 0:
+                    message = pulled.stderr.strip() or "local source pull failed"
+                    return failure("local_pull_failed", message)
+
+                raw_path = (
+                    RolloutStore.scratch_dir(state)
+                    / f"local_raw_{uuid.uuid4().hex}"
+                )
+                try:
+                    raw_path.write_text(pulled.stdout, encoding="utf-8")
+                    docs = list(
+                        _iter_local_documents(
+                            raw_path, source.local_format, source.text_field
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - typed soft failure
+                    return failure("local_parse_failed", str(exc))
+                finally:
+                    raw_path.unlink(missing_ok=True)
+
+                RolloutStore.store_docs(state, cache_key, docs)
+                truncated = size > cap
+                RolloutStore.add_local_source(
+                    state,
+                    bytes_pulled=min(size, cap),
+                    truncated=truncated,
+                )
+                ledger = RolloutStore.ledger(state)
+                ledger.code_calls += 1
+                ledger.tokens += sum(estimate_tokens(doc) for doc in docs)
+                RolloutStore.set_ledger(state, ledger)
+                return docs, None
+        finally:
+            self._discard_fetch_lock(lock_key)
+
     async def materialize(
-        self, manifest: Manifest, state: CuratorState
+        self,
+        manifest: Manifest,
+        state: CuratorState,
+        *,
+        runtime: vf.Runtime | None = None,
     ) -> CuratedCorpus:
         """Cache-aware async corpus build; the single materialization per rollout.
 
@@ -529,19 +695,23 @@ class CorpusBuilder:
                     },
                     False,
                 )
-            n = (
-                _est_fetch_docs(weight_target, cap)
-                if weight_target is not None
-                else cap
-            )
-            key = FetchKey(
-                dataset_id=source.dataset_id,
-                config=source.config,
-                split=source.split,
-                text_field=source.text_field,
-                n=n,
-            )
-            raw, error = await self.fetch_source_docs(state, key)
+            if source.kind == "local":
+                key = self._local_fetch_key(source)
+                raw, error = await self.fetch_local_docs(state, source, runtime)
+            else:
+                n = (
+                    _est_fetch_docs(weight_target, cap)
+                    if weight_target is not None
+                    else cap
+                )
+                key = FetchKey(
+                    dataset_id=source.dataset_id,
+                    config=source.config,
+                    split=source.split,
+                    text_field=source.text_field,
+                    n=n,
+                )
+                raw, error = await self.fetch_source_docs(state, key)
             filtered_count = 0
             filtered_exhausted = False
 

@@ -32,7 +32,9 @@ R(M, H) = Perf(M) - Cost(M) - Leakage(M)
 
 Each term is also emitted as a metric (`perf_loss`, `perf_accuracy`,
 `perf_vs_baseline`, `train_flops`, `corpus_tokens`, `num_sources`, `leakage_*`,
-`cost_total`, `finalized`). Two further zero-weight **diagnostics**,
+`cost_total`, `finalized`). Local-source provenance is exposed as
+`local_source_count`, `local_source_bytes`, `local_source_truncated`, and
+`val_set_access`. Two further zero-weight **diagnostics**,
 `tool_error_count` and `external_failure`, separate bad curation from
 external/infrastructure failure (a flaky Hub or sandbox). See
 [`docs/reward.md`](docs/reward.md).
@@ -178,6 +180,9 @@ minimal schema:
 ```
 
 Each source requires `id` (the Hugging Face dataset id) and `weight` (≥ 0).
+For script-backed or otherwise non-streamable datasets, the agent may instead
+download/derive text or JSONL in its bash workspace and use a `kind: "local"`
+source. See [Manifest and filtering](docs/manifest.md#local-sources).
 `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are
 optional. Supported filter kinds: `min_chars`, `max_chars`, `min_tokens`,
 `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, `dedup_exact`.
@@ -243,6 +248,8 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `scan_limit` | int | `50` | Discovery budget input; benchmark configs raise it so the prompt allows more discovery rounds. |
 | `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
 | `allow_script_datasets` | bool | `false` | Permit script-backed repositories only when the installed `datasets` runtime supports them. The current `datasets>=3` runtime still rejects them permanently. |
+| `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |
+| `max_local_source_bytes` | int | `33554432` | Maximum bytes transferred per local source before parsing. |
 | `max_turns` | int | `12` | Max agent turns; benchmark configs raise it for longer discovery and curation. |
 | `alpha_perf` | float | `1.0` | Positive cross-entropy performance weight. |
 | `lambda_cost` / `lambda_leakage` | float | `0.1` / `1.0` | Penalty weights. |
@@ -263,6 +270,11 @@ Before streaming a source, the materializer checks for the Hugging Face
 to `true` never bypasses the runtime capability check. Script execution remains
 unavailable in this release because the pinned Verifiers package requires
 `datasets>=3`.
+
+When streaming is unavailable, a local source can bridge a genuine downloaded
+dataset into scoring without executing repository code. Local paths are
+validated, transferred through the live runtime with `head -c`, billed like
+fetched tokens plus one code call, and audited with provenance metrics.
 
 ## Module Layout
 

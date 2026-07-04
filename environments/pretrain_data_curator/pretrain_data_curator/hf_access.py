@@ -269,6 +269,46 @@ class DatasetSearchClient(Protocol):
     ) -> list[str]: ...
 
 
+def extract_text_from_row(row: dict, text_field: str | None) -> str | None:
+    """Extract one non-empty text value using the shared HF/local heuristic."""
+    value = row.get(text_field) if text_field is not None else None
+    if not isinstance(value, str) or not value.strip():
+        candidates: list[object] = []
+        for field in (
+            "text",
+            "content",
+            "passage",
+            "document",
+            "abstract",
+            "body",
+            "article",
+            "sentence",
+            "query",
+            "answer",
+            "response",
+            "output",
+            "instruction",
+            "input",
+            "context",
+        ):
+            if field == "query" and (
+                row.get("query") is not None or row.get("response") is not None
+            ):
+                candidates.append(
+                    str(row.get("query", "")) + " " + str(row.get("response", ""))
+                )
+            candidates.append(row.get(field))
+        value = next(
+            (
+                candidate
+                for candidate in candidates
+                if isinstance(candidate, str) and candidate.strip()
+            ),
+            None,
+        )
+    return value if isinstance(value, str) and value.strip() else None
+
+
 class HuggingFaceDatasetClient:
     """Live Hugging Face Hub client (streaming document sampling)."""
 
@@ -379,45 +419,8 @@ class HuggingFaceDatasetClient:
                 break
             if not isinstance(row, dict):
                 continue
-
-            value = row.get(text_field) if text_field is not None else None
-            if not isinstance(value, str) or not value.strip():
-                candidates: list[object] = []
-                for field in (
-                    "text",
-                    "content",
-                    "passage",
-                    "document",
-                    "abstract",
-                    "body",
-                    "article",
-                    "sentence",
-                    "query",
-                    "answer",
-                    "response",
-                    "output",
-                    "instruction",
-                    "input",
-                    "context",
-                ):
-                    if field == "query" and (
-                        row.get("query") is not None or row.get("response") is not None
-                    ):
-                        candidates.append(
-                            str(row.get("query", ""))
-                            + " "
-                            + str(row.get("response", ""))
-                        )
-                    candidates.append(row.get(field))
-                value = next(
-                    (
-                        candidate
-                        for candidate in candidates
-                        if isinstance(candidate, str) and candidate.strip()
-                    ),
-                    None,
-                )
-            if isinstance(value, str) and value.strip():
+            value = extract_text_from_row(row, text_field)
+            if value is not None:
                 docs.append(value)
         return docs
 

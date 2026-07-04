@@ -37,6 +37,26 @@ The agent should not create a virtual environment, write a Python Hub client, or
 search for legacy `huggingface-cli`/`curator_*` commands. Those paths consume a
 finite turn without improving the manifest.
 
+## Downloading a local source
+
+When a real pre-cutoff dataset is script-backed or otherwise cannot be streamed,
+the agent can download a raw file and transform it into text or JSONL in the same
+workspace:
+
+```bash
+hf download allenai/dolma data/v1.7/sample.json.gz \
+  --repo-type dataset --local-dir ./dl
+gunzip -c ./dl/data/v1.7/sample.json.gz \
+  | head -c 20000000 > data/dolma.jsonl
+```
+
+The manifest then references `data/dolma.jsonl` with `kind: "local"`. Paths are
+relative to the bash working directory; absolute paths, `..`, and reserved
+trainer files are rejected. Local files are capped during the runtime transfer,
+not after an unbounded read. Agents must not fabricate documents or copy
+held-out/evaluation data; local provenance and validation-repository access are
+emitted for audit.
+
 ## Recommended decision loop
 
 1. Search two or three distinct corpus categories with small result limits.
@@ -81,6 +101,10 @@ consumes resources.
 After finalization, each unique scoring fetch adds one Hub call and the estimated
 tokens in the returned documents. That charge is independent of CLI discovery
 output.
+
+Each unique successful local pull adds one code call and bills its parsed
+document tokens at the same rate as fetched tokens. Downloading and referencing
+a local file is therefore not a free path around the cost penalty.
 
 ## Turn budget
 
@@ -127,5 +151,9 @@ request to exceed its context window.
   deliberate mixture.
 - **Using unsupported filters.** Unknown filter kinds are discarded during
   manifest coercion.
+- **Using one-document-per-line `.txt`.** Text files split on blank lines; use
+  JSONL strings or objects for one document per line.
+- **Fabricating a local corpus.** Local sources must come from genuine
+  pre-cutoff data and their pulls are audited.
 - **Waiting until the last token to submit.** No usable manifest means zero
   positive performance reward.

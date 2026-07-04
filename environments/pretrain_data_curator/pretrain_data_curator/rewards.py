@@ -60,7 +60,9 @@ class CuratorScorer:
             RolloutStore.set_leakage_reference(state, leakage_reference)
             return self._empty_scoring(state)
 
-        corpus = await self.corpus_builder.materialize(manifest, state)
+        corpus = await self.corpus_builder.materialize(
+            manifest, state, runtime=runtime
+        )
         train_result = await self._train(corpus, state, runtime)
         leakage_detector, leakage_reference = await self._leakage_reference()
         RolloutStore.set_leakage_reference(state, leakage_reference)

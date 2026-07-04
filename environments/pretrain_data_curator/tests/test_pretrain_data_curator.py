@@ -1397,9 +1397,9 @@ class _CountingBuilder(CorpusBuilder):
         super().__init__(*args, **kwargs)
         self.materialize_calls = 0
 
-    async def materialize(self, manifest, state):
+    async def materialize(self, manifest, state, *, runtime=None):
         self.materialize_calls += 1
-        return await super().materialize(manifest, state)
+        return await super().materialize(manifest, state, runtime=runtime)
 
 
 class _CountingTrainer(HeuristicProxyTrainer):
@@ -1427,7 +1427,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 19  # 3 rewards + 16 diagnostic metrics
+    assert len(funcs) == 23  # 3 rewards + 20 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
