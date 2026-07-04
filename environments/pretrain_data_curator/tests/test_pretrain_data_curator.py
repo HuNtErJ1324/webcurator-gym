@@ -1917,32 +1917,40 @@ def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_
     assert score["leakage_estimate"] is None
 
 
-def test_self_score_rejects_final_validation_source_before_network_access(tmp_path):
+def test_self_score_dataset_id_precedence_matches_taskset_before_network_access(
+    tmp_path,
+):
     config = CuratorConfig(token_budget=1_000)
     (tmp_path / SELF_SCORE_FILENAME).write_bytes(render_self_score_script(config))
-    (tmp_path / "draft.json").write_text(
-        json.dumps(
-            {
-                "token_budget": 1_000,
-                "sources": [{"id": config.validation_set.dataset_id}],
-            }
-        ),
-        encoding="utf-8",
-    )
+    sources = [
+        {"dataset_id": config.validation_set.dataset_id},
+        {
+            "dataset_id": config.validation_set.dataset_id,
+            "id": "ignored/lower-priority-alias",
+        },
+    ]
+    for index, source in enumerate(sources):
+        manifest = {"token_budget": 1_000, "sources": [source]}
+        parsed = parse_manifest(json.dumps(manifest))
+        assert parsed is not None
+        assert parsed.sources[0].dataset_id == config.validation_set.dataset_id
+        draft = tmp_path / f"draft-{index}.json"
+        draft.write_text(json.dumps(manifest), encoding="utf-8")
 
-    result = subprocess.run(
-        [sys.executable, SELF_SCORE_FILENAME, "draft.json"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:1"},
-    )
-    score = json.loads(result.stdout)
-    assert score["validation_data_used"] is False
-    assert score["estimated_proxy_ce"] is None
-    assert score["sources"][0]["sampled_documents"] == 0
-    assert "reserved for final validation" in score["sources"][0]["error"]
+        result = subprocess.run(
+            [sys.executable, SELF_SCORE_FILENAME, draft.name],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:1"},
+        )
+        score = json.loads(result.stdout)
+        assert score["validation_data_used"] is False
+        assert score["estimated_proxy_ce"] is None
+        assert score["sources"][0]["sampled_documents"] == 0
+        assert score["sources"][0]["source"] == config.validation_set.dataset_id
+        assert "reserved for final validation" in score["sources"][0]["error"]
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------

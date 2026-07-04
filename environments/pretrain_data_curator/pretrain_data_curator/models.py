@@ -356,7 +356,14 @@ class CuratorConfig(BaseModel):
     # and metrics: token_budget is the sole optimization budget.
     max_turns: int = Field(default=64, ge=1, le=1000)
 
-    candidate_limit: int = Field(default=8, ge=1, le=1000)
+    candidate_limit: int = Field(
+        default=8,
+        ge=1,
+        le=1000,
+        description=(
+            "Maximum dataset IDs used by trace-based manifest recovery/fallback only."
+        ),
+    )
     sample_docs_per_source: int = Field(default=64, ge=1, le=100_000)
     allow_local_sources: bool = True
     max_local_source_bytes: int = Field(

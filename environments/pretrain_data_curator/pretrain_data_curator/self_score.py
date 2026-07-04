@@ -112,8 +112,19 @@ def local_docs(source, limit):
     return [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()][:limit]
 
 
+def source_dataset_id(source):
+    return (
+        source.get("dataset_id")
+        or source.get("id")
+        or source.get("dataset")
+        or source.get("repo_id")
+        or source.get("name")
+        or ""
+    )
+
+
 def remote_docs(source, limit):
-    dataset_id = str(source.get("id") or source.get("dataset_id") or "")
+    dataset_id = str(source_dataset_id(source))
     if hashlib.sha256(dataset_id.encode()).hexdigest() == FORBIDDEN_SOURCE_SHA256:
         raise ValueError("source is reserved for final validation")
     split = str(source.get("split") or "train")
@@ -212,7 +223,7 @@ def main():
     for source, weight in zip(sources, weights):
         kind = source.get("kind", "hf")
         label = source.get("local_path") if kind == "local" else (
-            source.get("id") or source.get("dataset_id")
+            source_dataset_id(source)
         )
         try:
             docs = (

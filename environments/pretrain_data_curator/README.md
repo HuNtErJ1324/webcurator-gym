@@ -266,7 +266,7 @@ but every rollout does.
 | `cutoff_date` | str | `"2024-12-31"` | Latest allowed Hugging Face `lastModified` date. |
 | `token_budget` | int | `1000000` | Target token budget for the mixture. |
 | `hf_token_env` | str | `"HF_TOKEN"` | Env var checked for the HF token before a rollout starts. |
-| `candidate_limit` | int | `8` | Maximum source IDs used by trace-based manifest recovery. |
+| `candidate_limit` | int | `8` | Maximum dataset IDs used by trace-based manifest recovery/fallback only. |
 | `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
 | `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |
 | `max_local_source_bytes` | int | `33554432` | Maximum bytes transferred per local source before parsing. |
