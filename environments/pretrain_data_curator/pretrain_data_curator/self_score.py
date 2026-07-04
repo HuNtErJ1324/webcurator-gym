@@ -47,6 +47,7 @@ FORBIDDEN_SOURCE_SHA256 = "__FORBIDDEN_SOURCE_SHA256__"
 HF_TOKEN_ENV = __HF_TOKEN_ENV__
 DATASETS_SERVER = "https://datasets-server.huggingface.co"
 TEXT_FIELDS = ("text", "content", "passage", "abstract")
+REDACTED_SOURCE_LABEL = "[withheld validation repository]"
 
 
 def fail(message):
@@ -123,9 +124,15 @@ def source_dataset_id(source):
     )
 
 
+def is_forbidden_source(dataset_id):
+    return hashlib.sha256(str(dataset_id).encode()).hexdigest() == (
+        FORBIDDEN_SOURCE_SHA256
+    )
+
+
 def remote_docs(source, limit):
     dataset_id = str(source_dataset_id(source))
-    if hashlib.sha256(dataset_id.encode()).hexdigest() == FORBIDDEN_SOURCE_SHA256:
+    if is_forbidden_source(dataset_id):
         raise ValueError("source is reserved for final validation")
     split = str(source.get("split") or "train")
     config = source.get("config")
@@ -222,9 +229,13 @@ def main():
     hub_calls = 0
     for source, weight in zip(sources, weights):
         kind = source.get("kind", "hf")
-        label = source.get("local_path") if kind == "local" else (
-            source_dataset_id(source)
-        )
+        dataset_id = str(source_dataset_id(source))
+        if kind == "local":
+            label = source.get("local_path")
+        elif is_forbidden_source(dataset_id):
+            label = REDACTED_SOURCE_LABEL
+        else:
+            label = dataset_id
         try:
             docs = (
                 local_docs(source, args.limit)

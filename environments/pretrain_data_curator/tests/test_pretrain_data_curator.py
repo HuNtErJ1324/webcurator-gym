@@ -1844,6 +1844,15 @@ def test_task_prompt_rules_state_failure_modes_without_dataset_priors_or_recipes
     assert "your first response" not in prompt.lower()
 
 
+def test_task_prompt_requires_commands_to_use_the_harness_interface():
+    prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
+
+    assert "execute them through the harness tool or shell interface" in prompt
+    assert "writing a command as prose does not run it" in prompt
+    assert "codex" not in prompt.lower()
+    assert "mini_swe_agent" not in prompt.lower()
+
+
 def test_discovery_has_no_call_or_output_stop():
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
     stops = discover_decorated(taskset, "stop")
@@ -1861,6 +1870,36 @@ def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
     assert "min_chars" in prompt
     assert "dedup_exact" in prompt
     assert '"sample_docs_per_source": <optional integer, 1-100000>' in prompt
+    manifest_fields = {
+        "token_budget": 1_000,
+        "sample_docs_per_source": 8,
+        "sources": [
+            {
+                "id": "owner/dataset",
+                "kind": "hf",
+                "weight": 1.0,
+                "config": None,
+                "split": "train",
+                "text_field": None,
+                "filters": [{"kind": "min_chars", "params": {"value": 10}}],
+                "max_docs": 4,
+                "max_tokens": 500,
+            }
+        ],
+    }
+    for field in manifest_fields | manifest_fields["sources"][0]:
+        assert f'"{field}"' in prompt
+
+    manifest = parse_manifest(
+        f"```json\n{json.dumps(manifest_fields)}\n```",
+        default_token_budget=1_000,
+    )
+    assert manifest is not None
+    assert manifest.token_budget == 1_000
+    assert manifest.sample_docs_per_source == 8
+    assert manifest.sources[0].dataset_id == "owner/dataset"
+    assert manifest.sources[0].sampling.max_docs == 4
+    assert manifest.sources[0].sampling.max_tokens == 500
 
 
 def test_self_score_script_is_standalone_and_hides_final_validation_identity():
@@ -1917,40 +1956,56 @@ def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_
     assert score["leakage_estimate"] is None
 
 
-def test_self_score_dataset_id_precedence_matches_taskset_before_network_access(
-    tmp_path,
-):
+def test_self_score_dataset_id_precedence_matches_taskset():
     config = CuratorConfig(token_budget=1_000)
-    (tmp_path / SELF_SCORE_FILENAME).write_bytes(render_self_score_script(config))
     sources = [
-        {"dataset_id": config.validation_set.dataset_id},
+        {"dataset_id": "legacy/non-forbidden"},
         {
-            "dataset_id": config.validation_set.dataset_id,
+            "dataset_id": "legacy/non-forbidden",
             "id": "ignored/lower-priority-alias",
         },
     ]
-    for index, source in enumerate(sources):
+    namespace = {"__name__": "self_score_test"}
+    exec(
+        compile(render_self_score_script(config), SELF_SCORE_FILENAME, "exec"),
+        namespace,
+    )
+    for source in sources:
         manifest = {"token_budget": 1_000, "sources": [source]}
         parsed = parse_manifest(json.dumps(manifest))
         assert parsed is not None
-        assert parsed.sources[0].dataset_id == config.validation_set.dataset_id
-        draft = tmp_path / f"draft-{index}.json"
-        draft.write_text(json.dumps(manifest), encoding="utf-8")
+        assert parsed.sources[0].dataset_id == "legacy/non-forbidden"
+        assert namespace["source_dataset_id"](source) == "legacy/non-forbidden"
 
-        result = subprocess.run(
-            [sys.executable, SELF_SCORE_FILENAME, draft.name],
-            cwd=tmp_path,
-            check=True,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:1"},
-        )
-        score = json.loads(result.stdout)
-        assert score["validation_data_used"] is False
-        assert score["estimated_proxy_ce"] is None
-        assert score["sources"][0]["sampled_documents"] == 0
-        assert score["sources"][0]["source"] == config.validation_set.dataset_id
-        assert "reserved for final validation" in score["sources"][0]["error"]
+
+def test_self_score_redacts_forbidden_source_from_all_stdout(tmp_path):
+    config = CuratorConfig(token_budget=1_000)
+    (tmp_path / SELF_SCORE_FILENAME).write_bytes(render_self_score_script(config))
+    draft = tmp_path / "draft.json"
+    draft.write_text(
+        json.dumps(
+            {
+                "token_budget": 1_000,
+                "sources": [{"dataset_id": config.validation_set.dataset_id}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, SELF_SCORE_FILENAME, draft.name],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:1"},
+    )
+    score = json.loads(result.stdout)
+    assert score["sources"][0]["source"] == "[withheld validation repository]"
+    assert score["sources"][0]["error"] == (
+        "ValueError: source is reserved for final validation"
+    )
+    assert config.validation_set.dataset_id not in result.stdout
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
