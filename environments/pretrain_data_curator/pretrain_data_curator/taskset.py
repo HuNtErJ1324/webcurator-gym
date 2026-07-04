@@ -82,6 +82,8 @@ You have complete freedom in source choice, mixture design, filtering, and how y
 You have a normal bash shell. Execute commands rather than merely describing them. If your interface provides a shell or execution tool, call it: writing a command out as ordinary text without calling your shell tool does NOT run it—you must invoke the tool. If your interface executes replies directly as shell commands, reply with the command itself.
 
 ## Information on the Setup
+Be concise: keep messages short and let commands and their output carry the work.
+
 The Hugging Face `hf` CLI is the primary discovery tool. Your FIRST response must run a shell command, not present a plan. Use one shell action that installs the CLI only if missing and continues directly to a useful search:
 
 `if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000`
@@ -95,9 +97,9 @@ Do not diagnose aliases such as `huggingface-cli` or `python -m huggingface_hub`
 
 End every `hf` discovery command with `| head -c 6000`. Never request `tags` from `datasets ls`; request them only for a shortlisted dataset with `datasets info`. Check downloads, license, last modification, splits, configs, and text fields. `"text_field": null` auto-detects `text`, `content`, `passage`, `abstract`, and query/response pairs; set it explicitly only when inspection establishes the column.
 
-Some script-based datasets cannot be streamed by the environment. Download their raw files with `hf download <repo> --repo-type dataset`, `curl`, or `wget`; decompress or convert them to plain text or JSONL inside the working directory; then declare a local source. For example:
+Some script-based datasets cannot be streamed by the environment. Follow their URL lists to real data; when a repository contains raw files, download them with `hf download <repo> --repo-type dataset`, `curl`, or `wget`, then convert them to plain text or JSONL inside the working directory. This verified raw-file example converts a small Wikitext training shard:
 
-`hf download allenai/dolma data/v1.7/sample.json.gz --repo-type dataset --local-dir ./dl && gunzip -c ./dl/data/v1.7/sample.json.gz | head -c 20000000 > data/dolma.jsonl`
+`mkdir -p data dl && hf download Salesforce/wikitext wikitext-2-raw-v1/train-00000-of-00001.parquet --repo-type dataset --local-dir ./dl && python -c 'import json, pyarrow.parquet as pq; rows=pq.read_table("dl/wikitext-2-raw-v1/train-00000-of-00001.parquet").column("text").to_pylist(); open("data/wikitext.jsonl", "w").writelines(json.dumps({"text": x}) + "\\n" for x in rows if x.strip())'`
 
 JSONL contains one JSON object or string per line and uses `text_field`, which may be null for auto-detection. Plain text is split into documents on blank lines, so one-document-per-line data must use JSONL. Local files are read only to the configured byte cap, logged for audit, and billed like fetched tokens.
 

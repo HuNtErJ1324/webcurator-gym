@@ -406,6 +406,9 @@ def test_load_environment_folds_system_prompt_for_cli_harnesses(
     system_prompt, prompt = env.harness.resolve_prompt(task)
     assert system_prompt is None
     assert prompt == f"{task.system_prompt}\n\n{task.prompt}"
+    assert prompt.count("## Rules") == 1
+    assert prompt.count("## Task Rules") == 1
+    assert prompt.count("Remember:") == 1
 
 
 def test_load_environment_rejects_unknown_harness():
@@ -1817,6 +1820,14 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
     assert "pip install -q 'huggingface-hub>=0.34'" in SYSTEM_PROMPT
     assert "--search" in SYSTEM_PROMPT
     assert "| head -c 6000" in SYSTEM_PROMPT
+    assert "mkdir -p data dl" in SYSTEM_PROMPT
+    assert (
+        "Salesforce/wikitext "
+        "wikitext-2-raw-v1/train-00000-of-00001.parquet"
+        in SYSTEM_PROMPT
+    )
+    assert 'json.dumps({"text": x}) + "\\n"' in SYSTEM_PROMPT
+    assert "allenai/dolma data/v1.7/sample.json.gz" not in SYSTEM_PROMPT
     assert "Never request `tags` from `datasets ls`" in SYSTEM_PROMPT
     assert "```json" in SYSTEM_PROMPT
     assert '"sources"' in SYSTEM_PROMPT
@@ -1901,6 +1912,11 @@ def test_system_prompt_is_harness_agnostic_about_running_commands():
     assert "provides a shell or execution tool, call it" in low
     assert "does NOT run it" in SYSTEM_PROMPT
     assert "you must invoke the tool" in low
+    assert (
+        "Be concise: keep messages short and let commands and their output carry "
+        "the work."
+        in SYSTEM_PROMPT
+    )
     assert "executes replies directly as shell commands" in low
     assert "bash harness" not in low
     assert "codex" not in low
@@ -3305,10 +3321,10 @@ def test_parse_manifest_finds_manifest_after_leading_note_block():
 def test_build_tasks_renders_single_structured_task_prompt():
     prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
     assert prompt.startswith("Your goal is:")
-    assert "## Objective" in TASK_PROMPT
-    assert "## Autonomy & Exploration" in prompt
-    assert "## Information on the Setup" in prompt
-    assert "## Rules" in prompt
+    assert "## Task Objective" in TASK_PROMPT
+    assert "## Task Autonomy & Exploration" in prompt
+    assert "## Task Setup" in prompt
+    assert "## Task Rules" in prompt
     assert "complete freedom in data-source choice" in prompt
     assert "Iteration is encouraged" in prompt
     assert "hf datasets ls" in prompt
@@ -3316,7 +3332,8 @@ def test_build_tasks_renders_single_structured_task_prompt():
     assert "2024-12-31" in prompt
     assert "1000000" in prompt
     assert "There will be no user interaction" in prompt
-    assert prompt.rstrip().endswith("observed evidence.")
+    assert "Remember:" not in prompt
+    assert prompt.rstrip().endswith("Do not print it through the shell.")
 
 
 # --- Tier R (cont.): finalize trace-fallback metering -----------------------

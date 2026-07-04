@@ -24,27 +24,25 @@ _GOALS = [
 
 TASK_PROMPT = """Your goal is: {goal}
 
-## Objective
+## Task Objective
 Produce the manifest that gives the fixed proxy student the strongest held-out performance within this rollout's data and discovery budgets.
 
-## Autonomy & Exploration
+## Task Autonomy & Exploration
 - You have complete freedom in data-source choice, mixture weights, and filters.
 - Iteration is encouraged. Use the shell to gather enough evidence, then stop when another call is unlikely to improve the mixture.
 
-## Information on the Setup
+## Task Setup
 - The target mixture budget is {token_budget} tokens.
 - You have {max_turns} model turns. A response that invokes the shell uses one turn even if it contains multiple tool calls; every individual `hf` call is still billed.
 - A discovery round is one `hf datasets ls` call and one `hf datasets info` call. Prefer one `hf` call per turn and use at most {discovery_rounds} rounds (<={discovery_calls} shell calls).
 - Local sources are {local_source_status}.
 - Scoring trains the fixed student and measures held-out cross-entropy. The reward is `{alpha_perf} * performance - {lambda_cost} * discovery/data cost - {lambda_leakage} * leakage`.
 
-## Rules
+## Task Rules
 1. Use only datasets modified on or before {cutoff_date}.
 2. Do not use, copy, or derive data from the environment's fixed held-out validation set or evaluation corpus; those are reserved exclusively for scoring.
 3. There will be no user interaction. Operate autonomously.
-4. When you have enough evidence, commit immediately; do not fill remaining turns with more discovery. Commit no later than turn {commit_by}, before the turn limit: stop running commands and return only the fenced JSON manifest as a plain response. Do not print it through the shell.
-
-Remember: the source choices are yours. Explore economically and commit the best manifest you can support with observed evidence."""
+4. When you have enough evidence, commit immediately; do not fill remaining turns with more discovery. Commit no later than turn {commit_by}, before the turn limit: stop running commands and return only the fenced JSON manifest as a plain response. Do not print it through the shell."""
 
 
 class CuratorTask(vf.Task):
