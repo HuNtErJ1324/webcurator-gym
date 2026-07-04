@@ -342,8 +342,12 @@ class HuggingFaceDatasetClient:
     @staticmethod
     def _reject_script_dataset(dataset_id: str) -> None:
         raise DatasetAccessError(
-            f"{dataset_id} is a script-based Hugging Face dataset; the installed "
-            "datasets runtime cannot load dataset scripts. Use a data-only export.",
+            f"{dataset_id} is a script-based Hugging Face dataset, which the "
+            "installed datasets runtime cannot load. Download its raw files in "
+            "your shell with `hf download <repo> --repo-type dataset` or `curl`, "
+            "then convert them to plain text or JSONL in your workspace. Cite the "
+            'result in the manifest as a source with `kind: "local"` and '
+            '`local_path: "<relative-path>"`.',
             kind="script_dataset",
             dataset_id=dataset_id,
         )

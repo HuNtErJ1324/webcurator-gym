@@ -1568,7 +1568,8 @@ async def test_script_dataset_runtime_error_is_permanent_without_retry():
     assert excinfo.value.kind == "script_dataset"
 
 
-def test_script_dataset_probe_blocks_unconditionally(monkeypatch):
+@pytest.mark.asyncio
+async def test_script_dataset_probe_blocks_unconditionally_with_guidance(monkeypatch):
     calls = []
     load_calls = []
 
@@ -1586,12 +1587,23 @@ def test_script_dataset_probe_blocks_unconditionally(monkeypatch):
         lambda *args, **kwargs: load_calls.append((args, kwargs)),
     )
     client = HuggingFaceDatasetClient(token="test-token")
+    builder = CorpusBuilder(
+        client=client,
+        retry_policy=RetryPolicy(attempts=3, timeout=1.0),
+    )
+    state = CuratorState()
 
-    with pytest.raises(DatasetAccessError) as excinfo:
-        client.sample_documents("owner/legacy", None, "train", None, 1)
+    docs, error = await builder.fetch_source_docs(
+        state, FetchKey("owner/legacy", None, "train", None, 1)
+    )
 
-    assert excinfo.value.kind == "script_dataset"
-    assert "cannot load dataset scripts" in str(excinfo.value)
+    assert docs == []
+    assert error is not None
+    assert error["error_kind"] == "script_dataset"
+    assert "`hf download <repo> --repo-type dataset` or `curl`" in error["error"]
+    assert '`kind: "local"`' in error["error"]
+    assert '`local_path: "<relative-path>"`' in error["error"]
+    assert RolloutStore.tool_error_count(state) == 1
     assert calls == [
         {
             "repo_id": "owner/legacy",
