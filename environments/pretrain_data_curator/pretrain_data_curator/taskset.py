@@ -55,6 +55,7 @@ from .models import (
 )
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
+from .self_score import SELF_SCORE_FILENAME, render_self_score_script
 from .tasks import CuratorTask, build_tasks
 from .trainer import (
     HeuristicProxyTrainer,
@@ -65,89 +66,6 @@ from .trainer import (
 from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
-
-_DISCOVERY_OUTPUT_CHARS_PER_CALL = 6_000
-_DISCOVERY_OUTPUT_MARGIN = 1.1
-
-SYSTEM_PROMPT = """We want to train a fixed small GPT-2-scale language model on the strongest possible pretraining mixture. You are the data-curation agent responsible for selecting that mixture.
-
-## Objective
-Assemble a diverse, high-quality text corpus that maximizes the fixed student's held-out performance. Strong general-purpose mixtures often combine encyclopedic, scientific, instructional, reasoning, math, code, and broad web text; use evidence from the available datasets instead of treating any starter list as mandatory.
-
-Useful candidates to inspect include `wikimedia/wikipedia`, `HuggingFaceFW/fineweb`, `roneneldan/TinyStories`, `allenai/c4`, `Skylion007/openwebtext`, `Salesforce/wikitext`, and `allenai/dolma`. Prefer broad, clearly licensed corpora over code-only or narrow task datasets unless the task objective supports that tradeoff; past scoring has generally favored encyclopedic, then scientific and instructional text. These are leads, not permission to put an unobserved ID or config in the manifest.
-
-## Autonomy & Exploration
-You have complete freedom in source choice, mixture design, filtering, and how you spend the discovery budget. Iteration is encouraged: search, inspect enough candidates to make a defensible choice, and commit as soon as further calls are unlikely to improve it.
-
-You have a normal bash shell. Execute commands rather than merely describing them. If your interface provides a shell or execution tool, call it: writing a command out as ordinary text without calling your shell tool does NOT run it—you must invoke the tool. If your interface executes replies directly as shell commands, reply with the command itself.
-
-## Information on the Setup
-Be concise: keep messages short and let commands and their output carry the work.
-
-The Hugging Face `hf` CLI is the primary discovery tool. Your FIRST response must run a shell command, not present a plan. Use one shell action that installs the CLI only if missing and continues directly to a useful search:
-
-`if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000`
-
-Do not diagnose aliases such as `huggingface-cli` or `python -m huggingface_hub`, create a virtual environment, write Python for discovery, or install unrelated packages. Useful commands are:
-
-- `hf datasets ls --search "<query>" --sort downloads --limit 5 | head -c 6000`
-- `hf datasets ls --search "<query>" --filter text --limit 10 -q | head -c 6000`
-- `hf datasets ls --search "<query>" --limit 5 --format json --expand downloads,likes,lastModified | head -c 6000`
-- `hf datasets info <dataset_id> --expand downloads,likes,tags | head -c 6000`
-
-End every `hf` discovery command with `| head -c 6000`. Never request `tags` from `datasets ls`; request them only for a shortlisted dataset with `datasets info`. Check downloads, license, last modification, splits, configs, and text fields. `"text_field": null` auto-detects `text`, `content`, `passage`, `abstract`, and query/response pairs; set it explicitly only when inspection establishes the column.
-
-Some script-based datasets cannot be streamed by the environment. Follow their URL lists to real data; when a repository contains raw files, download them with `hf download <repo> --repo-type dataset`, `curl`, or `wget`, then convert them to plain text or JSONL inside the working directory. This verified raw-file example converts a small Wikitext training shard:
-
-`mkdir -p data dl && hf download Salesforce/wikitext wikitext-2-raw-v1/train-00000-of-00001.parquet --repo-type dataset --local-dir ./dl && python -c 'import json, pyarrow.parquet as pq; rows=pq.read_table("dl/wikitext-2-raw-v1/train-00000-of-00001.parquet").column("text").to_pylist(); open("data/wikitext.jsonl", "w").writelines(json.dumps({"text": x}) + "\\n" for x in rows if x.strip())'`
-
-JSONL contains one JSON object or string per line and uses `text_field`, which may be null for auto-detection. Plain text is split into documents on blank lines, so one-document-per-line data must use JSONL. Local files are read only to the configured byte cap, logged for audit, and billed like fetched tokens.
-
-## Manifest Contract
-Your final answer is one fenced `json` block with a non-empty `sources` list. Include no text after the closing ``` fence.
-
-```json
-{
-  "token_budget": 10000000,
-  "sample_docs_per_source": "<int, 1-100000; compute for this mixture>",
-  "sources": [
-    {
-      "id": "wikimedia/wikipedia",
-      "kind": "hf",
-      "local_path": null,
-      "local_format": "auto",
-      "weight": 1.0,
-      "config": null,
-      "split": "train",
-      "text_field": null,
-      "filters": [{"kind": "min_chars", "params": {"value": 200}}, {"kind": "dedup_exact"}],
-      "max_docs": null,
-      "max_tokens": null
-    },
-    {
-      "kind": "local",
-      "local_path": "data/source.jsonl",
-      "local_format": "jsonl",
-      "weight": 1.0,
-      "text_field": "text",
-      "filters": [{"kind": "min_chars", "params": {"value": 200}}, {"kind": "dedup_exact"}]
-    }
-  ]
-}
-```
-
-Set `token_budget` to the task's stated token budget. An `hf` source requires `id`; `kind` defaults to `"hf"`. A local source requires `kind: "local"` and `local_path`, and accepts `local_format` as `"auto"`, `"jsonl"`, or `"txt"`. Every source accepts a nonnegative `weight`; weights are relative and determine proportional token allocations. Optional source fields are `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens`; the two caps may instead be nested under `sampling`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
-
-Top-level `sample_docs_per_source` is the pre-filter fetch cap per source, not the post-filter `max_docs` or `max_tokens` cap. Omit it to use the environment default, or estimate it from `token_budget / (number of sources * 250 tokens per document)`, capped at 100000. Every search, inspection, download, and fetched token contributes to the cost penalty.
-
-## Rules
-1. Every Hugging Face `id` and non-null `config` must be copied exactly from `hf` output observed in this rollout. If a `config` was not explicitly observed, set `config` to null. A fabricated id or config materializes zero tokens; an empty manifest scores zero.
-2. Use only genuine downloaded data. Never fabricate documents, generate them from your own knowledge, or use held-out validation or evaluation text. Leakage is measured and penalized.
-3. A `local_path` must be relative to the working directory, with no leading `/` and no `..`.
-4. Commit the manifest as a plain final response, not through the shell.
-
-Remember: you own the source and mixture decisions. Explore economically, then commit the strongest evidence-backed manifest."""
-
 
 # --------------------------------------------------------------------------- #
 # manifest parsing (the agent's final-message deliverable)
@@ -512,11 +430,10 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     token_budget: int = 1_000_000
     hf_token_env: str = "HF_TOKEN"
     candidate_limit: int = 8
-    scan_limit: int = 50
     sample_docs_per_source: int = 64
     allow_local_sources: bool = True
     max_local_source_bytes: int = 33_554_432
-    max_turns: int = 12
+    max_turns: int = 64
     alpha_perf: float = 1.0
     lambda_cost: float = 0.1
     lambda_leakage: float = 1.0
@@ -572,7 +489,6 @@ class CuratorTaskset(_TasksetBase):
             cutoff_date=config.cutoff_date,
             token_budget=config.token_budget,
             candidate_limit=config.candidate_limit,
-            scan_limit=config.scan_limit,
             sample_docs_per_source=config.sample_docs_per_source,
             allow_local_sources=config.allow_local_sources,
             max_local_source_bytes=config.max_local_source_bytes,
@@ -678,20 +594,13 @@ class CuratorTaskset(_TasksetBase):
     # -- taskset surface -------------------------------------------------------
 
     def load_tasks(self) -> list[CuratorTask]:
-        max_turns = self.curator.max_turns
-        discovery_rounds, discovery_calls = self._discovery_budget()
         tasks = build_tasks(
             self.curator.cutoff_date,
             self.curator.token_budget,
-            max_turns=max_turns,
-            discovery_rounds=discovery_rounds,
-            discovery_calls=discovery_calls,
-            commit_by=max(1, max_turns - max(3, max_turns // 8)),
             allow_local_sources=self.curator.allow_local_sources,
             alpha_perf=self.curator.alpha_perf,
             lambda_cost=self.curator.lambda_cost,
             lambda_leakage=self.curator.lambda_leakage,
-            system_prompt=SYSTEM_PROMPT,
         )
         updates: dict[str, Any] = {}
         ps = self.curator.proxy_student
@@ -734,21 +643,6 @@ class CuratorTaskset(_TasksetBase):
             )
         return [task.model_copy(update=updates) for task in tasks]
 
-    def _discovery_budget(self) -> tuple[int, int]:
-        """Return the configured ``(rounds, calls)`` discovery allowance."""
-        rounds = max(
-            2,
-            min(12, self.curator.max_turns // 6, self.curator.scan_limit // 10),
-        )
-        return rounds, rounds * 2
-
-    def _discovery_output_budget_chars(self) -> int:
-        """Match the stop budget to the prompt's per-call output contract."""
-        _, calls = self._discovery_budget()
-        return math.ceil(
-            calls * _DISCOVERY_OUTPUT_CHARS_PER_CALL * _DISCOVERY_OUTPUT_MARGIN
-        )
-
     # NOTE: deliberately no ``tools(...)`` override — the agent curates via the
     # `hf` CLI in its own shell, so the taskset exposes no MCP tool servers and
     # ``type(CuratorTaskset).tools is Taskset.tools`` holds. This is what lets the
@@ -781,28 +675,21 @@ class CuratorTaskset(_TasksetBase):
             )
         if runtime.type == "docker":
             DockerHostReachability.configure()
+        # The self-score is copied into the live harness workspace instead of
+        # importing the environment package there. This keeps it available in
+        # subprocess, Docker, and Modal runtimes with no image-specific install.
+        await runtime.write(
+            SELF_SCORE_FILENAME,
+            render_self_score_script(
+                self.curator,
+                hf_token_env=self.config.hf_token_env,
+            ),
+        )
 
     @vf.stop
     async def max_turns_reached(self, trace: vf.Trace) -> bool:
-        """Cap the rollout at ``max_turns`` model turns (the harness also stops
-        naturally once the model emits a final answer with no tool calls)."""
+        """Generous harness safety cap, not an agent budget or scoring input."""
         return trace.num_turns >= self.curator.max_turns
-
-    @vf.stop
-    async def discovery_output_budget_reached(self, trace: vf.Trace) -> bool:
-        """Stop before oversized CLI results can overflow the model context.
-
-        Finalization can still recover a manifest from dataset ids observed in
-        the trace, so this degrades to a scored fallback instead of a provider
-        error that skips finalization and scoring entirely.
-        """
-        return (
-            sum(
-                len(_content_text(getattr(message, "content", "")))
-                for message in trace.tool_messages
-            )
-            >= self._discovery_output_budget_chars()
-        )
 
     # -- finalize (runs before scoring, while the runtime is live) -------------
 
@@ -1175,7 +1062,6 @@ class CuratorTaskset(_TasksetBase):
 
 __all__ = [
     "CuratorTaskset",
-    "SYSTEM_PROMPT",
     "_ids_from_trace",
     "parse_manifest",
     "extract_json_object",

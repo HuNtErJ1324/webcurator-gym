@@ -7,9 +7,8 @@ rollouts_per_example = 1
 
 [eval.args]
 token_budget = 10000000
-max_turns = 24
+max_turns = 64
 candidate_limit = 64
-scan_limit = 100
 sample_docs_per_source = 50000
 lambda_cost = 0.0
 baseline_relative_perf = true

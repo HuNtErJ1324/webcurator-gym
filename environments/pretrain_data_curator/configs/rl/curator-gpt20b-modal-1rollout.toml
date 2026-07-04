@@ -18,10 +18,9 @@ temperature   = 0.9
 id = "hunterj/pretrain-data-curator"
 
 args.use_real_trainer          = true
-args.max_turns                 = 25
+args.max_turns                 = 64
 args.token_budget              = 500_000
 args.candidate_limit           = 8
-args.scan_limit                = 10
 
 args.proxy_student.runtime_backend    = "modal"
 args.proxy_student.modal_gpu          = "L4"

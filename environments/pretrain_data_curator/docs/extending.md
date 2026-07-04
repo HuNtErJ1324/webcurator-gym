@@ -12,7 +12,7 @@ coordinated changes:
 1. Add the kind to `taskset._SUPPORTED_FILTER_KINDS`.
 2. Add its implementation to `DocumentFilter._apply_one_iter`
    (`pretrain_data_curator/corpus.py`).
-3. Add it to `SYSTEM_PROMPT` and
+3. Add it to `tasks.TASK_PROMPT`, `self_score.py`, and
    [Manifest and filtering](manifest.md#filters).
 
 ```python
@@ -28,9 +28,10 @@ fetches asynchronously, but the filter iterator itself runs inline.
 
 ## Extend the agent's CLI workflow
 
-Agent behavior is defined by both `SYSTEM_PROMPT` in `taskset.py` and the task
-prompt in `tasks.py`. Keep those aligned. Do not reintroduce an MCP toolset
-unless the intended harness compatibility changes.
+Agent behavior is defined by the single `TASK_PROMPT` in `tasks.py`; task
+instances set `system_prompt=None`. Keep the self-score contract aligned with
+the prompt and manifest parser. Do not reintroduce an MCP toolset unless the
+intended harness compatibility changes.
 
 If a new `hf` subcommand needs different billing, update
 `hf_meter.classify_hf_argv()` and tests for both JSONL records and trace
@@ -130,5 +131,5 @@ Test `hf` discovery independently through `hf_meter`:
 - `meter_ledger` for runtime-log preference.
 
 Direct native tests with injected collaborators do not need a real HF token.
-`load_environment()` also constructs without one; `hf_token_env` is read lazily
-when a rollout first materializes Hub data.
+`load_environment()` also constructs without one, but `taskset.setup()` requires
+`hf_token_env` before the agent starts.

@@ -98,7 +98,7 @@ Update together:
 
 - Pydantic models in `models.py`;
 - coercion in `taskset.py`;
-- prompt schema in `SYSTEM_PROMPT`;
+- single initial prompt contract in `tasks.TASK_PROMPT`;
 - parsing/finalization tests;
 - [Manifest and filtering](manifest.md);
 - relevant checked-in configs.

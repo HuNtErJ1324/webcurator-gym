@@ -23,14 +23,16 @@ num_examples = 4
 rollouts_per_example = 1
 
 [eval.args]
-# --- task / discovery -------------------------------------------------------
+# --- task -------------------------------------------------------------------
 cutoff_date = "2024-12-31"          # latest allowed HF `lastModified`
 token_budget = 1000000              # target mixture token budget (manifest default)
-hf_token_env = "HF_TOKEN"           # env var checked lazily at first Hub use
+hf_token_env = "HF_TOKEN"           # env var checked before each rollout
 candidate_limit = 8                 # trace-recovery fallback cap on synthesized sources
-scan_limit = 50                     # discovery-round budget input (prompt-only; must be >= candidate_limit)
 sample_docs_per_source = 64         # docs sampled per source for scoring
-max_turns = 12                      # agent turn cap
+allow_local_sources = true          # permit workspace-relative text/JSONL sources
+max_local_source_bytes = 33554432   # per-local-source runtime transfer cap
+max_turns = 64                      # generous harness safety cap; not a scoring budget
+harness_id = "bash"                 # compatible bundled Verifiers harness
 
 # --- reward weights ----------------------------------------------------------
 alpha_perf = 1.0                    # R = alpha_perf*Perf - lambda_cost*Cost - lambda_leakage*Leakage
@@ -46,6 +48,7 @@ baseline_relative_perf = true            # Perf reward = bounded relative loss r
 max_concurrent_fetches = 8
 max_concurrent_training = 1
 fetch_timeout_seconds = 30.0
+fetch_timeout_per_doc_seconds = 0.25
 fetch_max_attempts = 3
 
 # --- proxy-student trainer ----------------------------------------------------

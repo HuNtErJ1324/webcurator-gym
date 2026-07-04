@@ -31,14 +31,13 @@ timeout_minutes       = 360     # heuristic run: setup + HF fetch only, no GPU t
 allow_sandbox_access  = true
 
 [eval.env_args]
-# --- task / discovery -------------------------------------------------------
+# --- task -------------------------------------------------------------------
 cutoff_date            = "2024-12-31"
 token_budget            = 130_000_000     # reachable target (see header); was 400M
 hf_token_env            = "HF_TOKEN"
 candidate_limit         = 128
-scan_limit              = 500
 sample_docs_per_source  = 100_000        # field ceiling (models.py: le=100_000)
-max_turns               = 300            # generous turn budget, well under the 1000 ceiling
+max_turns               = 300            # generous safety cap, well under the 1000 ceiling
 
 # --- reward weights ----------------------------------------------------------
 alpha_perf    = 1.0

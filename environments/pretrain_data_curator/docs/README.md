@@ -22,7 +22,8 @@ it.
 
 - **Taskset**: the verifiers v1 object that supplies tasks, setup/finalization,
   stopping conditions, rewards, and metrics.
-- **Harness**: the agent loop. This environment uses the bash harness.
+- **Harness**: the agent loop. Bash is the default; `harness_id` can select
+  compatible bundled CLI harnesses such as Codex or mini-SWE-agent.
 - **Runtime**: where harness commands execute. It is a subprocess by default,
   or a rollout-owned Docker/Modal runtime for those real-trainer backends.
 - **Manifest**: the agent's final JSON decision: source slices, weights, filters,

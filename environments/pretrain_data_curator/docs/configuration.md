@@ -5,22 +5,22 @@ fields raise `TypeError` instead of being silently ignored.
 
 ## Environment arguments
 
-### Task and discovery
+### Task and harness
 
 | Argument | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `cutoff_date` | `str` | `"2024-12-31"` | Latest repository modification date the agent is instructed to use |
 | `token_budget` | `int` | `1_000_000` | Manifest default and source-weight allocation budget |
-| `hf_token_env` | `str` | `"HF_TOKEN"` | Environment variable read on first materialization |
+| `hf_token_env` | `str` | `"HF_TOKEN"` | Environment variable required during rollout setup |
 | `candidate_limit` | `int` | `8` | Maximum IDs used by trace-based manifest recovery |
-| `scan_limit` | `int` | `50` | Input to the prompt's suggested discovery-round count |
 | `sample_docs_per_source` | `int` | `64` | Hard upper bound on rows requested from each source |
 | `allow_local_sources` | `bool` | `true` | Permit manifests to pull workspace-local text/JSONL files at scoring time |
 | `max_local_source_bytes` | `int` | `33_554_432` | Per-local-source transfer cap; valid range 1 byte through 1 GiB |
-| `max_turns` | `int` | `12` | Agent-loop turn cap |
+| `max_turns` | `int` | `64` | Harness safety cap; not shown to the agent or used in scoring |
+| `harness_id` | `str` | `"bash"` | Bundled Verifiers harness ID, including `bash`, `codex`, and `mini_swe_agent` |
 
-`scan_limit` must be at least `candidate_limit`. Both are configuration and
-prompt/recovery controls; the agent still chooses actual `hf --limit` values.
+`token_budget` is the only agent-facing optimization budget. There is no
+discovery-call/output allocation, and `max_turns` is only a safety backstop.
 
 The source fetch path probes for `{dataset_name}.py` before loading. If that file
 exists, the source records the permanent `script_dataset` error and is attempted
@@ -151,11 +151,26 @@ To override a few fields:
 ```bash
 prime eval run pretrain-data-curator \
   -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"max_turns": 24, "token_budget": 2000000, "sample_docs_per_source": 256}'
+  -a '{"token_budget": 2000000, "sample_docs_per_source": 256}'
 ```
 
 Do not add `--skip-upload`; canonical Prime eval runs save results for the
 private Evaluations tab and `prime eval tui`.
+
+## Agent self-score
+
+Rollout setup copies `self_score.py` into the harness workspace. It accepts a
+draft manifest and a bounded candidate-sample limit:
+
+```bash
+python self_score.py draft.json --limit 8
+```
+
+This script is independent of `use_real_trainer`: it always returns a cheap
+development heuristic. It samples only manifest sources, blocks the configured
+validation repository by a non-reversible digest, and never loads the final
+validation shard or leakage reference. See [Agent workflow](agent-workflow.md)
+for output fields and limitations.
 
 ## Docker harness runtime
 
@@ -182,7 +197,7 @@ uv run eval pretrain-data-curator \
   --taskset.use-real-trainer true \
   --taskset.token-budget 50000 \
   --taskset.sample-docs-per-source 16 \
-  --taskset.max-turns 12 \
+  --taskset.max-turns 64 \
   --taskset.proxy-student \
     '{"runtime_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":8192,"gpu_count":1}' \
   -m deepseek/deepseek-v4-flash -n 1 -r 1

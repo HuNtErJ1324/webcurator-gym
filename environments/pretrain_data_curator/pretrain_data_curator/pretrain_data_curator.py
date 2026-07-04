@@ -14,11 +14,12 @@ from verifiers.v1.runtimes.modal import ModalConfig
 from .hosted_compat import Environment
 from .modal_backend import _modal_gpu_for
 from .models import ProxyStudentConfig
-from .taskset import SYSTEM_PROMPT, CuratorTasksetConfig
+from .taskset import CuratorTasksetConfig
+from .tasks import TASK_PROMPT
 
 TASKSET_ID = "pretrain-data-curator"
 
-__all__ = ["SYSTEM_PROMPT", "load_environment"]
+__all__ = ["TASK_PROMPT", "load_environment"]
 
 
 def load_environment(
@@ -26,11 +27,10 @@ def load_environment(
     token_budget: int = 1_000_000,
     hf_token_env: str = "HF_TOKEN",
     candidate_limit: int = 8,
-    scan_limit: int = 50,
     sample_docs_per_source: int = 64,
     allow_local_sources: bool = True,
     max_local_source_bytes: int = 33_554_432,
-    max_turns: int = 12,
+    max_turns: int = 64,
     alpha_perf: float = 1.0,
     lambda_cost: float = 0.1,
     lambda_leakage: float = 1.0,
@@ -75,7 +75,6 @@ def load_environment(
         token_budget=token_budget,
         hf_token_env=hf_token_env,
         candidate_limit=candidate_limit,
-        scan_limit=scan_limit,
         sample_docs_per_source=sample_docs_per_source,
         allow_local_sources=allow_local_sources,
         max_local_source_bytes=max_local_source_bytes,
@@ -100,7 +99,6 @@ def load_environment(
         "token_budget": token_budget,
         "hf_token_env": hf_token_env,
         "candidate_limit": candidate_limit,
-        "scan_limit": scan_limit,
         "sample_docs_per_source": sample_docs_per_source,
         "harness_id": harness_id,
         "allow_local_sources": allow_local_sources,

@@ -45,9 +45,12 @@ from pretrain_data_curator.models import (
 from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
+from pretrain_data_curator.self_score import (
+    SELF_SCORE_FILENAME,
+    render_self_score_script,
+)
 from pretrain_data_curator.tasks import TASK_PROMPT, build_tasks
 from pretrain_data_curator.taskset import (
-    SYSTEM_PROMPT,
     CuratorTaskset,
     CuratorTasksetConfig,
     extract_json_object,
@@ -390,8 +393,8 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.taskset.load_tasks()
 
 
-@pytest.mark.parametrize("harness_id", ["codex", "mini_swe_agent"])
-def test_load_environment_folds_system_prompt_for_cli_harnesses(
+@pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
+def test_load_environment_uses_one_initial_prompt_for_all_harnesses(
     monkeypatch, harness_id
 ):
     monkeypatch.setenv("HF_TOKEN", "test-token")
@@ -405,10 +408,10 @@ def test_load_environment_folds_system_prompt_for_cli_harnesses(
     task = env.taskset.load_tasks()[0]
     system_prompt, prompt = env.harness.resolve_prompt(task)
     assert system_prompt is None
-    assert prompt == f"{task.system_prompt}\n\n{task.prompt}"
+    assert task.system_prompt is None
+    assert prompt == task.prompt
     assert prompt.count("## Rules") == 1
-    assert prompt.count("## Task Rules") == 1
-    assert prompt.count("Remember:") == 1
+    assert "self_score.py" in prompt
 
 
 def test_load_environment_rejects_unknown_harness():
@@ -1086,15 +1089,15 @@ class FailingClient(FakeClient):
 
 
 def test_config_valid_defaults_and_overrides():
-    cfg = CuratorConfig(candidate_limit=4, scan_limit=10)
-    assert cfg.scan_limit >= cfg.candidate_limit
+    cfg = CuratorConfig(candidate_limit=4)
+    assert cfg.candidate_limit == 4
+    assert cfg.max_turns == 64
     assert ProxyStudentConfig(n_embd=128, n_head=4).n_embd == 128
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"scan_limit": 5, "candidate_limit": 10},  # cross-field: scan < candidate
         {"token_budget": 0},
         {"max_turns": 0},
         {"fetch_max_attempts": 0},
@@ -1808,119 +1811,138 @@ async def test_severe_leakage_remains_a_penalty_without_bonus_gating():
     assert "diversity" not in scoring
 
 
-# --- Tier M: system prompt teaches the hf-CLI + JSON-manifest workflow ------
+# --- Tier M: single PTB-style prompt + leakage-safe self-score --------------
 
 
-def test_system_prompt_teaches_hf_cli_and_json_manifest():
-    # The agent curates via the `hf` CLI and emits a fenced JSON manifest; the
-    # prompt must teach both (and not reference the retired curator_* MCP tools).
-    assert "hf datasets ls" in SYSTEM_PROMPT
-    assert "hf datasets info" in SYSTEM_PROMPT
-    assert "command -v hf" in SYSTEM_PROMPT
-    assert "pip install -q 'huggingface-hub>=0.34'" in SYSTEM_PROMPT
-    assert "--search" in SYSTEM_PROMPT
-    assert "| head -c 6000" in SYSTEM_PROMPT
-    assert "mkdir -p data dl" in SYSTEM_PROMPT
-    assert (
-        "Salesforce/wikitext "
-        "wikitext-2-raw-v1/train-00000-of-00001.parquet"
-        in SYSTEM_PROMPT
+def test_task_prompt_is_compact_method_open_and_single_budget():
+    task = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load_tasks()[0]
+    prompt = task.prompt
+
+    assert task.system_prompt is None
+    assert len(prompt) < 5_000
+    assert "complete freedom" in prompt
+    assert '"token_budget": 1000000' in prompt
+    assert '"sources"' in prompt
+    assert "python self_score.py draft.json --limit 8" in prompt
+    assert "Never ask the user" in prompt
+    assert "7 model turns" not in prompt
+    assert "turn budget" not in prompt.lower()
+    assert "discovery budget" not in prompt.lower()
+    assert "discovery round" not in prompt.lower()
+
+
+def test_task_prompt_rules_state_failure_modes_without_dataset_priors_or_recipes():
+    prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
+
+    assert "contamination and incurs the leakage penalty" in prompt
+    assert "increases the cost penalty without increasing the scored corpus" in prompt
+    assert "there is no positive performance score" in prompt
+    assert "hf datasets ls" not in prompt
+    assert "pip install" not in prompt
+    assert "wikimedia/wikipedia" not in prompt
+    assert "HuggingFaceFW/fineweb" not in prompt
+    assert "your first response" not in prompt.lower()
+
+
+def test_discovery_has_no_call_or_output_stop():
+    taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
+    stops = discover_decorated(taskset, "stop")
+
+    assert [stop.__name__ for stop in stops] == ["max_turns_reached"]
+
+
+def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
+    prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
+
+    assert '"id": "<observed Hugging Face owner/name>"' in prompt
+    assert '"kind": "hf"' in prompt
+    assert '"kind": "local"' in prompt
+    assert '"local_path"' in prompt
+    assert "min_chars" in prompt
+    assert "dedup_exact" in prompt
+    assert '"sample_docs_per_source": <optional integer, 1-100000>' in prompt
+
+
+def test_self_score_script_is_standalone_and_hides_final_validation_identity():
+    config = CuratorConfig(token_budget=1_000)
+    script = render_self_score_script(config)
+
+    assert config.validation_set.dataset_id.encode() not in script
+    assert b"validation_data_used" in script
+    assert b"urllib.request" in script
+    compile(script, SELF_SCORE_FILENAME, "exec")
+
+
+def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_path):
+    (tmp_path / SELF_SCORE_FILENAME).write_bytes(
+        render_self_score_script(CuratorConfig(token_budget=1_000))
     )
-    assert 'json.dumps({"text": x}) + "\\n"' in SYSTEM_PROMPT
-    assert "allenai/dolma data/v1.7/sample.json.gz" not in SYSTEM_PROMPT
-    assert "Never request `tags` from `datasets ls`" in SYSTEM_PROMPT
-    assert "```json" in SYSTEM_PROMPT
-    assert '"sources"' in SYSTEM_PROMPT
-    assert (
-        "If a `config` was not explicitly observed, set `config` to null."
-        in SYSTEM_PROMPT
+    (tmp_path / "dev.jsonl").write_text(
+        "\n".join(
+            json.dumps({"text": "Clean development sample text " * 40})
+            for _ in range(8)
+        ),
+        encoding="utf-8",
     )
-    assert "fabricated id or config materializes zero tokens" in SYSTEM_PROMPT
-    assert "Include no text after the closing ``` fence." in SYSTEM_PROMPT
-    assert (
-        "`text`, `content`, `passage`, `abstract`, and query/response pairs"
-        in SYSTEM_PROMPT
-    )
-    assert "curator_" not in SYSTEM_PROMPT  # no stale MCP tool references
-
-
-@pytest.mark.asyncio
-async def test_discovery_output_budget_stops_before_provider_context_overflow():
-    curator = await _make()
-    budget = curator.taskset._discovery_output_budget_chars()
-    trace = _trace_with_bash_calls(
-        curator.task,
-        curator.state,
-        [
-            (
-                "hf datasets ls --search wikipedia --limit 5",
-                "wikimedia/wikipedia " + ("x" * budget),
-            ),
-            ("hf datasets info wikimedia/wikipedia", "unused"),
-        ],
+    (tmp_path / "draft.json").write_text(
+        json.dumps(
+            {
+                "token_budget": 1_000,
+                "sample_docs_per_source": 8,
+                "sources": [
+                    {
+                        "kind": "local",
+                        "local_path": "dev.jsonl",
+                        "local_format": "jsonl",
+                        "weight": 1.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
     )
 
-    assert await curator.taskset.discovery_output_budget_reached(trace)
-
-
-def test_discovery_output_budget_derives_from_prompt_call_allowance():
-    taskset = CuratorTaskset(
-        CuratorTasksetConfig(id="test", max_turns=1000, scan_limit=1000)
+    result = subprocess.run(
+        [sys.executable, SELF_SCORE_FILENAME, "draft.json", "--limit", "4"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    _, calls = taskset._discovery_budget()
-    assert calls == 24
-    assert taskset._discovery_output_budget_chars() > calls * 6_000
+    score = json.loads(result.stdout)
+    assert score["ok"] is True
+    assert score["validation_data_used"] is False
+    assert score["estimated_proxy_ce"] > 0.0
+    assert score["estimated_budget_fill_ratio"] > 0.0
+    assert score["leakage_estimate"] is None
 
 
-def test_system_prompt_manifest_example_parses():
-    # The schema example embedded in the prompt must itself parse into a Manifest,
-    # so the documented contract and the parser cannot silently drift apart.
-    manifest = parse_manifest(SYSTEM_PROMPT, default_token_budget=1_000_000)
-    assert manifest is not None
-    assert manifest.sources  # the example carries at least one source
-    assert manifest.token_budget == 10_000_000
-    assert manifest.sources[0].dataset_id == "wikimedia/wikipedia"
-    assert manifest.sources[0].text_field is None
-    assert "Set `token_budget` to the task's stated token budget." in SYSTEM_PROMPT
-
-
-def test_system_prompt_sample_docs_per_source_example_is_not_a_bare_literal():
-    # Regression: a live eval showed an agent anchoring on a literal example
-    # value (copying "sample_docs_per_source": 64 verbatim instead of computing
-    # its own number from token_budget). The example's shown value must not be
-    # a bare copy-pasteable integer -- match the existing `id` field's
-    # placeholder-string convention so it reads as "fill this in", not a
-    # literal answer -- while the field name itself still appears (so the agent
-    # sees it's a real, expected top-level key) and the prose still documents
-    # bounds/behavior.
-    assert '"sample_docs_per_source"' in SYSTEM_PROMPT
-    assert '"sample_docs_per_source": 64' not in SYSTEM_PROMPT
-    assert "1-100000" in SYSTEM_PROMPT
-    assert "compute" in SYSTEM_PROMPT.lower()
-
-
-def test_system_prompt_is_harness_agnostic_about_running_commands():
-    # Regression: with a tool-calling CLI harness (e.g. codex) the agent must be
-    # told to CALL its shell tool, not to "respond with a bash command" — the latter
-    # made models emit the command as prose and stop after a single turn, never
-    # running discovery (finalized=0, reward=0). The prompt must drive command
-    # execution in a way that works for BOTH message-executing harnesses (bash,
-    # kimi_code, default) and tool-calling ones (codex, ...), with no response-format
-    # wording that assumes the message itself is the command.
-    low = SYSTEM_PROMPT.lower()
-    assert "your first response must be a bash command" not in low
-    assert "provides a shell or execution tool, call it" in low
-    assert "does NOT run it" in SYSTEM_PROMPT
-    assert "you must invoke the tool" in low
-    assert (
-        "Be concise: keep messages short and let commands and their output carry "
-        "the work."
-        in SYSTEM_PROMPT
+def test_self_score_rejects_final_validation_source_before_network_access(tmp_path):
+    config = CuratorConfig(token_budget=1_000)
+    (tmp_path / SELF_SCORE_FILENAME).write_bytes(render_self_score_script(config))
+    (tmp_path / "draft.json").write_text(
+        json.dumps(
+            {
+                "token_budget": 1_000,
+                "sources": [{"id": config.validation_set.dataset_id}],
+            }
+        ),
+        encoding="utf-8",
     )
-    assert "executes replies directly as shell commands" in low
-    assert "bash harness" not in low
-    assert "codex" not in low
-    assert "mini_swe_agent" not in low
+
+    result = subprocess.run(
+        [sys.executable, SELF_SCORE_FILENAME, "draft.json"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HTTPS_PROXY": "http://127.0.0.1:1"},
+    )
+    score = json.loads(result.stdout)
+    assert score["validation_data_used"] is False
+    assert score["estimated_proxy_ce"] is None
+    assert score["sources"][0]["sampled_documents"] == 0
+    assert "reserved for final validation" in score["sources"][0]["error"]
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
@@ -3175,19 +3197,12 @@ async def test_finalize_falls_back_when_final_message_never_arrives():
     assert manifest.sources[0].config is None
 
 
-def test_task_prompt_includes_configured_turn_budget():
-    # Concrete rollout parameters belong to the one task prompt; the system
-    # prompt remains the same coherent environment contract across tasks.
-    tasks = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load_tasks()
-    assert tasks
-    prompt = tasks[0].prompt
-    assert "7 model turns" in prompt  # the configured value is rendered in
-    assert "manifest" in prompt and "before the turn limit" in prompt
-    assert tasks[0].system_prompt == SYSTEM_PROMPT
-    # A different budget renders a different number (not a hard-coded constant).
-    other = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=20)).load_tasks()
-    assert "20 model turns" in other[0].prompt
-    assert other[0].system_prompt == SYSTEM_PROMPT
+def test_safety_turn_cap_does_not_change_agent_prompt():
+    short = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load_tasks()
+    long = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=200)).load_tasks()
+    assert short[0].prompt == long[0].prompt
+    assert short[0].system_prompt is None
+    assert long[0].system_prompt is None
 
 
 def test_task_prompt_renders_scoring_parameters_and_local_policy():
@@ -3203,65 +3218,32 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
 
     assert "Local sources are disabled; use only Hugging Face sources" in task.prompt
     assert (
-        "`2.0 * performance - 0.25 * discovery/data cost - 3.0 * leakage`"
+        "`2.0 * performance - 0.25 * cost - 3.0 * leakage`"
         in task.prompt
     )
 
 
-def test_task_prompt_scales_discovery_with_benchmark_budget():
-    # Discovery is capped so the agent commits before exhausting its turns, but
-    # benchmark-sized scan/turn budgets are allowed more than smoke runs.
-    for max_turns in (7, 12):
-        prompt = (
-            CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=max_turns))
-            .load_tasks()[0]
-            .prompt
-        )
-        assert f"{max_turns} model turns" in prompt
-        assert "contains multiple tool calls" in prompt
-        assert "every individual `hf` call is still billed" in prompt
-        assert "use at most 2 rounds (<=4 shell calls)" in prompt
-        assert "commit immediately; do not fill remaining turns" in prompt
-        assert "stop running commands and return only the fenced JSON manifest" in prompt
-        assert "Do not print it through the shell" in prompt
+@pytest.mark.asyncio
+async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "test-token")
 
-    smoke_prompt = (
-        CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=25, scan_limit=10))
-        .load_tasks()[0]
-        .prompt
-    )
-    assert "25 model turns" in smoke_prompt
-    assert "use at most 2 rounds (<=4 shell calls)" in smoke_prompt
+    class Runtime:
+        type = "subprocess"
 
-    benchmark_task = (
-        CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=64, scan_limit=200))
-        .load_tasks()[0]
-    )
-    benchmark_prompt = benchmark_task.prompt
-    assert "64 model turns" in benchmark_prompt
-    assert "use at most 10 rounds (<=20 shell calls)" in benchmark_prompt
-    assert "Commit no later than turn 56" in benchmark_prompt
-    assert "must be copied exactly from `hf` output" in benchmark_task.system_prompt
-    assert "fabricated id or config materializes zero tokens" in (
-        benchmark_task.system_prompt
-    )
+        def __init__(self):
+            self.files = {}
 
+        async def write(self, path, data):
+            self.files[path] = data
 
-def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
-    # Bare Modal/Prime images may not contain the CLI. The first command must
-    # self-heal and search in one turn, while prohibiting unproductive alias/import
-    # diagnosis and unrelated installs.
-    low = SYSTEM_PROMPT.lower()
-    assert "already installed" not in low
-    assert "command -v hf" in low
-    assert "pip install -q 'huggingface-hub>=0.34'" in low
-    assert "fi; hf datasets ls" in low  # bootstrap and useful discovery share one turn
-    assert "your first response must run a shell command, not present a plan" in low
-    assert "do not diagnose aliases such as `huggingface-cli`" in low
-    assert "installs the cli only if missing" in low
-    assert "install unrelated packages" in low
-    assert "pip will only waste your turns" not in low
-    assert "no setup required" not in low
+    runtime = Runtime()
+    taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
+    await taskset.setup(taskset.load_tasks()[0], runtime)
+
+    assert SELF_SCORE_FILENAME in runtime.files
+    assert taskset.curator.validation_set.dataset_id.encode() not in runtime.files[
+        SELF_SCORE_FILENAME
+    ]
 
 
 # --- the PATH-shadow shim --------------------------------------------------
@@ -3315,25 +3297,26 @@ def test_parse_manifest_finds_manifest_after_leading_note_block():
     assert m.sources[0].dataset_id == "good/encyclopedia"
 
 
-# --- Tier M (cont.): the per-task goal prompt teaches the hf-CLI workflow ----
+# --- Tier M (cont.): the per-task goal renders into the initial prompt --------
 
 
 def test_build_tasks_renders_single_structured_task_prompt():
     prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
-    assert prompt.startswith("Your goal is:")
-    assert "## Task Objective" in TASK_PROMPT
-    assert "## Task Autonomy & Exploration" in prompt
-    assert "## Task Setup" in prompt
-    assert "## Task Rules" in prompt
-    assert "complete freedom in data-source choice" in prompt
-    assert "Iteration is encouraged" in prompt
-    assert "hf datasets ls" in prompt
-    assert "hf datasets info" in prompt
+    assert prompt.startswith("We want to train")
+    assert "## Objective" in TASK_PROMPT
+    assert "## Deliverable" in prompt
+    assert "## Setup" in prompt
+    assert "## Rules" in prompt
+    assert "complete freedom" in prompt
+    assert "Research and iterate autonomously" in prompt
+    assert "Hugging Face `hf` CLI" in prompt
     assert "2024-12-31" in prompt
     assert "1000000" in prompt
     assert "There will be no user interaction" in prompt
     assert "Remember:" not in prompt
-    assert prompt.rstrip().endswith("Do not print it through the shell.")
+    assert prompt.rstrip().endswith(
+        "operate autonomously and execute the actions that make the most sense."
+    )
 
 
 # --- Tier R (cont.): finalize trace-fallback metering -----------------------

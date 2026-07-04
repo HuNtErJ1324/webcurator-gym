@@ -348,18 +348,15 @@ class ProxyStudentConfig(BaseModel):
 
 
 class CuratorConfig(BaseModel):
-    """Central, validated configuration for the environment and reward.
-
-    Bounds and a cross-field check (``scan_limit >= candidate_limit``) keep
-    nonsensical configurations from silently producing degenerate rollouts.
-    """
+    """Central, validated configuration for the environment and reward."""
 
     cutoff_date: str = "2024-12-31"
     token_budget: int = Field(default=1_000_000, gt=0)
-    max_turns: int = Field(default=12, ge=1, le=1000)
+    # Safety-only harness cap. It is deliberately absent from prompts, rewards,
+    # and metrics: token_budget is the sole optimization budget.
+    max_turns: int = Field(default=64, ge=1, le=1000)
 
     candidate_limit: int = Field(default=8, ge=1, le=1000)
-    scan_limit: int = Field(default=50, ge=1, le=100_000)
     sample_docs_per_source: int = Field(default=64, ge=1, le=100_000)
     allow_local_sources: bool = True
     max_local_source_bytes: int = Field(
@@ -401,12 +398,3 @@ class CuratorConfig(BaseModel):
     # tokens). Consumed by the real (sandbox) proxy-student trainer.
     validation_set: ValidationSetConfig = Field(default_factory=ValidationSetConfig)
     use_real_trainer: bool = False
-
-    @model_validator(mode="after")
-    def _check_scan_covers_candidates(self) -> "CuratorConfig":
-        if self.scan_limit < self.candidate_limit:
-            raise ValueError(
-                f"scan_limit ({self.scan_limit}) must be >= candidate_limit "
-                f"({self.candidate_limit})"
-            )
-        return self

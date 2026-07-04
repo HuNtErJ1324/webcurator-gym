@@ -5,12 +5,23 @@ pre-cutoff Hugging Face universe. The curated mixture is scored by training a
 **fixed GPT-2-scale proxy-student where everything but the data is held
 constant**, combined with cross-entropy performance, cost, and leakage terms.
 
+## Quickstart
+
+```bash
+export HF_TOKEN=...
+prime env install pretrain-data-curator -p ./environments
+prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1
+```
+
+`HF_TOKEN` is checked before each rollout. For setup and zero-score failures, see
+[Troubleshooting](docs/troubleshooting.md).
+
 ## Overview
 
 - **Environment ID**: `pretrain-data-curator`
-- **Type**: toolless native verifiers v1 `CuratorTaskset` (`vf.Taskset`) — the agent discovers datasets using the `hf` CLI in its own shell, installing it defensively when the runtime image omits it; no MCP tool server is exposed
+- **Type**: toolless native verifiers v1 `CuratorTaskset` (`vf.Taskset`) — the agent discovers datasets using the `hf` CLI in its own shell; no MCP tool server is exposed
 - **External service**: Hugging Face Hub API (search + streaming sampling)
-- **Required secret**: `HF_TOKEN` by default (checked lazily in the env-server, not at load time)
+- **Required secret**: `HF_TOKEN` by default (checked in taskset setup before each rollout)
 - **Proxy-student training**: optional GPU training, off by default; selectable co-located harness-runtime Docker backend **or Modal** (recommended for Hosted Training)
 
 The agent searches Hugging Face for datasets at or before a cutoff date,
@@ -20,8 +31,10 @@ and scored.
 
 ## Reward
 
-```
-R(M, H) = Perf(M) - Cost(M) - Leakage(M)
+```text
+R(M, H) = alpha_perf * Perf(M)
+        - lambda_cost * Cost(M)
+        - lambda_leakage * Leakage(M, H)
 ```
 
 | Term | Meaning | Default weight |
@@ -115,7 +128,7 @@ uv run eval pretrain-data-curator \
   --taskset.use-real-trainer true \
   --taskset.token-budget 50000 \
   --taskset.sample-docs-per-source 16 \
-  --taskset.max-turns 12 \
+  --taskset.max-turns 64 \
   --taskset.proxy-student \
     '{"runtime_backend":"docker","docker_image":"pretrain-data-curator:gpu","train_token_budget":8192,"gpu_count":1}' \
   -m deepseek/deepseek-v4-flash -n 1 -r 1
@@ -148,9 +161,18 @@ reward timeout.
 ## Agent interface
 
 `CuratorTaskset` deliberately exposes **no MCP tool server** (`Taskset.tools` is
-not overridden). The agent's interface is the Hugging Face `hf` CLI in its own
-shell, with a conditional first-command install when the image omits it — there
-are no `curator_*` API commands.
+not overridden). The agent receives one initial user prompt and no separate
+system prompt, so bash, Codex, and mini-SWE-agent harnesses see the same task.
+The prompt is method-open: the shell, internet, `hf`, and other harness tools are
+available without a prescribed command sequence. There are no `curator_*` API
+commands.
+
+Taskset setup also writes `self_score.py` into the rollout workspace. An agent
+can run `python self_score.py draft.json --limit 8` to sample only the candidate
+training sources and estimate proxy CE, token fill, scoring cost, and reward
+excluding leakage/prior discovery. This development signal does not load the
+final validation shard; the configured validation repository is blocked by a
+hash so its identity is not disclosed by the script.
 
 | `hf` command | Purpose | Cost |
 | --- | --- | --- |
@@ -190,8 +212,8 @@ When a multi-config dataset has no default and `config` is omitted, the
 materializer chooses a stable English/default config (for example `en` or a
 config ending in `.en`) before falling back to the first advertised config.
 
-See [`docs/agent-workflow.md`](docs/agent-workflow.md) for the full `hf` workflow, metering
-details, manifest schema, filter reference, and turn-budget guidance.
+See [`docs/agent-workflow.md`](docs/agent-workflow.md) for the prompt, self-score,
+metering, and manifest-recovery behavior.
 
 ## Documentation
 
@@ -199,7 +221,7 @@ details, manifest schema, filter reference, and turn-budget guidance.
 | --- | --- |
 | [Documentation map](docs/README.md) | Choose the right guide. |
 | [Architecture](docs/architecture.md) | Follow a rollout from task loading through cleanup. |
-| [Agent workflow](docs/agent-workflow.md) | Understand shell discovery, metering, output limits, and manifest recovery. |
+| [Agent workflow](docs/agent-workflow.md) | Understand the single prompt, self-score, metering, and manifest recovery. |
 | [Manifest and filtering](docs/manifest.md) | Author or audit the final JSON contract. |
 | [Configuration](docs/configuration.md) | Choose loader arguments, runtime resources, and eval commands. |
 | [Reward and metrics](docs/reward.md) | Interpret scores, costs, leakage, and failure signals. |
@@ -224,14 +246,14 @@ the run (up to ~1e9 tokens):
 
 ```bash
 prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"use_real_trainer": true, "max_turns": 64, "scan_limit": 200, "sample_docs_per_source": 50000, "proxy_student": {"runtime_backend": "modal", "train_token_budget": 400000000, "modal_gpu": "H200"}}'
+  -a '{"use_real_trainer": true, "max_turns": 64, "sample_docs_per_source": 50000, "proxy_student": {"runtime_backend": "modal", "train_token_budget": 400000000, "modal_gpu": "H200"}}'
 ```
 
 ## Required Environment Variables
 
-Hugging Face credentials are validated lazily in the env-server container when
-a rollout first accesses the Hub. Constructing the environment does not require
-`HF_TOKEN` in the orchestrator process.
+Hugging Face credentials are validated eagerly in taskset `setup()` before the
+agent starts. Constructing the environment itself does not require `HF_TOKEN`,
+but every rollout does.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -243,15 +265,17 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | --- | --- | --- | --- |
 | `cutoff_date` | str | `"2024-12-31"` | Latest allowed Hugging Face `lastModified` date. |
 | `token_budget` | int | `1000000` | Target token budget for the mixture. |
-| `hf_token_env` | str | `"HF_TOKEN"` | Env var checked for the HF token at first Hub API use. |
-| `candidate_limit` | int | `8` | Max candidates returned per search. |
-| `scan_limit` | int | `50` | Discovery budget input; benchmark configs raise it so the prompt allows more discovery rounds. |
+| `hf_token_env` | str | `"HF_TOKEN"` | Env var checked for the HF token before a rollout starts. |
+| `candidate_limit` | int | `8` | Maximum source IDs used by trace-based manifest recovery. |
 | `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
 | `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |
 | `max_local_source_bytes` | int | `33554432` | Maximum bytes transferred per local source before parsing. |
-| `max_turns` | int | `12` | Max agent turns; benchmark configs raise it for longer discovery and curation. |
+| `max_turns` | int | `64` | Generous harness safety cap; absent from the prompt, reward, and metrics. |
+| `harness_id` | str | `"bash"` | Bundled Verifiers harness (`bash`, `codex`, `mini_swe_agent`, etc.). |
 | `alpha_perf` | float | `1.0` | Positive cross-entropy performance weight. |
 | `lambda_cost` / `lambda_leakage` | float | `0.1` / `1.0` | Penalty weights. |
+| `perf_baseline_loss` | float | `log(50304)` | Neutral CE reference for relative performance. |
+| `baseline_relative_perf` | bool | `true` | Use bounded relative loss reduction; `false` uses `exp(-loss)`. |
 | `max_concurrent_fetches` | int | `8` | Bound on concurrent HF fetches (also the corpus-builder fetch limit). |
 | `max_concurrent_training` | int | `1` | Bound on concurrent sandbox-training jobs (real trainer). |
 | `fetch_timeout_seconds` | float | `30.0` | Base per-attempt timeout for external HF calls. |
@@ -278,7 +302,7 @@ fetched tokens plus one code call, and audited with provenance metrics.
 - `pretrain_data_curator.py` — `load_environment` entry point; builds `CuratorTasksetConfig` and returns a `hosted_compat.Environment`.
 - `hosted_compat.py` — `Environment`: multiple-inheritance v0/v1 bridge. Derives from both `vf.Environment` and `legacy_vf.Environment`; delegates rollout work to the v1 episode engine and translates `vf.Trace` to the v0 `State` / `RolloutTiming` / trajectory format consumed by `prime eval` and Hosted Training.
 - `models.py` — Pydantic contracts (`Manifest`, `Source`, `FilterSpec`, `CostLedger`, `CuratorConfig`, `ProxyStudentConfig`, ...).
-- `hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers. Credentials checked lazily here at first Hub use, not at `load_environment` call time.
+- `hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers. Setup checks credentials before rollout; the client checks again at first Hub use.
 - `hf_meter.py` — PATH-shadow `hf` shim, per-rollout JSONL cost log, and trace-reconstruction fallback.
 - `corpus.py` — `CorpusBuilder` + `DocumentFilter` (materialize manifest into documents).
 - `leakage.py` — `LeakageDetector` (exact/fuzzy/semantic contamination).
@@ -292,7 +316,8 @@ fetched tokens plus one code call, and audited with provenance metrics.
 - `rewards.py` — `CuratorScorer`, the framework-agnostic heavy scoring pass.
 - `rollout_state.py` — typed `CuratorState` plus `RolloutStore` accessors.
 - `taskset.py` — `CuratorTaskset`, manifest parsing/recovery, `finalize()`, decorated rewards/metrics, and `@vf.stop` turn cap. No MCP tool server.
-- `tasks.py` — four typed v1 curation tasks and their user prompts.
+- `tasks.py` — four typed v1 curation tasks rendered as one initial user prompt.
+- `self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace.
 - `eval_corpus.py` — small offline fallback corpus for the leakage term.
 
 ## Notes And Limitations
@@ -310,6 +335,6 @@ fetched tokens plus one code call, and audited with provenance metrics.
   `DatasetAccessError`; on failure tools/scoring **degrade** to a defined sentinel
   (empty slice / infinite-loss `TrainResult`) and record diagnostics rather than
   crashing the rollout.
-- Token counts are estimated (~4 chars/token) on the env side; the real trainer
-  tokenizes inside the sandbox.
+- Token counts use `max(word_count, character_count // 4)` on the env side; the
+  real trainer tokenizes inside the sandbox.
 - Filtering is expressed via the structured `filters` argument.

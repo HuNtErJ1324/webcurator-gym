@@ -1,128 +1,98 @@
-"""Curation task definitions.
-
-Under verifiers v1 a task is a typed, frozen ``vf.Task`` rather than a row in an
-HF ``Dataset``. ``CuratorTask`` carries the per-episode goal as its ``prompt``
-plus the typed ``token_budget`` / ``cutoff_date`` that used to ride in the v0
-``info`` dict (so per-task overrides are typed and round-trip into rollout state
-without the JSON-string-vs-dict ambiguity the v0 env had to defend against).
-"""
+"""Typed curation tasks and their single initial prompt."""
 
 from __future__ import annotations
 
 import verifiers.v1 as vf
 
 _GOALS = [
-    "Curate a general-purpose pretraining mixture that teaches broad world "
-    "knowledge and clean prose to a small GPT-2-scale student.",
-    "Curate a pretraining mixture emphasizing reasoning, math, and code while "
-    "keeping enough natural language for fluent generation.",
-    "Curate a diverse pretraining mixture spanning encyclopedic, scientific, and "
-    "instructional text with strong deduplication and quality filtering.",
-    "Curate a compact, high-quality pretraining mixture that maximizes student "
-    "performance per training token under a tight budget.",
+    "Curate the strongest general-purpose pretraining mixture for the fixed student.",
+    "Maximize fixed-student performance from the available pretraining data.",
+    "Find an effective weighted and filtered pretraining mixture for the fixed student.",
+    "Use the fixed token allocation as effectively as possible for pretraining.",
 ]
 
-TASK_PROMPT = """Your goal is: {goal}
+TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to {goal}
 
-## Task Objective
-Produce the manifest that gives the fixed proxy student the strongest held-out performance within this rollout's data and discovery budgets.
+## Objective
+Research and iterate autonomously, then return the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 
-## Task Autonomy & Exploration
-- You have complete freedom in data-source choice, mixture weights, and filters.
-- Iteration is encouraged. Use the shell to gather enough evidence, then stop when another call is unlikely to improve the mixture.
+## Deliverable
+Your final response must contain only one fenced `json` block with this contract:
 
-## Task Setup
-- The target mixture budget is {token_budget} tokens.
-- You have {max_turns} model turns. A response that invokes the shell uses one turn even if it contains multiple tool calls; every individual `hf` call is still billed.
-- A discovery round is one `hf datasets ls` call and one `hf datasets info` call. Prefer one `hf` call per turn and use at most {discovery_rounds} rounds (<={discovery_calls} shell calls).
-- Local sources are {local_source_status}.
-- Scoring trains the fixed student and measures held-out cross-entropy. The reward is `{alpha_perf} * performance - {lambda_cost} * discovery/data cost - {lambda_leakage} * leakage`.
+```text
+{{
+  "token_budget": {token_budget},
+  "sample_docs_per_source": <optional integer, 1-100000>,
+  "sources": [
+    {{
+      "id": "<observed Hugging Face owner/name>",
+      "kind": "hf",
+      "weight": <nonnegative number>,
+      "config": <observed config or null>,
+      "split": "train",
+      "text_field": <field name or null>,
+      "filters": [{{"kind": "<supported filter>", "params": {{...}}}}],
+      "max_docs": <optional positive integer>,
+      "max_tokens": <optional positive integer>
+    }}
+  ]
+}}
+```
 
-## Task Rules
-1. Use only datasets modified on or before {cutoff_date}.
-2. Do not use, copy, or derive data from the environment's fixed held-out validation set or evaluation corpus; those are reserved exclusively for scoring.
-3. There will be no user interaction. Operate autonomously.
-4. When you have enough evidence, commit immediately; do not fill remaining turns with more discovery. Commit no later than turn {commit_by}, before the turn limit: stop running commands and return only the fenced JSON manifest as a plain response. Do not print it through the shell."""
+`kind` defaults to `"hf"`. A local source instead uses `"kind": "local"`, a workspace-relative `"local_path"`, and optional `"local_format": "auto" | "jsonl" | "txt"`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
+
+## Setup
+- The sole curation budget is {token_budget} tokens.
+- Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
+- Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_cost} * cost - {lambda_leakage} * leakage`.
+- For cheap iteration, save a draft manifest and run `python self_score.py draft.json --limit 8`. This development-only heuristic samples candidate-source data and reports estimated proxy CE and reward components; it never uses final held-out validation data.
+
+## Rules
+1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so its cost produces no performance.
+2. Never access, copy, infer, or derive data from the held-out validation or evaluation corpus. Doing so is contamination and incurs the leakage penalty.
+3. Keep the manifest at exactly {token_budget} tokens and use data, calls, and training work economically. Fetching or processing beyond what can fill that token allocation increases the cost penalty without increasing the scored corpus.
+4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
+5. Commit the manifest as the plain final response, not through the shell. Without a committed non-empty manifest, there is no positive performance score.
+
+There will be no user interaction. Never ask the user for feedback or clarification; operate autonomously and execute the actions that make the most sense."""
 
 
 class CuratorTask(vf.Task):
-    """One curation episode: a goal plus its budget and cutoff metadata.
-
-    ``answer`` is the cutoff date (the v0 reward never used it for scoring; it is
-    kept as task-provenance metadata). ``token_budget`` / ``cutoff_date`` are the
-    typed per-task overrides the toolset seeds into the manifest/cutoff.
-    """
+    """One curation episode with typed budget and cutoff provenance."""
 
     answer: str
     token_budget: int
     cutoff_date: str
 
 
-def _goal_prompt(
-    goal: str,
-    cutoff_date: str,
-    token_budget: int,
-    *,
-    max_turns: int,
-    discovery_rounds: int,
-    discovery_calls: int,
-    commit_by: int,
-    allow_local_sources: bool,
-    alpha_perf: float,
-    lambda_cost: float,
-    lambda_leakage: float,
-) -> str:
-    return TASK_PROMPT.format(
-        goal=goal,
-        cutoff_date=cutoff_date,
-        token_budget=token_budget,
-        max_turns=max_turns,
-        discovery_rounds=discovery_rounds,
-        discovery_calls=discovery_calls,
-        commit_by=commit_by,
-        local_source_status=(
-            "enabled for workspace-relative plain-text or JSONL files"
-            if allow_local_sources
-            else "disabled; use only Hugging Face sources"
-        ),
-        alpha_perf=alpha_perf,
-        lambda_cost=lambda_cost,
-        lambda_leakage=lambda_leakage,
-    )
-
-
 def build_tasks(
     cutoff_date: str,
     token_budget: int,
     *,
-    max_turns: int = 12,
-    discovery_rounds: int = 2,
-    discovery_calls: int = 4,
-    commit_by: int = 9,
     allow_local_sources: bool = True,
     alpha_perf: float = 1.0,
     lambda_cost: float = 0.1,
     lambda_leakage: float = 1.0,
-    system_prompt: str | None = None,
 ) -> list[CuratorTask]:
-    """One :class:`CuratorTask` per curation goal, with shared budget + cutoff."""
+    """Build one task per method-open curation goal."""
+    local_source_status = (
+        "enabled for workspace-relative plain-text or JSONL files"
+        if allow_local_sources
+        else "disabled; use only Hugging Face sources"
+    )
     return [
         CuratorTask(
             idx=i,
-            prompt=_goal_prompt(
-                goal,
-                cutoff_date,
-                token_budget,
-                max_turns=max_turns,
-                discovery_rounds=discovery_rounds,
-                discovery_calls=discovery_calls,
-                commit_by=commit_by,
-                allow_local_sources=allow_local_sources,
+            prompt=TASK_PROMPT.format(
+                goal=goal,
+                cutoff_date=cutoff_date,
+                token_budget=token_budget,
+                local_source_status=local_source_status,
                 alpha_perf=alpha_perf,
                 lambda_cost=lambda_cost,
                 lambda_leakage=lambda_leakage,
             ),
-            system_prompt=system_prompt,
+            system_prompt=None,
             answer=cutoff_date,
             token_budget=token_budget,
             cutoff_date=cutoff_date,
