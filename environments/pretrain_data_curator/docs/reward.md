@@ -90,8 +90,9 @@ sum.
 
 ## Leakage
 
-Every materialized document is compared with the held-out leakage corpus using
-three deterministic detectors:
+Every materialized document is compared with a bounded, decoded sample of the
+same held-out validation token stream used for proxy-student scoring, using three
+deterministic detectors:
 
 | Metric | Method | Default match condition |
 | --- | --- | --- |
@@ -113,6 +114,13 @@ processes.
 The "semantic" detector is lexical character-trigram similarity, not a neural
 embedding model. It is fast and reproducible but should not be interpreted as a
 general semantic-contamination detector.
+
+The reference samples 64 deterministic strata with windows of at most 1,024
+GPT-2 tokens, caps each decoded window at 8,192 characters and the semantic
+vocabulary at 32,768 trigrams, and is cached after construction. If the
+validation shard cannot be loaded or decoded, scoring logs
+`leakage_reference=stub` and exposes `stub` on
+`CuratorState.leakage_reference` while using the built-in offline fallback.
 
 ## Empty and unfinalized rollouts
 

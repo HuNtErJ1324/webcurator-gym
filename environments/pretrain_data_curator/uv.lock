@@ -1558,7 +1558,7 @@ wheels = [
 
 [[package]]
 name = "pretrain-data-curator"
-version = "0.4.5"
+version = "0.4.7"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -1567,6 +1567,7 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "renderers" },
+    { name = "tiktoken" },
     { name = "tqdm" },
     { name = "verifiers" },
 ]
@@ -1585,6 +1586,7 @@ requires-dist = [
     { name = "modal", specifier = ">=0.73" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "renderers", specifier = "==0.1.8.dev49" },
+    { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "verifiers", specifier = "==0.1.15.dev376" },
 ]

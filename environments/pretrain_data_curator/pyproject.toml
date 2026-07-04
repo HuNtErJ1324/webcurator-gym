@@ -2,7 +2,7 @@
 name = "pretrain-data-curator"
 description = "Agent curates an LLM pretraining corpus from the pre-cutoff Hugging Face universe, scored by proxy-student cross-entropy plus cost and leakage penalties."
 tags = ["huggingface", "datasets", "data-curation", "pretraining", "tool-use", "multi-turn", "train", "eval"]
-version = "0.4.5"
+version = "0.4.7"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "verifiers==0.1.15.dev376",
@@ -11,6 +11,7 @@ dependencies = [
     "huggingface-hub>=0.24.0",
     "numpy>=1.24.0",
     "modal>=0.73",
+    "tiktoken>=0.7.0",
     "tqdm>=4.66.0",
 ]
 

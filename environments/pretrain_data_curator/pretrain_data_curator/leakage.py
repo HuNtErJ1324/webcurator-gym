@@ -12,11 +12,14 @@ light; it can be swapped for a real embedding model later.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"\w+")
 
@@ -80,11 +83,20 @@ class LeakageDetector:
         fuzzy_threshold: float = 0.5,
         semantic_threshold: float = 0.8,
         seed: int = 0,
+        max_semantic_features: int | None = None,
+        fuzzy_chunk_words: int = 0,
     ) -> None:
+        if max_semantic_features is not None and max_semantic_features < 1:
+            raise ValueError(
+                "max_semantic_features must be >= 1 when set, "
+                f"got {max_semantic_features}"
+            )
         self._num_perm = num_perm
         self._shingle_k = shingle_k
         self._fuzzy_threshold = fuzzy_threshold
         self._semantic_threshold = semantic_threshold
+        self._max_semantic_features = max_semantic_features
+        self._fuzzy_chunk_words = fuzzy_chunk_words
         rng = np.random.default_rng(seed)
         mask = (1 << 32) - 1
         self._a = rng.integers(1, mask, size=num_perm, dtype=np.uint64)
@@ -95,6 +107,7 @@ class LeakageDetector:
         self._eval_minhashes = np.array(
             [self._minhash(d) for d in eval_docs], dtype=np.uint64
         ) if eval_docs else np.empty((0, num_perm), dtype=np.uint64)
+        self._eval_shingle_sets = [_word_shingles(d, self._shingle_k) for d in eval_docs]
         self._trigram_index, self._eval_vectors = self._build_vectors(eval_docs)
 
     def score(self, docs: Iterable[str]) -> LeakageScores:
@@ -134,6 +147,32 @@ class LeakageDetector:
         return hashed.min(axis=1)
 
     def _is_fuzzy_hit(self, doc: str) -> bool:
+        if self._fuzzy_chunk_words > 0:
+            words = _WORD_RE.findall(doc.lower())
+            if not words:
+                return False
+            chunk_size = self._fuzzy_chunk_words
+            stride = max(1, chunk_size // 2)
+            i = 0
+            while i < len(words):
+                chunk = " ".join(words[i : i + chunk_size])
+                sig = self._minhash(chunk)
+                equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
+                if bool(equal.max() >= self._fuzzy_threshold):
+                    return True
+                if self._eval_shingle_sets:
+                    chunk_shingles = _word_shingles(chunk, self._shingle_k)
+                    if chunk_shingles:
+                        for eval_shingles in self._eval_shingle_sets:
+                            if not eval_shingles:
+                                continue
+                            containment = len(chunk_shingles & eval_shingles) / len(
+                                chunk_shingles
+                            )
+                            if containment >= self._fuzzy_threshold:
+                                return True
+                i += stride
+            return False
         sig = self._minhash(doc)
         equal = (self._eval_minhashes == sig[None, :]).mean(axis=1)
         return bool(equal.max() >= self._fuzzy_threshold)
@@ -142,15 +181,32 @@ class LeakageDetector:
         self, docs: list[str]
     ) -> tuple[dict[str, int], np.ndarray]:
         index: dict[str, int] = {}
+        _truncation_warned = False
         for doc in docs:
             for tri in self._trigrams(doc):
+                if (
+                    tri not in index
+                    and self._max_semantic_features is not None
+                    and len(index) >= self._max_semantic_features
+                ):
+                    if not _truncation_warned:
+                        logger.warning(
+                            "[curator] max_semantic_features=%d reached: "
+                            "semantic trigram index truncated "
+                            "(unique trigrams exceed cap)",
+                            self._max_semantic_features,
+                        )
+                        _truncation_warned = True
+                    continue
                 index.setdefault(tri, len(index))
         if not docs or not index:
             return index, np.empty((0, len(index)), dtype=np.float64)
         vectors = np.zeros((len(docs), len(index)), dtype=np.float64)
         for row, doc in enumerate(docs):
             for tri in self._trigrams(doc):
-                vectors[row, index[tri]] += 1.0
+                col = index.get(tri)
+                if col is not None:
+                    vectors[row, col] += 1.0
         vectors = _l2_normalize(vectors)
         return index, vectors
 

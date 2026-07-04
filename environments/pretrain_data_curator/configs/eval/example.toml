@@ -52,8 +52,10 @@ fetch_max_attempts = 3
 # --- proxy-student trainer ----------------------------------------------------
 use_real_trainer = false            # false = deterministic CPU heuristic (no GPU or measured CE signal)
 
-# eval_corpus overrides the built-in held-out leakage reference corpus (list[str]).
-# Left commented to use the built-in eval_corpus.py default set.
+# eval_corpus overrides the default held-out leakage reference.
+# When unset, the reference is built from the real validation-set token shard
+# (kjj0/fineweb10B-gpt2 / fineweb_val_000000.bin) via LeakageReferenceLoader.
+# Set explicitly to a list[str] to bypass the real val-set and use a static corpus.
 # eval_corpus = ["..."]
 
 [eval.args.proxy_student]

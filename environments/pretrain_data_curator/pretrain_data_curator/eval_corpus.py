@@ -1,8 +1,8 @@
-"""A small fixed held-out evaluation corpus.
+"""A small fixed offline fallback corpus.
 
-Used as the contamination reference for the Leakage term. It is intentionally
-generic and self-contained so the environment has a deterministic eval set with
-no network dependency; swap in a real held-out benchmark via `load_environment`.
+Used only when the real tokenized validation set cannot be loaded or decoded.
+It is intentionally generic and self-contained so leakage scoring still works
+offline, with explicit fallback provenance and a warning.
 """
 
 from __future__ import annotations

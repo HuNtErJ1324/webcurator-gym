@@ -18,7 +18,9 @@ from verifiers.v1.decorators import discover_decorated
 
 from pretrain_data_curator.corpus import (
     CorpusBuilder,
+    CuratedCorpus,
     DocumentFilter,
+    SourceCorpus,
     _iter_sampling,
 )
 from pretrain_data_curator.eval_corpus import DEFAULT_EVAL_CORPUS
@@ -32,6 +34,7 @@ from pretrain_data_curator.hf_access import (
     run_blocking_with_retry,
 )
 from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
+from pretrain_data_curator.leakage_reference import LeakageReferenceLoader
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
@@ -61,6 +64,7 @@ from pretrain_data_curator.val_set import (
     NANOGPT_VAL_DATASET_ID,
     NANOGPT_VAL_FILENAME,
     NANOGPT_VAL_TOKENS,
+    HeldOutValSet,
     SHARD_HEADER_INTS,
     SHARD_MAGIC,
     SHARD_VERSION,
@@ -935,6 +939,109 @@ def test_leakage_detects_exact_and_paraphrase():
     assert contaminated.exact == 1.0
 
 
+def test_leakage_semantic_build_vectors_handles_trigram_cap():
+    docs = [
+        "abc def ghi jkl mno pqr stu vwx yzA BCD EFG HIJ KLM NOP QRS "
+        "TUV WXY Z01 234 567 890 123 456 789 ABC DEF GHI JKL MNO PQR"
+    ]
+    detector = LeakageDetector(docs, max_semantic_features=2, seed=0)
+    scores = detector.score(docs)
+    assert scores.exact == 1.0
+
+
+def test_leakage_trigram_cap_exceeded_no_keyerror():
+    docs_with_many_trigrams = [
+        " ".join(f"word{i:04d}" for i in range(200))
+        for _ in range(5)
+    ]
+    detector = LeakageDetector(docs_with_many_trigrams, max_semantic_features=4, seed=0)
+    scores = detector.score(docs_with_many_trigrams)
+    assert scores.fuzzy == 1.0
+
+
+def test_leakage_fuzzy_chunking_detects_embedded_reference():
+    import random
+
+    ref_text = (
+        "Photosynthesis is the process by which green plants and certain other "
+        "organisms transform light energy into chemical energy. During photosynthesis "
+        "in green plants light energy is captured and used to convert water carbon "
+        "dioxide and minerals into oxygen and energy-rich organic compounds."
+    ) * 10
+    ref_window = " ".join(ref_text.split()[:200])
+    vocab = [
+        "astronomy", "bicycle", "chemistry", "dolphin", "elephant", "fractal",
+        "galaxy", "horizon", "igloo", "jupiter", "kaleidoscope", "lemonade",
+        "mountain", "nebula", "oceanography", "pencil", "quasar", "rainforest",
+        "symphony", "telescope", "umbrella", "volcano", "waterfall", "xylophone",
+    ]
+
+    hits_chunked = 0
+    for trial in range(25):
+        rng = random.Random(42 + trial)
+        filler_words = [rng.choice(vocab) for _ in range(2000)]
+        insert_pos = rng.randint(0, len(filler_words))
+        combined = (
+            filler_words[:insert_pos]
+            + ref_window.split()
+            + filler_words[insert_pos:]
+        )
+        large_doc = " ".join(combined)
+        detector_chunked = LeakageDetector(
+            [ref_window], fuzzy_threshold=0.5, fuzzy_chunk_words=100, seed=0
+        )
+        if detector_chunked.score([large_doc]).fuzzy > 0:
+            hits_chunked += 1
+
+    assert hits_chunked >= 24
+
+
+def test_containment_catches_bisected_span_when_jaccard_fails():
+    """Containment scoring catches a copied span straddling chunk boundaries
+    where the per-chunk MinHash Jaccard stays below threshold, because the
+    eval document has many non-overlapping shingles that inflate the union.
+    Containment (|intersection| / |chunk|) ignores extraneous eval shingles,
+    so a chunk mostly composed of copied text passes the threshold."""
+    eval_doc = " ".join(f"tok{i}" for i in range(500))
+    span = " ".join(f"tok{i}" for i in range(200, 230))
+    filler = " ".join(f"zzz{i}" for i in range(2000))
+    words = filler.split()[:985] + span.split() + filler.split()[985:]
+    doc = " ".join(words)
+
+    detector_whole = LeakageDetector(
+        [eval_doc], fuzzy_threshold=0.5, fuzzy_chunk_words=0, seed=42
+    )
+    detector_chunked = LeakageDetector(
+        [eval_doc], fuzzy_threshold=0.5, fuzzy_chunk_words=30, seed=42
+    )
+
+    scores_whole = detector_whole.score([doc])
+    scores_chunked = detector_chunked.score([doc])
+
+    assert scores_whole.fuzzy == 0.0, (
+        f"Whole-doc Jaccard should miss this; got fuzzy={scores_whole.fuzzy}"
+    )
+    assert scores_chunked.fuzzy > 0.0, (
+        "Containment scoring should detect bisected span; "
+        f"got fuzzy={scores_chunked.fuzzy}"
+    )
+
+
+def test_containment_no_false_positive():
+    """A document with zero eval-doc overlap must not trigger containment."""
+    eval_doc = " ".join(f"tok{i}" for i in range(500))
+    unrelated = " ".join(f"xyz{i}" for i in range(2000))
+
+    detector = LeakageDetector(
+        [eval_doc], fuzzy_threshold=0.5, fuzzy_chunk_words=30, seed=42
+    )
+    scores = detector.score([unrelated])
+
+    assert scores.fuzzy == 0.0, (
+        f"Unrelated doc must have zero fuzzy score; got {scores.fuzzy}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared fakes for the robustness/concurrency tests.
 # ---------------------------------------------------------------------------
@@ -1320,7 +1427,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 18  # 3 rewards + 15 diagnostic metrics
+    assert len(funcs) == 19  # 3 rewards + 16 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -1924,6 +2031,268 @@ async def test_val_loader_fetch_failure_raises_typed_error(tmp_path):
     with pytest.raises(DatasetAccessError) as excinfo:
         await loader.load()
     assert excinfo.value.kind == "network"
+
+
+def _word_decoder_factory(calls=None):
+    def factory(tokenizer):
+        if calls is not None:
+            calls.append(tokenizer)
+
+        def decode(token_ids):
+            return " ".join(f"word{token_id}" for token_id in token_ids)
+
+        return decode
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_builds_from_fake_tokenized_val_source(tmp_path):
+    tokens = list(range(1, 129))
+    loader = ValTokenLoader(
+        ValidationSetConfig(val_tokens=len(tokens)),
+        download_fn=_shard_download_fn(tmp_path, tokens),
+    )
+    decoder_calls = []
+    reference = await LeakageReferenceLoader(
+        loader,
+        decoder_factory=_word_decoder_factory(decoder_calls),
+        sample_count=4,
+        chunk_tokens=16,
+    ).load()
+
+    assert reference.source == "real"
+    assert len(reference.documents) == 4
+    assert reference.sampled_tokens == 64
+    assert decoder_calls == ["gpt2"]
+    assert all(document.startswith("word") for document in reference.documents)
+
+
+@pytest.mark.asyncio
+async def test_real_val_reference_detects_copied_chunk_exact_and_fuzzy(tmp_path):
+    tokens = list(range(1, 129))
+    reference_loader = LeakageReferenceLoader(
+        ValTokenLoader(
+            ValidationSetConfig(val_tokens=len(tokens)),
+            download_fn=_shard_download_fn(tmp_path, tokens),
+        ),
+        decoder_factory=_word_decoder_factory(),
+        sample_count=4,
+        chunk_tokens=16,
+    )
+    reference = await reference_loader.load()
+    copied = reference.documents[0]
+    altered = f"{copied} one harmless appended phrase"
+
+    class CopiedCorpusBuilder:
+        async def materialize(self, manifest, state):
+            return CuratedCorpus(
+                sources=[
+                    SourceCorpus.from_iter(
+                        "fake/train", None, 1.0, [copied, altered]
+                    )
+                ]
+            )
+
+    scorer = CuratorScorer(
+        CuratorConfig(),
+        CopiedCorpusBuilder(),
+        HeuristicProxyTrainer(),
+        None,
+        reference_loader,
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="fake/train")])
+    )
+    RolloutStore.set_finalized(state, True)
+    scoring = await scorer.compute_scoring(state)
+
+    assert scoring["leakage"]["exact"] == 0.5
+    assert scoring["leakage"]["fuzzy"] == 1.0
+    assert scoring["leakage"]["overall"] > 0.0
+    assert state.leakage_reference == "real"
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_cache_reuses_decoded_detector():
+    class CountingValLoader:
+        def __init__(self):
+            self.calls = 0
+
+        async def load(self):
+            self.calls += 1
+            tokens = np.arange(1, 65, dtype="<u2")
+            return HeldOutValSet("fake/val", "val.bin", "gpt2", tokens, len(tokens))
+
+    val_loader = CountingValLoader()
+    decoder_calls = []
+    loader = LeakageReferenceLoader(
+        val_loader,
+        decoder_factory=_word_decoder_factory(decoder_calls),
+        sample_count=2,
+        chunk_tokens=16,
+    )
+
+    first = await loader.load()
+    second = await loader.load()
+
+    assert first is second
+    assert val_loader.calls == 1
+    assert decoder_calls == ["gpt2"]
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_offline_falls_back_loudly_and_sets_state_flag(
+    caplog,
+):
+    class UnavailableValLoader:
+        async def load(self):
+            raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
+
+    class StaticCorpusBuilder:
+        async def materialize(self, manifest, state):
+            return CuratedCorpus(
+                sources=[
+                    SourceCorpus.from_iter(
+                        "fake/train", None, 1.0, [DEFAULT_EVAL_CORPUS[0]]
+                    )
+                ]
+            )
+
+    reference_loader = LeakageReferenceLoader(UnavailableValLoader())
+    scorer = CuratorScorer(
+        CuratorConfig(),
+        StaticCorpusBuilder(),
+        HeuristicProxyTrainer(),
+        None,
+        reference_loader,
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="fake/train")])
+    )
+    RolloutStore.set_finalized(state, True)
+
+    with caplog.at_level("WARNING"):
+        scoring = await scorer.compute_scoring(state)
+
+    assert scoring["leakage"]["exact"] == 1.0
+    assert state.leakage_reference == "stub"
+    assert "leakage_reference=stub" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_stub_not_cached_retry_succeeds(tmp_path):
+    tokens = list(range(1, 65))
+    calls = []
+
+    class _FlipFlopValLoader:
+        def __init__(self):
+            self._attempt = 0
+
+        async def load(self):
+            self._attempt += 1
+            calls.append(self._attempt)
+            if self._attempt == 1:
+                raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
+            return HeldOutValSet(
+                "kjj0/fineweb10B-gpt2",
+                "fineweb_val_000000.bin",
+                "gpt2",
+                np.array(tokens, dtype="<u2"),
+                len(tokens),
+            )
+
+    reference_loader = LeakageReferenceLoader(
+        _FlipFlopValLoader(),
+        decoder_factory=_word_decoder_factory(),
+        sample_count=4,
+        chunk_tokens=16,
+        stub_ttl_seconds=0.0,
+    )
+
+    first = await reference_loader.load()
+    assert first.source == "stub"
+    assert calls == [1]
+
+    second = await reference_loader.load()
+    assert second.source == "real"
+    assert calls == [1, 2]
+    assert first is not second
+
+
+@pytest.mark.asyncio
+async def test_leakage_reference_stub_cached_with_ttl_then_retries():
+    load_calls = []
+
+    class _AlwaysFailingValLoader:
+        async def load(self):
+            load_calls.append(len(load_calls) + 1)
+            raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
+
+    loader = LeakageReferenceLoader(
+        _AlwaysFailingValLoader(),
+        decoder_factory=_word_decoder_factory(),
+        sample_count=2,
+        chunk_tokens=16,
+        stub_ttl_seconds=0.05,
+    )
+
+    first = await loader.load()
+    assert first.source == "stub"
+    assert load_calls == [1]
+
+    second = await loader.load()
+    assert second is first
+    assert load_calls == [1]
+
+    await asyncio.sleep(0.06)
+
+    third = await loader.load()
+    assert third.source == "stub"
+    assert load_calls == [1, 2]
+    assert third is not first
+
+
+@pytest.mark.asyncio
+async def test_default_taskset_path_produces_leakage_reference_via_ensure():
+    """Integration: the DEFAULT taskset path (no injected detector, no injected
+    loader) builds the val-based reference through CuratorTaskset._ensure()
+    and scoring reflects the real reference provenance."""
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(
+            id="test",
+            eval_corpus=None,
+        )
+    )
+    tokens = np.arange(1, 129, dtype="<u2")
+
+    class _FixedValLoader:
+        async def load(self):
+            return HeldOutValSet("fake/val", "val.bin", "gpt2", tokens, len(tokens))
+
+    taskset._val_loader = _FixedValLoader()
+    taskset._client = FakeClient()
+    taskset._corpus_builder = CorpusBuilder(client=taskset._client)
+    taskset._trainer = HeuristicProxyTrainer()
+
+    scorer = taskset._ensure()
+    assert taskset._leakage_reference_loader is not None
+    assert taskset._leakage_detector is None
+
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="good/encyclopedia")])
+    )
+    RolloutStore.set_finalized(state, True)
+    scoring = await scorer.compute_scoring(state)
+
+    assert state.leakage_reference == "real", (
+        f"expected 'real' got {state.leakage_reference!r}"
+    )
+    assert "leakage" in scoring
+    assert scoring["leakage"]["overall"] >= 0.0
 
 
 @pytest.mark.asyncio

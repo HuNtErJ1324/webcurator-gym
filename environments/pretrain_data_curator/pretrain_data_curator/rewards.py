@@ -19,12 +19,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from typing import Any
+from typing import Any, Literal
 
 import verifiers.v1 as vf
 
 from .corpus import CorpusBuilder, CuratedCorpus
 from .leakage import LeakageDetector
+from .leakage_reference import LeakageReferenceLoader
 from .models import CuratorConfig
 from .rollout_state import CuratorState, RolloutStore
 from .trainer import ProxyStudentTrainer, TrainResult
@@ -40,12 +41,14 @@ class CuratorScorer:
         config: CuratorConfig,
         corpus_builder: CorpusBuilder,
         trainer: ProxyStudentTrainer,
-        leakage_detector: LeakageDetector,
+        leakage_detector: LeakageDetector | None,
+        leakage_reference_loader: LeakageReferenceLoader | None = None,
     ) -> None:
         self.config = config
         self.corpus_builder = corpus_builder
         self.trainer = trainer
         self.leakage_detector = leakage_detector
+        self.leakage_reference_loader = leakage_reference_loader
 
     async def compute_scoring(
         self, state: CuratorState, runtime: vf.Runtime | None = None
@@ -53,10 +56,14 @@ class CuratorScorer:
         manifest = RolloutStore.manifest(state)
         finalized = RolloutStore.is_finalized(state)
         if not finalized or not manifest.sources:
+            _, leakage_reference = await self._leakage_reference()
+            RolloutStore.set_leakage_reference(state, leakage_reference)
             return self._empty_scoring(state)
 
         corpus = await self.corpus_builder.materialize(manifest, state)
         train_result = await self._train(corpus, state, runtime)
+        leakage_detector, leakage_reference = await self._leakage_reference()
+        RolloutStore.set_leakage_reference(state, leakage_reference)
 
         ledger = RolloutStore.ledger(state)
         ledger.train_flops += train_result.flops
@@ -67,7 +74,7 @@ class CuratorScorer:
         # streams from the on-disk corpus in a single pass rather than materializing
         # the full corpus text (see `LeakageDetector.score`).
         leakage = await asyncio.to_thread(
-            self.leakage_detector.score, corpus.iter_documents()
+            leakage_detector.score, corpus.iter_documents()
         )
 
         return {
@@ -87,6 +94,16 @@ class CuratorScorer:
             "perf_vs_baseline": self._relative_improvement(train_result),
             "perf_baseline_loss": self.config.perf_baseline_loss,
         }
+
+    async def _leakage_reference(
+        self,
+    ) -> tuple[LeakageDetector, Literal["real", "stub", "custom"]]:
+        if self.leakage_detector is not None:
+            return self.leakage_detector, "custom"
+        if self.leakage_reference_loader is None:
+            raise RuntimeError("no leakage reference is configured")
+        reference = await self.leakage_reference_loader.load()
+        return reference.detector, reference.source
 
     async def _train(
         self,

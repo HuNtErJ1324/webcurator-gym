@@ -38,7 +38,7 @@ remote repository code remains blocked.
 | `lambda_leakage` | `1.0` | Multiplier on the leakage penalty |
 | `perf_baseline_loss` | `log(50304)` | No-information loss used by baseline-relative performance |
 | `baseline_relative_perf` | `true` | Use bounded relative loss improvement; otherwise use `exp(-loss)` |
-| `eval_corpus` | built-in list | Override leakage-reference text |
+| `eval_corpus` | `None` | Optional leakage-reference override; otherwise a bounded real-validation sample is decoded, with a loud built-in fallback |
 
 ### Reliability and concurrency
 
@@ -121,8 +121,8 @@ does not.
 
 ## Validation-set fields
 
-Real training defaults to the first 10,485,760 tokens in the NanoGPT speedrun
-FineWeb validation shard:
+Real training and the default leakage reference use the first 10,485,760 tokens
+in the NanoGPT speedrun FineWeb validation shard:
 
 | Field | Default |
 | --- | --- |
@@ -132,7 +132,8 @@ FineWeb validation shard:
 | `tokenizer` | `"gpt2"` |
 | `val_tokens` | `10_485_760` |
 
-The heuristic trainer ignores this configuration.
+The heuristic trainer ignores this configuration for its synthetic performance
+signal, but leakage detection still uses it.
 
 ## Heuristic smoke run
 

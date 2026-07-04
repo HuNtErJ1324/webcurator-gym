@@ -46,7 +46,7 @@ external/infrastructure failure (a flaky Hub or sandbox). See
   **dev/smoke surrogate, not a real training signal** — it lets the environment
   run and be tested without a GPU, but its `Perf` is a proxy, not a measurement.
   It trains no model, so it does **not** compute per-token CE on the held-out
-  validation set and is unaffected by `validation_set`.
+  validation set. `validation_set` still supplies the default leakage reference.
 - **Real proxy-student training** (`use_real_trainer=true`): the path that yields a
   **meaningful** `Perf`. It actually trains a fixed small GPT (config in
   `ProxyStudentConfig`), GPT-2-BPE-tokenized, in the live Docker or Modal harness
@@ -253,8 +253,8 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `fetch_max_attempts` | int | `3` | Max attempts (retry/backoff) for transient HF failures. |
 | `use_real_trainer` | bool | `false` | Use the GPU sandbox proxy-student instead of the heuristic. |
 | `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, `gpu_count`, etc.). `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `runtime_backend` (`"docker"` / `"modal"`; required, no default, whenever `use_real_trainer=true`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`; also `"H100"`/`"H200"`/`"A100"`) and `gpu_count`, and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
-| `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set: FineWeb GPT-2 val tokens, first `10_485_760`). Real-trainer only. |
-| `eval_corpus` | list[str] | built-in | Held-out reference corpus for the leakage term. |
+| `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set and default leakage source: FineWeb GPT-2 val tokens, first `10_485_760`). |
+| `eval_corpus` | list[str] | `None` | Optional explicit leakage-reference override. By default a bounded sample of the real `validation_set` is decoded; the built-in corpus is only an observable offline fallback. |
 
 Before streaming a source, the materializer checks for the Hugging Face
 `{dataset_name}.py` convention. Script-backed sources fail once with
@@ -285,7 +285,7 @@ unavailable in this release because the pinned Verifiers package requires
 - `rollout_state.py` — typed `CuratorState` plus `RolloutStore` accessors.
 - `taskset.py` — `CuratorTaskset`, manifest parsing/recovery, `finalize()`, decorated rewards/metrics, and `@vf.stop` turn cap. No MCP tool server.
 - `tasks.py` — four typed v1 curation tasks and their user prompts.
-- `eval_corpus.py` — small built-in held-out reference corpus for the leakage term.
+- `eval_corpus.py` — small offline fallback corpus for the leakage term.
 
 ## Notes And Limitations
 
