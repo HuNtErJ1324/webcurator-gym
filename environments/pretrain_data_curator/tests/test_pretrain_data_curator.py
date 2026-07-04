@@ -45,7 +45,7 @@ from pretrain_data_curator.models import (
 from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
-from pretrain_data_curator.tasks import build_tasks
+from pretrain_data_curator.tasks import TASK_PROMPT, build_tasks
 from pretrain_data_curator.taskset import (
     SYSTEM_PROMPT,
     CuratorTaskset,
@@ -256,7 +256,6 @@ def test_hf_client_accepts_explicit_token_without_environment(monkeypatch):
     client = HuggingFaceDatasetClient(token="test-token")
 
     assert client._token == "test-token"
-    assert client._allow_script_datasets is False
 
 
 def test_fetch_key_serializes_auto_text_field_stably():
@@ -287,7 +286,6 @@ def test_hf_client_auto_detects_text_columns_and_query_response(monkeypatch):
     )
     client = object.__new__(HuggingFaceDatasetClient)
     client._token = "test-token"
-    client._allow_script_datasets = False
 
     assert client.sample_documents("owner/name", None, "train", None, 4) == [
         "content document",
@@ -324,7 +322,6 @@ def test_hf_client_resolves_missing_default_config_to_english(monkeypatch):
     )
     client = object.__new__(HuggingFaceDatasetClient)
     client._token = "test-token"
-    client._allow_script_datasets = False
 
     assert client.sample_documents("wikimedia/wikipedia", None, "train", None, 1) == [
         "configured document"
@@ -393,20 +390,25 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.taskset.load_tasks()
 
 
-def test_load_environment_selects_codex_harness(monkeypatch):
+@pytest.mark.parametrize("harness_id", ["codex", "mini_swe_agent"])
+def test_load_environment_folds_system_prompt_for_cli_harnesses(
+    monkeypatch, harness_id
+):
     monkeypatch.setenv("HF_TOKEN", "test-token")
 
-    env = load_environment(harness_id="codex")
+    env = load_environment(harness_id=harness_id)
 
-    assert env.harness.config.id == "codex"
-    assert type(env.harness.config).__name__ == "CodexHarnessConfig"
+    assert env.harness.config.id == harness_id
     assert env.harness.config.env == {}
-    assert env.env_args["harness_id"] == "codex"
+    assert env.env_args["harness_id"] == harness_id
 
     task = env.taskset.load_tasks()[0]
     system_prompt, prompt = env.harness.resolve_prompt(task)
     assert system_prompt is None
     assert prompt == f"{task.system_prompt}\n\n{task.prompt}"
+    assert prompt.count("## Rules") == 1
+    assert prompt.count("## Task Rules") == 1
+    assert prompt.count("Remember:") == 1
 
 
 def test_load_environment_rejects_unknown_harness():
@@ -418,16 +420,6 @@ def test_load_environment_rejects_unknown_harness():
         ),
     ):
         load_environment(harness_id="unknown")
-
-
-def test_load_environment_plumbs_allow_script_datasets(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "test-token")
-
-    env = load_environment(allow_script_datasets=True)
-
-    assert env.taskset.config.allow_script_datasets is True
-    assert env.taskset.curator.allow_script_datasets is True
-    assert env.env_args["allow_script_datasets"] is True
 
 
 def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
@@ -1581,7 +1573,8 @@ async def test_script_dataset_runtime_error_is_permanent_without_retry():
     assert excinfo.value.kind == "script_dataset"
 
 
-def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
+@pytest.mark.asyncio
+async def test_script_dataset_probe_blocks_unconditionally_with_guidance(monkeypatch):
     calls = []
     load_calls = []
 
@@ -1598,15 +1591,26 @@ def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
         "datasets.load_dataset",
         lambda *args, **kwargs: load_calls.append((args, kwargs)),
     )
-    client = HuggingFaceDatasetClient(
-        token="test-token", allow_script_datasets=False
+    client = HuggingFaceDatasetClient(token="test-token")
+    builder = CorpusBuilder(
+        client=client,
+        retry_policy=RetryPolicy(attempts=3, timeout=1.0),
+    )
+    state = CuratorState()
+
+    docs, error = await builder.fetch_source_docs(
+        state, FetchKey("owner/legacy", None, "train", None, 1)
     )
 
-    with pytest.raises(DatasetAccessError) as excinfo:
-        client.sample_documents("owner/legacy", None, "train", None, 1)
-
-    assert excinfo.value.kind == "script_dataset"
-    assert "allow_script_datasets=True" in str(excinfo.value)
+    assert docs == []
+    assert error is not None
+    assert error["error_kind"] == "script_dataset"
+    assert "`hf download <repo> --repo-type dataset` or `curl`" in error["error"]
+    assert '`kind: "local"`' in error["error"]
+    assert '`local_path: "<relative-path>"`' in error["error"]
+    assert "`local_format`" in error["error"]
+    assert "`text_field`" in error["error"]
+    assert RolloutStore.tool_error_count(state) == 1
     assert calls == [
         {
             "repo_id": "owner/legacy",
@@ -1615,32 +1619,6 @@ def test_script_dataset_probe_blocks_when_disabled(monkeypatch):
         }
     ]
     assert load_calls == []
-
-
-def test_script_dataset_probe_blocks_when_datasets_runtime_is_unsupported(
-    monkeypatch,
-):
-    class FakeHfApi:
-        def __init__(self, *, token):
-            pass
-
-        def file_exists(self, **kwargs):
-            return True
-
-    monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
-    monkeypatch.setattr("datasets.__version__", "4.6.1")
-    client = HuggingFaceDatasetClient(
-        token="test-token", allow_script_datasets=True
-    )
-
-    with pytest.raises(DatasetAccessError) as excinfo:
-        client.sample_documents("owner/legacy", None, "train", None, 1)
-
-    assert excinfo.value.kind == "script_dataset"
-    assert "datasets==4.6.1" in str(excinfo.value)
-    assert "allow_script_datasets=True" in str(excinfo.value)
-
-
 def test_non_script_dataset_load_does_not_pass_trust_remote_code(monkeypatch):
     class FakeHfApi:
         def __init__(self, *, token):
@@ -1657,9 +1635,7 @@ def test_non_script_dataset_load_does_not_pass_trust_remote_code(monkeypatch):
 
     monkeypatch.setattr("huggingface_hub.HfApi", FakeHfApi)
     monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
-    client = HuggingFaceDatasetClient(
-        token="test-token", allow_script_datasets=False
-    )
+    client = HuggingFaceDatasetClient(token="test-token")
 
     assert client.sample_documents("owner/data", None, "train", None, 1) == [
         "data-only document"
@@ -1844,9 +1820,27 @@ def test_system_prompt_teaches_hf_cli_and_json_manifest():
     assert "pip install -q 'huggingface-hub>=0.34'" in SYSTEM_PROMPT
     assert "--search" in SYSTEM_PROMPT
     assert "| head -c 6000" in SYSTEM_PROMPT
+    assert "mkdir -p data dl" in SYSTEM_PROMPT
+    assert (
+        "Salesforce/wikitext "
+        "wikitext-2-raw-v1/train-00000-of-00001.parquet"
+        in SYSTEM_PROMPT
+    )
+    assert 'json.dumps({"text": x}) + "\\n"' in SYSTEM_PROMPT
+    assert "allenai/dolma data/v1.7/sample.json.gz" not in SYSTEM_PROMPT
     assert "Never request `tags` from `datasets ls`" in SYSTEM_PROMPT
     assert "```json" in SYSTEM_PROMPT
     assert '"sources"' in SYSTEM_PROMPT
+    assert (
+        "If a `config` was not explicitly observed, set `config` to null."
+        in SYSTEM_PROMPT
+    )
+    assert "fabricated id or config materializes zero tokens" in SYSTEM_PROMPT
+    assert "Include no text after the closing ``` fence." in SYSTEM_PROMPT
+    assert (
+        "`text`, `content`, `passage`, `abstract`, and query/response pairs"
+        in SYSTEM_PROMPT
+    )
     assert "curator_" not in SYSTEM_PROMPT  # no stale MCP tool references
 
 
@@ -1884,7 +1878,10 @@ def test_system_prompt_manifest_example_parses():
     manifest = parse_manifest(SYSTEM_PROMPT, default_token_budget=1_000_000)
     assert manifest is not None
     assert manifest.sources  # the example carries at least one source
+    assert manifest.token_budget == 10_000_000
+    assert manifest.sources[0].dataset_id == "wikimedia/wikipedia"
     assert manifest.sources[0].text_field is None
+    assert "Set `token_budget` to the task's stated token budget." in SYSTEM_PROMPT
 
 
 def test_system_prompt_sample_docs_per_source_example_is_not_a_bare_literal():
@@ -1912,10 +1909,18 @@ def test_system_prompt_is_harness_agnostic_about_running_commands():
     # wording that assumes the message itself is the command.
     low = SYSTEM_PROMPT.lower()
     assert "your first response must be a bash command" not in low
-    assert "call that tool to run each command" in low  # tool-calling harnesses
-    assert "reply with the command itself" in low  # message-executing harnesses
-    # Explicitly warns that merely writing the command out is not running it.
-    assert "does not run it" in low
+    assert "provides a shell or execution tool, call it" in low
+    assert "does NOT run it" in SYSTEM_PROMPT
+    assert "you must invoke the tool" in low
+    assert (
+        "Be concise: keep messages short and let commands and their output carry "
+        "the work."
+        in SYSTEM_PROMPT
+    )
+    assert "executes replies directly as shell commands" in low
+    assert "bash harness" not in low
+    assert "codex" not in low
+    assert "mini_swe_agent" not in low
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
@@ -3170,64 +3175,76 @@ async def test_finalize_falls_back_when_final_message_never_arrives():
     assert manifest.sources[0].config is None
 
 
-def test_system_prompt_includes_configured_turn_budget():
-    # The per-rollout system prompt must spell out the ACTUAL configured max_turns so
-    # the agent stops calling `hf` and emits its final manifest before the cap trips.
+def test_task_prompt_includes_configured_turn_budget():
+    # Concrete rollout parameters belong to the one task prompt; the system
+    # prompt remains the same coherent environment contract across tasks.
     tasks = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load_tasks()
     assert tasks
-    prompt = tasks[0].system_prompt
-    assert "7 turns" in prompt  # the configured value is rendered in
-    assert "manifest" in prompt and "scores zero" in prompt
-    # The base hf-CLI teaching is preserved alongside the budget note.
-    assert "hf datasets ls" in prompt
+    prompt = tasks[0].prompt
+    assert "7 model turns" in prompt  # the configured value is rendered in
+    assert "manifest" in prompt and "before the turn limit" in prompt
+    assert tasks[0].system_prompt == SYSTEM_PROMPT
     # A different budget renders a different number (not a hard-coded constant).
     other = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=20)).load_tasks()
-    assert "20 turns" in other[0].system_prompt
+    assert "20 model turns" in other[0].prompt
+    assert other[0].system_prompt == SYSTEM_PROMPT
 
 
-def test_system_prompt_scales_discovery_with_benchmark_budget():
+def test_task_prompt_renders_scoring_parameters_and_local_policy():
+    task = CuratorTaskset(
+        CuratorTasksetConfig(
+            id="test",
+            allow_local_sources=False,
+            alpha_perf=2.0,
+            lambda_cost=0.25,
+            lambda_leakage=3.0,
+        )
+    ).load_tasks()[0]
+
+    assert "Local sources are disabled; use only Hugging Face sources" in task.prompt
+    assert (
+        "`2.0 * performance - 0.25 * discovery/data cost - 3.0 * leakage`"
+        in task.prompt
+    )
+
+
+def test_task_prompt_scales_discovery_with_benchmark_budget():
     # Discovery is capped so the agent commits before exhausting its turns, but
     # benchmark-sized scan/turn budgets are allowed more than smoke runs.
     for max_turns in (7, 12):
         prompt = (
             CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=max_turns))
             .load_tasks()[0]
-            .system_prompt
+            .prompt
         )
-        assert f"{max_turns} turns" in prompt
+        assert f"{max_turns} model turns" in prompt
         assert "contains multiple tool calls" in prompt
         assert "every individual `hf` call is still billed" in prompt
-        assert "MUST perform at most 2 discovery rounds" in prompt
-        # Commit mechanics: a plain final message, no shell command (works whether
-        # the harness runs a shell tool or executes the reply as a command).
-        assert "HOW TO COMMIT" in prompt
-        assert "stop running commands and reply with a plain message" in prompt
-        assert "do not print the manifest through the shell" in prompt
-        assert "scores zero" in prompt
+        assert "use at most 2 rounds (<=4 shell calls)" in prompt
+        assert "commit immediately; do not fill remaining turns" in prompt
+        assert "stop running commands and return only the fenced JSON manifest" in prompt
+        assert "Do not print it through the shell" in prompt
 
     smoke_prompt = (
         CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=25, scan_limit=10))
         .load_tasks()[0]
-        .system_prompt
+        .prompt
     )
-    assert "25 turns" in smoke_prompt
-    assert "MUST perform at most 2 discovery rounds" in smoke_prompt
+    assert "25 model turns" in smoke_prompt
+    assert "use at most 2 rounds (<=4 shell calls)" in smoke_prompt
 
-    benchmark_prompt = (
+    benchmark_task = (
         CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=64, scan_limit=200))
         .load_tasks()[0]
-        .system_prompt
     )
-    assert "64 turns" in benchmark_prompt
-    assert (
-        "MUST perform at most 10 discovery rounds (<=20 bash calls)" in benchmark_prompt
+    benchmark_prompt = benchmark_task.prompt
+    assert "64 model turns" in benchmark_prompt
+    assert "use at most 10 rounds (<=20 shell calls)" in benchmark_prompt
+    assert "Commit no later than turn 56" in benchmark_prompt
+    assert "must be copied exactly from `hf` output" in benchmark_task.system_prompt
+    assert "fabricated id or config materializes zero tokens" in (
+        benchmark_task.system_prompt
     )
-    assert "no later than turn 56" in benchmark_prompt
-    # No-invention guard: manifest ids must come from observed tool output.
-    assert "copied verbatim from a dataset id" in benchmark_prompt
-    assert "Do NOT invent or guess" in benchmark_prompt
-    assert "config` was not explicitly listed" in benchmark_prompt
-    assert "fabricated id" in benchmark_prompt
 
 
 def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
@@ -3239,9 +3256,10 @@ def test_system_prompt_bootstraps_missing_hf_without_diagnosis_turns():
     assert "command -v hf" in low
     assert "pip install -q 'huggingface-hub>=0.34'" in low
     assert "fi; hf datasets ls" in low  # bootstrap and useful discovery share one turn
-    assert "do not spend turns diagnosing missing commands" in low
-    assert "do not try `huggingface-cli`" in low
-    assert "only installation step allowed" in low
+    assert "your first response must run a shell command, not present a plan" in low
+    assert "do not diagnose aliases such as `huggingface-cli`" in low
+    assert "installs the cli only if missing" in low
+    assert "install unrelated packages" in low
     assert "pip will only waste your turns" not in low
     assert "no setup required" not in low
 
@@ -3300,20 +3318,22 @@ def test_parse_manifest_finds_manifest_after_leading_note_block():
 # --- Tier M (cont.): the per-task goal prompt teaches the hf-CLI workflow ----
 
 
-def test_build_tasks_prompt_describes_hf_cli_not_curation_tools():
-    # The per-task goal prompt must teach the `hf` CLI + fenced-JSON manifest
-    # workflow (with the metered-cost note) and no longer reference the retired
-    # "curation tools".
+def test_build_tasks_renders_single_structured_task_prompt():
     prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
-    assert "curation tools" not in prompt  # the stale, retired wording is gone
+    assert prompt.startswith("Your goal is:")
+    assert "## Task Objective" in TASK_PROMPT
+    assert "## Task Autonomy & Exploration" in prompt
+    assert "## Task Setup" in prompt
+    assert "## Task Rules" in prompt
+    assert "complete freedom in data-source choice" in prompt
+    assert "Iteration is encouraged" in prompt
     assert "hf datasets ls" in prompt
     assert "hf datasets info" in prompt
-    assert "--search" in prompt
-    assert "```json" in prompt
-    assert "sources" in prompt
-    assert "metered" in prompt  # the per-call cost guidance
-    assert "2024-12-31" in prompt  # cutoff constraint preserved
-    assert "1000000" in prompt  # token budget rendered into the target
+    assert "2024-12-31" in prompt
+    assert "1000000" in prompt
+    assert "There will be no user interaction" in prompt
+    assert "Remember:" not in prompt
+    assert prompt.rstrip().endswith("Do not print it through the shell.")
 
 
 # --- Tier R (cont.): finalize trace-fallback metering -----------------------

@@ -317,7 +317,6 @@ class HuggingFaceDatasetClient:
         token: str | None = None,
         *,
         token_env: str = "HF_TOKEN",
-        allow_script_datasets: bool = False,
     ) -> None:
         token = token or os.environ.get(token_env)
         if not token:
@@ -328,7 +327,6 @@ class HuggingFaceDatasetClient:
             )
 
         self._token = token
-        self._allow_script_datasets = allow_script_datasets
 
     def _is_script_dataset(self, dataset_id: str) -> bool:
         """Check for the Hub convention ``{dataset_name}.py`` with one API call."""
@@ -342,33 +340,19 @@ class HuggingFaceDatasetClient:
         )
 
     @staticmethod
-    def _supports_script_datasets(datasets_version: str) -> bool:
-        try:
-            return int(datasets_version.split(".", 1)[0]) < 3
-        except (TypeError, ValueError):
-            return False
-
-    def _reject_unsupported_script_dataset(
-        self, dataset_id: str, datasets_version: str
-    ) -> None:
-        if not self._allow_script_datasets:
-            raise DatasetAccessError(
-                f"{dataset_id} is a script-based Hugging Face dataset; remote "
-                "dataset code is disabled by allow_script_datasets=False. Set "
-                "allow_script_datasets=True only in a trusted container with a "
-                "datasets 2.x runtime.",
-                kind="script_dataset",
-                dataset_id=dataset_id,
-            )
-        if not self._supports_script_datasets(datasets_version):
-            raise DatasetAccessError(
-                f"{dataset_id} is a script-based Hugging Face dataset, but "
-                f"installed datasets=={datasets_version} cannot load dataset "
-                "scripts. Use a data-only export, or run with datasets 2.x and "
-                "allow_script_datasets=True.",
-                kind="script_dataset",
-                dataset_id=dataset_id,
-            )
+    def _reject_script_dataset(dataset_id: str) -> None:
+        raise DatasetAccessError(
+            f"{dataset_id} is a script-based Hugging Face dataset, which the "
+            "installed datasets runtime cannot load. Download its raw files in "
+            "your shell with `hf download <repo> --repo-type dataset` or `curl`, "
+            "then convert them to plain text or JSONL in your workspace. Cite the "
+            'result in the manifest as a source with `kind: "local"` and '
+            '`local_path: "<relative-path>"`. Set `local_format` to `"auto"`, '
+            '`"jsonl"`, or `"txt"`, and set `text_field` to the document text '
+            "column or `null` for auto-detection.",
+            kind="script_dataset",
+            dataset_id=dataset_id,
+        )
 
     def sample_documents(
         self,
@@ -378,13 +362,10 @@ class HuggingFaceDatasetClient:
         text_field: str | None,
         n: int,
     ) -> list[str]:
-        import datasets
         from datasets import get_dataset_config_names, load_dataset
 
         if self._is_script_dataset(dataset_id):
-            self._reject_unsupported_script_dataset(
-                dataset_id, datasets.__version__
-            )
+            self._reject_script_dataset(dataset_id)
 
         try:
             stream = load_dataset(

@@ -69,49 +69,50 @@ logger = logging.getLogger(__name__)
 _DISCOVERY_OUTPUT_CHARS_PER_CALL = 6_000
 _DISCOVERY_OUTPUT_MARGIN = 1.1
 
-SYSTEM_PROMPT = """IMPORTANT: Be extremely concise in every message, and work by RUNNING commands in your shell rather than describing them. On your very first step, actually run a command — no preamble, no plan, no explanation first. If your harness gives you a shell/terminal/exec tool, you MUST call that tool to run each command below; writing a command out as ordinary text without calling the tool does NOT run it and wastes the rollout. If instead your harness executes your reply directly as a shell command, just reply with the command itself. Bootstrap the hf CLI if needed and run a search in that same first command. If you must plan, keep it to one sentence, then immediately run a command.
+SYSTEM_PROMPT = """We want to train a fixed small GPT-2-scale language model on the strongest possible pretraining mixture. You are the data-curation agent responsible for selecting that mixture.
 
-You are a pretraining-data curation agent. Your job is to assemble a dataset mixture that, when used to train a fixed small GPT-2-scale student (everything fixed but the data), maximizes the student's performance.
+## Objective
+Assemble a diverse, high-quality text corpus that maximizes the fixed student's held-out performance. Strong general-purpose mixtures often combine encyclopedic, scientific, instructional, reasoning, math, code, and broad web text; use evidence from the available datasets instead of treating any starter list as mandatory.
 
-Domain context — target large-scale, diverse, high-quality text corpora for general-purpose LLM pretraining. Good sources include encyclopedic text (Wikipedia, encyclopedias), scientific literature (papers, research), instructional text, and broad web corpora (C4, FineWeb, OpenWebText). Prefer encyclopedic sources (highest utility), then scientific, then instructional. Well-known high-quality datasets: Wikimedia/Wikipedia, allenai/c4, Skylion007/openwebtext, HuggingFaceFW/fineweb, allenai/dolma. Avoid code-only or narrow task-specific datasets. For each candidate, retrieve key metadata: downloads, likes, last modified, splits, configs. Use result limits appropriate to the turn budget. Avoid repetition: if you already have detailed info for a dataset, move on.
+Useful candidates to inspect include `wikimedia/wikipedia`, `HuggingFaceFW/fineweb`, `roneneldan/TinyStories`, `allenai/c4`, `Skylion007/openwebtext`, `Salesforce/wikitext`, and `allenai/dolma`. Prefer broad, clearly licensed corpora over code-only or narrow task datasets unless the task objective supports that tradeoff; past scoring has generally favored encyclopedic, then scientific and instructional text. These are leads, not permission to put an unobserved ID or config in the manifest.
 
-You have a normal bash shell. The Hugging Face `hf` CLI is the only tool you need, but some runtime images do not include it. Your FIRST command MUST defensively check and install it if missing, then continue directly to an `hf datasets ls` search in the SAME shell command (one turn total):
+## Autonomy & Exploration
+You have complete freedom in source choice, mixture design, filtering, and how you spend the discovery budget. Iteration is encouraged: search, inspect enough candidates to make a defensible choice, and commit as soon as further calls are unlikely to improve it.
+
+You have a normal bash shell. Execute commands rather than merely describing them. If your interface provides a shell or execution tool, call it: writing a command out as ordinary text without calling your shell tool does NOT run it—you must invoke the tool. If your interface executes replies directly as shell commands, reply with the command itself.
+
+## Information on the Setup
+Be concise: keep messages short and let commands and their output carry the work.
+
+The Hugging Face `hf` CLI is the primary discovery tool. Your FIRST response must run a shell command, not present a plan. Use one shell action that installs the CLI only if missing and continues directly to a useful search:
 
 `if ! command -v hf >/dev/null 2>&1; then pip install -q 'huggingface-hub>=0.34'; fi; hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000`
 
-Do not spend turns diagnosing missing commands: do not try `huggingface-cli` or `python -m huggingface_hub`. The one conditional pip install above is the ONLY installation step allowed. After it, run the `hf` subcommands below directly in bash; do not write Python, create a virtualenv, import `huggingface_hub`/`datasets`, or install anything else. Use `hf` to discover and inspect candidates, then decide a weighted curation mixture. Only use Hugging Face datasets modified on or before the cutoff date.
+Do not diagnose aliases such as `huggingface-cli` or `python -m huggingface_hub`, create a virtual environment, write Python for discovery, or install unrelated packages. Useful commands are:
 
-`hf` command cheat-sheet:
-  - Search datasets:   hf datasets ls --search "<query>" --sort downloads --limit 5 | head -c 6000
-  - Filter / quiet:    hf datasets ls --search "<query>" --filter text --limit 10 -q | head -c 6000
-  - JSON output:        hf datasets ls --search "<query>" --limit 5 --format json --expand downloads,likes,lastModified | head -c 6000
-  - Inspect a dataset: hf datasets info <dataset_id> --expand downloads,likes,tags | head -c 6000
-Every `hf` command MUST end with `| head -c 6000`. Never request `tags` from `datasets ls`: multilingual repositories can return tens of thousands of tag characters and overflow your model context. Request tags only when inspecting one shortlisted dataset.
-Inspect a few candidates, prefer well-downloaded, clearly-licensed text datasets, and check each was last modified on or before the cutoff date.
+- `hf datasets ls --search "<query>" --sort downloads --limit 5 | head -c 6000`
+- `hf datasets ls --search "<query>" --filter text --limit 10 -q | head -c 6000`
+- `hf datasets ls --search "<query>" --limit 5 --format json --expand downloads,likes,lastModified | head -c 6000`
+- `hf datasets info <dataset_id> --expand downloads,likes,tags | head -c 6000`
 
-You are billed for live discovery: each search and each inspect/download call adds to the cost penalty, so be economical. Your reward is derived from proxy-student held-out cross-entropy loss, with penalties for cost and for leakage/contamination against a held-out evaluation set.
+End every `hf` discovery command with `| head -c 6000`. Never request `tags` from `datasets ls`; request them only for a shortlisted dataset with `datasets info`. Check downloads, license, last modification, splits, configs, and text fields. `"text_field": null` auto-detects `text`, `content`, `passage`, `abstract`, and query/response pairs; set it explicitly only when inspection establishes the column.
 
-`"text_field": null` triggers auto-detection (the environment tries 'text', 'content', 'passage', 'abstract', 'query'/'response' concat, etc.). Set explicitly only if you know the exact column from `hf datasets info`.
+Some script-based datasets cannot be streamed by the environment. Follow their URL lists to real data; when a repository contains raw files, download them with `hf download <repo> --repo-type dataset`, `curl`, or `wget`, then convert them to plain text or JSONL inside the working directory. This verified raw-file example converts a small Wikitext training shard:
 
-Reliable starter datasets: HuggingFaceFW/fineweb (text_field: "text"), roneneldan/TinyStories (text_field: "text"), wikimedia/wikipedia (config: "20231101.en", text_field: "text"), allenai/c4 (config: "en", text_field: "text"), Salesforce/wikitext (config: "wikitext-103-v1", text_field: "text").
+`mkdir -p data dl && hf download Salesforce/wikitext wikitext-2-raw-v1/train-00000-of-00001.parquet --repo-type dataset --local-dir ./dl && python -c 'import json, pyarrow.parquet as pq; rows=pq.read_table("dl/wikitext-2-raw-v1/train-00000-of-00001.parquet").column("text").to_pylist(); open("data/wikitext.jsonl", "w").writelines(json.dumps({"text": x}) + "\\n" for x in rows if x.strip())'`
 
-**Building a source yourself (local sources).** Some useful datasets are script-based and cannot be streamed by the environment. When `hf datasets info` shows a dataset you want but streaming is unavailable, you may download or derive its data in this same shell. For example, use `curl`/`wget` for a raw file or `hf download <id> <file> --repo-type dataset`, then decompress or transform it into plain text or JSONL under your working directory:
+JSONL contains one JSON object or string per line and uses `text_field`, which may be null for auto-detection. Plain text is split into documents on blank lines, so one-document-per-line data must use JSONL. Local files are read only to the configured byte cap, logged for audit, and billed like fetched tokens.
 
-`hf download allenai/dolma data/v1.7/sample.json.gz --repo-type dataset --local-dir ./dl && gunzip -c ./dl/data/v1.7/sample.json.gz | head -c 20000000 > data/dolma.jsonl`
-
-Reference that file with a local source such as `{"kind":"local","local_path":"data/dolma.jsonl","local_format":"jsonl","text_field":"text","weight":1.0,"filters":[{"kind":"min_chars","params":{"value":200}},{"kind":"dedup_exact"}]}`.
-
-Local-source rules: `local_path` must be a relative path inside your working directory, with no leading `/` and no `..`. JSONL reads one JSON object or string per line and uses `text_field` (auto-detected when null); plain text is split into documents on blank lines, so one-document-per-line data must use JSONL. Files are read only up to a configured size cap. Local tokens are billed exactly like fetched tokens, so downloading data is not free and counts against the cost penalty. Only reference data genuinely downloaded from a real, pre-cutoff dataset. Do NOT fabricate text, generate documents from your own knowledge, or copy held-out, validation, or evaluation text. Contamination is measured and penalized, and local pulls are logged for audit.
-
-When you are done, emit your decision as your FINAL message: a single fenced ```json block (and nothing else after it) with this exact schema:
+## Manifest Contract
+Your final answer is one fenced `json` block with a non-empty `sources` list. Include no text after the closing ``` fence.
 
 ```json
 {
-  "token_budget": 1000000,
-  "sample_docs_per_source": "<int, 1-100000; compute from your own token_budget, do not copy this>",
+  "token_budget": 10000000,
+  "sample_docs_per_source": "<int, 1-100000; compute for this mixture>",
   "sources": [
     {
-      "id": "<huggingface dataset id, e.g. HuggingFaceFW/fineweb>",
+      "id": "wikimedia/wikipedia",
       "kind": "hf",
       "local_path": null,
       "local_format": "auto",
@@ -122,14 +123,30 @@ When you are done, emit your decision as your FINAL message: a single fenced ```
       "filters": [{"kind": "min_chars", "params": {"value": 200}}, {"kind": "dedup_exact"}],
       "max_docs": null,
       "max_tokens": null
+    },
+    {
+      "kind": "local",
+      "local_path": "data/source.jsonl",
+      "local_format": "jsonl",
+      "weight": 1.0,
+      "text_field": "text",
+      "filters": [{"kind": "min_chars", "params": {"value": 200}}, {"kind": "dedup_exact"}]
     }
   ]
 }
 ```
 
-Each Hugging Face source REQUIRES `id` (the Hugging Face dataset id); a local source may use its `local_path` as its generated label. Every source accepts `weight` (>= 0, relative mixing weight). `kind` defaults to `"hf"`; set it to `"local"` with `local_path` and optional `local_format` (`"auto"`, `"jsonl"`, or `"txt"`) for a file you created in this workspace. `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are optional. Supported filter kinds: min_chars, max_chars, min_tokens, max_symbol_ratio, min_alpha_ratio, drop_regex, keep_regex, dedup_exact. Always emit a non-empty `sources` list — an empty or missing manifest scores zero.
+Set `token_budget` to the task's stated token budget. An `hf` source requires `id`; `kind` defaults to `"hf"`. A local source requires `kind: "local"` and `local_path`, and accepts `local_format` as `"auto"`, `"jsonl"`, or `"txt"`. Every source accepts a nonnegative `weight`; weights are relative and determine proportional token allocations. Optional source fields are `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens`; the two caps may instead be nested under `sampling`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
 
-Optional top-level `sample_docs_per_source` (integer, 1-100000) controls how many documents are fetched PER SOURCE from the Hub for this rollout — it is the fetch cap itself, not a post-fetch truncation like `max_docs`/`max_tokens`. Omit it (or set it to null) to use the environment's configured default. Fetching more documents lets the student train on more unique tokens (useful for a large `token_budget`), but also raises `cost_penalty`, since every fetched token is billed. You MUST compute this number yourself from your actual `token_budget` and number of sources — roughly `token_budget / (num_sources * 250)` tokens-per-doc, capped at 100000 — rather than reusing the schema example's placeholder verbatim."""
+Top-level `sample_docs_per_source` is the pre-filter fetch cap per source, not the post-filter `max_docs` or `max_tokens` cap. Omit it to use the environment default, or estimate it from `token_budget / (number of sources * 250 tokens per document)`, capped at 100000. Every search, inspection, download, and fetched token contributes to the cost penalty.
+
+## Rules
+1. Every Hugging Face `id` and non-null `config` must be copied exactly from `hf` output observed in this rollout. If a `config` was not explicitly observed, set `config` to null. A fabricated id or config materializes zero tokens; an empty manifest scores zero.
+2. Use only genuine downloaded data. Never fabricate documents, generate them from your own knowledge, or use held-out validation or evaluation text. Leakage is measured and penalized.
+3. A `local_path` must be relative to the working directory, with no leading `/` and no `..`.
+4. Commit the manifest as a plain final response, not through the shell.
+
+Remember: you own the source and mixture decisions. Explore economically, then commit the strongest evidence-backed manifest."""
 
 
 # --------------------------------------------------------------------------- #
@@ -497,7 +514,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     candidate_limit: int = 8
     scan_limit: int = 50
     sample_docs_per_source: int = 64
-    allow_script_datasets: bool = False
     allow_local_sources: bool = True
     max_local_source_bytes: int = 33_554_432
     max_turns: int = 12
@@ -558,7 +574,6 @@ class CuratorTaskset(_TasksetBase):
             candidate_limit=config.candidate_limit,
             scan_limit=config.scan_limit,
             sample_docs_per_source=config.sample_docs_per_source,
-            allow_script_datasets=config.allow_script_datasets,
             allow_local_sources=config.allow_local_sources,
             max_local_source_bytes=config.max_local_source_bytes,
             max_turns=config.max_turns,
@@ -593,7 +608,6 @@ class CuratorTaskset(_TasksetBase):
         if self._client is None:
             self._client = HuggingFaceDatasetClient(
                 token_env=self.config.hf_token_env,
-                allow_script_datasets=self.curator.allow_script_datasets,
             )
         if self._corpus_builder is None:
             self._corpus_builder = CorpusBuilder(
@@ -664,9 +678,22 @@ class CuratorTaskset(_TasksetBase):
     # -- taskset surface -------------------------------------------------------
 
     def load_tasks(self) -> list[CuratorTask]:
-        tasks = build_tasks(self.curator.cutoff_date, self.curator.token_budget)
-        system_prompt = self._system_prompt()
-        updates: dict[str, Any] = {"system_prompt": system_prompt}
+        max_turns = self.curator.max_turns
+        discovery_rounds, discovery_calls = self._discovery_budget()
+        tasks = build_tasks(
+            self.curator.cutoff_date,
+            self.curator.token_budget,
+            max_turns=max_turns,
+            discovery_rounds=discovery_rounds,
+            discovery_calls=discovery_calls,
+            commit_by=max(1, max_turns - max(3, max_turns // 8)),
+            allow_local_sources=self.curator.allow_local_sources,
+            alpha_perf=self.curator.alpha_perf,
+            lambda_cost=self.curator.lambda_cost,
+            lambda_leakage=self.curator.lambda_leakage,
+            system_prompt=SYSTEM_PROMPT,
+        )
+        updates: dict[str, Any] = {}
         ps = self.curator.proxy_student
         if self.curator.use_real_trainer and ps.runtime_backend == "docker":
             # Native taskset runs do not call load_environment(), so declare the
@@ -706,46 +733,6 @@ class CuratorTaskset(_TasksetBase):
                 }
             )
         return [task.model_copy(update=updates) for task in tasks]
-
-    def _system_prompt(self) -> str:
-        """Render the configured turn budget into the per-rollout prompt.
-
-        Spells out the actual ``max_turns`` and strictly limits discovery so the
-        agent commits a manifest before the turn cap.
-        """
-        max_turns = self.curator.max_turns
-        discovery_rounds, discovery_calls = self._discovery_budget()
-        commit_by = max(1, max_turns - max(3, max_turns // 8))
-        local_source_status = (
-            ""
-            if self.curator.allow_local_sources
-            else "\n\nLocal sources are disabled for this run; use only Hugging Face sources."
-        )
-        return (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"You have {max_turns} turns total (model turns). A response that invokes bash "
-            f"uses one model turn even if it contains multiple tool calls; every "
-            f"individual `hf` call is still billed, so run one command at a time. "
-            f"A discovery round = one `hf datasets ls` call + one `hf datasets info` "
-            f"call (2 turns). You MUST perform at most {discovery_rounds} discovery "
-            f"rounds (<={discovery_calls} bash calls). After your final discovery "
-            f"round, and no later than turn "
-            f"{commit_by} — you MUST commit your manifest.\n\n"
-            f"HOW TO COMMIT: stop running commands and reply with a plain message "
-            f"containing ONLY the fenced ```json block — do not run any shell command "
-            f"in that step, and do not print the manifest through the shell. "
-            f"Do not add any text after the closing ``` fence. If you still have "
-            f"commands available but you have enough evidence to pick sources, commit "
-            f"immediately — do not fill remaining turns with more searches.\n\n"
-            f"CRITICAL — no invented sources: every `id` in your manifest MUST be "
-            f"copied verbatim from a dataset id that appeared in your `hf datasets ls` "
-            f"or `hf datasets info` output during this rollout. Do NOT invent or guess "
-            f"dataset ids or config names. If a `config` was not explicitly listed in "
-            f"command output, set `config` to null. A manifest with a fabricated id or "
-            f"config materializes zero tokens and scores zero. An empty or missing "
-            f"manifest also scores zero."
-            f"{local_source_status}"
-        )
 
     def _discovery_budget(self) -> tuple[int, int]:
         """Return the configured ``(rounds, calls)`` discovery allowance."""

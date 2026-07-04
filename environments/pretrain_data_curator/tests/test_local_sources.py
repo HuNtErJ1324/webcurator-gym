@@ -481,8 +481,8 @@ def test_local_configuration_is_validated_and_plumbed():
 def test_system_prompt_discloses_local_source_safety_and_billing():
     assert '"kind": "hf"' in SYSTEM_PROMPT
     assert '"local_path": null' in SYSTEM_PROMPT
-    assert "relative path inside your working directory" in SYSTEM_PROMPT
+    assert "relative to the working directory" in SYSTEM_PROMPT
     assert "no leading `/`" in SYSTEM_PROMPT
     assert "no `..`" in SYSTEM_PROMPT
-    assert "Local tokens are billed exactly like fetched tokens" in SYSTEM_PROMPT
-    assert "Do NOT fabricate text" in SYSTEM_PROMPT
+    assert "billed like fetched tokens" in SYSTEM_PROMPT
+    assert "Never fabricate documents" in SYSTEM_PROMPT

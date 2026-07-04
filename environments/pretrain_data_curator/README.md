@@ -247,7 +247,6 @@ a rollout first accesses the Hub. Constructing the environment does not require
 | `candidate_limit` | int | `8` | Max candidates returned per search. |
 | `scan_limit` | int | `50` | Discovery budget input; benchmark configs raise it so the prompt allows more discovery rounds. |
 | `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
-| `allow_script_datasets` | bool | `false` | Permit script-backed repositories only when the installed `datasets` runtime supports them. The current `datasets>=3` runtime still rejects them permanently. |
 | `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |
 | `max_local_source_bytes` | int | `33554432` | Maximum bytes transferred per local source before parsing. |
 | `max_turns` | int | `12` | Max agent turns; benchmark configs raise it for longer discovery and curation. |
@@ -265,11 +264,8 @@ a rollout first accesses the Hub. Constructing the environment does not require
 
 Before streaming a source, the materializer checks for the Hugging Face
 `{dataset_name}.py` convention. Script-backed sources fail once with
-`error_kind="script_dataset"` when `allow_script_datasets=false` or the installed
-`datasets` version cannot execute scripts; they are not retried. Setting the knob
-to `true` never bypasses the runtime capability check. Script execution remains
-unavailable in this release because the pinned Verifiers package requires
-`datasets>=3`.
+`error_kind="script_dataset"` and are not retried. Script execution is
+unavailable because the pinned Verifiers package requires `datasets>=3`.
 
 When streaming is unavailable, a local source can bridge a genuine downloaded
 dataset into scoring without executing repository code. Local paths are
