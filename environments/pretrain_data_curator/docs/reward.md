@@ -90,42 +90,49 @@ sum.
 
 ## Leakage
 
-Every materialized document is compared with a bounded, decoded sample of the
-same held-out validation token stream used for proxy-student scoring, using three
-deterministic detectors:
+Contamination is detected by the [allenai/decon](https://github.com/allenai/decon)
+Rust n-gram detector, run at scoring time against the materialized corpus. Decon
+replaces the previous exact/fuzzy/semantic (SHA-1 / MinHash / character-trigram)
+detectors. It compares the corpus against two reference sets:
 
-| Metric | Method | Default match condition |
+| Reference set | Source | Exposure |
 | --- | --- | --- |
-| Exact | SHA-1 of normalized lowercase whitespace | identical normalized text |
-| Fuzzy | seeded MinHash of word shingles | estimated Jaccard at least `0.5` |
-| Semantic | cosine over normalized character-trigram counts | cosine at least `0.8` |
+| Public benchmarks | Bundled eval sets under `decon/bundled-evals/` (e.g. MMLU, GSM8K, AGIEval) | Baked into the runtime image; offline at scoring time |
+| Held-out validation set | The FineWeb-10B GPT-2 val shard, detokenised from BPE token IDs back to text via `tiktoken` (enabled by `screen_val_set`, default `true`) | Built ephemerally in a server-side temp dir and deleted after scoring; **never** written to `decon/bundled-evals/`, the workspace, or any container image |
 
-Each detector reports the fraction of curated documents that match at least one
-held-out document. The penalty is:
+Decon emits a JSONL report with one record per (training document x eval
+instance) match, each carrying a `contamination_score` in `[0, 1]`. The scorer
+reduces the report to a single token-weighted scalar via `_reduce_report`:
 
 ```text
-Leakage = max(exact_fraction, fuzzy_fraction, semantic_fraction)
+Leakage = min(1.0, sum(score * matched_tokens) / corpus_tokens)
 ```
 
-All three fractions and the maximum are in `[0, 1]`. Fuzzy hashing uses seeded
-`blake2b`, not Python's process-randomized `hash`, so results are stable across
-processes.
+Matches are deduplicated per training document (only the highest
+`score * matched_tokens` per document counts), so `Leakage` is in `[0, 1]`. Decon
+runs deterministically as a subprocess off the event loop.
 
-The "semantic" detector is lexical character-trigram similarity, not a neural
-embedding model. It is fast and reproducible but should not be interpreted as a
-general semantic-contamination detector.
+Because decon's IDF weighting needs many eval records, the held-out val screen is
+meaningful only at production scale (~9,700 records from the 10M-token shard); a
+tiny synthetic val set can score `0` even on verbatim matches.
 
-The reference samples 64 deterministic strata with windows of at most 1,024
-GPT-2 tokens, caps each decoded window at 8,192 characters and the semantic
-vocabulary at 32,768 trigrams, and is cached after construction. If the
-validation shard cannot be loaded or decoded, scoring logs
-`leakage_reference=stub` and exposes `stub` on
-`CuratorState.leakage_reference` while using the built-in offline fallback.
+### Fail-loud on detector failure
 
-Local-source audit telemetry supplements, but does not replace, these leakage
-detectors. `val_set_access` flags bash commands containing the configured
-validation repository ID. It is intentionally a conservative command-provenance
-signal; it does not prove which bytes entered the corpus.
+A decon failure (missing binary, non-zero exit, timeout, or crash) raises
+`DeconError`, which the scorer catches and records as `decon_error=1.0` and
+`external_failure=True`, keeping `leakage_score=0.0`. This makes a broken detector
+**unambiguously distinguishable** from a genuinely clean corpus (clean =
+`decon_error=0`, `external_failure=False`), so a detector failure is never a
+silent free pass on the leakage penalty.
+
+The development self-scoring script (`self_score.py`) runs decon against the
+**bundled benchmarks only** — the held-out val set is never exposed inside the
+agent container.
+
+Local-source audit telemetry supplements, but does not replace, decon.
+`val_set_access` flags bash commands containing the configured validation
+repository ID. It is intentionally a conservative command-provenance signal; it
+does not prove which bytes entered the corpus.
 
 ## Empty and unfinalized rollouts
 
@@ -180,19 +187,18 @@ data, or the infrastructure can fail before that data is evaluated.
 | `local_source_bytes` | Bytes transferred by capped local pulls |
 | `local_source_truncated` | `1.0` when any local source exceeded its cap |
 | `val_set_access` | `1.0` when a bash command named the validation repository |
-| `leakage_exact` | Exact-match document fraction |
-| `leakage_fuzzy` | MinHash-match document fraction |
-| `leakage_semantic` | Character-trigram-match document fraction |
+| `leakage_score` | Token-weighted decon contamination scalar in `[0, 1]` |
+| `num_contaminated_matches` | Count of deduplicated contaminated training documents |
+| `decon_error` | `1.0` when the decon detector failed (paired with `external_failure`); `leakage_score` is then `0.0` but not trustworthy |
 | `cost_total` | Priced ledger total before `lambda_cost` |
 | `finalized` | `1.0` when a usable manifest was recovered |
 | `tool_error_count` | Total classified Hub/trainer errors |
 | `external_failure` | `1.0` when external infrastructure failed |
 | `trainer_error_msg` | `1.0` when trainer detail was recorded |
-| `leakage_reference` | Leakage-reference provenance: `0` unresolved, `1` built-in stub, `2` real validation-derived reference, `3` custom `eval_corpus` |
 
 The trainer error string itself is logged in truncated form rather than emitted
-as a numeric metric. Do not average `leakage_reference` as an ordinal score; use
-the encoded values to count provenance classes, especially the `1` stub rate.
+as a numeric metric. Always read `decon_error` alongside `leakage_score`: a
+`leakage_score` of `0.0` means "clean corpus" only when `decon_error=0`.
 
 ## Reading a result
 
@@ -202,7 +208,8 @@ A practical order is:
 2. Check `external_failure`, `tool_error_count`, and `trainer_error_msg`.
 3. Check `num_sources`, `corpus_tokens`, and local-source provenance metrics.
 4. Compare `perf_loss` and `perf_vs_baseline`.
-5. Inspect all three leakage metrics.
+5. Inspect `leakage_score` and `num_contaminated_matches`, and confirm
+   `decon_error=0` before trusting a low leakage score.
 6. Decompose the final reward into the three named reward components.
 
 This avoids attributing a zero performance score to data quality when the

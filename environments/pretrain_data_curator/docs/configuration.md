@@ -41,7 +41,10 @@ source while leaving Hub entries unchanged. The byte cap is enforced by
 | `lambda_leakage` | `1.0` | Multiplier on the leakage penalty |
 | `perf_baseline_loss` | `log(50304)` | No-information loss used by baseline-relative performance |
 | `baseline_relative_perf` | `true` | Use bounded relative loss improvement; otherwise use `exp(-loss)` |
-| `eval_corpus` | `None` | Optional leakage-reference override; otherwise a bounded real-validation sample is decoded, with a loud built-in fallback |
+| `decon_binary` | `"decon"` | Path to the decon Rust binary; falls back to the vendored `decon/bin/decon` |
+| `decon_evals_dir` | `None` | Override directory for the bundled benchmark eval sets; defaults to `decon/bundled-evals/` |
+| `decon_threshold` | `0.2` | decon `--contamination-score-threshold` |
+| `screen_val_set` | `true` | Also screen the corpus against the held-out val set (detokenised ephemerally; never exposed to the agent) |
 
 ### Reliability and concurrency
 

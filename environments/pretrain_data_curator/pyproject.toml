@@ -2,7 +2,7 @@
 name = "pretrain-data-curator"
 description = "Agent curates an LLM pretraining corpus from the pre-cutoff Hugging Face universe, scored by proxy-student cross-entropy plus cost and leakage penalties."
 tags = ["huggingface", "datasets", "data-curation", "pretraining", "tool-use", "multi-turn", "train", "eval"]
-version = "0.8.1"
+version = "0.8.2"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "verifiers==0.1.15.dev376",
@@ -37,4 +37,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "torch==2.7.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests that require the decon binary (deselect with '-m \"not slow\"')",
 ]

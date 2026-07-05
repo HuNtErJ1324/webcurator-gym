@@ -5,8 +5,10 @@
     R(M) = alpha_perf * Perf(M) - lambda_cost*Cost(M) - lambda_leakage*Leakage(M)
 
 where Leakage(M) is a token-weighted contamination scalar from the decon
-Rust n-gram detector run against PUBLIC BENCHMARK eval sets (never the
-held-out validation set).
+Rust n-gram detector run against PUBLIC BENCHMARK eval sets AND, optionally,
+the held-out validation set (detokenised from GPT-2-BPE token IDs back to
+text via tiktoken at scoring time only; the val set is NEVER exposed to the
+agent).
 
 Performance, cost, and leakage derive from one prepared scoring pass over the
 finalized manifest. The expensive corpus build and proxy-student training run
@@ -24,10 +26,12 @@ from typing import Any
 import verifiers.v1 as vf
 
 from .corpus import CorpusBuilder, CuratedCorpus
+from .hf_access import DatasetAccessError
 from .leakage import DeconError, DeconLeakageDetector, LeakageScores
 from .models import CuratorConfig
 from .rollout_state import CuratorState, RolloutStore
 from .trainer import ProxyStudentTrainer, TrainResult
+from .val_set import ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +45,16 @@ class CuratorScorer:
         corpus_builder: CorpusBuilder,
         trainer: ProxyStudentTrainer,
         decon_detector: DeconLeakageDetector | None = None,
+        *,
+        val_loader: ValTokenLoader | None = None,
+        screen_val_set: bool = True,
     ) -> None:
         self.config = config
         self.corpus_builder = corpus_builder
         self.trainer = trainer
         self.decon_detector = decon_detector
+        self.val_loader = val_loader
+        self.screen_val_set = screen_val_set
 
     async def compute_scoring(
         self, state: CuratorState, runtime: vf.Runtime | None = None
@@ -66,10 +75,23 @@ class CuratorScorer:
 
         # Decon runs off the event loop via subprocess.
         decon_error = False
+        val_screen_skipped = False
         if self.decon_detector is not None:
+            # Load the held-out val set for decon screening if configured.
+            val_set = None
+            if self.screen_val_set and self.val_loader is not None:
+                try:
+                    val_set = await self.val_loader.load()
+                except DatasetAccessError:
+                    logger.warning(
+                        "[curator] val set load failed, skipping val leakage screen"
+                    )
+                    val_screen_skipped = True
             try:
                 leakage = await asyncio.to_thread(
-                    self.decon_detector.score, corpus.iter_documents()
+                    self.decon_detector.score,
+                    corpus.iter_documents(),
+                    val_set,
                 )
             except DeconError as exc:
                 logger.warning("[curator] decon detection failed: %s", exc)
@@ -85,6 +107,7 @@ class CuratorScorer:
             "cost": ledger.total(self.config.prices),
             "leakage": leakage.as_dict(),
             "decon_error": float(decon_error),
+            "val_screen_skipped": float(val_screen_skipped),
             "loss": train_result.loss if math.isfinite(train_result.loss) else 0.0,
             "accuracy": float(train_result.accuracy or 0.0),
             "flops": train_result.flops,
@@ -131,6 +154,7 @@ class CuratorScorer:
             "cost": ledger.total(self.config.prices),
             "leakage": {"leakage_score": 0.0, "num_contaminated_matches": 0},
             "decon_error": 0.0,
+            "val_screen_skipped": 0.0,
             "loss": 0.0,
             "accuracy": 0.0,
             "flops": 0.0,

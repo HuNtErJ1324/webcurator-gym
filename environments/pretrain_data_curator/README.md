@@ -45,10 +45,11 @@ R(M, H) = alpha_perf * Perf(M)
 | --- | --- | --- |
 | `Perf` | Proxy-student cross-entropy performance on the curated corpus | `alpha_perf=1.0` |
 | `Cost` | Web queries, hub calls, tokens, training FLOPs (one ledger) | `lambda_cost=0.1` |
-| `Leakage` | Exact + fuzzy (MinHash) + semantic overlap vs the held-out eval set | `lambda_leakage=1.0` |
+| `Leakage` | Token-weighted [decon](https://github.com/allenai/decon) n-gram contamination vs public benchmarks **and** the held-out val set | `lambda_leakage=1.0` |
 
 Each term is also emitted as a metric (`perf_loss`, `perf_accuracy`,
-`perf_vs_baseline`, `train_flops`, `corpus_tokens`, `num_sources`, `leakage_*`,
+`perf_vs_baseline`, `train_flops`, `corpus_tokens`, `num_sources`,
+`leakage_score`, `num_contaminated_matches`, `decon_error`,
 `cost_total`, `finalized`). Local-source provenance is exposed as
 `local_source_count`, `local_source_bytes`, `local_source_truncated`, and
 `val_set_access`. Two further zero-weight **diagnostics**,
@@ -65,7 +66,7 @@ external/infrastructure failure (a flaky Hub or sandbox). See
   **dev/smoke surrogate, not a real training signal** — it lets the environment
   run and be tested without a GPU, but its `Perf` is a proxy, not a measurement.
   It trains no model, so it does **not** compute per-token CE on the held-out
-  validation set. `validation_set` still supplies the default leakage reference.
+  validation set. Leakage is computed separately by decon (see below).
 - **Real proxy-student training** (`use_real_trainer=true`): the path that yields a
   **meaningful** `Perf`. It actually trains a fixed small GPT (config in
   `ProxyStudentConfig`), GPT-2-BPE-tokenized, in the live Docker or Modal harness
@@ -283,8 +284,11 @@ but every rollout does.
 | `fetch_max_attempts` | int | `3` | Max attempts (retry/backoff) for transient HF failures. |
 | `use_real_trainer` | bool | `false` | Use the GPU sandbox proxy-student instead of the heuristic. |
 | `proxy_student` | dict | `{}` | Overrides for `ProxyStudentConfig` (arch, `train_token_budget`, `gpu_count`, etc.). `train_token_budget` (≤ 1e9) scales steps/corpus-cap/timeout. Selects the real-trainer backend via `runtime_backend` (`"docker"` / `"modal"`; required, no default, whenever `use_real_trainer=true`); for `"docker"`, set `docker_image` to a combined discovery/training image and leave `docker_host` unset; for `"modal"` see `modal_gpu` (default `"L4"`; also `"H100"`/`"H200"`/`"A100"`) and `gpu_count`, and set `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. |
-| `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set and default leakage source: FineWeb GPT-2 val tokens, first `10_485_760`). |
-| `eval_corpus` | list[str] | `None` | Optional explicit leakage-reference override. By default a bounded sample of the real `validation_set` is decoded; the built-in corpus is only an observable offline fallback. |
+| `validation_set` | dict | NanoGPT speedrun set | Overrides for `ValidationSetConfig` (held-out downstream-CE val set: FineWeb GPT-2 val tokens, first `10_485_760`). Used for proxy-student CE scoring, and — when `screen_val_set=true` — detokenised ephemerally as an extra decon leakage reference (never exposed to the agent). |
+| `decon_binary` | str | `"decon"` | Path/name of the decon binary; falls back to the vendored `decon/bin/decon`. |
+| `decon_evals_dir` | str \| None | `None` | Override for the benchmark eval-set directory; defaults to the bundled `decon/bundled-evals/`. |
+| `decon_threshold` | float | `0.2` | decon `--contamination-score-threshold`. |
+| `screen_val_set` | bool | `true` | Also screen the corpus against the held-out val set (in addition to public benchmarks). The val text is built server-side in an ephemeral temp dir and never written to the workspace, the agent container, or `decon/bundled-evals/`. |
 
 Before streaming a source, the materializer checks for the Hugging Face
 `{dataset_name}.py` convention. Script-backed sources fail once with
@@ -305,7 +309,7 @@ fetched tokens plus one code call, and audited with provenance metrics.
 - `hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers. Setup checks credentials before rollout; the client checks again at first Hub use.
 - `hf_meter.py` — PATH-shadow `hf` shim, per-rollout JSONL cost log, and trace-reconstruction fallback.
 - `corpus.py` — `CorpusBuilder` + `DocumentFilter` (materialize manifest into documents).
-- `leakage.py` — `LeakageDetector` (exact/fuzzy/semantic contamination).
+- `leakage.py` — `DeconLeakageDetector` (decon n-gram contamination vs bundled benchmarks + optional ephemeral held-out val screen), `LeakageScores`, `DeconError`, and the token-weighted `_reduce_report`.
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
 - `trainer.py` — `ProxyStudentTrainer` interface, the heuristic backend, and `RuntimeSelectedTrainer` (dispatches to the docker/modal backend matching the live harness runtime's type).
 - `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
@@ -317,16 +321,16 @@ fetched tokens plus one code call, and audited with provenance metrics.
 - `rollout_state.py` — typed `CuratorState` plus `RolloutStore` accessors.
 - `taskset.py` — `CuratorTaskset`, manifest parsing/recovery, `finalize()`, decorated rewards/metrics, and `@vf.stop` turn cap. No MCP tool server.
 - `tasks.py` — one typed v1 curation task rendered as the initial user prompt.
-- `self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace.
-- `eval_corpus.py` — small offline fallback corpus for the leakage term.
+- `self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace; runs decon against the bundled **benchmarks only** (never the held-out val set).
+- `eval_corpus.py` — legacy offline fallback corpus; no longer wired into scoring after the decon swap (pending removal).
 
 ## Notes And Limitations
 
-- Leakage detection is fully deterministic and reproducible across processes:
-  the semantic signal is a lightweight character-trigram cosine (no neural deps),
-  and the fuzzy MinHash hashes shingles with a seeded `blake2b` (`_stable_hash32`)
-  rather than Python's per-process-salted `hash()`. Swap in a real embedder if
-  needed.
+- Leakage detection is deterministic: the decon Rust binary runs as a subprocess
+  over the materialized corpus against baked benchmark eval sets (and, when
+  `screen_val_set=true`, an ephemeral detokenised val reference), reduced to a
+  token-weighted scalar. A detector failure raises `DeconError` and is surfaced
+  as `decon_error`/`external_failure` rather than a silent `0.0`.
 - Token/corpus cost is billed **once per real fetch**: documents are fetched
   through a per-rollout cache keyed by `(dataset_id, config, split, text_field, n)`
   with per-key single-flight, so previews and final scoring observe identical docs

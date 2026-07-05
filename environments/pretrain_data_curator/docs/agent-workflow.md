@@ -64,7 +64,10 @@ This is a development proxy, not final scoring. It uses no validation shard,
 validation tokens, decoded leakage reference, or final trainer. The configured
 validation repository is represented only by a SHA-256 digest and is rejected
 before any network request, so the script neither reveals nor consumes the
-held-out source. `leakage_estimate` is deliberately `null`.
+held-out source. `leakage_estimate` reports a development-only contamination
+estimate from the vendored decon binary against the **bundled benchmarks only**
+(never the held-out val set); it is `null` only when decon or its evals are
+unavailable.
 
 ## Cutoff and contamination
 
@@ -73,8 +76,8 @@ must verify it; finalization does not make a hidden metadata request.
 
 The held-out validation/evaluation data is reserved for final scoring. Attempts
 to access its configured repository are recorded by `val_set_access`, and
-materialized overlap is penalized by exact, fuzzy, and character-trigram leakage
-detectors.
+materialized overlap with public benchmarks and the held-out val set is penalized
+by the decon n-gram contamination detector (token-weighted `leakage_score`).
 
 ## Cost metering
 

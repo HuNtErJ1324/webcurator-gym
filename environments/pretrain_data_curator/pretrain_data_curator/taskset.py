@@ -20,8 +20,10 @@ and used to train the fixed proxy student, and the composite reward is:
     R(M, H) = alpha_perf*Perf - lambda_cost*Cost - lambda_leakage*Leakage
 
 Leakage is a token-weighted scalar from the decon Rust n-gram detector run
-against PUBLIC BENCHMARK eval sets (bundled under ``decon/bundled-evals/``),
-NEVER the held-out validation set.
+against PUBLIC BENCHMARK eval sets (bundled under ``decon/bundled-evals/``)
+AND, optionally, the held-out validation set (when ``screen_val_set`` is
+enabled — the default).  The val eval file is detokenised ephemerally at
+scoring time and never persists.
 
 The reward coefficients are runtime config, so each ``@vf.reward`` is registered
 with the framework weight ``1.0`` and folds its (signed) coefficient into the
@@ -428,6 +430,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     decon_binary: str = DEFAULT_DECON_BINARY
     decon_evals_dir: str | None = None
     decon_threshold: float = 0.2
+    screen_val_set: bool = True
 
     @field_validator("manifest_filename")
     @classmethod
@@ -519,6 +522,7 @@ class CuratorTaskset(_TasksetBase):
                 decon_binary=self.config.decon_binary,
                 evals_dir=evals_dir,
                 threshold=self.config.decon_threshold,
+                screen_val_set=self.config.screen_val_set,
             )
         if self._trainer is None:
             self._trainer = (
@@ -531,6 +535,8 @@ class CuratorTaskset(_TasksetBase):
             self._corpus_builder,
             self._trainer,
             self._decon_detector,
+            val_loader=self._val_loader,
+            screen_val_set=self.config.screen_val_set,
         )
         return self._scorer
 
@@ -986,6 +992,12 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
         return (await self._prepared(trace, runtime)).get("decon_error", 0.0)
+
+    @vf.metric
+    async def val_screen_skipped(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime)).get("val_screen_skipped", 0.0)
 
     async def trainer_error_str(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None

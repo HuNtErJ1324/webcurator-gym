@@ -165,7 +165,9 @@ The scorer:
 2. materializes the corpus;
 3. invokes the configured trainer;
 4. adds training FLOPs to the same cost ledger;
-5. checks every materialized document for leakage;
+5. runs the decon n-gram detector over the materialized corpus against the
+   bundled benchmarks (and the ephemeral held-out val reference when
+   `screen_val_set=true`);
 6. derives performance, cost, leakage, and diagnostic values.
 
 ## Failure semantics

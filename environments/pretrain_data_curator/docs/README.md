@@ -32,8 +32,10 @@ it.
   enforcing allocation/caps.
 - **Proxy student**: the fixed model and recipe used to measure the selected
   corpus. The cheap default is only a deterministic surrogate.
-- **Leakage corpus**: short held-out text used to penalize contamination. It is
-  separate from the tokenized validation set used by real proxy training.
+- **Decon reference sets**: public benchmark eval sets (MMLU/GSM8K/AGIEval,
+  bundled under `decon/bundled-evals/`) plus, optionally, the held-out
+  validation set detokenised ephemerally — the reference corpora the decon
+  n-gram detector screens the curated corpus against for contamination.
 - **Validation set**: a fixed GPT-2-token shard used to compute real student
   cross-entropy after training.
 
