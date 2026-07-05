@@ -49,7 +49,7 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 
 ## Rules
 1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so its cost produces no performance.
-2. Never access, copy, infer, or derive data from the held-out validation or evaluation corpus. Doing so is contamination and incurs the leakage penalty.
+2. Your corpus is checked for data contamination against public benchmark eval sets (AGI Eval, GSM8K, MMLU) using the decon n-gram detector. Benchmark contamination incurs the leakage penalty in the reward. The held-out validation set is never used for contamination detection.
 3. Set the manifest's `token_budget` field to exactly {token_budget}, and use data, calls, and training work economically. Fetching or processing beyond what can fill that token allocation increases the cost penalty without increasing the scored corpus.
 4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
 5. Create the final manifest file through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.

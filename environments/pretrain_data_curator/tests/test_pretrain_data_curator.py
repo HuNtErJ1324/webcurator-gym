@@ -26,7 +26,6 @@ from pretrain_data_curator.corpus import (
     SourceCorpus,
     _iter_sampling,
 )
-from pretrain_data_curator.eval_corpus import DEFAULT_EVAL_CORPUS
 from pretrain_data_curator.hf_access import (
     DatasetAccessError,
     FetchKey,
@@ -36,8 +35,7 @@ from pretrain_data_curator.hf_access import (
     loop_local_semaphore,
     run_blocking_with_retry,
 )
-from pretrain_data_curator.leakage import LeakageDetector, _stable_hash32
-from pretrain_data_curator.leakage_reference import LeakageReferenceLoader
+from pretrain_data_curator.leakage import DeconLeakageDetector
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
@@ -71,7 +69,6 @@ from pretrain_data_curator.val_set import (
     NANOGPT_VAL_DATASET_ID,
     NANOGPT_VAL_FILENAME,
     NANOGPT_VAL_TOKENS,
-    HeldOutValSet,
     SHARD_HEADER_INTS,
     SHARD_MAGIC,
     SHARD_VERSION,
@@ -169,8 +166,9 @@ class _Curator:
             ),
             fetch_limit=self.config.max_concurrent_fetches,
         )
-        self.leakage_detector = leakage_detector or LeakageDetector(
-            cfg.get("eval_corpus") or DEFAULT_EVAL_CORPUS
+        self.leakage_detector = leakage_detector or DeconLeakageDetector(
+            decon_binary="/nonexistent/decon",
+            evals_dir="/nonexistent/evals",
         )
         self.trainer = trainer or HeuristicProxyTrainer()
         # Inject the shared collaborators into the taskset's lazy scoring slots so
@@ -241,7 +239,10 @@ def _scorer(
         config or CuratorConfig(),
         corpus_builder or CorpusBuilder(client=FakeClient()),
         trainer,
-        leakage or LeakageDetector(DEFAULT_EVAL_CORPUS),
+        leakage or DeconLeakageDetector(
+            decon_binary="/nonexistent/decon",
+            evals_dir="/nonexistent/evals",
+        ),
     )
 
 
@@ -980,119 +981,7 @@ async def test_materialize_different_sample_sizes_do_not_share_cache_key():
     assert len(corpus_large.sources[0].documents) == 20
 
 
-def test_leakage_detects_exact_and_paraphrase():
-    eval_docs = [
-        "The mitochondrion is the powerhouse of the cell and provides energy.",
-        "Binary search finds a target value within a sorted array efficiently.",
-    ]
-    detector = LeakageDetector(eval_docs, seed=0)
-    clean = detector.score(["Unrelated text about gardening and the weather today."])
-    contaminated = detector.score([eval_docs[0]])
-    assert contaminated.overall > clean.overall
-    assert contaminated.exact == 1.0
 
-
-def test_leakage_semantic_build_vectors_handles_trigram_cap():
-    docs = [
-        "abc def ghi jkl mno pqr stu vwx yzA BCD EFG HIJ KLM NOP QRS "
-        "TUV WXY Z01 234 567 890 123 456 789 ABC DEF GHI JKL MNO PQR"
-    ]
-    detector = LeakageDetector(docs, max_semantic_features=2, seed=0)
-    scores = detector.score(docs)
-    assert scores.exact == 1.0
-
-
-def test_leakage_trigram_cap_exceeded_no_keyerror():
-    docs_with_many_trigrams = [
-        " ".join(f"word{i:04d}" for i in range(200))
-        for _ in range(5)
-    ]
-    detector = LeakageDetector(docs_with_many_trigrams, max_semantic_features=4, seed=0)
-    scores = detector.score(docs_with_many_trigrams)
-    assert scores.fuzzy == 1.0
-
-
-def test_leakage_fuzzy_chunking_detects_embedded_reference():
-    import random
-
-    ref_text = (
-        "Photosynthesis is the process by which green plants and certain other "
-        "organisms transform light energy into chemical energy. During photosynthesis "
-        "in green plants light energy is captured and used to convert water carbon "
-        "dioxide and minerals into oxygen and energy-rich organic compounds."
-    ) * 10
-    ref_window = " ".join(ref_text.split()[:200])
-    vocab = [
-        "astronomy", "bicycle", "chemistry", "dolphin", "elephant", "fractal",
-        "galaxy", "horizon", "igloo", "jupiter", "kaleidoscope", "lemonade",
-        "mountain", "nebula", "oceanography", "pencil", "quasar", "rainforest",
-        "symphony", "telescope", "umbrella", "volcano", "waterfall", "xylophone",
-    ]
-
-    hits_chunked = 0
-    for trial in range(25):
-        rng = random.Random(42 + trial)
-        filler_words = [rng.choice(vocab) for _ in range(2000)]
-        insert_pos = rng.randint(0, len(filler_words))
-        combined = (
-            filler_words[:insert_pos]
-            + ref_window.split()
-            + filler_words[insert_pos:]
-        )
-        large_doc = " ".join(combined)
-        detector_chunked = LeakageDetector(
-            [ref_window], fuzzy_threshold=0.5, fuzzy_chunk_words=100, seed=0
-        )
-        if detector_chunked.score([large_doc]).fuzzy > 0:
-            hits_chunked += 1
-
-    assert hits_chunked >= 24
-
-
-def test_containment_catches_bisected_span_when_jaccard_fails():
-    """Containment scoring catches a copied span straddling chunk boundaries
-    where the per-chunk MinHash Jaccard stays below threshold, because the
-    eval document has many non-overlapping shingles that inflate the union.
-    Containment (|intersection| / |chunk|) ignores extraneous eval shingles,
-    so a chunk mostly composed of copied text passes the threshold."""
-    eval_doc = " ".join(f"tok{i}" for i in range(500))
-    span = " ".join(f"tok{i}" for i in range(200, 230))
-    filler = " ".join(f"zzz{i}" for i in range(2000))
-    words = filler.split()[:985] + span.split() + filler.split()[985:]
-    doc = " ".join(words)
-
-    detector_whole = LeakageDetector(
-        [eval_doc], fuzzy_threshold=0.5, fuzzy_chunk_words=0, seed=42
-    )
-    detector_chunked = LeakageDetector(
-        [eval_doc], fuzzy_threshold=0.5, fuzzy_chunk_words=30, seed=42
-    )
-
-    scores_whole = detector_whole.score([doc])
-    scores_chunked = detector_chunked.score([doc])
-
-    assert scores_whole.fuzzy == 0.0, (
-        f"Whole-doc Jaccard should miss this; got fuzzy={scores_whole.fuzzy}"
-    )
-    assert scores_chunked.fuzzy > 0.0, (
-        "Containment scoring should detect bisected span; "
-        f"got fuzzy={scores_chunked.fuzzy}"
-    )
-
-
-def test_containment_no_false_positive():
-    """A document with zero eval-doc overlap must not trigger containment."""
-    eval_doc = " ".join(f"tok{i}" for i in range(500))
-    unrelated = " ".join(f"xyz{i}" for i in range(2000))
-
-    detector = LeakageDetector(
-        [eval_doc], fuzzy_threshold=0.5, fuzzy_chunk_words=30, seed=42
-    )
-    scores = detector.score([unrelated])
-
-    assert scores.fuzzy == 0.0, (
-        f"Unrelated doc must have zero fuzzy score; got {scores.fuzzy}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1238,35 +1127,6 @@ def test_effective_timeout_minutes_scales_and_is_bounded():
         ProxyStudentConfig(runtime_backend="modal", timeout_minutes=1441)
 
 
-# --- Tier B: process-stable hash for fuzzy leakage -------------------------
-
-
-def test_stable_hash_is_pinned_constant():
-    # Pinned value: proves the shingle hash does not depend on PYTHONHASHSEED.
-    assert _stable_hash32("the quick brown fox jumps") == 2016863831
-
-
-def test_leakage_fuzzy_is_cross_process_deterministic():
-    doc = "the quick brown fox jumps over the lazy dog near the river bank"
-    code = (
-        "from pretrain_data_curator.leakage import LeakageDetector;"
-        "d=LeakageDetector(['%s'], seed=0);"
-        "print(round(d.score(['%s']).fuzzy, 10))" % (doc, doc)
-    )
-    in_proc = round(LeakageDetector([doc], seed=0).score([doc]).fuzzy, 10)
-    outputs = set()
-    for seed in ("0", "1", "987654"):
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin"},
-            capture_output=True,
-            text=True,
-        )
-        assert proc.returncode == 0, proc.stderr
-        outputs.add(proc.stdout.strip())
-    assert outputs == {str(in_proc)}
-
-
 # --- Tier C: per-task token budget seeds the parsed manifest ----------------
 #
 # The per-task `CuratorTask.token_budget` seeds the manifest when the agent's
@@ -1354,7 +1214,10 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     )
     taskset._client = client
     taskset._corpus_builder = builder
-    taskset._leakage_detector = LeakageDetector(DEFAULT_EVAL_CORPUS)
+    taskset._decon_detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon",
+        evals_dir="/nonexistent/evals",
+    )
     taskset._trainer = HeuristicProxyTrainer()
 
     # The taskset exposes NO tools (the non-MCP gate passes).
@@ -1475,7 +1338,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 23  # 3 rewards + 20 diagnostic metrics
+    assert len(funcs) == 22  # 3 rewards + 19 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -1710,7 +1573,7 @@ async def test_heavy_compute_is_offloaded(monkeypatch):
     await _finalized(curator)
     await curator.prepared()
     # Leakage scoring goes through to_thread.
-    assert "score" in offloaded  # LeakageDetector.score
+    assert "score" in offloaded  # DeconLeakageDetector.score
 
 
 def test_proxy_student_recipe_defaults_mirror_record01():
@@ -1752,7 +1615,6 @@ def test_proxy_student_recipe_fields_reject_invalid(kwargs):
 
 
 def test_heuristic_flops_scale_with_budget_when_corpus_permits():
-    from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
 
     # ~5000 estimated tokens (4000 words / 20000 chars -> chars//4 dominates).
     corpus = CuratedCorpus(
@@ -1817,25 +1679,6 @@ def test_reward_surface_has_only_perf_cost_and_leakage():
     assert reward_names == {"perf_reward", "cost_penalty", "leakage_penalty"}
 
 
-@pytest.mark.asyncio
-async def test_severe_leakage_remains_a_penalty_without_bonus_gating():
-    client = FakeClient()
-    curator = await _make(client=client)
-    state = await _finalized(curator, sources=("good/encyclopedia",))
-    # Eval corpus == the exact docs the source returns -> severe leakage.
-    leaky_eval = client._docs["good/encyclopedia"]
-    scorer = _scorer(
-        HeuristicProxyTrainer(),
-        config=curator.config,
-        corpus_builder=curator.corpus_builder,
-        leakage=LeakageDetector(leaky_eval, seed=0),
-    )
-    scoring = await scorer.compute_scoring(state)
-    assert scoring["leakage"]["overall"] > 0.0
-    assert "quality" not in scoring
-    assert "diversity" not in scoring
-
-
 # --- Tier M: single PTB-style prompt + leakage-safe self-score --------------
 
 
@@ -1859,7 +1702,7 @@ def test_task_prompt_is_compact_method_open_and_single_budget():
 def test_task_prompt_rules_state_failure_modes_without_dataset_priors_or_recipes():
     prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
 
-    assert "contamination and incurs the leakage penalty" in prompt
+    assert "Benchmark contamination incurs the leakage penalty" in prompt
     assert "increases the cost penalty without increasing the scored corpus" in prompt
     assert "there is no positive performance score" in prompt
     assert "hf datasets ls" not in prompt
@@ -2176,253 +2019,26 @@ async def test_val_loader_fetch_failure_raises_typed_error(tmp_path):
     assert excinfo.value.kind == "network"
 
 
-def _word_decoder_factory(calls=None):
-    def factory(tokenizer):
-        if calls is not None:
-            calls.append(tokenizer)
 
-        def decode(token_ids):
-            return " ".join(f"word{token_id}" for token_id in token_ids)
-
-        return decode
-
-    return factory
 
 
 @pytest.mark.asyncio
-async def test_leakage_reference_builds_from_fake_tokenized_val_source(tmp_path):
-    tokens = list(range(1, 129))
-    loader = ValTokenLoader(
-        ValidationSetConfig(val_tokens=len(tokens)),
-        download_fn=_shard_download_fn(tmp_path, tokens),
-    )
-    decoder_calls = []
-    reference = await LeakageReferenceLoader(
-        loader,
-        decoder_factory=_word_decoder_factory(decoder_calls),
-        sample_count=4,
-        chunk_tokens=16,
-    ).load()
-
-    assert reference.source == "real"
-    assert len(reference.documents) == 4
-    assert reference.sampled_tokens == 64
-    assert decoder_calls == ["gpt2"]
-    assert all(document.startswith("word") for document in reference.documents)
-
-
-@pytest.mark.asyncio
-async def test_real_val_reference_detects_copied_chunk_exact_and_fuzzy(tmp_path):
-    tokens = list(range(1, 129))
-    reference_loader = LeakageReferenceLoader(
-        ValTokenLoader(
-            ValidationSetConfig(val_tokens=len(tokens)),
-            download_fn=_shard_download_fn(tmp_path, tokens),
-        ),
-        decoder_factory=_word_decoder_factory(),
-        sample_count=4,
-        chunk_tokens=16,
-    )
-    reference = await reference_loader.load()
-    copied = reference.documents[0]
-    altered = f"{copied} one harmless appended phrase"
-
-    class CopiedCorpusBuilder:
-        async def materialize(self, manifest, state, *, runtime=None):
-            return CuratedCorpus(
-                sources=[
-                    SourceCorpus.from_iter(
-                        "fake/train", None, 1.0, [copied, altered]
-                    )
-                ]
-            )
-
-    scorer = CuratorScorer(
-        CuratorConfig(),
-        CopiedCorpusBuilder(),
-        HeuristicProxyTrainer(),
-        None,
-        reference_loader,
-    )
-    state = CuratorState()
-    RolloutStore.set_manifest(
-        state, Manifest(sources=[Source(dataset_id="fake/train")])
-    )
-    RolloutStore.set_finalized(state, True)
-    scoring = await scorer.compute_scoring(state)
-
-    assert scoring["leakage"]["exact"] == 0.5
-    assert scoring["leakage"]["fuzzy"] == 1.0
-    assert scoring["leakage"]["overall"] > 0.0
-    assert state.leakage_reference == "real"
-
-
-@pytest.mark.asyncio
-async def test_leakage_reference_cache_reuses_decoded_detector():
-    class CountingValLoader:
-        def __init__(self):
-            self.calls = 0
-
-        async def load(self):
-            self.calls += 1
-            tokens = np.arange(1, 65, dtype="<u2")
-            return HeldOutValSet("fake/val", "val.bin", "gpt2", tokens, len(tokens))
-
-    val_loader = CountingValLoader()
-    decoder_calls = []
-    loader = LeakageReferenceLoader(
-        val_loader,
-        decoder_factory=_word_decoder_factory(decoder_calls),
-        sample_count=2,
-        chunk_tokens=16,
-    )
-
-    first = await loader.load()
-    second = await loader.load()
-
-    assert first is second
-    assert val_loader.calls == 1
-    assert decoder_calls == ["gpt2"]
-
-
-@pytest.mark.asyncio
-async def test_leakage_reference_offline_falls_back_loudly_and_sets_state_flag(
-    caplog,
-):
-    class UnavailableValLoader:
-        async def load(self):
-            raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
-
-    class StaticCorpusBuilder:
-        async def materialize(self, manifest, state, *, runtime=None):
-            return CuratedCorpus(
-                sources=[
-                    SourceCorpus.from_iter(
-                        "fake/train", None, 1.0, [DEFAULT_EVAL_CORPUS[0]]
-                    )
-                ]
-            )
-
-    reference_loader = LeakageReferenceLoader(UnavailableValLoader())
-    scorer = CuratorScorer(
-        CuratorConfig(),
-        StaticCorpusBuilder(),
-        HeuristicProxyTrainer(),
-        None,
-        reference_loader,
-    )
-    state = CuratorState()
-    RolloutStore.set_manifest(
-        state, Manifest(sources=[Source(dataset_id="fake/train")])
-    )
-    RolloutStore.set_finalized(state, True)
-
-    with caplog.at_level("WARNING"):
-        scoring = await scorer.compute_scoring(state)
-
-    assert scoring["leakage"]["exact"] == 1.0
-    assert state.leakage_reference == "stub"
-    assert "leakage_reference=stub" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_leakage_reference_stub_not_cached_retry_succeeds(tmp_path):
-    tokens = list(range(1, 65))
-    calls = []
-
-    class _FlipFlopValLoader:
-        def __init__(self):
-            self._attempt = 0
-
-        async def load(self):
-            self._attempt += 1
-            calls.append(self._attempt)
-            if self._attempt == 1:
-                raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
-            return HeldOutValSet(
-                "kjj0/fineweb10B-gpt2",
-                "fineweb_val_000000.bin",
-                "gpt2",
-                np.array(tokens, dtype="<u2"),
-                len(tokens),
-            )
-
-    reference_loader = LeakageReferenceLoader(
-        _FlipFlopValLoader(),
-        decoder_factory=_word_decoder_factory(),
-        sample_count=4,
-        chunk_tokens=16,
-        stub_ttl_seconds=0.0,
-    )
-
-    first = await reference_loader.load()
-    assert first.source == "stub"
-    assert calls == [1]
-
-    second = await reference_loader.load()
-    assert second.source == "real"
-    assert calls == [1, 2]
-    assert first is not second
-
-
-@pytest.mark.asyncio
-async def test_leakage_reference_stub_cached_with_ttl_then_retries():
-    load_calls = []
-
-    class _AlwaysFailingValLoader:
-        async def load(self):
-            load_calls.append(len(load_calls) + 1)
-            raise DatasetAccessError("offline", kind="network", dataset_id="fake/val")
-
-    loader = LeakageReferenceLoader(
-        _AlwaysFailingValLoader(),
-        decoder_factory=_word_decoder_factory(),
-        sample_count=2,
-        chunk_tokens=16,
-        stub_ttl_seconds=0.05,
-    )
-
-    first = await loader.load()
-    assert first.source == "stub"
-    assert load_calls == [1]
-
-    second = await loader.load()
-    assert second is first
-    assert load_calls == [1]
-
-    await asyncio.sleep(0.06)
-
-    third = await loader.load()
-    assert third.source == "stub"
-    assert load_calls == [1, 2]
-    assert third is not first
-
-
-@pytest.mark.asyncio
-async def test_default_taskset_path_produces_leakage_reference_via_ensure():
-    """Integration: the DEFAULT taskset path (no injected detector, no injected
-    loader) builds the val-based reference through CuratorTaskset._ensure()
-    and scoring reflects the real reference provenance."""
+async def test_default_taskset_path_builds_decon_detector():
+    """The DEFAULT taskset path builds a DeconLeakageDetector through _ensure()."""
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="test",
-            eval_corpus=None,
+            decon_binary="/nonexistent/decon",
         )
     )
-    tokens = np.arange(1, 129, dtype="<u2")
-
-    class _FixedValLoader:
-        async def load(self):
-            return HeldOutValSet("fake/val", "val.bin", "gpt2", tokens, len(tokens))
-
-    taskset._val_loader = _FixedValLoader()
     taskset._client = FakeClient()
     taskset._corpus_builder = CorpusBuilder(client=taskset._client)
     taskset._trainer = HeuristicProxyTrainer()
 
     scorer = taskset._ensure()
-    assert taskset._leakage_reference_loader is not None
-    assert taskset._leakage_detector is None
+    assert taskset._decon_detector is not None
+    assert taskset._scorer is scorer
+    assert taskset._decon_detector._binary == "/nonexistent/decon"
 
     state = CuratorState()
     RolloutStore.set_manifest(
@@ -2430,12 +2046,393 @@ async def test_default_taskset_path_produces_leakage_reference_via_ensure():
     )
     RolloutStore.set_finalized(state, True)
     scoring = await scorer.compute_scoring(state)
-
-    assert state.leakage_reference == "real", (
-        f"expected 'real' got {state.leakage_reference!r}"
-    )
     assert "leakage" in scoring
-    assert scoring["leakage"]["overall"] >= 0.0
+    assert scoring["leakage"]["leakage_score"] == 0.0
+
+
+# === Decon reducer unit tests ==============================================
+
+
+def _decon_jsonl_line(
+    *,
+    training_file: str = "corpus.jsonl",
+    training_line: int = 0,
+    contamination_score: float = 0.5,
+    eval_dataset: str = "test/eval",
+    answer_start_idx: int | None = 10,
+    answer_end_idx: int | None = 50,
+    question_start_idx: int | None = None,
+    question_end_idx: int | None = None,
+    cluster_token_length: int | None = None,
+) -> str:
+    """Build a single decon report JSONL line."""
+    rec: dict[str, object] = {
+        "training_file": training_file,
+        "training_line": training_line,
+        "contamination_score": contamination_score,
+        "eval_dataset": eval_dataset,
+    }
+    if answer_start_idx is not None:
+        rec["answer_start_idx"] = answer_start_idx
+    if answer_end_idx is not None:
+        rec["answer_end_idx"] = answer_end_idx
+    if question_start_idx is not None:
+        rec["question_start_idx"] = question_start_idx
+    if question_end_idx is not None:
+        rec["question_end_idx"] = question_end_idx
+    if cluster_token_length is not None:
+        rec["cluster_token_length"] = cluster_token_length
+    return json.dumps(rec)
+
+
+_BASELINE_TOTAL_TOKENS = 1000
+
+
+def test_reduce_empty_report():
+    """Empty report => 0.0."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    result = detector._reduce_report([], total_tokens=_BASELINE_TOTAL_TOKENS)
+    assert result.leakage_score == 0.0
+    assert result.num_contaminated_matches == 0
+    assert result.contamination_details == ()
+
+
+def test_reduce_blank_lines_skipped():
+    """Blank and whitespace-only lines are skipped."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = ["", "   ", _decon_jsonl_line(contamination_score=0.8), "\t", ""]
+    result = detector._reduce_report(lines, total_tokens=_BASELINE_TOTAL_TOKENS)
+    assert result.num_contaminated_matches == 1
+    assert result.leakage_score > 0.0
+
+
+def test_reduce_malformed_json_line_skipped():
+    """Malformed JSON lines are skipped without crashing."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = ["{not json}", _decon_jsonl_line(contamination_score=0.8)]
+    result = detector._reduce_report(lines, total_tokens=_BASELINE_TOTAL_TOKENS)
+    assert result.num_contaminated_matches == 1
+    assert result.leakage_score > 0.0
+
+
+def test_reduce_zero_char_corpus():
+    """Empty/zero-char corpus => 0.0 with NO divide-by-zero."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector, _MIN_TOKENS
+
+    assert _MIN_TOKENS == 1  # guards against divide-by-zero
+    # total_tokens = max(1, 0 // 4) = 1 so the division is safe.
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = [_decon_jsonl_line(contamination_score=0.8)]
+    result = detector._reduce_report(lines, total_tokens=_MIN_TOKENS)
+    # With total_tokens=1 and weighted sum=0.8*10=8.0, clamped to 1.0:
+    assert result.leakage_score == 1.0
+
+
+def test_reduce_multi_match_dedup_keeps_max_contribution():
+    """Dedup per (training_file, training_line): keep max weighted contribution."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Two records for the same doc: (corpus.jsonl, line 0).
+    # Record 1: score=0.5, span=answer(10..50)=40 chars=10 tokens -> 0.5*10=5.0
+    # Record 2: score=0.9, span=answer(10..20)=10 chars=2 tokens -> 0.9*2=1.8
+    # After dedup: max(5.0, 1.8) = 5.0
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.5,
+            answer_start_idx=10,
+            answer_end_idx=50,
+        ),
+        _decon_jsonl_line(
+            contamination_score=0.9,
+            answer_start_idx=10,
+            answer_end_idx=20,
+        ),
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    assert result.num_contaminated_matches == 1
+    # 5.0 / 100 = 0.05
+    assert result.leakage_score == pytest.approx(0.05)
+
+
+def test_reduce_different_docs_not_deduped():
+    """Different (training_file, training_line) pairs are summed, not deduped."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = [
+        _decon_jsonl_line(training_line=0, contamination_score=0.5),
+        _decon_jsonl_line(training_line=1, contamination_score=0.3),
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    assert result.num_contaminated_matches == 2
+    # (0.5*10 + 0.3*10) / 100 = 0.08
+    assert result.leakage_score == pytest.approx(0.08)
+
+
+def test_reduce_clamp_at_one():
+    """[0,1] clamp when weighted sum exceeds corpus tokens."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # High score + high token count to push leakage > 1.0 before clamp.
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=1.0,
+            answer_start_idx=0,
+            answer_end_idx=401,  # 401 chars = 100 tokens
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=50)
+    # Without clamp: (1.0 * 100) / 50 = 2.0. Clamped to 1.0.
+    assert result.leakage_score == 1.0
+
+
+def test_reduce_hand_worked_example():
+    """Token-weighted magnitude computes as expected on a hand-worked example."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Doc A: score=0.8, span answer(0..200)=200 chars=50 tokens, contribution=40.0
+    # Doc B: score=0.4, span answer(5..25)=20 chars=5 tokens, contribution=2.0
+    # Total weighted = 42.0, total_tokens = 200
+    # leakage = 42.0 / 200 = 0.21
+    lines = [
+        _decon_jsonl_line(
+            training_line=0,
+            contamination_score=0.8,
+            answer_start_idx=0,
+            answer_end_idx=200,
+        ),
+        _decon_jsonl_line(
+            training_line=1,
+            contamination_score=0.4,
+            answer_start_idx=5,
+            answer_end_idx=25,
+        ),
+    ]
+    result = detector._reduce_report(lines, total_tokens=200)
+    assert result.leakage_score == pytest.approx(0.21)
+    assert result.num_contaminated_matches == 2
+    assert len(result.contamination_details) == 2
+
+
+def test_reduce_question_fallback():
+    """Fallback to question_start_idx/end_idx when answer indices are missing."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Only question fields, no answer fields.
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.6,
+            answer_start_idx=None,
+            answer_end_idx=None,
+            question_start_idx=5,
+            question_end_idx=85,  # 80 chars = 20 tokens
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    # (0.6 * 20) / 100 = 0.12
+    assert result.leakage_score == pytest.approx(0.12)
+
+
+def test_reduce_both_question_and_answer_uses_outer_bounds():
+    """When both question and answer indices exist, use min(start)/max(end)."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Answer: start=20, end=60 (40 chars)
+    # Question: start=5, end=90 (85 chars)
+    # Outer bounds: min(20,5)=5, max(60,90)=90 => 85 chars = 21 tokens
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.5,
+            answer_start_idx=20,
+            answer_end_idx=60,
+            question_start_idx=5,
+            question_end_idx=90,
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    # (0.5 * 21) / 100 = 0.105
+    assert result.leakage_score == pytest.approx(0.105)
+
+
+def test_reduce_cluster_token_length_preferred():
+    """cluster_token_length is preferred over character-span estimation."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # cluster_token_length=25, answer span=40 chars=10 tokens.
+    # With cluster_token_length, est_tokens=25, contribution=0.4*25=10.0
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.4,
+            answer_start_idx=0,
+            answer_end_idx=40,
+            cluster_token_length=25,
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    # (0.4 * 25) / 100 = 0.1
+    assert result.leakage_score == pytest.approx(0.1)
+    # Verify span_tokens reflects cluster_token_length, not char-derived.
+    assert result.contamination_details[0]["span_tokens"] == 25
+
+
+def test_reduce_threshold_prefiltering():
+    """Contamination_score >= threshold records pass through.
+
+    The threshold is enforced by decon itself via --contamination-score-threshold;
+    _reduce_report consumes whatever decon emits. Verify a record below threshold
+    still flows through but contributes minimally.
+    """
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals",
+    )
+    # Very low score that decon would have filtered if below its threshold.
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.01,
+            answer_start_idx=0,
+            answer_end_idx=400,
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=1000)
+    # (0.01 * 100) / 1000 = 0.001
+    assert result.leakage_score == pytest.approx(0.001)
+    assert result.num_contaminated_matches == 1
+
+
+def test_leakage_penalty_positive():
+    """A non-empty contamination report drives leakage_penalty < 0.
+
+    Monkey-patches DeconLeakageDetector to return a synthetic report without
+    needing a real decon binary.
+    """
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+    from pretrain_data_curator.rewards import CuratorScorer
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+
+    # Monkey-patch score() to simulate decon report directly.
+    original_score = DeconLeakageDetector.score
+
+    def fake_score(self, docs):
+        lines = [
+            _decon_jsonl_line(
+                contamination_score=0.8,
+                answer_start_idx=0,
+                answer_end_idx=400,
+            )
+        ]
+        return self._reduce_report(lines, total_tokens=1000)
+
+    DeconLeakageDetector.score = fake_score
+    try:
+        config = CuratorConfig(lambda_leakage=1.0)
+        scorer = CuratorScorer(
+            config,
+            corpus_builder=CorpusBuilder(client=FakeClient()),
+            trainer=HeuristicProxyTrainer(),
+            decon_detector=detector,
+        )
+        state = CuratorState()
+        RolloutStore.set_manifest(
+            state,
+            Manifest(
+                token_budget=1000,
+                sources=[Source(dataset_id="good/encyclopedia")],
+            ),
+        )
+        RolloutStore.set_finalized(state, True)
+        scoring = asyncio.run(scorer.compute_scoring(state))
+        leakage_score = scoring["leakage"]["leakage_score"]
+        assert leakage_score > 0.0
+        # The penalty term would be: -lambda_leakage * leakage_score < 0
+        expected_penalty = -1.0 * leakage_score
+        assert expected_penalty < 0.0
+    finally:
+        DeconLeakageDetector.score = original_score
+
+
+def test_decon_error_raised_on_decon_failure():
+    """DeconLeakageDetector.score raises DeconError when decon fails."""
+    from pretrain_data_curator.leakage import DeconError, DeconLeakageDetector
+
+    # The decon binary exists (resolved from project path), but the evals dir
+    # doesn't, so decon exits non-zero -> DeconError.
+    detector = DeconLeakageDetector(
+        decon_binary="decon-nonexistent-name",
+        evals_dir="/nonexistent/evals",
+    )
+    with pytest.raises(DeconError):
+        detector.score(["some document text"])
+
+
+@pytest.mark.asyncio
+async def test_decon_error_sets_external_failure():
+    """When DeconError is raised, the scorer records external_failure."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+    from pretrain_data_curator.rewards import CuratorScorer
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon_nope",
+        evals_dir="/nonexistent/evals",
+    )
+    config = CuratorConfig(lambda_leakage=1.0)
+    scorer = CuratorScorer(
+        config,
+        corpus_builder=CorpusBuilder(client=FakeClient()),
+        trainer=HeuristicProxyTrainer(),
+        decon_detector=detector,
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state,
+        Manifest(
+            token_budget=1000,
+            sources=[Source(dataset_id="good/encyclopedia")],
+        ),
+    )
+    RolloutStore.set_finalized(state, True)
+    scoring = await scorer.compute_scoring(state)
+    assert scoring["decon_error"] == 1.0
+    assert RolloutStore.has_external_failure(state)
+    assert scoring["leakage"]["leakage_score"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -3686,7 +3683,10 @@ def _real_trainer_taskset(**proxy_student):
     # (no HF token / network needed); the trainer slot stays None for selection.
     ts._client = FakeClient()
     ts._corpus_builder = CorpusBuilder(client=ts._client)
-    ts._leakage_detector = LeakageDetector(DEFAULT_EVAL_CORPUS)
+    ts._decon_detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon",
+        evals_dir="/nonexistent/evals",
+    )
     return ts
 
 

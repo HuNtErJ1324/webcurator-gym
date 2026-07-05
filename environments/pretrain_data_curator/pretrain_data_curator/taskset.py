@@ -1,4 +1,4 @@
-"""The curation taskset: tasks, manifest parsing, finalize, rewards, and metrics.
+"""The curation taskset: tasks, manifest parsing, finalize, rewards, metrics.
 
 ``CuratorTaskset`` drives a *toolless* curation rollout: the agent runs the
 Hugging Face ``hf`` CLI in its own shell to search/inspect datasets and decides a
@@ -18,6 +18,10 @@ Scoring is unchanged from v1: the finalized manifest's datasets are materialized
 and used to train the fixed proxy student, and the composite reward is:
 
     R(M, H) = alpha_perf*Perf - lambda_cost*Cost - lambda_leakage*Leakage
+
+Leakage is a token-weighted scalar from the decon Rust n-gram detector run
+against PUBLIC BENCHMARK eval sets (bundled under ``decon/bundled-evals/``),
+NEVER the held-out validation set.
 
 The reward coefficients are runtime config, so each ``@vf.reward`` is registered
 with the framework weight ``1.0`` and folds its (signed) coefficient into the
@@ -40,12 +44,11 @@ import verifiers.v1 as vf
 from pydantic import ValidationError, field_validator
 
 from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
+from .leakage import DeconLeakageDetector
 from .docker_network import DockerHostReachability
-from .eval_corpus import DEFAULT_EVAL_CORPUS
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
-from .leakage import LeakageDetector
-from .leakage_reference import FUZZY_CHUNK_WORDS, LeakageReferenceLoader
+from .leakage import DEFAULT_DECON_BINARY, DEFAULT_EVAL_SETS_DIR
 from .models import (
     CuratorConfig,
     FilterSpec,
@@ -83,17 +86,12 @@ _SUPPORTED_FILTER_KINDS = {
     "keep_regex",
     "dedup_exact",
 }
-# ```json ... ``` (or bare ```), used to locate the agent's manifest block.
 _FENCE_RE = re.compile(r"```(?:json|jsonc|JSON)?\s*(.*?)```", re.DOTALL)
 
-# Matches "owner/name" patterns in free-form text.  Lookbehind blocks URL
-# scheme colons, existing slashes, and word characters so only standalone
-# identifiers match.
 _HF_ID_RE = re.compile(
     r"(?<![:/\w])([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]+)(?![/\w])"
 )
 
-# Namespace / name tokens that are path segments or field names, not HF ids.
 _NOT_HF_NAMESPACES = frozenset(
     {
         "http",
@@ -143,7 +141,6 @@ _FILE_EXTS = frozenset(
 
 
 def _looks_like_hf_id(s: str) -> bool:
-    """True when ``s`` plausibly is a HuggingFace dataset id (owner/name)."""
     if "/" not in s:
         return False
     ns, name = s.split("/", 1)
@@ -151,30 +148,13 @@ def _looks_like_hf_id(s: str) -> bool:
         return False
     if ns.lower() in _NOT_HF_NAMESPACES or name.lower() in _NOT_HF_NAMES:
         return False
-    # Skip file-extension-looking names (e.g. "some/file.json").
     if "." in name and name.rsplit(".", 1)[-1].lower() in _FILE_EXTS:
         return False
     return True
 
 
 def _ids_from_trace(trace: vf.Trace) -> list[str]:
-    """Dataset ids actually observed in the rollout's tool calls and outputs.
-
-    Two tiers, in order of reliability:
-    1. ``hf datasets info <id>`` command arguments — the agent explicitly
-       inspected these ids, so they are definitive.
-    2. Free-form text in bash tool-result messages — covers ids that appeared
-       in ``hf datasets ls`` output but were never individually inspected.
-
-    If the agent inspected any ids, only those ids are returned. Search-result
-    ids are used only when no inspection happened: blindly materializing every
-    search hit makes recovery select post-cutoff, gated, or incompatible
-    repositories the agent deliberately did not shortlist. Within a tier,
-    results preserve first-observation order and are deduplicated.
-    """
-    inspected: dict[str, None] = {}  # ordered-set via insertion-order dict
-
-    # 1. Explicitly-inspected ids from assistant tool-call argument JSON.
+    inspected: dict[str, None] = {}
     for msg in trace.assistant_messages:
         for tc in msg.tool_calls or []:
             try:
@@ -184,7 +164,6 @@ def _ids_from_trace(trace: vf.Trace) -> list[str]:
             except (json.JSONDecodeError, AttributeError):
                 cmd = getattr(tc, "arguments", "") or ""
             for argv in extract_hf_commands(cmd):
-                # argv from hf_meter: ["datasets", "info", "<id>", ...]
                 if (
                     len(argv) >= 3
                     and argv[0] == "datasets"
@@ -193,11 +172,8 @@ def _ids_from_trace(trace: vf.Trace) -> list[str]:
                     and not argv[2].startswith("-")
                 ):
                     inspected[argv[2]] = None
-
     if inspected:
         return list(inspected)
-
-    # 2. Ids from bash tool-result text (hf datasets ls output, info summaries).
     observed: dict[str, None] = {}
     for msg in getattr(trace, "tool_messages", []):
         text = _content_text(getattr(msg, "content", ""))
@@ -205,12 +181,10 @@ def _ids_from_trace(trace: vf.Trace) -> list[str]:
             did = m.group(1)
             if _looks_like_hf_id(did):
                 observed.setdefault(did, None)
-
     return list(observed)
 
 
 def _iter_json_objects(s: str):
-    """Yield each top-level balanced ``{...}`` substring (string-aware)."""
     depth = 0
     start: int | None = None
     in_str = False
@@ -240,12 +214,6 @@ def _iter_json_objects(s: str):
 def _last_json_object(
     s: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Scan ``s`` for balanced JSON objects → ``(last_with_sources, last_any)``.
-
-    ``last_with_sources`` is the LAST object that is a dict carrying a non-empty
-    ``sources`` list; ``last_any`` is the LAST parseable dict object. Either may be
-    ``None`` when ``s`` contains no such object.
-    """
     last_with_sources: dict[str, Any] | None = None
     last_any: dict[str, Any] | None = None
     for chunk in _iter_json_objects(s):
@@ -275,7 +243,6 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     """
     if not text:
         return None
-    # Every fenced block (in order) plus the whole text; later candidates win.
     candidates = [m.group(1) for m in _FENCE_RE.finditer(text)]
     candidates.append(text)
     last_with_sources: dict[str, Any] | None = None
@@ -314,16 +281,12 @@ def _coerce_filters(raw: Any) -> list[FilterSpec]:
                 re.compile(pattern)
                 params["pattern"] = pattern
         except (TypeError, ValueError, OverflowError, re.error):
-            # Agent-supplied filters are best-effort. Invalid params follow the
-            # same tolerant policy as unknown kinds: discard the spec rather than
-            # failing the scoring pass later in DocumentFilter.
             continue
         specs.append(FilterSpec(kind=kind, params=params))
     return specs
 
 
 def _coerce_source(raw: Any) -> Source | None:
-    """Map one agent-supplied source dict (tolerant of `id`/`dataset_id`) to a Source."""
     if isinstance(raw, str):
         return Source(dataset_id=raw.strip()) if raw.strip() else None
     if not isinstance(raw, dict):
@@ -437,8 +400,7 @@ def parse_manifest(
 
 
 class CuratorTasksetConfig(vf.TasksetConfig):
-    """Validated configuration for the curation taskset (mirrors the v0
-    ``load_environment`` knobs). Tunable via ``--taskset.*``."""
+    """Validated configuration for the curation taskset."""
 
     cutoff_date: str = "2024-12-31"
     token_budget: int = 1_000_000
@@ -452,10 +414,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     alpha_perf: float = 1.0
     lambda_cost: float = 0.1
     lambda_leakage: float = 1.0
-    # Baseline-relative Perf signal. True (default) uses relative loss reduction
-    # over ``perf_baseline_loss`` as the Perf reward — the right choice for real
-    # LMs where loss ~ 9 nats and exp(-loss) ≈ 0.  Set to False only for toy
-    # models where absolute loss < 1 and exp(-loss) is meaningful.
     perf_baseline_loss: float = math.log(50304)
     baseline_relative_perf: bool = True
     max_concurrent_fetches: int = 8
@@ -466,7 +424,10 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     use_real_trainer: bool = False
     proxy_student: dict[str, Any] = {}
     validation_set: dict[str, Any] = {}
-    eval_corpus: list[str] | None = None
+    # Decon contamination detection knobs.
+    decon_binary: str = DEFAULT_DECON_BINARY
+    decon_evals_dir: str | None = None
+    decon_threshold: float = 0.2
 
     @field_validator("manifest_filename")
     @classmethod
@@ -485,23 +446,14 @@ except TypeError:
 class CuratorTaskset(_TasksetBase):
     def __init__(self, config: CuratorTasksetConfig) -> None:
         super().__init__(config)
-        # The single validated config the reward derives from (bounds + cross-field
-        # checks fail fast here, exactly as v0 ``CuratorConfig`` did).
         self.curator = self._build_curator_config(config)
-        # Install the PATH-shadow `hf` cost-metering shim once per worker (best
-        # effort; a missing hf just routes metering through the trace fallback).
         install_shim()
-        # Collaborators are built lazily (so constructing the taskset needs no HF
-        # token / network); each is also a test-injection seam.
         self._client: HuggingFaceDatasetClient | None = None
         self._corpus_builder: CorpusBuilder | None = None
         self._trainer: ProxyStudentTrainer | None = None
-        self._leakage_detector: LeakageDetector | None = None
-        self._leakage_reference_loader: LeakageReferenceLoader | None = None
+        self._decon_detector: DeconLeakageDetector | None = None
         self._val_loader: ValTokenLoader | None = None
         self._scorer: CuratorScorer | None = None
-        # Per-rollout scoring cache + locks, keyed by trace id: the heavy prepare
-        # region runs once even under concurrent reward/metric evaluation.
         self._scoring_cache: dict[str, dict[str, Any]] = {}
         self._scoring_locks: dict[str, asyncio.Lock] = {}
 
@@ -540,7 +492,6 @@ class CuratorTaskset(_TasksetBase):
         )
 
     def _ensure(self) -> CuratorScorer:
-        """Build the scoring collaborators on first use (honoring injected ones)."""
         if self._scorer is not None:
             return self._scorer
         if self._client is None:
@@ -562,14 +513,12 @@ class CuratorTaskset(_TasksetBase):
                 retry_policy=self._fetch_policy(),
                 fetch_limit=self.curator.max_concurrent_fetches,
             )
-        if self._leakage_detector is None and self.config.eval_corpus:
-            self._leakage_detector = LeakageDetector(
-                self.config.eval_corpus, fuzzy_chunk_words=FUZZY_CHUNK_WORDS
-            )
-        if self._leakage_detector is None and self._leakage_reference_loader is None:
-            self._leakage_reference_loader = LeakageReferenceLoader(
-                self._val_loader,
-                fallback_docs=DEFAULT_EVAL_CORPUS,
+        if self._decon_detector is None:
+            evals_dir = self.config.decon_evals_dir or DEFAULT_EVAL_SETS_DIR
+            self._decon_detector = DeconLeakageDetector(
+                decon_binary=self.config.decon_binary,
+                evals_dir=evals_dir,
+                threshold=self.config.decon_threshold,
             )
         if self._trainer is None:
             self._trainer = (
@@ -581,22 +530,11 @@ class CuratorTaskset(_TasksetBase):
             self.curator,
             self._corpus_builder,
             self._trainer,
-            self._leakage_detector,
-            self._leakage_reference_loader,
+            self._decon_detector,
         )
         return self._scorer
 
     def _build_real_trainer(self) -> ProxyStudentTrainer:
-        """Construct the real (GPU) proxy-student trainer.
-
-        Both concrete backends are built eagerly (cheap, no I/O): which one
-        actually trains is decided at SCORE time from the live harness
-        runtime's ``type`` (docker -> ``HarnessRuntimeProxyTrainer``, modal ->
-        ``ModalProxyTrainer``), via ``RuntimeSelectedTrainer``.
-        ``proxy_student.runtime_backend`` is never read here -- it only shapes
-        the static task/harness declarations built ahead of any live runtime
-        (see ``load_tasks`` and ``load_environment``).
-        """
         from .docker_backend import HarnessRuntimeProxyTrainer
         from .modal_backend import ModalProxyTrainer
 
@@ -628,9 +566,6 @@ class CuratorTaskset(_TasksetBase):
         updates: dict[str, Any] = {}
         ps = self.curator.proxy_student
         if self.curator.use_real_trainer and ps.runtime_backend == "docker":
-            # Native taskset runs do not call load_environment(), so declare the
-            # image, resources, and scoring deadline on each task. A task image
-            # also makes a subprocess runtime fail before rollout.
             updates.update(
                 {
                     "image": ps.docker_image,
@@ -666,20 +601,7 @@ class CuratorTaskset(_TasksetBase):
             )
         return [task.model_copy(update=updates) for task in tasks]
 
-    # NOTE: deliberately no ``tools(...)`` override — the agent curates via the
-    # `hf` CLI in its own shell, so the taskset exposes no MCP tool servers and
-    # ``type(CuratorTaskset).tools is Taskset.tools`` holds. This is what lets the
-    # non-MCP gate (env.py:239-247) pass for codex / kimi_code / bash harnesses.
-
     async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:
-        """Require a Docker or Modal harness runtime when the real trainer is on.
-
-        Trainer selection itself is decided entirely by the live
-        ``runtime.type`` (see ``RuntimeSelectedTrainer``); this only guards
-        against forgetting to configure a container/sandbox harness runtime at
-        all -- Prime sandboxes are no longer supported, and the subprocess
-        runtime cannot host GPU training.
-        """
         token_env = self.config.hf_token_env
         if not os.environ.get(token_env):
             raise RuntimeError(
@@ -698,20 +620,19 @@ class CuratorTaskset(_TasksetBase):
             )
         if runtime.type == "docker":
             DockerHostReachability.configure()
-        # The self-score is copied into the live harness workspace instead of
-        # importing the environment package there. This keeps it available in
-        # subprocess, Docker, and Modal runtimes with no image-specific install.
         await runtime.write(
             SELF_SCORE_FILENAME,
             render_self_score_script(
                 self.curator,
                 hf_token_env=self.config.hf_token_env,
+                decon_binary=self.config.decon_binary,
+                decon_evals_dir=self.config.decon_evals_dir,
+                decon_threshold=self.config.decon_threshold,
             ),
         )
 
     @vf.stop
     async def max_turns_reached(self, trace: vf.Trace) -> bool:
-        """Generous harness safety cap, not an agent budget or scoring input."""
         return trace.num_turns >= self.curator.max_turns
 
     # -- finalize (runs before scoring, while the runtime is live) -------------
@@ -789,10 +710,6 @@ class CuratorTaskset(_TasksetBase):
     def _manifest_from_trace_ids(
         self, task: CuratorTask, trace: vf.Trace
     ) -> Manifest | None:
-        """Tier 2: synthesize from dataset ids actually observed in the rollout's
-        bash tool calls / outputs. Uses only ids the agent genuinely discovered;
-        never invents ids. ``config`` is ``null`` for all sources unless a config
-        was explicitly shown in tool output."""
         observed = _ids_from_trace(trace)
         if not observed:
             return None
@@ -871,7 +788,7 @@ class CuratorTaskset(_TasksetBase):
             RolloutStore.set_finalized(state, False)
         try:
             ledger = await meter_ledger(trace, runtime)
-        except Exception:  # noqa: BLE001 - metering must never fail the rollout
+        except Exception:
             ledger = RolloutStore.ledger(state)
         RolloutStore.set_ledger(state, ledger)
         validation_id = self.curator.validation_set.dataset_id
@@ -905,11 +822,6 @@ class CuratorTaskset(_TasksetBase):
     async def _prepared(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> dict[str, Any]:
-        """The single heavy scoring pass for a rollout, cached per trace.
-
-        Double-checked locking: the cache is populated exactly once even when many
-        reward/metric methods await this concurrently for the same rollout.
-        """
         cached = self._scoring_cache.get(trace.id)
         if cached is not None:
             return cached
@@ -921,22 +833,10 @@ class CuratorTaskset(_TasksetBase):
                 return cached
             scoring = await scorer.compute_scoring(trace.state, runtime)
             self._scoring_cache[trace.id] = scoring
-        # Safe to drop: later callers short-circuit on the populated cache above.
         self._scoring_locks.pop(trace.id, None)
         return scoring
 
     async def score(self, trace: vf.Trace, runtime: vf.Runtime | None) -> None:
-        """Score the trace, then remove its scratch directory (raw fetch cache +
-        materialized corpus files under `RolloutStore.scratch_dir`).
-
-        By the time `Taskset.score` returns, every `@vf.reward`/`@vf.metric` has
-        resolved -- including the single cached `_prepared`/`compute_scoring`
-        pass, so nothing still needs the on-disk corpus. Cleaning up here (rather
-        than relying solely on the `weakref.finalize` safety net registered when
-        the directory was created) makes disk cleanup deterministic for the real
-        rollout lifecycle, matching how `doc_cache`/materialized corpus files are
-        kept off the long-lived `CuratorState` in the first place.
-        """
         try:
             await super().score(trace, runtime)
         finally:
@@ -966,7 +866,7 @@ class CuratorTaskset(_TasksetBase):
     ) -> float:
         return (
             -self.curator.lambda_leakage
-            * (await self._prepared(trace, runtime))["leakage"]["overall"]
+            * (await self._prepared(trace, runtime))["leakage"]["leakage_score"]
         )
 
     # -- zero-weight diagnostic metrics (recorded, not summed into reward) -----
@@ -987,9 +887,6 @@ class CuratorTaskset(_TasksetBase):
     async def perf_vs_baseline(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
-        """Relative val-loss reduction over the neutral baseline (always surfaced,
-        zero-weight). Positive => the curated corpus beat the no-information
-        baseline; this is the sharpened, scale-anchored read on data quality."""
         return (await self._prepared(trace, runtime))["perf_vs_baseline"]
 
     @vf.metric
@@ -1045,22 +942,20 @@ class CuratorTaskset(_TasksetBase):
         return 1.0 if RolloutStore.val_set_access(trace.state) else 0.0
 
     @vf.metric
-    async def leakage_exact(
+    async def leakage_score(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
-        return (await self._prepared(trace, runtime))["leakage"]["exact"]
+        return (await self._prepared(trace, runtime))["leakage"]["leakage_score"]
 
     @vf.metric
-    async def leakage_fuzzy(
+    async def num_contaminated_matches(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
-        return (await self._prepared(trace, runtime))["leakage"]["fuzzy"]
-
-    @vf.metric
-    async def leakage_semantic(
-        self, trace: vf.Trace, runtime: vf.Runtime | None = None
-    ) -> float:
-        return (await self._prepared(trace, runtime))["leakage"]["semantic"]
+        return float(
+            (await self._prepared(trace, runtime))["leakage"][
+                "num_contaminated_matches"
+            ]
+        )
 
     @vf.metric
     async def cost_total(
@@ -1072,7 +967,6 @@ class CuratorTaskset(_TasksetBase):
     async def finalized(self, trace: vf.Trace) -> float:
         return 1.0 if RolloutStore.is_finalized(trace.state) else 0.0
 
-    # Diagnostics that separate "bad curation" from "external/HF/sandbox failure".
     @vf.metric
     async def tool_error_count(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
@@ -1087,10 +981,15 @@ class CuratorTaskset(_TasksetBase):
         await self._prepared(trace, runtime)
         return 1.0 if RolloutStore.has_external_failure(trace.state) else 0.0
 
+    @vf.metric
+    async def decon_error(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime)).get("decon_error", 0.0)
+
     async def trainer_error_str(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> str:
-        """Log and return the trainer error message, truncated for diagnostics."""
         await self._prepared(trace, runtime)
         err = (RolloutStore.trainer_error(trace.state) or "")[:500]
         if err:
@@ -1101,22 +1000,7 @@ class CuratorTaskset(_TasksetBase):
     async def trainer_error_msg(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
-        """Whether a trainer error occurred. Zero-weight diagnostic."""
         return 1.0 if await self.trainer_error_str(trace, runtime) else 0.0
-
-    @vf.metric
-    async def leakage_reference(
-        self, trace: vf.Trace, runtime: vf.Runtime | None = None
-    ) -> float:
-        """Leakage-reference provenance encoded as float:
-        0.0 = unresolved, 1.0 = stub, 2.0 = real, 3.0 = custom.
-        The aggregate mean across rollouts is NOT meaningful; the
-        fraction where value==1.0 (stub-rate) is the diagnostic that
-        signals how often the real val-set was unavailable."""
-        await self._prepared(trace, runtime)
-        return {"unresolved": 0.0, "stub": 1.0, "real": 2.0, "custom": 3.0}.get(
-            str(trace.state.leakage_reference), 0.0
-        )
 
 
 __all__ = [

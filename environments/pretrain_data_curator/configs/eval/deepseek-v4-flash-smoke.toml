@@ -44,9 +44,12 @@ fetch_timeout_seconds = 120.0
 fetch_timeout_per_doc_seconds = 0.02
 fetch_max_attempts = 5
 
-# Real held-out-CE trainer. An empty list means no custom leakage override.
+# Real held-out-CE trainer. Decon detects benchmark contamination against
+# vendored public benchmark eval sets.
 use_real_trainer = true
-eval_corpus = []
+decon_binary = "decon"
+decon_evals_dir = ""
+decon_threshold = 0.2
 
 [eval.args.proxy_student]
 # Fixed student architecture.

@@ -100,10 +100,8 @@ class _Leakage:
     def score(self, documents):
         return SimpleNamespace(
             as_dict=lambda: {
-                "exact": 0.0,
-                "fuzzy": 0.0,
-                "semantic": 0.0,
-                "overall": 0.0,
+                "leakage_score": 0.0,
+                "num_contaminated_matches": 0,
             }
         )
 

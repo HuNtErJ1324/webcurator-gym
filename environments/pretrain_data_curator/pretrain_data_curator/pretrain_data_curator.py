@@ -12,6 +12,7 @@ import verifiers.v1.harnesses as vf_harnesses
 from verifiers.v1.runtimes.modal import ModalConfig
 
 from .hosted_compat import Environment
+from .leakage import DEFAULT_DECON_BINARY
 from .modal_backend import _modal_gpu_for
 from .models import MANIFEST_FILENAME, ProxyStudentConfig
 from .taskset import CuratorTasksetConfig
@@ -44,9 +45,11 @@ def load_environment(
     use_real_trainer: bool = False,
     proxy_student: dict[str, Any] | None = None,
     validation_set: dict[str, Any] | None = None,
-    eval_corpus: list[str] | None = None,
     fetch_timeout_per_doc_seconds: float = 0.25,
     harness_id: str = "bash",
+    decon_binary: str = DEFAULT_DECON_BINARY,
+    decon_evals_dir: str | None = None,
+    decon_threshold: float = 0.2,
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -94,7 +97,9 @@ def load_environment(
         use_real_trainer=use_real_trainer,
         proxy_student=proxy_student or {},
         validation_set=validation_set or {},
-        eval_corpus=eval_corpus,
+        decon_binary=decon_binary,
+        decon_evals_dir=decon_evals_dir,
+        decon_threshold=decon_threshold,
     )
     env_args = {
         "cutoff_date": cutoff_date,
@@ -120,7 +125,9 @@ def load_environment(
         "use_real_trainer": use_real_trainer,
         "proxy_student": proxy_student,
         "validation_set": validation_set,
-        "eval_corpus": eval_corpus,
+        "decon_binary": decon_binary,
+        "decon_evals_dir": decon_evals_dir,
+        "decon_threshold": decon_threshold,
     }
     harness_env: dict[str, str] = {}
     harness_runtime: vf.RuntimeConfig = vf.SubprocessConfig()

@@ -7,3 +7,7 @@ RUN python -m pip install --no-cache-dir \
     tiktoken \
     tqdm \
     uv
+
+# Bake the decon Rust n-gram detector binary and its bundled public-benchmark
+# eval sets for fully offline contamination detection.
+COPY decon/ decon/

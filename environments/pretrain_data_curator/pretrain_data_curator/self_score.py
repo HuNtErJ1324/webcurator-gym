@@ -27,7 +27,9 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -39,12 +41,16 @@ PERF_BASELINE_LOSS = __PERF_BASELINE_LOSS__
 BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
 LAMBDA_COST = __LAMBDA_COST__
+LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
 HUB_CALL_PRICE = __HUB_CALL_PRICE__
 PER_1K_TOKENS_PRICE = __PER_1K_TOKENS_PRICE__
 PER_GFLOP_PRICE = __PER_GFLOP_PRICE__
 PARAM_COUNT = __PARAM_COUNT__
 FORBIDDEN_SOURCE_SHA256 = "__FORBIDDEN_SOURCE_SHA256__"
 HF_TOKEN_ENV = __HF_TOKEN_ENV__
+DECON_BINARY = __DECON_BINARY__
+DECON_EVALS_DIR = __DECON_EVALS_DIR__
+DECON_THRESHOLD = __DECON_THRESHOLD__
 DATASETS_SERVER = "https://datasets-server.huggingface.co"
 TEXT_FIELDS = ("text", "content", "passage", "abstract")
 REDACTED_SOURCE_LABEL = "[withheld validation repository]"
@@ -193,6 +199,126 @@ def apply_filters(docs, filters):
     return result
 
 
+def _reduce_report(report_lines, total_tokens):
+    """Shared reducer: token-weighted contamination from decon report JSONL.
+
+    Mirrors leakage._reduce_report exactly so the dev self-score estimate
+    matches the production scorer.  Dedup per (training_file, training_line).
+    Token weight prefers cluster_token_length, falling back to span chars // 4.
+    """
+    best_per_doc = {}
+    for line in report_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        doc_key = (r.get("training_file", ""), r.get("training_line", 0))
+        score = float(r.get("contamination_score", 0.0))
+
+        cluster_tok = r.get("cluster_token_length")
+        if cluster_tok is not None and int(cluster_tok) > 0:
+            est_tokens = int(cluster_tok)
+        else:
+            ans_start = r.get("answer_start_idx")
+            ans_end = r.get("answer_end_idx")
+            q_start = r.get("question_start_idx")
+            q_end = r.get("question_end_idx")
+
+            start = min(
+                ans_start if ans_start is not None else q_start or 0,
+                q_start if q_start is not None else ans_start or 0,
+            )
+            end = max(
+                ans_end if ans_end is not None else q_end or 0,
+                q_end if q_end is not None else ans_end or 0,
+            )
+            span_chars = max(int(end) - int(start), 1)
+            est_tokens = max(1, span_chars // 4)
+
+        contribution = score * est_tokens
+        if doc_key not in best_per_doc or contribution > best_per_doc[doc_key]:
+            best_per_doc[doc_key] = contribution
+
+    if not best_per_doc:
+        return 0.0, 0
+
+    total_weighted = sum(best_per_doc.values())
+    leakage = min(1.0, total_weighted / total_tokens)
+    return leakage, len(best_per_doc)
+
+
+def decon_score(docs):
+    """Run decon on sampled documents, return (leakage_score, num_matches) or (None, None)."""
+    binary = DECON_BINARY
+    if not binary or binary == "decon" or not os.path.isfile(binary):
+        paths_to_try = [
+            os.path.join(os.path.dirname(__file__), "..", "decon", "bin", "decon"),
+        ]
+        for p in paths_to_try:
+            if os.path.isfile(p):
+                binary = p
+                break
+        else:
+            print("[self-score] WARNING: decon binary not found, skipping leakage check", file=sys.stderr)
+            return None, None
+    if not DECON_EVALS_DIR or not os.path.isdir(DECON_EVALS_DIR):
+        print("[self-score] WARNING: decon evals dir not found, skipping leakage check", file=sys.stderr)
+        return None, None
+    tmp = tempfile.mkdtemp(prefix="decon_selfscore_")
+    try:
+        corpus_path = os.path.join(tmp, "corpus.jsonl")
+        with open(corpus_path, "w") as fh:
+            for doc in docs:
+                if doc:
+                    fh.write(json.dumps({"text": doc}, ensure_ascii=False) + "\n")
+        total_chars = sum(len(d) for d in docs if d)
+        total_tok = max(1, total_chars // 4)
+
+        report_dir = os.path.join(tmp, "report")
+        os.makedirs(report_dir, exist_ok=True)
+        result = subprocess.run(
+            [
+                binary, "detect",
+                "--training-dir", tmp,
+                "--content-key", "text",
+                "--evals-dir", DECON_EVALS_DIR,
+                "--report-output-dir", report_dir,
+                "--contamination-score-threshold", str(DECON_THRESHOLD),
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            print("[self-score] WARNING: decon exited %d: %s" % (
+                result.returncode, result.stderr[:200],
+            ), file=sys.stderr)
+            return None, None
+
+        report_lines = []
+        for fname in os.listdir(report_dir):
+            if not fname.endswith(".jsonl"):
+                continue
+            with open(os.path.join(report_dir, fname)) as fh:
+                report_lines.extend(fh.readlines())
+
+        if not report_lines:
+            return 0.0, 0
+
+        return _reduce_report(report_lines, total_tok)
+    except subprocess.TimeoutExpired:
+        print("[self-score] WARNING: decon timed out after 600s", file=sys.stderr)
+        return None, None
+    except Exception as exc:
+        print("[self-score] WARNING: decon failed: %s" % exc, file=sys.stderr)
+        return None, None
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Leakage-safe development proxy for a draft curator manifest."
@@ -227,6 +353,7 @@ def main():
     clean_sum = 0.0
     clean_count = 0
     hub_calls = 0
+    all_docs: list[str] = []
     for source, weight in zip(sources, weights):
         kind = source.get("kind", "hf")
         dataset_id = str(source_dataset_id(source))
@@ -245,6 +372,7 @@ def main():
             if kind != "local":
                 hub_calls += 2 if not source.get("config") else 1
             docs = [x for x in apply_filters(docs, source.get("filters")) if x]
+            all_docs.extend(docs)
             sample_tokens = sum(estimate_tokens(x) for x in docs)
             average_tokens = sample_tokens / len(docs) if docs else 0.0
             target = int(token_budget * weight / total_weight)
@@ -294,6 +422,12 @@ def main():
         + estimated_total / 1000.0 * PER_1K_TOKENS_PRICE
         + flops / 1e9 * PER_GFLOP_PRICE
     )
+
+    leakage_score, num_matches = decon_score(all_docs) if all_docs else (None, None)
+    reward = ALPHA_PERF * perf - LAMBDA_COST * scoring_cost
+    if leakage_score is not None:
+        reward -= LAMBDA_LEAKAGE * leakage_score
+
     print(json.dumps({
         "ok": True,
         "signal": "development-only heuristic; not the final score",
@@ -302,10 +436,9 @@ def main():
         "estimated_performance": perf,
         "estimated_budget_fill_ratio": fill,
         "estimated_scoring_cost": scoring_cost,
-        "estimated_reward_excluding_leakage_and_prior_discovery": (
-            ALPHA_PERF * perf - LAMBDA_COST * scoring_cost
-        ),
-        "leakage_estimate": None,
+        "estimated_reward": reward,
+        "leakage_estimate": leakage_score,
+        "num_contaminated_matches": num_matches,
         "sources": source_stats,
     }, indent=2, sort_keys=True))
 
@@ -316,9 +449,17 @@ if __name__ == "__main__":
 
 
 def render_self_score_script(
-    config: CuratorConfig, *, hf_token_env: str = "HF_TOKEN"
+    config: CuratorConfig,
+    *,
+    hf_token_env: str = "HF_TOKEN",
+    decon_binary: str = "decon",
+    decon_evals_dir: str | None = None,
+    decon_threshold: float = 0.2,
 ) -> bytes:
     """Return a configured self-score script without exposing held-out data."""
+    import os as _os
+    from .leakage import DEFAULT_EVAL_SETS_DIR as _DEFAULT_EVAL_SETS_DIR
+    evals_dir = decon_evals_dir or _DEFAULT_EVAL_SETS_DIR
     replacements: dict[str, object] = {
         "__EXPECTED_TOKEN_BUDGET__": config.token_budget,
         "__DEFAULT_FETCH_CAP__": config.sample_docs_per_source,
@@ -327,6 +468,7 @@ def render_self_score_script(
         "__BASELINE_RELATIVE_PERF__": repr(config.baseline_relative_perf),
         "__ALPHA_PERF__": repr(config.alpha_perf),
         "__LAMBDA_COST__": repr(config.lambda_cost),
+        "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),
         "__HUB_CALL_PRICE__": repr(config.prices.hub_call),
         "__PER_1K_TOKENS_PRICE__": repr(config.prices.per_1k_tokens),
         "__PER_GFLOP_PRICE__": repr(config.prices.per_gflop),
@@ -335,6 +477,9 @@ def render_self_score_script(
             config.validation_set.dataset_id.encode()
         ).hexdigest(),
         "__HF_TOKEN_ENV__": repr(hf_token_env),
+        "__DECON_BINARY__": repr(decon_binary),
+        "__DECON_EVALS_DIR__": repr(_os.path.abspath(evals_dir) if evals_dir else ""),
+        "__DECON_THRESHOLD__": repr(decon_threshold),
     }
     script = dedent(_SCRIPT).lstrip()
     for marker, value in replacements.items():

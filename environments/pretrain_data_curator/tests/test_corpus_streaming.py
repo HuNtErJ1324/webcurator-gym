@@ -27,7 +27,6 @@ from pretrain_data_curator.corpus import (
     DocumentFilter,
     SourceCorpus,
 )
-from pretrain_data_curator.leakage import LeakageDetector
 from pretrain_data_curator.models import FilterSpec, Manifest, Source
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
@@ -330,29 +329,6 @@ def test_curated_corpus_is_empty_matches_zero_total_documents():
         sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["doc"])]
     )
     assert not nonempty.is_empty()
-
-
-def test_leakage_score_single_pass_generator_matches_list_input():
-    """`LeakageDetector.score` was refactored to a single pass over its input
-    (so a one-shot streaming generator works, since the old implementation
-    iterated `docs` three times -- once per signal -- which would silently see
-    nothing on the 2nd/3rd pass for a generator). A generator and the
-    equivalent materialized list must score identically."""
-    eval_docs = [
-        "The mitochondrion is the powerhouse of the cell and provides energy.",
-        "Binary search finds a target value within a sorted array efficiently.",
-    ]
-    detector = LeakageDetector(eval_docs, seed=0)
-    docs = [
-        eval_docs[0],  # exact hit
-        "Unrelated text about gardening and the weather today.",
-        "The mitochondrion is basically the powerhouse of the cell, giving energy.",
-    ]
-
-    from_list = detector.score(list(docs))
-    from_generator = detector.score(iter(docs))
-    assert from_generator == from_list
-    assert from_list.exact > 0.0
 
 
 @pytest.mark.asyncio

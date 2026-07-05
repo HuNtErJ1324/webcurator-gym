@@ -4,9 +4,9 @@
 
     R(M) = alpha_perf * Perf(M) - lambda_cost*Cost(M) - lambda_leakage*Leakage(M)
 
-where Perf(M) defaults to the bounded relative val-loss reduction over a neutral
-baseline (``baseline_relative_perf=True``), or falls back to ``exp(-loss)`` for
-toy models when ``baseline_relative_perf=False``.
+where Leakage(M) is a token-weighted contamination scalar from the decon
+Rust n-gram detector run against PUBLIC BENCHMARK eval sets (never the
+held-out validation set).
 
 Performance, cost, and leakage derive from one prepared scoring pass over the
 finalized manifest. The expensive corpus build and proxy-student training run
@@ -19,13 +19,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from typing import Any, Literal
+from typing import Any
 
 import verifiers.v1 as vf
 
 from .corpus import CorpusBuilder, CuratedCorpus
-from .leakage import LeakageDetector
-from .leakage_reference import LeakageReferenceLoader
+from .leakage import DeconError, DeconLeakageDetector, LeakageScores
 from .models import CuratorConfig
 from .rollout_state import CuratorState, RolloutStore
 from .trainer import ProxyStudentTrainer, TrainResult
@@ -41,14 +40,12 @@ class CuratorScorer:
         config: CuratorConfig,
         corpus_builder: CorpusBuilder,
         trainer: ProxyStudentTrainer,
-        leakage_detector: LeakageDetector | None,
-        leakage_reference_loader: LeakageReferenceLoader | None = None,
+        decon_detector: DeconLeakageDetector | None = None,
     ) -> None:
         self.config = config
         self.corpus_builder = corpus_builder
         self.trainer = trainer
-        self.leakage_detector = leakage_detector
-        self.leakage_reference_loader = leakage_reference_loader
+        self.decon_detector = decon_detector
 
     async def compute_scoring(
         self, state: CuratorState, runtime: vf.Runtime | None = None
@@ -56,56 +53,47 @@ class CuratorScorer:
         manifest = RolloutStore.manifest(state)
         finalized = RolloutStore.is_finalized(state)
         if not finalized or not manifest.sources:
-            _, leakage_reference = await self._leakage_reference()
-            RolloutStore.set_leakage_reference(state, leakage_reference)
             return self._empty_scoring(state)
 
         corpus = await self.corpus_builder.materialize(
             manifest, state, runtime=runtime
         )
         train_result = await self._train(corpus, state, runtime)
-        leakage_detector, leakage_reference = await self._leakage_reference()
-        RolloutStore.set_leakage_reference(state, leakage_reference)
 
         ledger = RolloutStore.ledger(state)
         ledger.train_flops += train_result.flops
-        # Token cost was already charged once per unique fetch in materialize.
         RolloutStore.set_ledger(state, ledger)
 
-        # Heavy CPU MinHash leakage work stays off the event loop. `iter_documents()`
-        # streams from the on-disk corpus in a single pass rather than materializing
-        # the full corpus text (see `LeakageDetector.score`).
-        leakage = await asyncio.to_thread(
-            leakage_detector.score, corpus.iter_documents()
-        )
+        # Decon runs off the event loop via subprocess.
+        decon_error = False
+        if self.decon_detector is not None:
+            try:
+                leakage = await asyncio.to_thread(
+                    self.decon_detector.score, corpus.iter_documents()
+                )
+            except DeconError as exc:
+                logger.warning("[curator] decon detection failed: %s", exc)
+                RolloutStore.record_tool_error(state, "decon")
+                RolloutStore.set_external_failure(state, True)
+                leakage = LeakageScores(0.0, 0, ())
+                decon_error = True
+        else:
+            leakage = LeakageScores(0.0, 0, ())
 
         return {
             "perf": self._perf(train_result),
             "cost": ledger.total(self.config.prices),
             "leakage": leakage.as_dict(),
+            "decon_error": float(decon_error),
             "loss": train_result.loss if math.isfinite(train_result.loss) else 0.0,
             "accuracy": float(train_result.accuracy or 0.0),
             "flops": train_result.flops,
             "tokens": corpus.total_tokens,
             "num_sources": len([s for s in corpus.sources if s.doc_count]),
             "budget_fill_ratio": state.budget_fill_ratio,
-            # Always-on baseline-relative diagnostics (zero-weight; never summed
-            # into the reward). ``perf_vs_baseline`` is the relative val-loss
-            # reduction over ``perf_baseline_loss`` -- a sharper, scale-anchored
-            # read on curated-data quality than the raw loss.
             "perf_vs_baseline": self._relative_improvement(train_result),
             "perf_baseline_loss": self.config.perf_baseline_loss,
         }
-
-    async def _leakage_reference(
-        self,
-    ) -> tuple[LeakageDetector, Literal["real", "stub", "custom"]]:
-        if self.leakage_detector is not None:
-            return self.leakage_detector, "custom"
-        if self.leakage_reference_loader is None:
-            raise RuntimeError("no leakage reference is configured")
-        reference = await self.leakage_reference_loader.load()
-        return reference.detector, reference.source
 
     async def _train(
         self,
@@ -113,19 +101,13 @@ class CuratorScorer:
         state: CuratorState,
         runtime: vf.Runtime | None = None,
     ) -> TrainResult:
-        """Train the proxy student, degrading external failures to a sentinel.
-
-        A trainer/sandbox failure records typed telemetry and yields a defined
-        sentinel (infinite loss -> zero perf, viability not met) so the rollout
-        completes and scoring stays deterministic rather than crashing.
-        """
         try:
             if self.config.use_real_trainer:
                 return await self.trainer.train_and_eval(
                     corpus, self.config.proxy_student, runtime=runtime
                 )
             return await self.trainer.train_and_eval(corpus, self.config.proxy_student)
-        except Exception as exc:  # noqa: BLE001 - surfaced as telemetry + sentinel
+        except Exception as exc:
             stderr_tail = getattr(exc, "stderr_tail", "")
             message = f"{type(exc).__name__}: {exc}"
             if stderr_tail:
@@ -147,7 +129,8 @@ class CuratorScorer:
         return {
             "perf": 0.0,
             "cost": ledger.total(self.config.prices),
-            "leakage": {"exact": 0.0, "fuzzy": 0.0, "semantic": 0.0, "overall": 0.0},
+            "leakage": {"leakage_score": 0.0, "num_contaminated_matches": 0},
+            "decon_error": 0.0,
             "loss": 0.0,
             "accuracy": 0.0,
             "flops": 0.0,
@@ -159,12 +142,6 @@ class CuratorScorer:
         }
 
     def _perf(self, result: TrainResult) -> float:
-        """The Perf REWARD term.
-
-        Baseline-relative (bounded relative loss reduction) when
-        ``config.baseline_relative_perf`` is set, otherwise ``exp(-loss)``.
-        Both variants depend only on held-out cross-entropy loss.
-        """
         if self.config.baseline_relative_perf:
             return max(0.0, min(1.0, self._relative_improvement(result)))
         return self._perf_from_result(result)
@@ -176,14 +153,6 @@ class CuratorScorer:
         return max(0.0, min(1.0, math.exp(-result.loss)))
 
     def _relative_improvement(self, result: TrainResult) -> float:
-        """Relative val-loss reduction over the neutral baseline: ``(baseline -
-        loss) / baseline``.
-
-        ``loss == baseline`` -> 0, ``loss -> 0`` -> 1, worse-than-baseline -> < 0,
-        and the infinite-loss sentinel (or a non-positive baseline) -> 0.0. Surfaced
-        as the always-on diagnostic and, clamped to [0, 1], used as the optional
-        baseline-relative reward.
-        """
         baseline = self.config.perf_baseline_loss
         if not math.isfinite(result.loss) or baseline <= 0:
             return 0.0
