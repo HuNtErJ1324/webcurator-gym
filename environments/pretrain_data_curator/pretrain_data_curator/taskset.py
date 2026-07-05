@@ -428,6 +428,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     decon_binary: str = DEFAULT_DECON_BINARY
     decon_evals_dir: str | None = None
     decon_threshold: float = 0.2
+    screen_val_set: bool = True
 
     @field_validator("manifest_filename")
     @classmethod
@@ -519,6 +520,7 @@ class CuratorTaskset(_TasksetBase):
                 decon_binary=self.config.decon_binary,
                 evals_dir=evals_dir,
                 threshold=self.config.decon_threshold,
+                screen_val_set=self.config.screen_val_set,
             )
         if self._trainer is None:
             self._trainer = (
@@ -531,6 +533,8 @@ class CuratorTaskset(_TasksetBase):
             self._corpus_builder,
             self._trainer,
             self._decon_detector,
+            val_loader=self._val_loader,
+            screen_val_set=self.config.screen_val_set,
         )
         return self._scorer
 

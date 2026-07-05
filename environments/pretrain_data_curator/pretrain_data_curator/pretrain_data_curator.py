@@ -50,6 +50,7 @@ def load_environment(
     decon_binary: str = DEFAULT_DECON_BINARY,
     decon_evals_dir: str | None = None,
     decon_threshold: float = 0.2,
+    screen_val_set: bool = True,
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -100,6 +101,7 @@ def load_environment(
         decon_binary=decon_binary,
         decon_evals_dir=decon_evals_dir,
         decon_threshold=decon_threshold,
+        screen_val_set=screen_val_set,
     )
     env_args = {
         "cutoff_date": cutoff_date,
@@ -128,6 +130,7 @@ def load_environment(
         "decon_binary": decon_binary,
         "decon_evals_dir": decon_evals_dir,
         "decon_threshold": decon_threshold,
+        "screen_val_set": screen_val_set,
     }
     harness_env: dict[str, str] = {}
     harness_runtime: vf.RuntimeConfig = vf.SubprocessConfig()

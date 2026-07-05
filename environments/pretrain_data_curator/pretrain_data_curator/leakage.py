@@ -1,14 +1,17 @@
-"""Benchmark contamination detection via the allenai/decon Rust n-gram detector.
+"""Benchmark + held-out val-set contamination detection via decon.
 
-Replaces the previous exact/fuzzy/semantic detectors that used the held-out val
-set as their reference. Decon runs offline against *public benchmark eval sets*
-only (bundled under ``decon/bundled-evals/``), keeping the held-out val set
-exclusively for the proxy-student cross-entropy (Perf) signal.
+Replaces the previous exact/fuzzy/semantic detectors. Decon runs offline against
+*public benchmark eval sets* (bundled under ``decon/bundled-evals/``) AND,
+optionally, the held-out validation set (detokenised from GPT-2-BPE token IDs
+back to text via tiktoken). The val-derived eval set is built ephemerally at
+scoring time into a temp directory and cleaned up immediately afterwards — it
+is NEVER written into ``decon/bundled-evals/``, the workspace, or any
+container image.
 
-PRODUCTION path (leakage.py): reads eval sets only from the baked
-decon/bundled-evals directory; requires NO network at scoring time.
-DEV path (self_score.py) fetches sample docs via HF datasets-server as an
-online proxy; it too runs decon against the same baked eval sets.
+PRODUCTION path (leakage.py): reads eval sets from the baked
+decon/bundled-evals directory combined with an ephemeral val eval file.
+DEV path (self_score.py) runs decon against only the baked benchmark eval
+sets — the val set is NEVER exposed inside the agent container.
 
 The report JSONL schema (observed from decon detect):
   contamination_score: float [0,1] — combined score for this match
@@ -22,13 +25,19 @@ The report JSONL schema (observed from decon detect):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .val_set import HeldOutValSet
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +51,10 @@ DEFAULT_DECON_BINARY = "decon"
 DEFAULT_EVAL_SETS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "decon", "bundled-evals"
 )
+
+# Decon eval-set constants for the ephemeral val-set eval file.
+_VAL_EVAL_KEY = "heldout_val"
+_VAL_EVAL_CHUNK_TOKENS = 1024  # GPT-2 BPE tokens per val eval record
 
 
 class DeconError(RuntimeError):
@@ -69,7 +82,14 @@ class LeakageScores:
 
 
 class DeconLeakageDetector:
-    """Runs decon via subprocess on a materialized corpus JSONL directory."""
+    """Runs decon via subprocess on a materialized corpus JSONL directory.
+
+    When ``screen_val_set`` is ``True`` and a ``HeldOutValSet`` is passed to
+    ``score()``, the detector builds an ephemeral combined evals directory
+    (bundled benchmarks + held-out val set) inside the temp workspace and
+    points decon at it.  The val eval file is cleaned up with the temp dir
+    after scoring.
+    """
 
     def __init__(
         self,
@@ -78,12 +98,61 @@ class DeconLeakageDetector:
         threshold: float = 0.2,
         ngram_size: int = 5,
         tokenizer: str = "cl100k",
+        screen_val_set: bool = True,
     ) -> None:
         self._binary = decon_binary
         self._evals_dir = evals_dir or DEFAULT_EVAL_SETS_DIR
         self._threshold = threshold
         self._ngram_size = ngram_size
         self._tokenizer = tokenizer
+        self._screen_val_set = screen_val_set
+
+    @staticmethod
+    def _build_val_eval(
+        val_set: HeldOutValSet,
+        output_path: str,
+        chunk_tokens: int = _VAL_EVAL_CHUNK_TOKENS,
+    ) -> None:
+        """Detokenize the held-out val tokens and write decon eval JSONL records.
+
+        Each record contains one chunk of detokenized text in the ``question``
+        field (``answer`` is left empty since this is raw text, not Q&A).
+        The ``eval_key`` is ``"heldout_val"`` so decon report lines are
+        distinguishable from benchmark matches.
+        """
+        import tiktoken
+
+        enc = tiktoken.get_encoding("gpt2")
+        tokens: list[int] = val_set.tokens.tolist()
+
+        with open(output_path, "w", encoding="utf-8") as fh:
+            idx = 0
+            for i in range(0, len(tokens), chunk_tokens):
+                chunk = tokens[i : i + chunk_tokens]
+                text = enc.decode(chunk)
+                if not text.strip():
+                    continue
+                record = {
+                    "eval_key": _VAL_EVAL_KEY,
+                    "eval_instance_index": idx,
+                    "split": "val",
+                    "question": text,
+                    "answer": "",
+                    "doc_id": idx + 1,
+                    "fingerprint": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                }
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                idx += 1
+
+    def _build_combined_evals_dir(self, parent_dir: str) -> str:
+        """Copy bundled evals into a temp subdir (no symlinks to avoid
+        filesystem-boundary issues) and return the path."""
+        combined = os.path.join(parent_dir, "combined_evals")
+        if os.path.isdir(self._evals_dir):
+            shutil.copytree(self._evals_dir, combined, dirs_exist_ok=True)
+        else:
+            os.makedirs(combined, exist_ok=True)
+        return combined
 
     def _check_binary(self) -> str:
         binary = self._binary
@@ -95,11 +164,21 @@ class DeconLeakageDetector:
                 return resolved
         return binary
 
-    def score(self, docs: Iterable[str]) -> LeakageScores:
-        """Run decon on ``docs`` against the bundled benchmark eval sets.
+    def score(
+        self,
+        docs: Iterable[str],
+        val_set: HeldOutValSet | None = None,
+    ) -> LeakageScores:
+        """Run decon on ``docs`` against bundled benchmarks and optional val set.
 
-        Writes the document stream to a temporary JSONL file, invokes the decon
-        subprocess, parses its report, and reduces to a token-weighted scalar.
+        Writes the document stream to a temporary JSONL file, optionally
+        detokenizes the held-out val tokens into an ephemeral decon eval file,
+        invokes the decon subprocess against the combined eval sets, parses its
+        report, and reduces to a token-weighted scalar.
+
+        The val eval file lives inside the temp workspace and is cleaned up
+        when this method returns.  It is NEVER written to
+        ``decon/bundled-evals/`` or any persistent path.
 
         Raises:
             DeconError: if the decon binary is missing, returns a non-zero exit
@@ -119,6 +198,13 @@ class DeconLeakageDetector:
             if total_chars == 0:
                 return LeakageScores(0.0, 0, ())
 
+            # --- determine evals dir: benchmarks only or combined with val set ----
+            if self._screen_val_set and val_set is not None:
+                evals_dir = self._build_combined_evals_dir(temp_dir)
+                self._build_val_eval(val_set, os.path.join(evals_dir, "heldout_val.jsonl"))
+            else:
+                evals_dir = self._evals_dir
+
             total_tokens = max(_MIN_TOKENS, total_chars // _CHARS_PER_TOKEN)
             report_dir = os.path.join(temp_dir, "report")
             os.makedirs(report_dir, exist_ok=True)
@@ -132,7 +218,7 @@ class DeconLeakageDetector:
                 "--content-key",
                 "text",
                 "--evals-dir",
-                self._evals_dir,
+                evals_dir,
                 "--report-output-dir",
                 report_dir,
                 "--tokenizer",
