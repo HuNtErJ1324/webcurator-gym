@@ -868,6 +868,12 @@ class CuratorTaskset(_TasksetBase):
         await self._prepared(trace, runtime)
         return 1.0 if RolloutStore.has_external_failure(trace.state) else 0.0
 
+    @vf.metric
+    async def decon_error(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime)).get("decon_error", 0.0)
+
     async def trainer_error_str(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> str:

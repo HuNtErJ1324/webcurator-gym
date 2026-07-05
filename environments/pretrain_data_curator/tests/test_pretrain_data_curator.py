@@ -1344,7 +1344,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 21  # 3 rewards + 18 diagnostic metrics
+    assert len(funcs) == 22  # 3 rewards + 19 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -2053,6 +2053,391 @@ async def test_default_taskset_path_builds_decon_detector():
     RolloutStore.set_finalized(state, True)
     scoring = await scorer.compute_scoring(state)
     assert "leakage" in scoring
+    assert scoring["leakage"]["leakage_score"] == 0.0
+
+
+# === Decon reducer unit tests ==============================================
+
+
+def _decon_jsonl_line(
+    *,
+    training_file: str = "corpus.jsonl",
+    training_line: int = 0,
+    contamination_score: float = 0.5,
+    eval_dataset: str = "test/eval",
+    answer_start_idx: int | None = 10,
+    answer_end_idx: int | None = 50,
+    question_start_idx: int | None = None,
+    question_end_idx: int | None = None,
+    cluster_token_length: int | None = None,
+) -> str:
+    """Build a single decon report JSONL line."""
+    rec: dict[str, object] = {
+        "training_file": training_file,
+        "training_line": training_line,
+        "contamination_score": contamination_score,
+        "eval_dataset": eval_dataset,
+    }
+    if answer_start_idx is not None:
+        rec["answer_start_idx"] = answer_start_idx
+    if answer_end_idx is not None:
+        rec["answer_end_idx"] = answer_end_idx
+    if question_start_idx is not None:
+        rec["question_start_idx"] = question_start_idx
+    if question_end_idx is not None:
+        rec["question_end_idx"] = question_end_idx
+    if cluster_token_length is not None:
+        rec["cluster_token_length"] = cluster_token_length
+    return json.dumps(rec)
+
+
+_BASELINE_TOTAL_TOKENS = 1000
+
+
+def test_reduce_empty_report():
+    """Empty report => 0.0."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    result = detector._reduce_report([], total_tokens=_BASELINE_TOTAL_TOKENS)
+    assert result.leakage_score == 0.0
+    assert result.num_contaminated_matches == 0
+    assert result.contamination_details == ()
+
+
+def test_reduce_blank_lines_skipped():
+    """Blank and whitespace-only lines are skipped."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = ["", "   ", _decon_jsonl_line(contamination_score=0.8), "\t", ""]
+    result = detector._reduce_report(lines, total_tokens=_BASELINE_TOTAL_TOKENS)
+    assert result.num_contaminated_matches == 1
+    assert result.leakage_score > 0.0
+
+
+def test_reduce_malformed_json_line_skipped():
+    """Malformed JSON lines are skipped without crashing."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = ["{not json}", _decon_jsonl_line(contamination_score=0.8)]
+    result = detector._reduce_report(lines, total_tokens=_BASELINE_TOTAL_TOKENS)
+    assert result.num_contaminated_matches == 1
+    assert result.leakage_score > 0.0
+
+
+def test_reduce_zero_char_corpus():
+    """Empty/zero-char corpus => 0.0 with NO divide-by-zero."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector, _MIN_TOKENS
+
+    assert _MIN_TOKENS == 1  # guards against divide-by-zero
+    # total_tokens = max(1, 0 // 4) = 1 so the division is safe.
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = [_decon_jsonl_line(contamination_score=0.8)]
+    result = detector._reduce_report(lines, total_tokens=_MIN_TOKENS)
+    # With total_tokens=1 and weighted sum=0.8*10=8.0, clamped to 1.0:
+    assert result.leakage_score == 1.0
+
+
+def test_reduce_multi_match_dedup_keeps_max_contribution():
+    """Dedup per (training_file, training_line): keep max weighted contribution."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Two records for the same doc: (corpus.jsonl, line 0).
+    # Record 1: score=0.5, span=answer(10..50)=40 chars=10 tokens -> 0.5*10=5.0
+    # Record 2: score=0.9, span=answer(10..20)=10 chars=2 tokens -> 0.9*2=1.8
+    # After dedup: max(5.0, 1.8) = 5.0
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.5,
+            answer_start_idx=10,
+            answer_end_idx=50,
+        ),
+        _decon_jsonl_line(
+            contamination_score=0.9,
+            answer_start_idx=10,
+            answer_end_idx=20,
+        ),
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    assert result.num_contaminated_matches == 1
+    # 5.0 / 100 = 0.05
+    assert result.leakage_score == pytest.approx(0.05)
+
+
+def test_reduce_different_docs_not_deduped():
+    """Different (training_file, training_line) pairs are summed, not deduped."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    lines = [
+        _decon_jsonl_line(training_line=0, contamination_score=0.5),
+        _decon_jsonl_line(training_line=1, contamination_score=0.3),
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    assert result.num_contaminated_matches == 2
+    # (0.5*10 + 0.3*10) / 100 = 0.08
+    assert result.leakage_score == pytest.approx(0.08)
+
+
+def test_reduce_clamp_at_one():
+    """[0,1] clamp when weighted sum exceeds corpus tokens."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # High score + high token count to push leakage > 1.0 before clamp.
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=1.0,
+            answer_start_idx=0,
+            answer_end_idx=401,  # 401 chars = 100 tokens
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=50)
+    # Without clamp: (1.0 * 100) / 50 = 2.0. Clamped to 1.0.
+    assert result.leakage_score == 1.0
+
+
+def test_reduce_hand_worked_example():
+    """Token-weighted magnitude computes as expected on a hand-worked example."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Doc A: score=0.8, span answer(0..200)=200 chars=50 tokens, contribution=40.0
+    # Doc B: score=0.4, span answer(5..25)=20 chars=5 tokens, contribution=2.0
+    # Total weighted = 42.0, total_tokens = 200
+    # leakage = 42.0 / 200 = 0.21
+    lines = [
+        _decon_jsonl_line(
+            training_line=0,
+            contamination_score=0.8,
+            answer_start_idx=0,
+            answer_end_idx=200,
+        ),
+        _decon_jsonl_line(
+            training_line=1,
+            contamination_score=0.4,
+            answer_start_idx=5,
+            answer_end_idx=25,
+        ),
+    ]
+    result = detector._reduce_report(lines, total_tokens=200)
+    assert result.leakage_score == pytest.approx(0.21)
+    assert result.num_contaminated_matches == 2
+    assert len(result.contamination_details) == 2
+
+
+def test_reduce_question_fallback():
+    """Fallback to question_start_idx/end_idx when answer indices are missing."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Only question fields, no answer fields.
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.6,
+            answer_start_idx=None,
+            answer_end_idx=None,
+            question_start_idx=5,
+            question_end_idx=85,  # 80 chars = 20 tokens
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    # (0.6 * 20) / 100 = 0.12
+    assert result.leakage_score == pytest.approx(0.12)
+
+
+def test_reduce_both_question_and_answer_uses_outer_bounds():
+    """When both question and answer indices exist, use min(start)/max(end)."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # Answer: start=20, end=60 (40 chars)
+    # Question: start=5, end=90 (85 chars)
+    # Outer bounds: min(20,5)=5, max(60,90)=90 => 85 chars = 21 tokens
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.5,
+            answer_start_idx=20,
+            answer_end_idx=60,
+            question_start_idx=5,
+            question_end_idx=90,
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    # (0.5 * 21) / 100 = 0.105
+    assert result.leakage_score == pytest.approx(0.105)
+
+
+def test_reduce_cluster_token_length_preferred():
+    """cluster_token_length is preferred over character-span estimation."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+    # cluster_token_length=25, answer span=40 chars=10 tokens.
+    # With cluster_token_length, est_tokens=25, contribution=0.4*25=10.0
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.4,
+            answer_start_idx=0,
+            answer_end_idx=40,
+            cluster_token_length=25,
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=100)
+    # (0.4 * 25) / 100 = 0.1
+    assert result.leakage_score == pytest.approx(0.1)
+    # Verify span_tokens reflects cluster_token_length, not char-derived.
+    assert result.contamination_details[0]["span_tokens"] == 25
+
+
+def test_reduce_threshold_prefiltering():
+    """Contamination_score >= threshold records pass through.
+
+    The threshold is enforced by decon itself via --contamination-score-threshold;
+    _reduce_report consumes whatever decon emits. Verify a record below threshold
+    still flows through but contributes minimally.
+    """
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals",
+    )
+    # Very low score that decon would have filtered if below its threshold.
+    lines = [
+        _decon_jsonl_line(
+            contamination_score=0.01,
+            answer_start_idx=0,
+            answer_end_idx=400,
+        )
+    ]
+    result = detector._reduce_report(lines, total_tokens=1000)
+    # (0.01 * 100) / 1000 = 0.001
+    assert result.leakage_score == pytest.approx(0.001)
+    assert result.num_contaminated_matches == 1
+
+
+def test_leakage_penalty_positive():
+    """A non-empty contamination report drives leakage_penalty < 0.
+
+    Monkey-patches DeconLeakageDetector to return a synthetic report without
+    needing a real decon binary.
+    """
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+    from pretrain_data_curator.rewards import CuratorScorer
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon", evals_dir="/nonexistent/evals"
+    )
+
+    # Monkey-patch score() to simulate decon report directly.
+    original_score = DeconLeakageDetector.score
+
+    def fake_score(self, docs):
+        lines = [
+            _decon_jsonl_line(
+                contamination_score=0.8,
+                answer_start_idx=0,
+                answer_end_idx=400,
+            )
+        ]
+        return self._reduce_report(lines, total_tokens=1000)
+
+    DeconLeakageDetector.score = fake_score
+    try:
+        config = CuratorConfig(lambda_leakage=1.0)
+        scorer = CuratorScorer(
+            config,
+            corpus_builder=CorpusBuilder(client=FakeClient()),
+            trainer=HeuristicProxyTrainer(),
+            decon_detector=detector,
+        )
+        state = CuratorState()
+        RolloutStore.set_manifest(
+            state,
+            Manifest(
+                token_budget=1000,
+                sources=[Source(dataset_id="good/encyclopedia")],
+            ),
+        )
+        RolloutStore.set_finalized(state, True)
+        scoring = asyncio.run(scorer.compute_scoring(state))
+        leakage_score = scoring["leakage"]["leakage_score"]
+        assert leakage_score > 0.0
+        # The penalty term would be: -lambda_leakage * leakage_score < 0
+        expected_penalty = -1.0 * leakage_score
+        assert expected_penalty < 0.0
+    finally:
+        DeconLeakageDetector.score = original_score
+
+
+def test_decon_error_raised_on_decon_failure():
+    """DeconLeakageDetector.score raises DeconError when decon fails."""
+    from pretrain_data_curator.leakage import DeconError, DeconLeakageDetector
+
+    # The decon binary exists (resolved from project path), but the evals dir
+    # doesn't, so decon exits non-zero -> DeconError.
+    detector = DeconLeakageDetector(
+        decon_binary="decon-nonexistent-name",
+        evals_dir="/nonexistent/evals",
+    )
+    with pytest.raises(DeconError):
+        detector.score(["some document text"])
+
+
+@pytest.mark.asyncio
+async def test_decon_error_sets_external_failure():
+    """When DeconError is raised, the scorer records external_failure."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+    from pretrain_data_curator.rewards import CuratorScorer
+
+    detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon_nope",
+        evals_dir="/nonexistent/evals",
+    )
+    config = CuratorConfig(lambda_leakage=1.0)
+    scorer = CuratorScorer(
+        config,
+        corpus_builder=CorpusBuilder(client=FakeClient()),
+        trainer=HeuristicProxyTrainer(),
+        decon_detector=detector,
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state,
+        Manifest(
+            token_budget=1000,
+            sources=[Source(dataset_id="good/encyclopedia")],
+        ),
+    )
+    RolloutStore.set_finalized(state, True)
+    scoring = await scorer.compute_scoring(state)
+    assert scoring["decon_error"] == 1.0
+    assert RolloutStore.has_external_failure(state)
     assert scoring["leakage"]["leakage_score"] == 0.0
 
 

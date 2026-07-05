@@ -199,8 +199,60 @@ def apply_filters(docs, filters):
     return result
 
 
+def _reduce_report(report_lines, total_tokens):
+    """Shared reducer: token-weighted contamination from decon report JSONL.
+
+    Mirrors leakage._reduce_report exactly so the dev self-score estimate
+    matches the production scorer.  Dedup per (training_file, training_line).
+    Token weight prefers cluster_token_length, falling back to span chars // 4.
+    """
+    best_per_doc = {}
+    for line in report_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        doc_key = (r.get("training_file", ""), r.get("training_line", 0))
+        score = float(r.get("contamination_score", 0.0))
+
+        cluster_tok = r.get("cluster_token_length")
+        if cluster_tok is not None and int(cluster_tok) > 0:
+            est_tokens = int(cluster_tok)
+        else:
+            ans_start = r.get("answer_start_idx")
+            ans_end = r.get("answer_end_idx")
+            q_start = r.get("question_start_idx")
+            q_end = r.get("question_end_idx")
+
+            start = min(
+                ans_start if ans_start is not None else q_start or 0,
+                q_start if q_start is not None else ans_start or 0,
+            )
+            end = max(
+                ans_end if ans_end is not None else q_end or 0,
+                q_end if q_end is not None else ans_end or 0,
+            )
+            span_chars = max(int(end) - int(start), 1)
+            est_tokens = max(1, span_chars // 4)
+
+        contribution = score * est_tokens
+        if doc_key not in best_per_doc or contribution > best_per_doc[doc_key]:
+            best_per_doc[doc_key] = contribution
+
+    if not best_per_doc:
+        return 0.0, 0
+
+    total_weighted = sum(best_per_doc.values())
+    leakage = min(1.0, total_weighted / total_tokens)
+    return leakage, len(best_per_doc)
+
+
 def decon_score(docs):
-    """Run decon on sampled documents, return (leakage_score, num_matches) or (0.0, 0)."""
+    """Run decon on sampled documents, return (leakage_score, num_matches) or (None, None)."""
     binary = DECON_BINARY
     if not binary or binary == "decon" or not os.path.isfile(binary):
         paths_to_try = [
@@ -211,8 +263,10 @@ def decon_score(docs):
                 binary = p
                 break
         else:
+            print("[self-score] WARNING: decon binary not found, skipping leakage check", file=sys.stderr)
             return None, None
     if not DECON_EVALS_DIR or not os.path.isdir(DECON_EVALS_DIR):
+        print("[self-score] WARNING: decon evals dir not found, skipping leakage check", file=sys.stderr)
         return None, None
     tmp = tempfile.mkdtemp(prefix="decon_selfscore_")
     try:
@@ -221,6 +275,9 @@ def decon_score(docs):
             for doc in docs:
                 if doc:
                     fh.write(json.dumps({"text": doc}, ensure_ascii=False) + "\n")
+        total_chars = sum(len(d) for d in docs if d)
+        total_tok = max(1, total_chars // 4)
+
         report_dir = os.path.join(tmp, "report")
         os.makedirs(report_dir, exist_ok=True)
         result = subprocess.run(
@@ -235,36 +292,27 @@ def decon_score(docs):
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
+            print("[self-score] WARNING: decon exited %d: %s" % (
+                result.returncode, result.stderr[:200],
+            ), file=sys.stderr)
             return None, None
-        total_weighted = 0.0
-        match_count = 0
-        best_per_doc = {}
+
+        report_lines = []
         for fname in os.listdir(report_dir):
             if not fname.endswith(".jsonl"):
                 continue
             with open(os.path.join(report_dir, fname)) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    doc_key = (r.get("training_file", ""), r.get("training_line", 0))
-                    score = float(r.get("contamination_score", 0.0))
-                    span_chars = max(int(r.get("answer_end_idx", 0) or r.get("question_end_idx", 0) or 0) - int(r.get("answer_start_idx", 0) or r.get("question_start_idx", 0) or 0), 1)
-                    est_tokens = max(1, span_chars // 4)
-                    contribution = score * est_tokens
-                    if doc_key not in best_per_doc or contribution > best_per_doc[doc_key]:
-                        best_per_doc[doc_key] = contribution
-        if not best_per_doc:
+                report_lines.extend(fh.readlines())
+
+        if not report_lines:
             return 0.0, 0
-        total_chars = sum(len(d) for d in docs if d)
-        total_tok = max(1, total_chars // 4)
-        leakage = min(1.0, sum(best_per_doc.values()) / total_tok)
-        return leakage, len(best_per_doc)
-    except Exception:
+
+        return _reduce_report(report_lines, total_tok)
+    except subprocess.TimeoutExpired:
+        print("[self-score] WARNING: decon timed out after 600s", file=sys.stderr)
+        return None, None
+    except Exception as exc:
+        print("[self-score] WARNING: decon failed: %s" % exc, file=sys.stderr)
         return None, None
     finally:
         import shutil

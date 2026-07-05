@@ -24,7 +24,7 @@ from typing import Any
 import verifiers.v1 as vf
 
 from .corpus import CorpusBuilder, CuratedCorpus
-from .leakage import DeconLeakageDetector, LeakageScores
+from .leakage import DeconError, DeconLeakageDetector, LeakageScores
 from .models import CuratorConfig
 from .rollout_state import CuratorState, RolloutStore
 from .trainer import ProxyStudentTrainer, TrainResult
@@ -65,10 +65,18 @@ class CuratorScorer:
         RolloutStore.set_ledger(state, ledger)
 
         # Decon runs off the event loop via subprocess.
+        decon_error = False
         if self.decon_detector is not None:
-            leakage = await asyncio.to_thread(
-                self.decon_detector.score, corpus.iter_documents()
-            )
+            try:
+                leakage = await asyncio.to_thread(
+                    self.decon_detector.score, corpus.iter_documents()
+                )
+            except DeconError as exc:
+                logger.warning("[curator] decon detection failed: %s", exc)
+                RolloutStore.record_tool_error(state, "decon")
+                RolloutStore.set_external_failure(state, True)
+                leakage = LeakageScores(0.0, 0, ())
+                decon_error = True
         else:
             leakage = LeakageScores(0.0, 0, ())
 
@@ -76,6 +84,7 @@ class CuratorScorer:
             "perf": self._perf(train_result),
             "cost": ledger.total(self.config.prices),
             "leakage": leakage.as_dict(),
+            "decon_error": float(decon_error),
             "loss": train_result.loss if math.isfinite(train_result.loss) else 0.0,
             "accuracy": float(train_result.accuracy or 0.0),
             "flops": train_result.flops,
@@ -121,6 +130,7 @@ class CuratorScorer:
             "perf": 0.0,
             "cost": ledger.total(self.config.prices),
             "leakage": {"leakage_score": 0.0, "num_contaminated_matches": 0},
+            "decon_error": 0.0,
             "loss": 0.0,
             "accuracy": 0.0,
             "flops": 0.0,
