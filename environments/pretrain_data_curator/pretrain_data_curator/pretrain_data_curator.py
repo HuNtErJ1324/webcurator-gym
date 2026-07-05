@@ -13,7 +13,7 @@ from verifiers.v1.runtimes.modal import ModalConfig
 
 from .hosted_compat import Environment
 from .modal_backend import _modal_gpu_for
-from .models import ProxyStudentConfig
+from .models import MANIFEST_FILENAME, ProxyStudentConfig
 from .taskset import CuratorTasksetConfig
 from .tasks import TASK_PROMPT
 
@@ -26,6 +26,7 @@ def load_environment(
     cutoff_date: str = "2024-12-31",
     token_budget: int = 1_000_000,
     hf_token_env: str = "HF_TOKEN",
+    manifest_filename: str = MANIFEST_FILENAME,
     candidate_limit: int = 8,
     sample_docs_per_source: int = 64,
     allow_local_sources: bool = True,
@@ -74,6 +75,7 @@ def load_environment(
         cutoff_date=cutoff_date,
         token_budget=token_budget,
         hf_token_env=hf_token_env,
+        manifest_filename=manifest_filename,
         candidate_limit=candidate_limit,
         sample_docs_per_source=sample_docs_per_source,
         allow_local_sources=allow_local_sources,
@@ -98,6 +100,7 @@ def load_environment(
         "cutoff_date": cutoff_date,
         "token_budget": token_budget,
         "hf_token_env": hf_token_env,
+        "manifest_filename": manifest_filename,
         "candidate_limit": candidate_limit,
         "sample_docs_per_source": sample_docs_per_source,
         "harness_id": harness_id,

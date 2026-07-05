@@ -18,6 +18,7 @@ from pretrain_data_curator.hf_access import estimate_tokens
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
+    MANIFEST_FILENAME,
     Manifest,
     Source,
 )
@@ -119,6 +120,7 @@ def test_local_source_rejects_absolute_and_parent_paths(path: str):
         "train.py",
         "outputs/val.bin",
         ".vf_hf_cost.jsonl",
+        MANIFEST_FILENAME,
     ],
 )
 def test_local_source_rejects_reserved_runtime_files(path: str):

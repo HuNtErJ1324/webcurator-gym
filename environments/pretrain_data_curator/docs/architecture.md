@@ -62,15 +62,19 @@ validation repository using a SHA-256 digest rather than exposing its identity.
 
 ## Manifest recovery
 
-The preferred output is the final assistant message containing one fenced JSON
-manifest. The parser is intentionally tolerant of model-output noise:
+The primary output is the configured manifest file
+(`/workspace/manifest.json` by default). `finalize()` reads it through the live
+runtime and briefly polls for it to handle ordering between the shell write and
+finalization. File existence is the only completion signal; there is no sentinel
+token.
 
-1. It scans fenced blocks and then the whole message.
-2. A string-aware balanced-brace scanner finds JSON objects.
-3. The last parseable object with a non-empty `sources` list wins.
-4. If the final message is unusable, finalization scans earlier assistant
-   messages newest first.
-5. If no manifest was emitted, a last-resort trace recovery synthesizes sources
+For backward compatibility, if the file is absent or unusable:
+
+1. Finalization scans assistant messages newest first.
+2. The compatibility parser scans fenced blocks and then the whole message.
+3. A string-aware balanced-brace scanner finds JSON objects.
+4. The last parseable object with a non-empty `sources` list wins.
+5. A last-resort trace recovery synthesizes sources
    from explicitly inspected `hf datasets info` IDs. Raw search-output IDs are
    used only when the agent inspected nothing.
 

@@ -179,9 +179,14 @@ valid.
 
 ## Parsing and recovery
 
-The parser accepts prose around JSON and scans multiple fenced blocks. The last
-parseable object containing a non-empty `sources` list wins. Finalization then
-searches older assistant messages if needed.
+The agent writes this JSON object to `/workspace/manifest.json` (or the
+configured root-level filename). Finalization polls and parses that file first.
+File existence is the completion signal; no sentinel token is used.
+
+For backward compatibility, assistant messages remain a fallback. That parser
+accepts prose around JSON and scans multiple fenced blocks; the last parseable
+object containing a non-empty `sources` list wins, then finalization searches
+older assistant messages if needed.
 
 Duplicates are not merged. Repeating the same dataset/config produces multiple
 source entries and can cause redundant logical weighting, although identical

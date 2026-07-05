@@ -22,6 +22,7 @@ id = "hunterj/pretrain-data-curator"
 args.use_real_trainer          = true
 args.max_turns                 = 64
 args.token_budget              = 400_000_000
+args.manifest_filename         = "manifest.json"
 args.candidate_limit           = 32
 args.sample_docs_per_source    = 50_000
 args.max_concurrent_fetches    = 16
