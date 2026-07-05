@@ -4147,6 +4147,160 @@ def test_self_score_contains_no_val_reference():
     assert "REDACTED_SOURCE_LABEL" in text or "[withheld validation repository]" in text
 
 
+# ---------------------------------------------------------------------------
+# _reduce_report parity test
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_report_record(
+    *,
+    training_file: str = "corpus.jsonl",
+    training_line: int = 0,
+    contamination_score: float = 0.0,
+    cluster_token_length: int | None = None,
+    answer_start_idx: int | None = None,
+    answer_end_idx: int | None = None,
+    question_start_idx: int | None = None,
+    question_end_idx: int | None = None,
+    eval_dataset: str = "heldout_val",
+) -> dict[str, object]:
+    """Build a decon-style report dict for the parity test."""
+    rec: dict[str, object] = {
+        "contamination_score": contamination_score,
+        "training_file": training_file,
+        "training_line": training_line,
+        "eval_dataset": eval_dataset,
+    }
+    if cluster_token_length is not None:
+        rec["cluster_token_length"] = cluster_token_length
+    if answer_start_idx is not None:
+        rec["answer_start_idx"] = answer_start_idx
+    if answer_end_idx is not None:
+        rec["answer_end_idx"] = answer_end_idx
+    if question_start_idx is not None:
+        rec["question_start_idx"] = question_start_idx
+    if question_end_idx is not None:
+        rec["question_end_idx"] = question_end_idx
+    return rec
+
+
+def _reduce_leakage(lines, total_tokens):
+    """Call the production DeconLeakageDetector._reduce_report (a method)."""
+    from pretrain_data_curator.leakage import DeconLeakageDetector
+
+    detector = DeconLeakageDetector()
+    result = detector._reduce_report(lines, total_tokens)
+    return result.leakage_score, result.num_contaminated_matches
+
+
+def _reduce_selfscore(lines, total_tokens):
+    """Call the dev standalone self_score._reduce_report.
+
+    The function lives inside the _SCRIPT template string in self_score.py.
+    We extract it, compile it, and call it so we can verify parity.
+    """
+    import json as _json
+    import re
+    from pretrain_data_curator import self_score as _self_score
+
+    script = _self_score._SCRIPT
+    match = re.search(
+        r'def _reduce_report\(report_lines, total_tokens\):.*?(?=\n\ndef |\n\n\n|\Z)',
+        script,
+        re.DOTALL,
+    )
+    assert match, "could not extract _reduce_report from self_score._SCRIPT"
+
+    func_code = match.group()
+    ns: dict[str, object] = {"json": _json}
+    exec(compile(func_code, "<self_score_SCRIPT>", "exec"), ns)
+    reducer = ns["_reduce_report"]
+    return reducer(lines, total_tokens)
+
+
+def test_reduce_report_parity_empty():
+    """(a) Empty report: both reducers return (0.0, 0)."""
+    prod = _reduce_leakage([], 100)
+    dev = _reduce_selfscore([], 100)
+    assert prod == (0.0, 0), f"production: {prod}"
+    assert dev == (0.0, 0), f"dev: {dev}"
+
+
+def test_reduce_report_parity_cluster_token_length():
+    """(b) Match with cluster_token_length: token weight uses it directly."""
+    lines = [
+        json.dumps(_synthetic_report_record(
+            contamination_score=0.5,
+            cluster_token_length=200,
+        ))
+    ]
+    prod = _reduce_leakage(lines, 1000)
+    dev = _reduce_selfscore(lines, 1000)
+    # score * cluster_tok = 0.5 * 200 = 100; 100 / 1000 = 0.1
+    assert prod == dev, f"prod={prod} dev={dev}"
+
+
+def test_reduce_report_parity_span_fallback():
+    """(c) Span-fallback match (no cluster_token_length)."""
+    lines = [
+        json.dumps(_synthetic_report_record(
+            contamination_score=1.0,
+            answer_start_idx=0,
+            answer_end_idx=400,
+        ))
+    ]
+    prod = _reduce_leakage(lines, 1000)
+    dev = _reduce_selfscore(lines, 1000)
+    # span_chars = 400 -> 400 // 4 = 100 tokens; 1.0 * 100 = 100; 100/1000 = 0.1
+    assert prod == dev, f"prod={prod} dev={dev}"
+
+
+def test_reduce_report_parity_dedup():
+    """(d) Dedup: multiple eval matches against same doc -> only highest counted."""
+    lines = [
+        json.dumps(_synthetic_report_record(
+            training_file="corpus.jsonl",
+            training_line=0,
+            contamination_score=0.3,
+            cluster_token_length=200,
+        )),
+        json.dumps(_synthetic_report_record(
+            training_file="corpus.jsonl",
+            training_line=0,
+            contamination_score=0.9,
+            cluster_token_length=50,
+        )),
+    ]
+    prod = _reduce_leakage(lines, 1000)
+    dev = _reduce_selfscore(lines, 1000)
+    # 0.9 * 50 = 45 (higher than 0.3 * 200 = 60... wait)
+    # Actually 0.3 * 200 = 60, 0.9 * 50 = 45.  So highest is 60.
+    # 60 / 1000 = 0.06
+    assert prod == dev, f"prod={prod} dev={dev}"
+
+
+def test_reduce_report_parity_clamp():
+    """(e) Clamp: sum > total_tokens -> both clamp to 1.0."""
+    lines = [
+        json.dumps(_synthetic_report_record(
+            training_file="a.jsonl",
+            contamination_score=0.9,
+            cluster_token_length=1000,
+        )),
+        json.dumps(_synthetic_report_record(
+            training_file="b.jsonl",
+            contamination_score=0.5,
+            cluster_token_length=800,
+        )),
+    ]
+    prod = _reduce_leakage(lines, 1000)
+    dev = _reduce_selfscore(lines, 1000)
+    # 0.9 * 1000 = 900; 0.5 * 800 = 400; sum = 1300; 1300/1000 = 1.3 -> min(1.0, 1.3) = 1.0
+    assert prod == dev, f"prod={prod} dev={dev}"
+    assert prod[0] == 1.0, f"expected clamp to 1.0, got {prod[0]}"
+    assert prod[1] == 2, f"expected 2 matches, got {prod[1]}"
+
+
 def test_smoke_config_includes_screen_val_set(monkeypatch):
     """The deepseek-v4-flash-smoke TOML config includes screen_val_set.
 
