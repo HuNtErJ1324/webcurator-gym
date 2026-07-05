@@ -73,8 +73,8 @@ must verify it; finalization does not make a hidden metadata request.
 
 The held-out validation/evaluation data is reserved for final scoring. Attempts
 to access its configured repository are recorded by `val_set_access`, and
-materialized overlap is penalized by exact, fuzzy, and character-trigram leakage
-detectors.
+materialized overlap with public benchmarks and the held-out val set is penalized
+by the decon n-gram contamination detector (token-weighted `leakage_score`).
 
 ## Cost metering
 

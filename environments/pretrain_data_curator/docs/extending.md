@@ -39,19 +39,29 @@ reconstruction. The shim must continue forwarding stdout, stderr, arguments,
 and exit status without changing CLI behavior. Metering failure must remain
 non-fatal.
 
-## Swap the leakage "semantic" backend
+## Tune the leakage (decon) backend
 
-`LeakageDetector` currently uses character-trigram cosine similarity for its
-semantic component. To use embeddings, preserve the contract:
+Leakage is computed by `DeconLeakageDetector` (`leakage.py`), which shells out to
+the bundled [allenai/decon](https://github.com/allenai/decon) Rust binary and
+reduces its report to a token-weighted scalar via `_reduce_report`. To adjust it,
+preserve the contract:
 
-- precompute held-out reference vectors;
-- return the fraction of curated documents above the configured threshold;
-- keep values in `[0,1]`;
-- keep `overall = max(exact, fuzzy, semantic)`.
+- keep `score()` returning a `LeakageScores` with `leakage_score` in `[0, 1]`;
+- keep the token-weighted, deduplicated reduction so one document is counted once;
+- raise `DeconError` on any detector failure (missing binary, non-zero exit,
+  timeout, crash) so the scorer records `decon_error`/`external_failure` rather
+  than a silent `0.0`;
+- keep heavy work off the event loop (decon already runs via `asyncio.to_thread`).
 
-Add any dependency to `pyproject.toml`, validate required credentials in
-`load_environment`, and keep heavy work off the event loop. Exact SHA-1 and
-fuzzy MinHash checks can remain unchanged.
+Reference sets: bundled public benchmarks live under `decon/bundled-evals/` (add
+more `.jsonl.gz` eval files there and rebuild the runtime image). The held-out
+validation screen (`screen_val_set`) is built ephemerally at scoring time by
+detokenising the val shard with `tiktoken`; if you change it, keep the val text
+server-side only — it must never be written into the workspace, the agent
+container, or `decon/bundled-evals/`, and `self_score.py` must stay
+benchmarks-only. If you change `_reduce_report`, update **both** the production
+copy in `leakage.py` and the templated dev copy in `self_score.py` (the parity
+test in `tests/` locks them together). Add any new dependency to `pyproject.toml`.
 
 ## Add a trainer backend
 
