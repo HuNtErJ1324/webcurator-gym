@@ -65,7 +65,16 @@ Evaluations tab and `prime eval tui`.
 
 A live eval makes Hugging Face and model calls and requires valid authenticated
 CLI state plus `HF_TOKEN`. For the local GPU Docker runtime the Docker Engine
-with NVIDIA Container Toolkit must be available on the same machine.
+with NVIDIA Container Toolkit must be available on the same machine, and
+`DOCKER_HOST` must name a reachable daemon socket. On Docker Desktop under WSL2
+that socket is non-standard, e.g.:
+
+```bash
+export DOCKER_HOST=unix:///mnt/wsl/docker-desktop/shared-sockets/guest-services/docker.proxy.sock
+```
+
+See `docs/troubleshooting.md` ("Docker runtime: `docker info` returns 'protocol
+not available'") if provisioning fails.
 
 ## Design rules
 

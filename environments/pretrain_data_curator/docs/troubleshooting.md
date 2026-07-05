@@ -184,6 +184,35 @@ The Docker harness-runtime example uses native v1 `uv run eval` because the
 installed `prime eval run` wrapper does not pass through
 `--harness.runtime.*`.
 
+## Docker runtime: `docker info` returns "protocol not available"
+
+The Docker real-trainer backend (`proxy_student.runtime_backend = "docker"`)
+talks to the local Docker daemon over the socket named by `DOCKER_HOST`. If
+that variable is unset and no daemon listens on the default
+`/var/run/docker.sock`, the backend fails at provisioning with
+`protocol not available` (or `Cannot connect to the Docker daemon`).
+
+On **Docker Desktop under WSL2** the daemon is reachable, but its API socket
+lives in a non-standard location and the default `/var/run/docker.sock` symlink
+may be absent for a given distro. Point `DOCKER_HOST` at the Docker Desktop
+guest-services proxy socket before running:
+
+```bash
+export DOCKER_HOST=unix:///mnt/wsl/docker-desktop/shared-sockets/guest-services/docker.proxy.sock
+docker info   # should report Server Version and, under Runtimes, "nvidia"
+```
+
+Confirm GPU passthrough works end-to-end before a real-trainer eval:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi -L
+```
+
+`docker_host` in the config must stay **unset** (`None`); the shared
+harness-runtime Docker backend rejects a non-`None` value and expects the
+rollout and daemon on the same machine. Select the daemon only through the
+`DOCKER_HOST` environment variable, never the config field.
+
 ## The heuristic and real trainer disagree
 
 That is expected. The heuristic is a deterministic engineering surrogate, not a
