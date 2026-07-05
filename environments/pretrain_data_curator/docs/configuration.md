@@ -140,7 +140,7 @@ signal, but leakage detection still uses it.
 ## Canonical smoke run
 
 The repository keeps one exhaustive local run config. It uses DeepSeek V4 Flash
-to curate a 25M-token corpus and the real proxy trainer on a Modal H100:
+to curate a 25M-token corpus and the real proxy trainer on a local GPU Docker:
 
 ```bash
 prime env install pretrain-data-curator -p ./environments

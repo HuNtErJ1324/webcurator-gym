@@ -1,7 +1,8 @@
 # Comprehensive local smoke: one DeepSeek rollout curates 25M tokens, then the
-# real fixed proxy student trains and evaluates in the rollout-owned Modal H100.
-# Run from environments/pretrain_data_curator after exporting the credentials in
-# the workspace-root secrets.env:
+# real fixed proxy student trains and evaluates in the rollout-owned local GPU
+# Docker container. Docker Engine with NVIDIA Container Toolkit required.
+# Run from environments/pretrain_data_curator after sourcing the workspace-root
+# secrets.env:
 #   prime eval run configs/eval/deepseek-v4-flash-smoke.toml
 
 env_dir_path = ".."                       # cwd is this environment; parent holds it
@@ -72,12 +73,10 @@ warmup_steps = 256
 lr_min_ratio = 0.1
 n_train_runs = 1
 
-# Modal is used because this WSL host exposes a GPU to nvidia-smi but its Docker
-# Desktop daemon/socket is unavailable. docker_host is explicit but ignored by
-# the Modal backend; the empty value represents no remote Docker endpoint.
-runtime_backend = "modal"
-docker_host = ""
-modal_gpu = "H100"
+# Local GPU Docker runtime. Requires Docker Engine with the NVIDIA Container
+# Toolkit on the same machine. docker_host must be unset (None) — the shared
+# harness-runtime Docker backend rejects a non-None value.
+runtime_backend = "docker"
 docker_image = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
 gpu_count = 1
 cpu_cores = 8
