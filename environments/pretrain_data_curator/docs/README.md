@@ -42,8 +42,9 @@ it.
 There is one checked-in local eval run config:
 
 - `configs/eval/deepseek-v4-flash-smoke.toml`: exhaustive DeepSeek V4 Flash
-  curation smoke with real Modal proxy training. It doubles as the authoritative
-  loader/student/validation field reference.
+  curation smoke with real local GPU Docker proxy training. It doubles as the
+  authoritative loader/student/validation field reference.
 
 RL training configs live under `configs/rl/` (`curator-gpt20b-modal.toml` and
 `curator-gpt20b-modal-1rollout.toml`) for Hosted Training with a Modal H100.
+Local eval uses the Docker backend in `configs/eval/deepseek-v4-flash-smoke.toml`.

@@ -63,9 +63,9 @@ prime eval run configs/eval/deepseek-v4-flash-smoke.toml
 Do not use `--skip-upload`; canonical evals should remain visible in the private
 Evaluations tab and `prime eval tui`.
 
-A live eval makes Hugging Face, model, and Modal GPU calls and requires valid
-authenticated CLI state plus `HF_TOKEN`, `MODAL_TOKEN_ID`, and
-`MODAL_TOKEN_SECRET`.
+A live eval makes Hugging Face and model calls and requires valid authenticated
+CLI state plus `HF_TOKEN`. For the local GPU Docker runtime the Docker Engine
+with NVIDIA Container Toolkit must be available on the same machine.
 
 ## Design rules
 
