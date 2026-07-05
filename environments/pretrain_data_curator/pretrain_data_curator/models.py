@@ -14,8 +14,17 @@ from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from .val_set import ValidationSetConfig
 
+MANIFEST_FILENAME = "manifest.json"
+
 _RESERVED_WORKSPACE_FILES = frozenset(
-    {"corpus.txt", "config.json", "train.py", "val.bin", ".vf_hf_cost.jsonl"}
+    {
+        MANIFEST_FILENAME,
+        "corpus.txt",
+        "config.json",
+        "train.py",
+        "val.bin",
+        ".vf_hf_cost.jsonl",
+    }
 )
 
 # --- proxy-student budget / sandbox derivation constants -------------------

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import verifiers.v1 as vf
 
+from .models import MANIFEST_FILENAME
+
 _GOALS = [
     "Curate the strongest general-purpose pretraining mixture for the fixed student.",
 ]
@@ -11,11 +13,11 @@ _GOALS = [
 TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to {goal}
 
 ## Objective
-Research and iterate autonomously, then return the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
+Research and iterate autonomously, then write the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
 
 ## Deliverable
-Your final response must contain only one fenced `json` block with this contract:
+When finished, write your final manifest as a single JSON object to `{manifest_path}` with this contract:
 
 ```text
 {{
@@ -50,7 +52,7 @@ Your final response must contain only one fenced `json` block with this contract
 2. Never access, copy, infer, or derive data from the held-out validation or evaluation corpus. Doing so is contamination and incurs the leakage penalty.
 3. Set the manifest's `token_budget` field to exactly {token_budget}, and use data, calls, and training work economically. Fetching or processing beyond what can fill that token allocation increases the cost penalty without increasing the scored corpus.
 4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
-5. Commit the manifest as the plain final response, not through the shell. Without a committed non-empty manifest, there is no positive performance score.
+5. Create the final manifest file through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.
 
 There will be no user interaction. Never ask the user for feedback or clarification; operate autonomously and execute the actions that make the most sense."""
 
@@ -67,6 +69,7 @@ def build_tasks(
     cutoff_date: str,
     token_budget: int,
     *,
+    manifest_filename: str = MANIFEST_FILENAME,
     allow_local_sources: bool = True,
     alpha_perf: float = 1.0,
     lambda_cost: float = 0.1,
@@ -85,6 +88,7 @@ def build_tasks(
                 goal=goal,
                 cutoff_date=cutoff_date,
                 token_budget=token_budget,
+                manifest_path=f"/workspace/{manifest_filename}",
                 local_source_status=local_source_status,
                 alpha_perf=alpha_perf,
                 lambda_cost=lambda_cost,

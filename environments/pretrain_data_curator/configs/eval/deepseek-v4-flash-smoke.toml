@@ -22,6 +22,7 @@ temperature = 0.2
 cutoff_date = "2024-12-31"
 token_budget = 25_000_000
 hf_token_env = "HF_TOKEN"
+manifest_filename = "manifest.json"
 candidate_limit = 64                     # trace-recovery fallback only
 sample_docs_per_source = 100_000         # field ceiling; enough to fill 25M
 allow_local_sources = true

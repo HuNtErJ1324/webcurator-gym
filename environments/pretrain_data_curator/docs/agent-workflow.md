@@ -8,7 +8,7 @@ The task uses a single initial user prompt and no separate system prompt.
 `bash`, `codex`, and `mini_swe_agent` therefore receive the same contract:
 
 - frame the fixed-student data-curation problem;
-- request a final fenced manifest JSON;
+- require a final manifest JSON file at `/workspace/manifest.json`;
 - grant broad autonomy over source choice, weights, filtering, shell, internet,
   Hugging Face `hf`, and local processing;
 - state the cutoff, token allocation, reward coefficients, and self-score command;
@@ -96,15 +96,18 @@ These are priced resources in the cost penalty, not separate budgets.
 
 ## Final manifest and recovery
 
-The intended completion is one final fenced `json` block with a non-empty
-`sources` list. See [Manifest and filtering](manifest.md) for the full contract.
-Without a committed manifest, positive performance is zero.
+The intended completion is a single JSON object with a non-empty `sources` list
+written to `/workspace/manifest.json` (or the configured filename). File
+existence is the completion signal, with no sentinel token or required
+final-message content. See [Manifest and filtering](manifest.md) for the full
+contract. Without a valid manifest file, positive performance is zero.
 
-For robustness, finalization scans assistant messages newest-first. If no
+Finalization polls the runtime file briefly to handle a shell-write race. For
+backward compatibility, it then scans assistant messages newest-first. If no
 manifest exists, it can synthesize an equal-weight fallback from dataset IDs
 explicitly inspected in the trace, capped by `candidate_limit`; raw search IDs
-are used only when no inspection occurred. Recovery preserves a scoreable
-rollout but loses deliberate weights, filters, configs, and fetch-cap choices.
+are used only when no inspection occurred. Recovery preserves a scoreable rollout
+but loses deliberate weights, filters, configs, and fetch-cap choices.
 
 ## Common failure modes
 
@@ -113,4 +116,5 @@ rollout but loses deliberate weights, filters, configs, and fetch-cap choices.
 - Too-small fetch caps produce a low `budget_fill_ratio`.
 - Excess calls, fetched tokens, or training work increase cost.
 - Held-out overlap increases leakage and can contaminate the evaluation.
-- Missing final manifest yields no positive performance score.
+- Missing or malformed manifest file yields no positive performance score unless
+  a compatibility fallback recovers a usable manifest.

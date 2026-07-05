@@ -12,9 +12,10 @@ Check metrics in this order:
    trainer loss; use the failure diagnostics with it.
 5. Reward components: cost or leakage can offset positive performance.
 
-An unfinalized rollout still pays discovery cost. Inspect the last assistant
-messages for truncated JSON, an empty `sources` list, or prose without a complete
-object.
+An unfinalized rollout still pays discovery cost. Check that the configured file
+(`/workspace/manifest.json` by default) exists, contains valid UTF-8 JSON, and has
+a non-empty `sources` list. Assistant-message parsing is only a compatibility
+fallback.
 
 ## `HF_TOKEN` is missing
 

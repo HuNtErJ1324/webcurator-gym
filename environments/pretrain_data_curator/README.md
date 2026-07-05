@@ -184,10 +184,11 @@ hash so its identity is not disclosed by the script.
 | `hf datasets ls --search "<q>" --format json --expand downloads,likes,lastModified --limit 5 \| head -c 6000` | JSON-formatted search; deliberately omit high-volume `tags`. | same as above |
 | `hf datasets info <dataset_id> --expand downloads,likes,tags \| head -c 6000` | Inspect one shortlisted repository. | `hub_calls += 1`, plus stdout bytes. |
 | `hf version`, `hf env`, `hf auth`, `hf cache` | Local setup/status — no network. | none |
-| Final fenced ` ```json ` block | The agent's curation decision; parsed by `finalize()`. | none |
+| `/workspace/manifest.json` | The agent's curation decision; read by `finalize()`. | none |
 
-The agent must emit a non-empty manifest JSON as its **final** message. The
-minimal schema:
+The agent must write a non-empty manifest JSON object to
+`/workspace/manifest.json`. File existence is the completion signal; no sentinel
+token or special final-message format is required. The minimal schema:
 
 ```json
 {
@@ -264,6 +265,7 @@ but every rollout does.
 | `cutoff_date` | str | `"2024-12-31"` | Latest allowed Hugging Face `lastModified` date. |
 | `token_budget` | int | `1000000` | Target token budget for the mixture. |
 | `hf_token_env` | str | `"HF_TOKEN"` | Env var checked for the HF token before a rollout starts. |
+| `manifest_filename` | str | `"manifest.json"` | Manifest filename under `/workspace`; must be a root-level filename. |
 | `candidate_limit` | int | `8` | Maximum dataset IDs used by trace-based manifest recovery/fallback only. |
 | `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
 | `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |

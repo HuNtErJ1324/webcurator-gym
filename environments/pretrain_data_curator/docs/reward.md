@@ -129,15 +129,16 @@ signal; it does not prove which bytes entered the corpus.
 
 ## Empty and unfinalized rollouts
 
-If no non-empty manifest was finalized, scoring returns:
+If no non-empty manifest was read from the workspace file or recovered by a
+compatibility fallback, scoring returns:
 
 - zero performance;
 - zero corpus/training/leakage diagnostics;
 - the discovery cost already accumulated;
 - `finalized=0`.
 
-No dataset materialization or trainer call occurs. This makes failure to commit
-a manifest strictly worse than submitting a minimally valid one after the same
+No dataset materialization or trainer call occurs. This makes failure to write a
+manifest strictly worse than writing a minimally valid one after the same
 discovery activity.
 
 ## External failure

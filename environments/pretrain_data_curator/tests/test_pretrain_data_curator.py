@@ -17,6 +17,7 @@ import verifiers.v1 as vf
 from pydantic import ValidationError
 from verifiers.v1 import graph
 from verifiers.v1.decorators import discover_decorated
+from verifiers.v1.runtimes.subprocess import SubprocessConfig, SubprocessRuntime
 
 from pretrain_data_curator.corpus import (
     CorpusBuilder,
@@ -40,6 +41,7 @@ from pretrain_data_curator.leakage_reference import LeakageReferenceLoader
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
+    MANIFEST_FILENAME,
     Manifest,
     ProxyStudentConfig,
     Source,
@@ -111,11 +113,7 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def _fast_finalize_grace_period(monkeypatch):
-    """`CuratorTaskset.finalize` polls for a late-arriving final message (see
-    `_await_final_manifest`) before falling back. Shrink the poll interval for
-    every test so genuine-fallback tests stay fast; the interval is still long
-    enough relative to a bare `asyncio.sleep(0)` for the race-simulation test to
-    land its delayed commit inside the grace window."""
+    """Shrink workspace-manifest polling while preserving race coverage."""
     monkeypatch.setattr(CuratorTaskset, "_FINALIZE_GRACE_INTERVAL_SECONDS", 0.01)
 
 
@@ -389,6 +387,7 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert isinstance(env, vf.Environment)
     assert isinstance(env.taskset, CuratorTaskset)
     assert env.taskset.config.candidate_limit == 3
+    assert env.taskset.config.manifest_filename == MANIFEST_FILENAME
     assert env.harness.config.id == "bash"
     assert env.harness.config.env == {}
     assert env.env_args["harness_id"] == "bash"
@@ -1345,7 +1344,7 @@ async def test_materialize_preview_and_scoring_observe_same_docs():
 
 @pytest.mark.asyncio
 async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
-    # Go through the REAL finalize -> score path: the agent's final-message manifest
+    # Go through the REAL finalize -> score path: the agent's workspace manifest
     # is parsed by `finalize`, written to the single per-rollout CuratorState, then
     # `score` materializes that manifest's sources and trains over the SAME state.
     client = FakeClient()
@@ -1364,29 +1363,24 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     task = taskset.load_tasks()[0]
     state = CuratorState()
     trace = vf.Trace(task=task, state=state)
-    # Seed the rollout with the agent's FINAL message: a fenced JSON manifest.
     prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
-    final = (
-        "Here is my curation decision.\n\n"
-        "```json\n"
+    manifest_bytes = (
         '{"sources": [{"id": "good/encyclopedia", "weight": 1.0},'
-        ' {"id": "good/science", "weight": 1.0}]}\n'
-        "```"
-    )
+        ' {"id": "good/science", "weight": 1.0}]}'
+    ).encode()
     graph.prepare_turn(trace, prompt).commit(
         vf.Response(
             id="x",
             created=0,
             model="m",
-            message=vf.AssistantMessage(content=final),
+            message=vf.AssistantMessage(content="Done."),
             finish_reason="stop",
             usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
         )
     )
 
-    # finalize parses the manifest into the shared state (runtime=None -> the trace
-    # metering fallback; no hf calls in the trace -> zero discovery cost here).
-    await taskset.finalize(task, trace, None)
+    runtime = _FakeRuntime(files={MANIFEST_FILENAME: manifest_bytes})
+    await taskset.finalize(task, trace, runtime)
     assert RolloutStore.is_finalized(state)
     manifest = RolloutStore.manifest(state)
     assert {s.dataset_id for s in manifest.sources} == {
@@ -2556,7 +2550,7 @@ def test_parse_token_shard_rejects_odd_body():
 # ===========================================================================
 
 
-# --- manifest parser (the agent's final-message deliverable) ---------------
+# --- compatibility assistant-message manifest parser ----------------------
 
 
 def test_parse_manifest_from_fenced_json():
@@ -2840,12 +2834,17 @@ def test_extract_hf_commands_splits_on_shell_separators():
 
 
 class _FakeRuntime:
-    """Minimal runtime exposing `read` over an optional in-memory cost log."""
+    """Minimal runtime exposing agent-written files and an optional cost log."""
 
-    def __init__(self, log_bytes=None):
+    def __init__(self, log_bytes=None, *, files=None):
         self._log = log_bytes
+        self._files = files or {}
 
     async def read(self, path):
+        if path in self._files:
+            return self._files[path]
+        if path != hf_meter.COST_LOG_NAME:
+            raise FileNotFoundError(path)
         if self._log is None:
             raise FileNotFoundError(path)
         return self._log
@@ -2916,6 +2915,96 @@ async def test_finalize_populates_manifest_and_meters_runtime_log():
     assert led.web_queries == 1 and led.hub_calls == 2
     assert led.tokens == 400 // 4 + 40 // 4
     assert led.train_flops == 0.0  # the scorer adds FLOPs later, not finalize
+
+
+@pytest.mark.asyncio
+async def test_finalize_prefers_valid_workspace_manifest_file():
+    curator = await _make()
+    trace = _trace_with_final(
+        curator.task,
+        curator.state,
+        '```json\n{"sources": [{"id": "message/fallback"}]}\n```',
+    )
+    runtime = _FakeRuntime(
+        files={
+            MANIFEST_FILENAME: json.dumps(
+                {
+                    "token_budget": 1234,
+                    "sources": [{"id": "file/primary", "weight": 2.0}],
+                }
+            ).encode()
+        }
+    )
+
+    await curator.taskset.finalize(curator.task, trace, runtime)
+
+    manifest = RolloutStore.manifest(curator.state)
+    assert RolloutStore.is_finalized(curator.state)
+    assert manifest.token_budget == 1234
+    assert [source.dataset_id for source in manifest.sources] == ["file/primary"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_polls_for_late_workspace_manifest_file():
+    curator = await _make()
+    trace = _trace_with_final(
+        curator.task,
+        curator.state,
+        '```json\n{"sources": [{"id": "message/fallback"}]}\n```',
+    )
+    runtime = _FakeRuntime()
+
+    async def write_manifest() -> None:
+        await asyncio.sleep(curator.taskset._FINALIZE_GRACE_INTERVAL_SECONDS * 2)
+        runtime._files[MANIFEST_FILENAME] = (
+            b'{"sources": [{"id": "file/late"}]}'
+        )
+
+    write = asyncio.create_task(write_manifest())
+    await curator.taskset.finalize(curator.task, trace, runtime)
+    await write
+
+    assert [
+        source.dataset_id for source in RolloutStore.manifest(curator.state).sources
+    ] == ["file/late"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_workspace_manifest_falls_back_to_messages():
+    curator = await _make()
+    trace = _trace_with_final(
+        curator.task,
+        curator.state,
+        '```json\n{"sources": [{"id": "message/fallback"}]}\n```',
+    )
+
+    await curator.taskset.finalize(curator.task, trace, _FakeRuntime())
+
+    assert RolloutStore.is_finalized(curator.state)
+    assert [
+        source.dataset_id for source in RolloutStore.manifest(curator.state).sources
+    ] == ["message/fallback"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_malformed_workspace_manifest_warns_and_falls_back(
+    caplog,
+):
+    curator = await _make()
+    trace = _trace_with_final(
+        curator.task,
+        curator.state,
+        '```json\n{"sources": [{"id": "message/fallback"}]}\n```',
+    )
+    runtime = _FakeRuntime(files={MANIFEST_FILENAME: b'{"sources": ['})
+
+    with caplog.at_level("WARNING"):
+        await curator.taskset.finalize(curator.task, trace, runtime)
+
+    assert "does not contain a valid non-empty manifest" in caplog.text
+    assert [
+        source.dataset_id for source in RolloutStore.manifest(curator.state).sources
+    ] == ["message/fallback"]
 
 
 @pytest.mark.asyncio
@@ -3018,10 +3107,9 @@ async def test_finalize_falls_back_to_mid_rollout_manifest_at_turn_cap():
 
 
 @pytest.mark.asyncio
-async def test_finalize_prefers_final_message_manifest_over_earlier_draft():
-    # The preferred path is UNCHANGED: when the FINAL message already carries a valid
-    # manifest it wins over any earlier (draft) manifest. The cross-turn fallback must
-    # never override a finalize the agent actually emitted last.
+async def test_finalize_message_fallback_prefers_latest_manifest():
+    # With no workspace file, the compatibility fallback prefers a later message
+    # manifest over an earlier draft.
     curator = await _make()
     draft = (
         "Draft mixture:\n```json\n"
@@ -3134,9 +3222,9 @@ async def test_finalize_fallback_only_real_ids_no_invented_sources():
 
 
 @pytest.mark.asyncio
-async def test_finalize_primary_path_unchanged_when_manifest_text_present():
-    # When a valid JSON manifest IS present in the assistant messages, the primary
-    # parse path must win — the trace-fallback synthesizer must not override it.
+async def test_finalize_message_fallback_wins_over_trace_ids():
+    # With no workspace file, a valid assistant-message manifest remains the first
+    # compatibility fallback and must beat trace-ID synthesis.
     curator = await _make(max_turns=4)
     calls = [
         (
@@ -3315,6 +3403,43 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
         "`2.0 * performance - 0.25 * cost - 3.0 * leakage`"
         in task.prompt
     )
+    assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
+    assert "final response must contain" not in task.prompt
+
+
+def test_manifest_filename_is_configurable_and_rendered():
+    env = load_environment(manifest_filename="curation-output.json")
+    task = env.taskset.load_tasks()[0]
+
+    assert env.taskset.config.manifest_filename == "curation-output.json"
+    assert env.env_args["manifest_filename"] == "curation-output.json"
+    assert "/workspace/curation-output.json" in task.prompt
+
+
+@pytest.mark.parametrize(
+    "filename", ["", ".", "..", "/tmp/manifest.json", "nested/manifest.json"]
+)
+def test_manifest_filename_must_name_workspace_root_file(filename):
+    with pytest.raises(ValidationError, match="filename in /workspace"):
+        load_environment(manifest_filename=filename)
+
+
+def test_configured_manifest_filename_cannot_be_a_local_source():
+    manifest = parse_manifest(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "kind": "local",
+                        "local_path": "custom-manifest.json",
+                    }
+                ]
+            }
+        ),
+        reserved_local_filename="custom-manifest.json",
+    )
+
+    assert manifest is None
 
 
 @pytest.mark.asyncio
@@ -3338,6 +3463,24 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
     assert taskset.curator.validation_set.dataset_id.encode() not in runtime.files[
         SELF_SCORE_FILENAME
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_read_reads_file_created_by_agent_shell():
+    runtime = SubprocessRuntime(SubprocessConfig())
+    await runtime.start()
+    try:
+        result = await runtime.run(
+            ["sh", "-c", 'printf "%s" "$MANIFEST" > manifest.json'],
+            {"MANIFEST": '{"sources":[{"id":"agent/written"}]}'},
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(await runtime.read(MANIFEST_FILENAME)) == {
+            "sources": [{"id": "agent/written"}]
+        }
+    finally:
+        runtime.cleanup()
 
 
 # --- the PATH-shadow shim --------------------------------------------------

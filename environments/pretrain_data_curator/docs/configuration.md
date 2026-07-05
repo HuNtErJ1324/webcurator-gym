@@ -12,6 +12,7 @@ fields raise `TypeError` instead of being silently ignored.
 | `cutoff_date` | `str` | `"2024-12-31"` | Latest repository modification date the agent is instructed to use |
 | `token_budget` | `int` | `1_000_000` | Manifest default and source-weight allocation budget |
 | `hf_token_env` | `str` | `"HF_TOKEN"` | Environment variable required during rollout setup |
+| `manifest_filename` | `str` | `"manifest.json"` | Root-level filename read from `/workspace` during finalization |
 | `candidate_limit` | `int` | `8` | Maximum IDs used by trace-based manifest recovery |
 | `sample_docs_per_source` | `int` | `64` | Hard upper bound on rows requested from each source |
 | `allow_local_sources` | `bool` | `true` | Permit manifests to pull workspace-local text/JSONL files at scoring time |

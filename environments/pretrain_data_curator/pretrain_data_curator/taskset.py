@@ -2,14 +2,14 @@
 
 ``CuratorTaskset`` drives a *toolless* curation rollout: the agent runs the
 Hugging Face ``hf`` CLI in its own shell to search/inspect datasets and decides a
-curation mixture, then emits that decision as a single fenced ```json block as its
-final message. Because the taskset exposes **no** tool servers (it does not
+curation mixture, then writes that decision to a JSON file in the runtime
+workspace. Because the taskset exposes **no** tool servers (it does not
 override ``Taskset.tools``), it satisfies the non-MCP harness gate at
 ``verifiers/v1/env.py:239-247`` and runs under codex / kimi_code as well as the
 default / bash harnesses.
 
 After generation, ``finalize`` (run before scoring, while the runtime is live):
-  1. parses the manifest JSON from the agent's final message,
+  1. reads and parses the manifest JSON from the runtime workspace,
   2. meters the live ``hf`` discovery cost into the cost ledger (see
      :mod:`hf_meter`), preferring the PATH-shim's runtime log and falling back to
      reconstructing hf calls from the trace.
@@ -33,10 +33,11 @@ import logging
 import math
 import os
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 import verifiers.v1 as vf
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 
 from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .docker_network import DockerHostReachability
@@ -48,6 +49,7 @@ from .leakage_reference import FUZZY_CHUNK_WORDS, LeakageReferenceLoader
 from .models import (
     CuratorConfig,
     FilterSpec,
+    MANIFEST_FILENAME,
     Manifest,
     ProxyStudentConfig,
     Sampling,
@@ -68,7 +70,7 @@ from .val_set import ValidationSetConfig, ValTokenLoader
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# manifest parsing (the agent's final-message deliverable)
+# manifest parsing (workspace file primary; assistant messages remain fallback)
 # --------------------------------------------------------------------------- #
 
 _SUPPORTED_FILTER_KINDS = {
@@ -261,7 +263,7 @@ def _last_json_object(
 
 
 def extract_json_object(text: str) -> dict[str, Any] | None:
-    """Extract the manifest JSON object from the agent's final message.
+    """Extract a manifest JSON object from compatibility assistant text.
 
     Scans every fenced ```json/``` block (and, as a final fallback candidate, the
     whole text) and prefers the LAST candidate that yields a JSON object carrying a
@@ -383,12 +385,14 @@ def _coerce_source(raw: Any) -> Source | None:
 
 
 def parse_manifest(
-    text: str, default_token_budget: int | None = None
+    text: str,
+    default_token_budget: int | None = None,
+    reserved_local_filename: str | None = None,
 ) -> Manifest | None:
-    """Parse + validate the agent's final-message manifest.
+    """Parse and validate manifest text.
 
     Returns a :class:`Manifest` with at least one source, or ``None`` when the
-    message has no usable manifest (empty / truncated / no valid sources) — the
+    text has no usable manifest (empty / truncated / no valid sources) — the
     caller treats ``None`` as "not finalized" → graceful zero score.
     """
     data = extract_json_object(text)
@@ -398,6 +402,16 @@ def parse_manifest(
     if not isinstance(raw_sources, list) or not raw_sources:
         return None
     sources = [s for s in (_coerce_source(r) for r in raw_sources) if s is not None]
+    if reserved_local_filename is not None:
+        sources = [
+            source
+            for source in sources
+            if not (
+                source.kind == "local"
+                and source.local_path is not None
+                and PurePosixPath(source.local_path).name == reserved_local_filename
+            )
+        ]
     if not sources:
         return None
     token_budget = default_token_budget or 1_000_000
@@ -429,6 +443,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     cutoff_date: str = "2024-12-31"
     token_budget: int = 1_000_000
     hf_token_env: str = "HF_TOKEN"
+    manifest_filename: str = MANIFEST_FILENAME
     candidate_limit: int = 8
     sample_docs_per_source: int = 64
     allow_local_sources: bool = True
@@ -452,6 +467,13 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     proxy_student: dict[str, Any] = {}
     validation_set: dict[str, Any] = {}
     eval_corpus: list[str] | None = None
+
+    @field_validator("manifest_filename")
+    @classmethod
+    def _manifest_filename_is_workspace_root_file(cls, value: str) -> str:
+        if not value or value in {".", ".."} or "/" in value or "\\" in value:
+            raise ValueError("manifest_filename must be a filename in /workspace")
+        return value
 
 
 try:
@@ -597,6 +619,7 @@ class CuratorTaskset(_TasksetBase):
         tasks = build_tasks(
             self.curator.cutoff_date,
             self.curator.token_budget,
+            manifest_filename=self.config.manifest_filename,
             allow_local_sources=self.curator.allow_local_sources,
             alpha_perf=self.curator.alpha_perf,
             lambda_cost=self.curator.lambda_cost,
@@ -700,19 +723,64 @@ class CuratorTaskset(_TasksetBase):
             return ""
         return msgs[-1].content or ""
 
+    async def _manifest_from_workspace_file(
+        self, task: CuratorTask, runtime: Any, *, warn_invalid: bool = False
+    ) -> Manifest | None:
+        """Read the agent-written manifest from the runtime workspace.
+
+        Runtime paths are relative to the configured workdir. Docker and Modal
+        resolve this filename under ``/workspace``; the subprocess runtime
+        resolves it under its per-rollout workspace. Missing, partially written,
+        or malformed files return ``None`` so the bounded poll can retry them.
+        """
+        if runtime is None:
+            return None
+        try:
+            raw = await runtime.read(self.config.manifest_filename)
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            log = logger.warning if warn_invalid else logger.debug
+            log(
+                "Manifest file %r exists but is not valid UTF-8",
+                self.config.manifest_filename,
+            )
+            return None
+        except Exception:  # noqa: BLE001 - runtime backends use different not-found errors
+            return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        manifest = parse_manifest(
+            json.dumps(data) if isinstance(data, dict) else "",
+            default_token_budget=task.token_budget,
+            reserved_local_filename=self.config.manifest_filename,
+        )
+        if manifest is None:
+            log = logger.warning if warn_invalid else logger.debug
+            log(
+                "Manifest file %r exists but does not contain a valid non-empty "
+                "manifest",
+                self.config.manifest_filename,
+            )
+        return manifest
+
     def _manifest_from_messages(
         self, task: CuratorTask, trace: vf.Trace
     ) -> Manifest | None:
-        """Tier 1: parse a fenced JSON manifest from any assistant text message,
-        newest first."""
+        """Compatibility fallback: parse assistant text messages newest first."""
         manifest = parse_manifest(
-            self._final_message_text(trace), default_token_budget=task.token_budget
+            self._final_message_text(trace),
+            default_token_budget=task.token_budget,
+            reserved_local_filename=self.config.manifest_filename,
         )
         if manifest is not None and manifest.sources:
             return manifest
         for message in reversed(trace.assistant_messages[:-1]):
             manifest = parse_manifest(
-                message.content or "", default_token_budget=task.token_budget
+                message.content or "",
+                default_token_budget=task.token_budget,
+                reserved_local_filename=self.config.manifest_filename,
             )
             if manifest is not None and manifest.sources:
                 return manifest
@@ -735,59 +803,50 @@ class CuratorTaskset(_TasksetBase):
         return Manifest(token_budget=task.token_budget, sources=sources)
 
     # Grace-period bound for `_await_final_manifest` (see its docstring): total
-    # worst-case wait is attempts * interval seconds, and it only ever runs on the
-    # race/fallback path -- never on a rollout whose final message already landed.
+    # worst-case wait is attempts * interval seconds, and it only runs when the
+    # first workspace-file read misses or catches a partial write.
     _FINALIZE_GRACE_ATTEMPTS = 6
     _FINALIZE_GRACE_INTERVAL_SECONDS = 0.5
 
     async def _await_final_manifest(
-        self, task: CuratorTask, trace: vf.Trace
+        self, task: CuratorTask, trace: vf.Trace, runtime: Any
     ) -> Manifest | None:
-        """Poll briefly for the agent's final assistant message before giving up
-        on the primary (message-parsed) manifest path.
+        """Poll briefly for the agent's workspace manifest before fallbacks.
 
-        WHY THIS EXISTS: the `verifiers` interception server (pinned third-party
-        dependency, `verifiers==0.1.15.dev376` -- not something we control or may
-        edit) streams the agent's final assistant message and commits it into
-        `trace.nodes` asynchronously, and can do so AFTER the rollout pool has
-        already unregistered this rollout and invoked our `finalize()`. When that
-        race is lost, `_manifest_from_messages` sees a trace that is one message
-        short of the agent's real, already-submitted manifest, and would otherwise
-        fall straight through to the lossy trace-discovered-ids fallback (whose
-        synthesized manifest always has `sample_docs_per_source=None`, silently
-        defaulting away whatever the agent actually requested). `trace.nodes` is a
-        plain list the interception server appends to in place, and
-        `trace.assistant_messages` is a live property over it (not a cached
-        snapshot), so yielding the event loop a few times via short sleeps is
-        enough for the pending append to land. Bounded to a handful of short
-        sleeps so a rollout that genuinely never submits a manifest still falls
-        through to the fallback promptly.
+        The shell command that writes the file and ``finalize()`` can become
+        observable in either order. Retrying also tolerates reading while a shell
+        redirection is still writing the JSON. The bounded sleeps preserve the
+        previous grace period for a late trace append before message recovery.
         """
-        for _ in range(self._FINALIZE_GRACE_ATTEMPTS):
+        for attempt in range(self._FINALIZE_GRACE_ATTEMPTS):
             await asyncio.sleep(self._FINALIZE_GRACE_INTERVAL_SECONDS)
-            manifest = self._manifest_from_messages(task, trace)
+            manifest = await self._manifest_from_workspace_file(
+                task,
+                runtime,
+                warn_invalid=attempt == self._FINALIZE_GRACE_ATTEMPTS - 1,
+            )
             if manifest is not None:
                 return manifest
         return None
 
     async def finalize(self, task: CuratorTask, trace: vf.Trace, runtime: Any) -> None:
-        """Parse the agent's manifest and meter live `hf` discovery cost.
+        """Read the agent's manifest and meter live `hf` discovery cost.
 
         Positional signature as invoked at ``verifiers/v1/rollout.py:241``; runs
-        after generation and before ``score``. Assistant turns are scanned most
-        recent first, so the final-message behavior is preserved while a manifest
-        emitted before trailing `hf` calls still finalizes at the turn cap. If the
-        final message hasn't landed in the trace yet (see `_await_final_manifest`),
-        a short grace-period poll gives the upstream race a chance to resolve
-        before falling back. Tolerant of a missing/garbled rollout (no manifest
-        anywhere -> "not finalized" -> the scorer returns the zero sentinel). The
-        discovery cost ledger is computed here and persisted; the scorer still adds
-        ``train_flops`` and the materialization cost on top.
+        after generation and before ``score``. The workspace file is the primary
+        and required agent-facing path. A short grace-period poll handles the
+        shell-write/finalize race. Assistant-message parsing and trace-ID synthesis
+        remain compatibility fallbacks. Tolerant of a missing/garbled rollout (no
+        usable manifest anywhere -> "not finalized" -> the scorer returns the zero
+        sentinel). The discovery cost ledger is computed here and persisted; the
+        scorer still adds ``train_flops`` and materialization cost on top.
         """
         state = trace.state
-        manifest = self._manifest_from_messages(task, trace)
+        manifest = await self._manifest_from_workspace_file(task, runtime)
         if manifest is None:
-            manifest = await self._await_final_manifest(task, trace)
+            manifest = await self._await_final_manifest(task, trace, runtime)
+        if manifest is None:
+            manifest = self._manifest_from_messages(task, trace)
         if manifest is None:
             manifest = self._manifest_from_trace_ids(task, trace)
         if manifest is not None and manifest.sources:
