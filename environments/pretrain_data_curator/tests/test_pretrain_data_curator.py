@@ -411,9 +411,15 @@ def test_single_smoke_config_exhaustively_matches_source_options():
     assert row["model"] == "deepseek/deepseek-v4-flash"
     assert set(args) == set(inspect.signature(load_environment).parameters)
     assert set(args["validation_set"]) == set(ValidationSetConfig.model_fields)
-    # Validate that the proxy_student config keys are a subset of the model
-    # fields (the smoke config only sets the fields relevant to its runtime).
-    assert set(args["proxy_student"]) <= set(ProxyStudentConfig.model_fields)
+    # Exact match against all ProxyStudentConfig fields except the two that
+    # are intentionally absent from the Docker smoke config:
+    #   - docker_host must be unset (None) for the Docker backend; an empty
+    #     string would trip the guard in load_environment.
+    #   - modal_gpu is Modal-only and irrelevant to the Docker backend.
+    # Every other proxy_student field must be present in the TOML so a newly
+    # added field cannot be silently omitted.
+    expected_proxy_fields = set(ProxyStudentConfig.model_fields) - {"docker_host", "modal_gpu"}
+    assert set(args["proxy_student"]) == expected_proxy_fields
     assert ProxyStudentConfig.model_validate(args["proxy_student"])
     assert ValidationSetConfig.model_validate(args["validation_set"])
 
