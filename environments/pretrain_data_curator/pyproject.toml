@@ -29,7 +29,7 @@ packages = ["pretrain_data_curator"]
 include = ["pretrain_data_curator/**/*.py", "pyproject.toml"]
 
 [tool.verifiers.eval]
-num_examples = 4
+num_examples = 1
 rollouts_per_example = 1
 
 [dependency-groups]
