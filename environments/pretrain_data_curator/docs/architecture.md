@@ -41,8 +41,8 @@ reasons:
 
 ## Tasks and prompts
 
-`tasks.py` defines four typed `CuratorTask` values. They vary the curation goal
-but share the configured token budget and cutoff date. Task data stays typed
+`tasks.py` defines one typed `CuratorTask` value with a single curation goal
+and the configured token budget and cutoff date. Task data stays typed
 rather than being carried in unstructured dataset metadata.
 
 `tasks.py` renders one compact initial user prompt; `system_prompt` is `None`.

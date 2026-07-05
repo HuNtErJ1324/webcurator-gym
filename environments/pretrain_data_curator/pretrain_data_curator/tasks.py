@@ -6,9 +6,6 @@ import verifiers.v1 as vf
 
 _GOALS = [
     "Curate the strongest general-purpose pretraining mixture for the fixed student.",
-    "Maximize fixed-student performance from the available pretraining data.",
-    "Find an effective weighted and filtered pretraining mixture for the fixed student.",
-    "Use the fixed token allocation as effectively as possible for pretraining.",
 ]
 
 TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to {goal}
@@ -75,7 +72,7 @@ def build_tasks(
     lambda_cost: float = 0.1,
     lambda_leakage: float = 1.0,
 ) -> list[CuratorTask]:
-    """Build one task per method-open curation goal."""
+    """Build one curation task with the single goal substituted into the prompt."""
     local_source_status = (
         "enabled for workspace-relative plain-text or JSONL files"
         if allow_local_sources
