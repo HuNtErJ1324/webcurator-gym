@@ -55,14 +55,17 @@ After unit tests:
 
 ```bash
 prime env install pretrain-data-curator -p ./environments
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 1 -r 1
+cd environments/pretrain_data_curator
+set -a; source ../../secrets.env; set +a
+prime eval run configs/eval/deepseek-v4-flash-smoke.toml
 ```
 
 Do not use `--skip-upload`; canonical evals should remain visible in the private
 Evaluations tab and `prime eval tui`.
 
-A live eval makes Hugging Face and model calls and requires valid authenticated
-CLI state plus `HF_TOKEN`.
+A live eval makes Hugging Face, model, and Modal GPU calls and requires valid
+authenticated CLI state plus `HF_TOKEN`, `MODAL_TOKEN_ID`, and
+`MODAL_TOKEN_SECRET`.
 
 ## Design rules
 
@@ -98,7 +101,7 @@ Update together:
 
 - Pydantic models in `models.py`;
 - coercion in `taskset.py`;
-- prompt schema in `SYSTEM_PROMPT`;
+- single initial prompt contract in `tasks.TASK_PROMPT`;
 - parsing/finalization tests;
 - [Manifest and filtering](manifest.md);
 - relevant checked-in configs.

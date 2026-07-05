@@ -23,7 +23,6 @@ args.use_real_trainer          = true
 args.max_turns                 = 64
 args.token_budget              = 400_000_000
 args.candidate_limit           = 32
-args.scan_limit                = 200
 args.sample_docs_per_source    = 50_000
 args.max_concurrent_fetches    = 16
 args.fetch_timeout_seconds     = 120.0

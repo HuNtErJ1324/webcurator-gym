@@ -23,9 +23,9 @@ agent invokes Hugging Face's `hf` executable there.
 load_environment
   -> build CuratorTasksetConfig and harness/runtime config
   -> taskset.load_tasks() selects one curation goal
-  -> taskset.setup() validates runtime/backend compatibility
+  -> taskset.setup() validates runtime/backend compatibility and writes self_score.py
   -> bash harness runs the agent and hf commands
-  -> stop on max_turns or normal harness completion
+  -> normal harness completion (with max_turns as a safety backstop)
   -> taskset.finalize() recovers a manifest and meters hf activity
   -> taskset.score() computes all metrics and rewards
   -> hosted_compat translates the v1 Trace to legacy State when needed
@@ -45,16 +45,20 @@ reasons:
 but share the configured token budget and cutoff date. Task data stays typed
 rather than being carried in unstructured dataset metadata.
 
-`taskset.py` combines the task prompt with a system prompt that explains:
+`tasks.py` renders one compact initial user prompt; `system_prompt` is `None`.
+Every harness therefore receives the same framing, objective, method-open
+autonomy, manifest contract, setup facts, and numbered failure-mode rules. The
+prompt contains no dataset priors, first-command requirement, command recipe
+wall, discovery allowance, or turn allocation.
 
-- first-command `hf` bootstrap behavior;
-- economical search and metadata inspection;
-- the cutoff constraint;
-- the manifest schema and filter kinds;
-- the finite turn budget and an approximate commit deadline.
+The only agent optimization budget is `token_budget`. `max_turns` remains a
+generous harness safety cap and is absent from the prompt, reward, and metrics.
 
-The system prompt includes reliable starter dataset examples, but a successful
-agent is expected to inspect candidates rather than blindly copy the example.
+During setup, `taskset.py` writes a standalone `self_score.py` into the runtime
+workspace. It samples candidate-source development rows and applies the same
+scale/cleanliness/diversity shape as the heuristic trainer. It never loads final
+validation tokens or decoded leakage references, and rejects the configured
+validation repository using a SHA-256 digest rather than exposing its identity.
 
 ## Manifest recovery
 
@@ -147,7 +151,7 @@ configuration, then the first advertised configuration.
 
 All decorated metrics and rewards may be invoked concurrently by verifiers.
 `CuratorTaskset._prepared()` therefore guards the heavy scoring pass with a
-per-trace lock and caches its result in `trace.info`. Corpus materialization,
+per-trace lock and caches its result in `self._scoring_cache`. Corpus materialization,
 proxy training, leakage detection, and final cost calculation execute once per
 rollout.
 

@@ -22,7 +22,8 @@ it.
 
 - **Taskset**: the verifiers v1 object that supplies tasks, setup/finalization,
   stopping conditions, rewards, and metrics.
-- **Harness**: the agent loop. This environment uses the bash harness.
+- **Harness**: the agent loop. Bash is the default; `harness_id` can select
+  compatible bundled CLI harnesses such as Codex or mini-SWE-agent.
 - **Runtime**: where harness commands execute. It is a subprocess by default,
   or a rollout-owned Docker/Modal runtime for those real-trainer backends.
 - **Manifest**: the agent's final JSON decision: source slices, weights, filters,
@@ -36,16 +37,13 @@ it.
 - **Validation set**: a fixed GPT-2-token shard used to compute real student
   cross-entropy after training.
 
-## Configuration examples
+## Run configuration
 
-Checked-in examples live under:
+There is one checked-in local eval run config:
 
-- `configs/eval/example.toml`: every loader/config field at its source
-  default, using the heuristic trainer.
-- `configs/eval/nemotron-nano-docker.toml`: benchmark-scale Docker intent; the
-  native v1 command still needs explicit harness-runtime flags.
-- `configs/rl/curator-gpt20b-modal.toml`: Hosted Training with a Modal H100.
-- `configs/rl/curator-gpt20b-modal-1rollout.toml`: reduced rollout count.
+- `configs/eval/deepseek-v4-flash-smoke.toml`: exhaustive DeepSeek V4 Flash
+  curation smoke with real Modal proxy training. It doubles as the authoritative
+  loader/student/validation field reference.
 
-Treat `example.toml` as a field reference, not as a recommended expensive
-run.
+RL training configs live under `configs/rl/` (`curator-gpt20b-modal.toml` and
+`curator-gpt20b-modal-1rollout.toml`) for Hosted Training with a Modal H100.

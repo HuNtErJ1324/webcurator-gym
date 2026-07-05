@@ -25,7 +25,6 @@ from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import (
-    SYSTEM_PROMPT,
     CuratorTaskset,
     CuratorTasksetConfig,
     _coerce_source,
@@ -478,11 +477,11 @@ def test_local_configuration_is_validated_and_plumbed():
     assert env.env_args["max_local_source_bytes"] == 4096
 
 
-def test_system_prompt_discloses_local_source_safety_and_billing():
-    assert '"kind": "hf"' in SYSTEM_PROMPT
-    assert '"local_path": null' in SYSTEM_PROMPT
-    assert "relative to the working directory" in SYSTEM_PROMPT
-    assert "no leading `/`" in SYSTEM_PROMPT
-    assert "no `..`" in SYSTEM_PROMPT
-    assert "billed like fetched tokens" in SYSTEM_PROMPT
-    assert "Never fabricate documents" in SYSTEM_PROMPT
+def test_initial_prompt_discloses_local_source_safety_and_cost():
+    prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
+    assert '"kind": "hf"' in prompt
+    assert '"kind": "local"' in prompt
+    assert "workspace-relative" in prompt
+    assert "no leading `/` or `..`" in prompt
+    assert "increases the cost penalty" in prompt
+    assert "Fabricated data" in prompt

@@ -1,159 +1,116 @@
 # Agent workflow
 
-This page describes the interface presented to the model being evaluated. It is
-not a replacement for Prime CLI setup instructions.
+This page describes the interface presented to the evaluated model.
+
+## One initial prompt
+
+The task uses a single initial user prompt and no separate system prompt.
+`bash`, `codex`, and `mini_swe_agent` therefore receive the same contract:
+
+- frame the fixed-student data-curation problem;
+- request a final fenced manifest JSON;
+- grant broad autonomy over source choice, weights, filtering, shell, internet,
+  Hugging Face `hf`, and local processing;
+- state the cutoff, token allocation, reward coefficients, and self-score command;
+- explain each rule through its failure mode;
+- require autonomous operation without user questions.
+
+There are no starter-dataset priors, mandatory first command, command recipes,
+discovery rounds, or commit-by turn. The agent chooses its own method.
 
 ## Available interface
 
-The agent receives a normal bash shell from the bash harness. The environment
-registers no MCP tools. Dataset discovery happens with Hugging Face's current
-`hf` CLI:
+The taskset registers no MCP tools. The selected harness supplies a shell, and
+the runtime image supplies the Hugging Face `hf` CLI. Agents may use `hf`, shell
+programs, downloads, and workspace files freely within the harness.
+
+For a script-backed or otherwise non-streamable source, genuine downloaded data
+can be transformed into text or JSONL in the workspace and referenced with
+`kind: "local"`. Paths must be relative; absolute paths, `..`, and reserved
+trainer files are rejected. Local files are capped during runtime transfer,
+billed like fetched documents, and included in provenance metrics.
+
+## Sole budget
+
+`token_budget` is the only budget exposed to or optimized by the agent. It is the
+manifest allocation used for source-weight targets and corpus truncation.
+
+`max_turns` is a generous harness safety limit (default `64`). It is not shown in
+the prompt and does not enter reward or metrics. There is no discovery-call or
+discovery-output budget. Harness/provider context limits still apply normally,
+so agents should keep command output practical, but the environment does not
+translate those limits into a curation budget.
+
+## Leakage-safe self-scoring
+
+Before the harness starts, setup writes `self_score.py` to the rollout workspace:
 
 ```bash
-hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000
-hf datasets ls --search "scientific text" --format json \
-  --expand downloads,likes,lastModified --limit 5 | head -c 6000
-hf datasets info HuggingFaceFW/fineweb --expand downloads,likes,tags \
-  | head -c 6000
+python self_score.py draft.json --limit 8
 ```
 
-Some GPU runtime images do not contain `hf`. The system prompt requires the
-first shell command to install it only when absent and continue to a search in
-the same turn:
+The script:
 
-```bash
-if ! command -v hf >/dev/null 2>&1; then
-  pip install -q 'huggingface-hub>=0.34'
-fi
-hf datasets ls --search "wikipedia" --sort downloads --limit 5 | head -c 6000
-```
+1. reads a draft manifest and requires the task's exact `token_budget`;
+2. samples at most `--limit` rows from each named candidate source through the
+   public datasets-server API, or from a bounded local file;
+3. applies supported filters to those development samples;
+4. estimates materialized tokens, fill ratio, cleanliness, source diversity,
+   heuristic proxy CE, performance, scoring cost, and reward excluding leakage
+   and discovery already incurred;
+5. reports per-source sampling errors so the agent can revise the draft.
 
-Every `hf` command should cap displayed output with `head -c 6000`. Dataset
-searches should not expand `tags`: multilingual repositories can emit enough
-language tags to exhaust the model context. Tags remain useful when inspecting
-one shortlisted repository.
+This is a development proxy, not final scoring. It uses no validation shard,
+validation tokens, decoded leakage reference, or final trainer. The configured
+validation repository is represented only by a SHA-256 digest and is rejected
+before any network request, so the script neither reveals nor consumes the
+held-out source. `leakage_estimate` is deliberately `null`.
 
-The agent should not create a virtual environment, write a Python Hub client, or
-search for legacy `huggingface-cli`/`curator_*` commands. Those paths consume a
-finite turn without improving the manifest.
+## Cutoff and contamination
 
-## Downloading a local source
+Every task states the latest allowed Hugging Face `lastModified` date. The agent
+must verify it; finalization does not make a hidden metadata request.
 
-When a real pre-cutoff dataset is script-backed or otherwise cannot be streamed,
-the agent can download a raw file and transform it into text or JSONL in the same
-workspace:
+The held-out validation/evaluation data is reserved for final scoring. Attempts
+to access its configured repository are recorded by `val_set_access`, and
+materialized overlap is penalized by exact, fuzzy, and character-trigram leakage
+detectors.
 
-```bash
-hf download allenai/dolma data/v1.7/sample.json.gz \
-  --repo-type dataset --local-dir ./dl
-gunzip -c ./dl/data/v1.7/sample.json.gz \
-  | head -c 20000000 > data/dolma.jsonl
-```
+## Cost metering
 
-The manifest then references `data/dolma.jsonl` with `kind: "local"`. Paths are
-relative to the bash working directory; absolute paths, `..`, and reserved
-trainer files are rejected. Local files are capped during the runtime transfer,
-not after an unbounded read. Agents must not fabricate documents or copy
-held-out/evaluation data; local provenance and validation-repository access are
-emitted for audit.
-
-## Recommended decision loop
-
-1. Search two or three distinct corpus categories with small result limits.
-2. Compare repository popularity, license/tags, likely text structure, and
-   `lastModified`.
-3. Inspect only the most plausible candidates with `hf datasets info`.
-4. Choose complementary sources rather than several near-duplicates.
-5. Assign weights according to expected utility and the task's emphasis.
-6. Add conservative quality filters whose parameters are supported.
-7. Submit a non-empty manifest before the turn cap.
-
-The prompt prioritizes encyclopedic, scientific, instructional, and broad web
-text for general pretraining. It warns against narrow task datasets and
-code-only mixtures unless the task goal justifies them.
-
-## Cutoff date
-
-Every task states a latest allowed Hugging Face `lastModified` date. The agent is
-responsible for checking and respecting it during discovery.
-
-This is a behavioral constraint, not an environment-side allow-list. The
-manifest finalizer does not make an additional metadata call to reject
-post-cutoff repositories. That design avoids hidden calls and keeps discovery
-cost attributable to the evaluated agent, but it also means cutoff compliance
-must be assessed from the trace when auditing a result.
-
-## What is charged
-
-The shim classifies `hf` commands as follows:
+The PATH shim classifies `hf` activity:
 
 | Command type | Ledger effect |
 | --- | --- |
-| `hf datasets ls ...` | one web query, one Hub call, output bytes |
-| `hf datasets info ...` | one Hub call, output bytes |
-| Other networked `hf` operations | one Hub call, output bytes |
+| `hf datasets ls ...` | one web query, one Hub call, output tokens |
+| `hf datasets info ...` | one Hub call, output tokens |
+| Other networked `hf` operations | one Hub call, output tokens |
 | `hf version`, `env`, `auth`, `cache`, `completion` | no network-call charge |
 
-Output bytes are converted to estimated tokens with integer division by four.
-A recognized call is counted even when it exits nonzero; failed discovery still
-consumes resources.
+Output tokens use `max(word_count, character_count // 4)`. A recognized call is
+counted even if it exits nonzero. Materialization adds one Hub call per unique
+fetch plus fetched document tokens. A successful local pull adds one code call
+plus parsed document tokens. Training FLOPs are added after proxy training.
 
-After finalization, each unique scoring fetch adds one Hub call and the estimated
-tokens in the returned documents. That charge is independent of CLI discovery
-output.
+These are priced resources in the cost penalty, not separate budgets.
 
-Each unique successful local pull adds one code call and bills its parsed
-document tokens at the same rate as fetched tokens. Downloading and referencing
-a local file is therefore not a free path around the cost penalty.
+## Final manifest and recovery
 
-## Turn budget
+The intended completion is one final fenced `json` block with a non-empty
+`sources` list. See [Manifest and filtering](manifest.md) for the full contract.
+Without a committed manifest, positive performance is zero.
 
-`max_turns` is the hard harness limit. The rendered prompt also gives an
-approximate discovery allowance and commit target:
+For robustness, finalization scans assistant messages newest-first. If no
+manifest exists, it can synthesize an equal-weight fallback from dataset IDs
+explicitly inspected in the trace, capped by `candidate_limit`; raw search IDs
+are used only when no inspection occurred. Recovery preserves a scoreable
+rollout but loses deliberate weights, filters, configs, and fetch-cap choices.
 
-```text
-discovery_rounds = max(2, min(12, max_turns // 6, scan_limit // 10))
-commit_by = max(1, max_turns - max(3, max_turns // 8))
-```
+## Common failure modes
 
-These are instructions, not additional framework stops. `max_turns_reached`
-enforces model turns, while `discovery_output_budget_reached` protects the
-provider context from oversized tool results. One assistant response can contain
-multiple bash calls; it still consumes one model turn, but every `hf` call is
-metered separately.
-
-| `max_turns` | `scan_limit` | Suggested discovery rounds | Suggested commit by |
-| ---: | ---: | ---: | ---: |
-| 12 | 50 | 2 | 9 |
-| 25 | 10 | 2 | 22 |
-| 64 | 200 | 10 | 56 |
-
-Earlier assistant messages are scanned for a valid manifest if the final turn is
-truncated. Submitting a manifest early and then continuing discovery is
-recoverable, but ending cleanly on the final JSON is more reliable.
-
-The taskset also stops generation when accumulated tool-result text reaches
-24,000 characters. Finalization then synthesizes a fallback manifest from
-explicitly inspected dataset IDs, falling back to raw search results only if no
-inspection occurred. This converts runaway discovery into a scored rollout
-without blindly selecting every search hit or allowing the next provider
-request to exceed its context window.
-
-## Common agent mistakes
-
-- **Describing commands instead of running them.** The harness needs actual shell
-  calls to produce discovery evidence.
-- **Spending turns installing tools.** Only the conditional `hf` bootstrap is
-  expected.
-- **Using an unknown text field.** Prefer `null` and let materialization
-  auto-detect unless metadata makes the field certain.
-- **Copying the schema placeholder.** Values must describe a real dataset and
-  deliberate mixture.
-- **Using unsupported filters.** Unknown filter kinds are discarded during
-  manifest coercion.
-- **Using one-document-per-line `.txt`.** Text files split on blank lines; use
-  JSONL strings or objects for one document per line.
-- **Fabricating a local corpus.** Local sources must come from genuine
-  pre-cutoff data and their pulls are audited.
-- **Waiting until the last token to submit.** No usable manifest means zero
-  positive performance reward.
+- An invented ID/config materializes no tokens.
+- A wrong text field or unsupported source format yields an empty slice.
+- Too-small fetch caps produce a low `budget_fill_ratio`.
+- Excess calls, fetched tokens, or training work increase cost.
+- Held-out overlap increases leakage and can contaminate the evaluation.
+- Missing final manifest yields no positive performance score.

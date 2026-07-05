@@ -115,19 +115,17 @@ The "semantic" detector is lexical character-trigram similarity, not a neural
 embedding model. It is fast and reproducible but should not be interpreted as a
 general semantic-contamination detector.
 
-<<<<<<< HEAD
 The reference samples 64 deterministic strata with windows of at most 1,024
 GPT-2 tokens, caps each decoded window at 8,192 characters and the semantic
 vocabulary at 32,768 trigrams, and is cached after construction. If the
 validation shard cannot be loaded or decoded, scoring logs
 `leakage_reference=stub` and exposes `stub` on
 `CuratorState.leakage_reference` while using the built-in offline fallback.
-=======
+
 Local-source audit telemetry supplements, but does not replace, these leakage
 detectors. `val_set_access` flags bash commands containing the configured
 validation repository ID. It is intentionally a conservative command-provenance
 signal; it does not prove which bytes entered the corpus.
->>>>>>> feat/agent-bash-datasets
 
 ## Empty and unfinalized rollouts
 
@@ -175,6 +173,7 @@ data, or the infrastructure can fail before that data is evaluated.
 | `perf_vs_baseline` | Unclipped relative loss improvement |
 | `train_flops` | Estimated/measured training FLOPs |
 | `corpus_tokens` | Estimated materialized corpus tokens |
+| `budget_fill_ratio` | `corpus_tokens / manifest.token_budget`; values below `1` indicate the selected/fetched data did not fill the allocation |
 | `num_sources` | Sources with at least one retained document |
 | `local_source_count` | Unique successful local pulls |
 | `local_source_bytes` | Bytes transferred by capped local pulls |
@@ -188,9 +187,11 @@ data, or the infrastructure can fail before that data is evaluated.
 | `tool_error_count` | Total classified Hub/trainer errors |
 | `external_failure` | `1.0` when external infrastructure failed |
 | `trainer_error_msg` | `1.0` when trainer detail was recorded |
+| `leakage_reference` | Leakage-reference provenance: `0` unresolved, `1` built-in stub, `2` real validation-derived reference, `3` custom `eval_corpus` |
 
 The trainer error string itself is logged in truncated form rather than emitted
-as a numeric metric.
+as a numeric metric. Do not average `leakage_reference` as an ordinal score; use
+the encoded values to count provenance classes, especially the `1` stub rate.
 
 ## Reading a result
 
