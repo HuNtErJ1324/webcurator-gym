@@ -20,8 +20,10 @@ and used to train the fixed proxy student, and the composite reward is:
     R(M, H) = alpha_perf*Perf - lambda_cost*Cost - lambda_leakage*Leakage
 
 Leakage is a token-weighted scalar from the decon Rust n-gram detector run
-against PUBLIC BENCHMARK eval sets (bundled under ``decon/bundled-evals/``),
-NEVER the held-out validation set.
+against PUBLIC BENCHMARK eval sets (bundled under ``decon/bundled-evals/``)
+AND, optionally, the held-out validation set (when ``screen_val_set`` is
+enabled — the default).  The val eval file is detokenised ephemerally at
+scoring time and never persists.
 
 The reward coefficients are runtime config, so each ``@vf.reward`` is registered
 with the framework weight ``1.0`` and folds its (signed) coefficient into the
@@ -990,6 +992,12 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
         return (await self._prepared(trace, runtime)).get("decon_error", 0.0)
+
+    @vf.metric
+    async def val_screen_skipped(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> float:
+        return (await self._prepared(trace, runtime)).get("val_screen_skipped", 0.0)
 
     async def trainer_error_str(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None

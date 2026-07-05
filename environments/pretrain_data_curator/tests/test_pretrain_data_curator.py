@@ -1338,7 +1338,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 22  # 3 rewards + 19 diagnostic metrics
+    assert len(funcs) == 23  # 3 rewards + 20 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -1702,7 +1702,7 @@ def test_task_prompt_is_compact_method_open_and_single_budget():
 def test_task_prompt_rules_state_failure_modes_without_dataset_priors_or_recipes():
     prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
 
-    assert "Benchmark contamination incurs the leakage penalty" in prompt
+    assert "Contamination against any eval set incurs the leakage penalty" in prompt
     assert "increases the cost penalty without increasing the scored corpus" in prompt
     assert "there is no positive performance score" in prompt
     assert "hf datasets ls" not in prompt
@@ -4054,15 +4054,19 @@ def test_decon_error_still_raises_with_val_set():
     """When decon fails, DeconError is raised even when val_set is provided."""
     from pretrain_data_curator.leakage import DeconError, DeconLeakageDetector
 
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    val = _make_synthetic_val_set(enc.encode("Some val text."))
+
     detector = DeconLeakageDetector(
         decon_binary="decon-nonexistent-name",
         evals_dir="/nonexistent/evals",
         screen_val_set=True,
     )
-    # Even with a val_set, a missing evals dir should cause decon to fail.
-    # We pass None for val_set since the evals dir failure happens first.
+    # With a real val_set, the combined-eval path is exercised before the
+    # missing binary causes DeconError.
     with pytest.raises(DeconError):
-        detector.score(["some document text"], val_set=None)
+        detector.score(["some document text"], val_set=val)
 
 
 def test_val_screening_scorer_error_not_silent():

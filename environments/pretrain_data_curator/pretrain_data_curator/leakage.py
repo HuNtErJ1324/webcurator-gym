@@ -144,12 +144,13 @@ class DeconLeakageDetector:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 idx += 1
 
-    def _build_combined_evals_dir(self, parent_dir: str) -> str:
+    @staticmethod
+    def _build_combined_evals_dir(evals_parent_dir: str, bundled_evals_dir: str) -> str:
         """Copy bundled evals into a temp subdir (no symlinks to avoid
         filesystem-boundary issues) and return the path."""
-        combined = os.path.join(parent_dir, "combined_evals")
-        if os.path.isdir(self._evals_dir):
-            shutil.copytree(self._evals_dir, combined, dirs_exist_ok=True)
+        combined = os.path.join(evals_parent_dir, "combined_evals")
+        if os.path.isdir(bundled_evals_dir):
+            shutil.copytree(bundled_evals_dir, combined, dirs_exist_ok=True)
         else:
             os.makedirs(combined, exist_ok=True)
         return combined
@@ -188,6 +189,7 @@ class DeconLeakageDetector:
         """
         total_chars = 0
         temp_dir = tempfile.mkdtemp(prefix="decon_corpus_")
+        evals_temp_dir = tempfile.mkdtemp(prefix="decon_evals_")
         corpus_path = os.path.join(temp_dir, "corpus.jsonl")
         try:
             with open(corpus_path, "w") as fh:
@@ -199,8 +201,10 @@ class DeconLeakageDetector:
                 return LeakageScores(0.0, 0, ())
 
             # --- determine evals dir: benchmarks only or combined with val set ----
+            # Build combined evals OUTSIDE temp_dir so decon's directory-walk under
+            # --training-dir cannot accidentally ingest eval files as training input.
             if self._screen_val_set and val_set is not None:
-                evals_dir = self._build_combined_evals_dir(temp_dir)
+                evals_dir = self._build_combined_evals_dir(evals_temp_dir, self._evals_dir)
                 self._build_val_eval(val_set, os.path.join(evals_dir, "heldout_val.jsonl"))
             else:
                 evals_dir = self._evals_dir
@@ -258,6 +262,8 @@ class DeconLeakageDetector:
             import shutil
 
             shutil.rmtree(temp_dir, ignore_errors=True)
+            if evals_temp_dir is not None:
+                shutil.rmtree(evals_temp_dir, ignore_errors=True)
 
         if not report_lines:
             return LeakageScores(0.0, 0, ())

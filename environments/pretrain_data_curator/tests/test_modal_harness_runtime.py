@@ -98,7 +98,7 @@ class _CorpusBuilder:
 
 
 class _Leakage:
-    def score(self, documents):
+    def score(self, documents, val_set=None):
         return SimpleNamespace(
             as_dict=lambda: {
                 "leakage_score": 0.0,

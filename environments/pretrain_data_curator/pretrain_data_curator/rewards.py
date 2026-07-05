@@ -75,6 +75,7 @@ class CuratorScorer:
 
         # Decon runs off the event loop via subprocess.
         decon_error = False
+        val_screen_skipped = False
         if self.decon_detector is not None:
             # Load the held-out val set for decon screening if configured.
             val_set = None
@@ -85,6 +86,7 @@ class CuratorScorer:
                     logger.warning(
                         "[curator] val set load failed, skipping val leakage screen"
                     )
+                    val_screen_skipped = True
             try:
                 leakage = await asyncio.to_thread(
                     self.decon_detector.score,
@@ -105,6 +107,7 @@ class CuratorScorer:
             "cost": ledger.total(self.config.prices),
             "leakage": leakage.as_dict(),
             "decon_error": float(decon_error),
+            "val_screen_skipped": float(val_screen_skipped),
             "loss": train_result.loss if math.isfinite(train_result.loss) else 0.0,
             "accuracy": float(train_result.accuracy or 0.0),
             "flops": train_result.flops,
@@ -151,6 +154,7 @@ class CuratorScorer:
             "cost": ledger.total(self.config.prices),
             "leakage": {"leakage_score": 0.0, "num_contaminated_matches": 0},
             "decon_error": 0.0,
+            "val_screen_skipped": 0.0,
             "loss": 0.0,
             "accuracy": 0.0,
             "flops": 0.0,
