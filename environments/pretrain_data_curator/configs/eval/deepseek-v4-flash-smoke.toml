@@ -1,20 +1,96 @@
+# Comprehensive local smoke: one DeepSeek rollout curates 25M tokens, then the
+# real fixed proxy student trains and evaluates in the rollout-owned Modal H100.
+# Run from environments/pretrain_data_curator after exporting the credentials in
+# the workspace-root secrets.env:
+#   prime eval run configs/eval/deepseek-v4-flash-smoke.toml
+
+env_dir_path = ".."                       # cwd is this environment; parent holds it
+
 [[eval]]
 name = "pretrain-data-curator-deepseek-v4-flash-smoke"
-env_id = "hunterj/pretrain-data-curator"
+env_id = "pretrain-data-curator"         # ownerless => resolve this local package
 model = "deepseek/deepseek-v4-flash"
 num_examples = 1
 rollouts_per_example = 1
+max_concurrent = 1
+max_tokens = 2048                         # bounded per turn for a responsive smoke
+temperature = 0.2
 
 [eval.args]
-token_budget = 10000000
-max_turns = 64
-candidate_limit = 64
-sample_docs_per_source = 50000
-lambda_cost = 0.0
+# Task and harness: token_budget is the sole agent-facing budget.
+cutoff_date = "2024-12-31"
+token_budget = 25_000_000
+hf_token_env = "HF_TOKEN"
+candidate_limit = 64                     # trace-recovery fallback only
+sample_docs_per_source = 100_000         # field ceiling; enough to fill 25M
+allow_local_sources = true
+max_local_source_bytes = 134_217_728     # 128 MiB per local source
+max_turns = 64                           # harness safety cap, not reward input
+harness_id = "bash"
+
+# Reward coefficients and performance mapping.
+alpha_perf = 1.0
+lambda_cost = 0.1
+lambda_leakage = 1.0
+perf_baseline_loss = 10.825839875788878  # ln(50304)
 baseline_relative_perf = true
+
+# External access and concurrency.
+max_concurrent_fetches = 8
+max_concurrent_training = 1
+fetch_timeout_seconds = 120.0
+fetch_timeout_per_doc_seconds = 0.02
+fetch_max_attempts = 5
+
+# Real held-out-CE trainer. An empty list means no custom leakage override.
 use_real_trainer = true
+eval_corpus = []
 
 [eval.args.proxy_student]
-runtime_backend = "docker"
+# Fixed student architecture.
+n_layer = 4
+n_head = 4
+n_embd = 256
+mlp_ratio = 4
+lm_head_softcap = 30.0
+num_value_embeds = 3
+
+# Training schedule. train_token_budget overrides steps.
+block_size = 256
+batch_size = 16
+steps = 200
+train_token_budget = 25_000_000
+learning_rate = 0.0003
+seed = 0
+val_fraction = 0.1
+weight_decay = 0.1
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+adam_eps = 0.00000001
+grad_clip = 1.0
+warmup_steps = 256
+lr_min_ratio = 0.1
+n_train_runs = 1
+
+# Modal is used because this WSL host exposes a GPU to nvidia-smi but its Docker
+# Desktop daemon/socket is unavailable. docker_host is explicit but ignored by
+# the Modal backend; the empty value represents no remote Docker endpoint.
+runtime_backend = "modal"
+docker_host = ""
+modal_gpu = "H100"
+docker_image = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
 gpu_count = 1
-train_token_budget = 10000000
+cpu_cores = 8
+memory_gb = 32
+disk_size_gb = 40
+max_corpus_chars = 100_000_000          # four chars per 25M-token allocation
+timeout_minutes = 90
+upload_timeout_seconds = 600.0
+
+[eval.args.validation_set]
+# Fixed held-out GPT-2-BPE validation stream used only by final scoring.
+dataset_id = "kjj0/fineweb10B-gpt2"
+filename = "fineweb_val_000000.bin"
+repo_type = "dataset"
+tokenizer = "gpt2"
+val_tokens = 10_485_760

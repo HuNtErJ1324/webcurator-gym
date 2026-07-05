@@ -8,13 +8,17 @@ constant**, combined with cross-entropy performance, cost, and leakage terms.
 ## Quickstart
 
 ```bash
-export HF_TOKEN=...
 prime env install pretrain-data-curator -p ./environments
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1
+cd environments/pretrain_data_curator
+set -a; source ../../secrets.env; set +a
+prime eval run configs/eval/deepseek-v4-flash-smoke.toml
 ```
 
-`HF_TOKEN` is checked before each rollout. For setup and zero-score failures, see
-[Troubleshooting](docs/troubleshooting.md).
+The checked-in smoke config is the single local run configuration. It uses
+DeepSeek V4 Flash for curation and a real Modal H100 proxy trainer, and explicitly
+lists every loader, student, and validation option. `HF_TOKEN`,
+`MODAL_TOKEN_ID`, and `MODAL_TOKEN_SECRET` must be exported. For setup and
+zero-score failures, see [Troubleshooting](docs/troubleshooting.md).
 
 ## Overview
 
@@ -233,21 +237,15 @@ metering, and manifest-recovery behavior.
 
 ```bash
 prime env install pretrain-data-curator -p ./environments
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1
+cd environments/pretrain_data_curator
+set -a; source ../../secrets.env; set +a
+prime eval run configs/eval/deepseek-v4-flash-smoke.toml
 ```
 
-Enable real GPU proxy-student training via Modal (requires `MODAL_TOKEN_ID` /
-`MODAL_TOKEN_SECRET`; see [`docs/configuration.md`](docs/configuration.md) for
-the Docker alternative, which needs a local GPU host instead).
-`proxy_student.runtime_backend` is required (no default) whenever
-`use_real_trainer=true`; set `modal_gpu` to choose the GPU type (default
-`"L4"`; also `"H100"`, `"H200"`, `"A100"`) and `train_token_budget` to scale
-the run (up to ~1e9 tokens):
-
-```bash
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"use_real_trainer": true, "max_turns": 64, "sample_docs_per_source": 50000, "proxy_student": {"runtime_backend": "modal", "train_token_budget": 400000000, "modal_gpu": "H200"}}'
-```
+See the [comprehensive smoke config](configs/eval/deepseek-v4-flash-smoke.toml)
+for the complete local-run argument surface. The Docker alternative requires a
+working local GPU daemon; this config uses Modal because the validated WSL host
+did not expose a usable Docker socket.
 
 ## Required Environment Variables
 

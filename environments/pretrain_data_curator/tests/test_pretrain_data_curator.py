@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -391,6 +393,27 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.harness.config.env == {}
     assert env.env_args["harness_id"] == "bash"
     assert env.taskset.load_tasks()
+
+
+def test_single_smoke_config_exhaustively_matches_source_options():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "eval"
+        / "deepseek-v4-flash-smoke.toml"
+    )
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    row = config["eval"][0]
+    args = row["args"]
+
+    assert config["env_dir_path"] == ".."
+    assert row["env_id"] == "pretrain-data-curator"
+    assert row["model"] == "deepseek/deepseek-v4-flash"
+    assert set(args) == set(inspect.signature(load_environment).parameters)
+    assert set(args["proxy_student"]) == set(ProxyStudentConfig.model_fields)
+    assert set(args["validation_set"]) == set(ValidationSetConfig.model_fields)
+    assert ProxyStudentConfig.model_validate(args["proxy_student"])
+    assert ValidationSetConfig.model_validate(args["validation_set"])
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])

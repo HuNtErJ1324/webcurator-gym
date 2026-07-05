@@ -137,25 +137,22 @@ in the NanoGPT speedrun FineWeb validation shard:
 The heuristic trainer ignores this configuration for its synthetic performance
 signal, but leakage detection still uses it.
 
-## Heuristic smoke run
+## Canonical smoke run
 
-The canonical local lifecycle is:
+The repository keeps one exhaustive local run config. It uses DeepSeek V4 Flash
+to curate a 25M-token corpus and the real proxy trainer on a Modal H100:
 
 ```bash
 prime env install pretrain-data-curator -p ./environments
-prime eval run pretrain-data-curator -m openai/gpt-4.1-mini -n 4 -r 1
-```
-
-To override a few fields:
-
-```bash
-prime eval run pretrain-data-curator \
-  -m openai/gpt-4.1-mini -n 4 -r 1 \
-  -a '{"token_budget": 2000000, "sample_docs_per_source": 256}'
+cd environments/pretrain_data_curator
+set -a; source ../../secrets.env; set +a
+prime eval run configs/eval/deepseek-v4-flash-smoke.toml
 ```
 
 Do not add `--skip-upload`; canonical Prime eval runs save results for the
-private Evaluations tab and `prime eval tui`.
+private Evaluations tab and `prime eval tui`. The config explicitly enumerates
+all loader, `ProxyStudentConfig`, and `ValidationSetConfig` fields; keep its
+exhaustiveness test synchronized when the source models change.
 
 ## Agent self-score
 
@@ -242,7 +239,7 @@ must pull a published registry image; it cannot build the local Dockerfile.
 
 ## Reference config
 
-[`../configs/eval/example.toml`](../configs/eval/example.toml)
-lists every environment, proxy-student, and validation-set field at its current
-source default. Keep it synchronized with `load_environment`,
-`ProxyStudentConfig`, and `ValidationSetConfig`.
+[`../configs/eval/deepseek-v4-flash-smoke.toml`](../configs/eval/deepseek-v4-flash-smoke.toml)
+is both the only checked-in local run config and the exhaustive field reference.
+Keep it synchronized with `load_environment`, `ProxyStudentConfig`, and
+`ValidationSetConfig`.

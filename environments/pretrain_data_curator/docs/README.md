@@ -37,16 +37,10 @@ it.
 - **Validation set**: a fixed GPT-2-token shard used to compute real student
   cross-entropy after training.
 
-## Configuration examples
+## Run configuration
 
-Checked-in examples live under:
+There is one checked-in local run config:
 
-- `configs/eval/example.toml`: every loader/config field at its source
-  default, using the heuristic trainer.
-- `configs/eval/nemotron-nano-docker.toml`: benchmark-scale Docker intent; the
-  native v1 command still needs explicit harness-runtime flags.
-- `configs/rl/curator-gpt20b-modal.toml`: Hosted Training with a Modal H100.
-- `configs/rl/curator-gpt20b-modal-1rollout.toml`: reduced rollout count.
-
-Treat `example.toml` as a field reference, not as a recommended expensive
-run.
+- `configs/eval/deepseek-v4-flash-smoke.toml`: exhaustive DeepSeek V4 Flash
+  curation smoke with real Modal proxy training. It doubles as the authoritative
+  loader/student/validation field reference.
