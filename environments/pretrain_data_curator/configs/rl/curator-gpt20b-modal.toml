@@ -1,6 +1,6 @@
 # Benchmark-oriented hosted training run — gpt-oss-20b + Modal H100 proxy student
 # max_turns=64 gives the agent enough turns to search, inspect, and refine.
-# batch_size=4 × rollouts_per_example=2 = 8 rollouts; all 4 curator tasks used.
+# batch_size=4 × rollouts_per_example=2 = 8 rollouts; the single curator task is repeated across the batch.
 
 name  = "pretrain-data-curator-gpt20b-modal"
 model = "openai/gpt-oss-20b"

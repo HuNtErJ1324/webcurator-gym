@@ -314,7 +314,7 @@ fetched tokens plus one code call, and audited with provenance metrics.
 - `rewards.py` — `CuratorScorer`, the framework-agnostic heavy scoring pass.
 - `rollout_state.py` — typed `CuratorState` plus `RolloutStore` accessors.
 - `taskset.py` — `CuratorTaskset`, manifest parsing/recovery, `finalize()`, decorated rewards/metrics, and `@vf.stop` turn cap. No MCP tool server.
-- `tasks.py` — four typed v1 curation tasks rendered as one initial user prompt.
+- `tasks.py` — one typed v1 curation task rendered as the initial user prompt.
 - `self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace.
 - `eval_corpus.py` — small offline fallback corpus for the leakage term.
 
