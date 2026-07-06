@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 class HarnessRuntimeProxyTrainer:
     """Train on the live Docker runtime supplied to taskset scoring."""
 
-    STDERR_TAIL = 2000
+    STREAM_TAIL = 8000
+    TRACEBACK_MARKER = "Traceback (most recent call last)"
 
     def __init__(
         self,
@@ -184,10 +185,11 @@ class HarnessRuntimeProxyTrainer:
             raise TrainerError(
                 f"proxy-student training timed out after {timeout}s"
             ) from exc
+        await self._persist_training_logs(runtime, result, config)
         if result.exit_code not in (0, None):
             raise TrainerError(
                 f"proxy-student training exited with code {result.exit_code}",
-                stderr_tail=(result.stderr or "")[-self.STDERR_TAIL :],
+                stderr_tail=self._training_diagnostic(result.stdout, result.stderr),
             )
         return result
 
@@ -203,7 +205,7 @@ class HarnessRuntimeProxyTrainer:
         if marker is None:
             raise TrainerError(
                 "proxy-student training produced no RESULT_JSON marker",
-                stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
+                stderr_tail=self._training_diagnostic(stdout, stderr),
             )
         try:
             data = json.loads(marker)
@@ -217,8 +219,40 @@ class HarnessRuntimeProxyTrainer:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TrainerError(
                 f"proxy-student training produced malformed RESULT_JSON: {exc}",
-                stderr_tail=(stderr or "")[-self.STDERR_TAIL :],
+                stderr_tail=self._training_diagnostic(stdout, stderr),
             ) from exc
+
+    async def _persist_training_logs(
+        self, runtime: vf.Runtime, result: Any, config: ProxyStudentConfig
+    ) -> None:
+        logs = {
+            "/workspace/train_stdout.log": (getattr(result, "stdout", "") or ""),
+            "/workspace/train_stderr.log": (getattr(result, "stderr", "") or ""),
+        }
+        try:
+            for path, text in logs.items():
+                await asyncio.wait_for(
+                    runtime.write(path, text.encode("utf-8", errors="replace")),
+                    timeout=config.upload_timeout_seconds,
+                )
+        except Exception:
+            logger.warning("failed to persist docker training logs", exc_info=True)
+
+    def _training_diagnostic(self, stdout: str | None, stderr: str | None) -> str:
+        return "\n".join(
+            [
+                "--- stdout tail ---",
+                self._diagnostic_stream(stdout or ""),
+                "--- stderr tail ---",
+                self._diagnostic_stream(stderr or ""),
+            ]
+        )
+
+    def _diagnostic_stream(self, text: str) -> str:
+        marker_at = text.find(self.TRACEBACK_MARKER)
+        if marker_at >= 0:
+            return text[marker_at:]
+        return text[-self.STREAM_TAIL :]
 
     @staticmethod
     async def _stop_cancel_safe(runtime: vf.Runtime) -> None:

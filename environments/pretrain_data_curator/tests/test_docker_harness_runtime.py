@@ -45,6 +45,15 @@ def _result(
     )
 
 
+TRACEBACK_STDOUT = """step 0 loss 10.2
+Traceback (most recent call last):
+  File "/workspace/train.py", line 217, in <module>
+    main()
+RuntimeError: loss is non-finite
+"""
+PIP_ROOT_WARNING = "WARNING: Running pip as the 'root' user can result in broken permissions"
+
+
 class FakeRuntime:
     def __init__(self, result=None, runtime_type="docker") -> None:
         self.config = SimpleNamespace(type=runtime_type)
@@ -85,10 +94,14 @@ async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
         "/workspace/corpus.txt",
         "/workspace/config.json",
         "/workspace/train.py",
+        "/workspace/train_stdout.log",
+        "/workspace/train_stderr.log",
     }
     assert runtime.commands == [(["python", "/workspace/train.py"], {})]
     # The rollout owns the successful runtime until all scoring finishes.
     assert runtime.stop_calls == 0
+    assert runtime.files["/workspace/train_stdout.log"] == _result().encode()
+    assert runtime.files["/workspace/train_stderr.log"] == b""
 
 
 class _CorpusBuilder:
@@ -260,7 +273,97 @@ async def test_runtime_failures_raise_clear_trainer_errors(result, message):
         )
 
     assert runtime.stop_calls == 1
-    assert excinfo.value.stderr_tail in {"CUDA exploded", "parse context", "missing"}
+    assert "--- stdout tail ---" in excinfo.value.stderr_tail
+    assert "--- stderr tail ---" in excinfo.value.stderr_tail
+    assert any(
+        expected in excinfo.value.stderr_tail
+        for expected in ("CUDA exploded", "parse context", "missing")
+    )
+
+
+@pytest.mark.asyncio
+async def test_training_crash_surfaces_stdout_traceback_and_persists_full_logs():
+    result = SimpleNamespace(
+        stdout=f"installing dependencies\n{TRACEBACK_STDOUT}",
+        stderr=PIP_ROOT_WARNING,
+        exit_code=1,
+    )
+    runtime = FakeRuntime(result)
+
+    with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
+        await HarnessRuntimeProxyTrainer().train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(runtime_backend="docker"),
+            runtime=runtime,
+        )
+
+    diagnostic = excinfo.value.stderr_tail
+    assert 'File "/workspace/train.py", line 217, in <module>' in diagnostic
+    assert "RuntimeError: loss is non-finite" in diagnostic
+    assert PIP_ROOT_WARNING in diagnostic
+    assert diagnostic.index("RuntimeError: loss is non-finite") < diagnostic.index(
+        PIP_ROOT_WARNING
+    )
+    assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
+    assert runtime.files["/workspace/train_stderr.log"] == result.stderr.encode()
+
+
+@pytest.mark.asyncio
+async def test_no_result_json_surfaces_stdout_tail():
+    result = SimpleNamespace(
+        stdout="loaded corpus\nlast progress line before crash",
+        stderr=PIP_ROOT_WARNING,
+        exit_code=0,
+    )
+    runtime = FakeRuntime(result)
+
+    with pytest.raises(TrainerError, match="no RESULT_JSON marker") as excinfo:
+        await HarnessRuntimeProxyTrainer().train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(runtime_backend="docker"),
+            runtime=runtime,
+        )
+
+    assert "last progress line before crash" in excinfo.value.stderr_tail
+    assert PIP_ROOT_WARNING in excinfo.value.stderr_tail
+    assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
+
+
+@pytest.mark.asyncio
+async def test_trainer_error_str_preserves_training_traceback():
+    config = CuratorConfig(
+        use_real_trainer=True,
+        proxy_student=ProxyStudentConfig(runtime_backend="docker"),
+    )
+    taskset = CuratorTaskset(
+        CuratorTasksetConfig(
+            id="test",
+            use_real_trainer=True,
+            proxy_student={"runtime_backend": "docker"},
+        )
+    )
+    taskset._scorer = CuratorScorer(
+        config, _CorpusBuilder(), HarnessRuntimeProxyTrainer(), _Leakage()
+    )
+    state = CuratorState()
+    RolloutStore.set_manifest(
+        state, Manifest(sources=[Source(dataset_id="owner/data")])
+    )
+    RolloutStore.set_finalized(state, True)
+    trace = vf.Trace(task=build_tasks("2024-12-31", 1_000_000)[0], state=state)
+    runtime = FakeRuntime(
+        SimpleNamespace(
+            stdout=TRACEBACK_STDOUT,
+            stderr=PIP_ROOT_WARNING,
+            exit_code=1,
+        )
+    )
+
+    err = await taskset.trainer_error_str(trace, runtime)
+
+    assert 'File "/workspace/train.py", line 217, in <module>' in err
+    assert "RuntimeError: loss is non-finite" in err
+    assert await taskset.trainer_error_msg(trace, runtime) == 1.0
 
 
 @pytest.mark.asyncio

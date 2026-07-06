@@ -46,7 +46,7 @@ def training_semaphore(limit: int) -> asyncio.Semaphore:
 
 
 class TrainerError(RuntimeError):
-    """A surfaced sandbox-training failure, preserving the stderr tail."""
+    """A surfaced sandbox-training failure, preserving log diagnostics."""
 
     def __init__(self, message: str, *, stderr_tail: str = "") -> None:
         super().__init__(message)
@@ -406,4 +406,3 @@ def __getattr__(name: str) -> Any:
     if name == "NANOGPT_TRAIN_SCRIPT":
         return _nanogpt_train_script()
     raise AttributeError(name)
-

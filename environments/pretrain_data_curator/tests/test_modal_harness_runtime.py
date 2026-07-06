@@ -48,6 +48,15 @@ def _result(
     )
 
 
+TRACEBACK_STDOUT = """step 0 loss 10.2
+Traceback (most recent call last):
+  File "/workspace/train.py", line 217, in <module>
+    main()
+RuntimeError: loss is non-finite
+"""
+PIP_ROOT_WARNING = "WARNING: Running pip as the 'root' user can result in broken permissions"
+
+
 class FakeRuntime:
     def __init__(self, result=None, runtime_type="modal") -> None:
         self.config = SimpleNamespace(type=runtime_type)
@@ -87,9 +96,13 @@ async def test_modal_trainer_writes_and_runs_on_supplied_harness_runtime():
         "/workspace/corpus.txt",
         "/workspace/config.json",
         "/workspace/train.py",
+        "/workspace/train_stdout.log",
+        "/workspace/train_stderr.log",
     }
     assert runtime.commands == [(["python", "/workspace/train.py"], {})]
     assert runtime.stop_calls == 0
+    assert runtime.files["/workspace/train_stdout.log"] == _result().encode()
+    assert runtime.files["/workspace/train_stderr.log"] == b""
 
 
 class _CorpusBuilder:
@@ -285,7 +298,60 @@ async def test_modal_runtime_failures_raise_clear_trainer_errors(result, message
         )
 
     assert runtime.stop_calls == 1
-    assert excinfo.value.stderr_tail in {"CUDA exploded", "parse context", "missing"}
+    assert "--- stdout tail ---" in excinfo.value.stderr_tail
+    assert "--- stderr tail ---" in excinfo.value.stderr_tail
+    assert any(
+        expected in excinfo.value.stderr_tail
+        for expected in ("CUDA exploded", "parse context", "missing")
+    )
+
+
+@pytest.mark.asyncio
+async def test_modal_training_crash_surfaces_stdout_traceback_and_persists_full_logs():
+    result = SimpleNamespace(
+        stdout=f"installing dependencies\n{TRACEBACK_STDOUT}",
+        stderr=PIP_ROOT_WARNING,
+        exit_code=1,
+    )
+    runtime = FakeRuntime(result)
+
+    with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
+        await ModalProxyTrainer().train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(runtime_backend="modal"),
+            runtime=runtime,
+        )
+
+    diagnostic = excinfo.value.stderr_tail
+    assert 'File "/workspace/train.py", line 217, in <module>' in diagnostic
+    assert "RuntimeError: loss is non-finite" in diagnostic
+    assert PIP_ROOT_WARNING in diagnostic
+    assert diagnostic.index("RuntimeError: loss is non-finite") < diagnostic.index(
+        PIP_ROOT_WARNING
+    )
+    assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
+    assert runtime.files["/workspace/train_stderr.log"] == result.stderr.encode()
+
+
+@pytest.mark.asyncio
+async def test_modal_no_result_json_surfaces_stdout_tail():
+    result = SimpleNamespace(
+        stdout="loaded corpus\nlast progress line before crash",
+        stderr=PIP_ROOT_WARNING,
+        exit_code=0,
+    )
+    runtime = FakeRuntime(result)
+
+    with pytest.raises(TrainerError, match="no RESULT_JSON marker") as excinfo:
+        await ModalProxyTrainer().train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(runtime_backend="modal"),
+            runtime=runtime,
+        )
+
+    assert "last progress line before crash" in excinfo.value.stderr_tail
+    assert PIP_ROOT_WARNING in excinfo.value.stderr_tail
+    assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
 
 
 def test_load_environment_uses_modal_config_and_gpu_mapping(monkeypatch):
