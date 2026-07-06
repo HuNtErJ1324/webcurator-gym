@@ -95,7 +95,7 @@ counted even if it exits nonzero. Materialization adds one Hub call per unique
 fetch plus fetched document tokens. A successful local pull adds one code call
 plus parsed document tokens. Training FLOPs are added after proxy training.
 
-These are priced resources in the cost penalty, not separate budgets.
+These are priced resources tracked in the cost_total telemetry metric (no longer a reward penalty), not separate budgets.
 
 ## Final manifest and recovery
 
