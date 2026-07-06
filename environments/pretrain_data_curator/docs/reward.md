@@ -7,7 +7,7 @@ evaluation does not repeat corpus fetches or training.
 ## Composite reward
 
 ```text
-R(M, H) = alpha_perf * max(0, Perf_vs_baseline(M)) - lambda_leakage * Leakage(M, H)
+R(M, H) = alpha_perf * Perf(M) - lambda_leakage * Leakage(M, H)
 ```
 
 Default coefficients are:
@@ -28,13 +28,18 @@ and a backend name. Lower loss is better.
 With the default `baseline_relative_perf=true`:
 
 ```text
-raw_relative = (perf_baseline_loss - loss) / perf_baseline_loss
-Perf = clamp(raw_relative, 0, 1)
+Perf = (perf_baseline_loss - loss) / (perf_baseline_loss - perf_target_loss)
 ```
 
 `perf_baseline_loss` defaults to `log(50304)`, the cross-entropy of a uniform
 distribution over the padded vocabulary. It is a constant; the environment does
 not train a second baseline model.
+
+`perf_target_loss` defaults to `3.28`, the nanoGPT speedrun validation-loss
+target. A loss equal to `perf_baseline_loss` maps to `0.0`; a loss equal to
+`perf_target_loss` maps to exactly `1.0`. The mapping is not clamped: worse than
+baseline is negative, and beating the target exceeds `1.0`. Configuration
+validation rejects `perf_baseline_loss <= perf_target_loss`.
 
 With `baseline_relative_perf=false`:
 
@@ -48,8 +53,9 @@ language-model losses near 9 nats/token, it collapses close to zero.
 Nonfinite loss always maps to zero performance. This includes empty training
 corpora and trainer-failure sentinels.
 
-`perf_vs_baseline` reports `raw_relative` without clipping. It can be negative
-when the student is worse than the no-information baseline.
+`perf_vs_baseline` reports the raw old diagnostic,
+`(perf_baseline_loss - loss) / perf_baseline_loss`. It can be negative when the
+student is worse than the no-information baseline.
 
 ## Cost
 
@@ -174,7 +180,7 @@ data, or the infrastructure can fail before that data is evaluated.
 | --- | --- |
 | `perf_loss` | Raw trainer loss; `0.0` when nonfinite |
 | `perf_accuracy` | Raw next-token accuracy |
-| `perf_vs_baseline` | Unclipped relative loss improvement |
+| `perf_vs_baseline` | Raw relative loss improvement vs `perf_baseline_loss` |
 | `train_flops` | Estimated/measured training FLOPs |
 | `corpus_tokens` | Estimated materialized corpus tokens |
 | `budget_fill_ratio` | `corpus_tokens / manifest.token_budget`; values below `1` indicate the selected/fetched data did not fill the allocation |

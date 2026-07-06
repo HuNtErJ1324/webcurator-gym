@@ -45,6 +45,7 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 - The sole curation budget is {token_budget} tokens.
 - Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
 - Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_leakage} * leakage`.
+- Performance is scaled linearly from a neutral baseline: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
 - For cheap iteration, save a draft manifest and run `python self_score.py draft.json --limit 8`. This development-only heuristic samples candidate-source data and reports estimated proxy CE, cost (telemetry), and reward components; it never uses final held-out validation data.
 
 ## Rules
@@ -73,6 +74,7 @@ def build_tasks(
     allow_local_sources: bool = True,
     alpha_perf: float = 1.0,
     lambda_leakage: float = 1.0,
+    perf_target_loss: float = 3.28,
 ) -> list[CuratorTask]:
     """Build one curation task with the single goal substituted into the prompt."""
     local_source_status = (
@@ -91,6 +93,7 @@ def build_tasks(
                 local_source_status=local_source_status,
                 alpha_perf=alpha_perf,
                 lambda_leakage=lambda_leakage,
+                perf_target_loss=perf_target_loss,
             ),
             system_prompt=None,
             answer=cutoff_date,

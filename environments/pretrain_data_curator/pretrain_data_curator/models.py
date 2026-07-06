@@ -379,7 +379,7 @@ class CuratorConfig(BaseModel):
         default=33_554_432, ge=1, le=1_073_741_824
     )
 
-    # Reward coefficients: R = a1*Perf_vs_baseline - l1*Leakage
+    # Reward coefficients: R = a1*Perf_scaled_to_target - l1*Leakage
     alpha_perf: float = Field(default=1.0, ge=0.0)
     lambda_leakage: float = Field(default=1.0, ge=0.0)
 
@@ -391,12 +391,16 @@ class CuratorConfig(BaseModel):
     # no-information reference for the real trainer's nats/token CE. (The default
     # HeuristicProxyTrainer uses a smaller synthetic ``reference_loss`` of 5.0.)
     perf_baseline_loss: float = Field(default=math.log(50304), gt=0.0)
-    # When True (the default), the Perf REWARD term is the bounded relative loss
-    # reduction over ``perf_baseline_loss`` instead of ``exp(-loss)``.  Set to
-    # False only when the absolute loss is meaningful (e.g. a tiny toy model with
-    # loss < 1): for real LMs (loss ~ 9 nats/token, 50K vocab) exp(-loss) ≈ 0
-    # and collapses the reward to zero.  The relative-improvement diagnostic
-    # (perf_vs_baseline) is always surfaced regardless of this flag.
+    # Target val cross-entropy that maps to Perf=1.0 under the default
+    # baseline-relative path. Default: the nanoGPT speedrun target.
+    perf_target_loss: float = Field(default=3.28, gt=0.0)
+    # When True (the default), the Perf REWARD term is the linear improvement
+    # from ``perf_baseline_loss`` to ``perf_target_loss`` instead of
+    # ``exp(-loss)``.  Set to False only when the absolute loss is meaningful
+    # (e.g. a tiny toy model with loss < 1): for real LMs (loss ~ 9 nats/token,
+    # 50K vocab) exp(-loss) ≈ 0 and collapses the reward to zero.  The raw
+    # relative-improvement diagnostic (perf_vs_baseline) is always surfaced
+    # regardless of this flag.
     baseline_relative_perf: bool = True
 
     # Bounded concurrency and robustness knobs for external (HF/sandbox) access.
@@ -413,3 +417,13 @@ class CuratorConfig(BaseModel):
     # tokens). Consumed by the real (sandbox) proxy-student trainer.
     validation_set: ValidationSetConfig = Field(default_factory=ValidationSetConfig)
     use_real_trainer: bool = False
+
+    @model_validator(mode="after")
+    def _check_perf_target_below_baseline(self) -> "CuratorConfig":
+        if self.perf_baseline_loss <= self.perf_target_loss:
+            raise ValueError(
+                "perf_baseline_loss must be greater than perf_target_loss "
+                f"(got baseline={self.perf_baseline_loss}, "
+                f"target={self.perf_target_loss})"
+            )
+        return self

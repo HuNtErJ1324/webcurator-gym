@@ -17,7 +17,7 @@ After generation, ``finalize`` (run before scoring, while the runtime is live):
 Scoring is unchanged from v1: the finalized manifest's datasets are materialized
 and used to train the fixed proxy student, and the composite reward is:
 
-    R(M, H) = alpha_perf*max(0, Perf_vs_baseline) - lambda_leakage*Leakage
+    R(M, H) = alpha_perf*Perf_scaled_to_target - lambda_leakage*Leakage
 
 Cost is recorded as a telemetry-only metric (``cost_total``) with zero weight on
 the reward. Leakage is a token-weighted scalar from the decon Rust n-gram
@@ -44,7 +44,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import verifiers.v1 as vf
-from pydantic import ValidationError, field_validator
+from pydantic import ValidationError, field_validator, model_validator
 
 from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .leakage import DeconLeakageDetector
@@ -417,6 +417,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     alpha_perf: float = 1.0
     lambda_leakage: float = 1.0
     perf_baseline_loss: float = math.log(50304)
+    perf_target_loss: float = 3.28
     baseline_relative_perf: bool = True
     max_concurrent_fetches: int = 8
     max_concurrent_training: int = 1
@@ -438,6 +439,16 @@ class CuratorTasksetConfig(vf.TasksetConfig):
         if not value or value in {".", ".."} or "/" in value or "\\" in value:
             raise ValueError("manifest_filename must be a filename in /workspace")
         return value
+
+    @model_validator(mode="after")
+    def _check_perf_target_below_baseline(self) -> "CuratorTasksetConfig":
+        if self.perf_baseline_loss <= self.perf_target_loss:
+            raise ValueError(
+                "perf_baseline_loss must be greater than perf_target_loss "
+                f"(got baseline={self.perf_baseline_loss}, "
+                f"target={self.perf_target_loss})"
+            )
+        return self
 
 
 try:
@@ -473,6 +484,7 @@ class CuratorTaskset(_TasksetBase):
             alpha_perf=config.alpha_perf,
             lambda_leakage=config.lambda_leakage,
             perf_baseline_loss=config.perf_baseline_loss,
+            perf_target_loss=config.perf_target_loss,
             baseline_relative_perf=config.baseline_relative_perf,
             max_concurrent_fetches=config.max_concurrent_fetches,
             max_concurrent_training=config.max_concurrent_training,
@@ -566,6 +578,7 @@ class CuratorTaskset(_TasksetBase):
             allow_local_sources=self.curator.allow_local_sources,
             alpha_perf=self.curator.alpha_perf,
             lambda_leakage=self.curator.lambda_leakage,
+            perf_target_loss=self.curator.perf_target_loss,
         )
         updates: dict[str, Any] = {}
         ps = self.curator.proxy_student

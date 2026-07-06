@@ -38,6 +38,7 @@ EXPECTED_TOKEN_BUDGET = __EXPECTED_TOKEN_BUDGET__
 DEFAULT_FETCH_CAP = __DEFAULT_FETCH_CAP__
 TARGET_TRAIN_TOKENS = __TARGET_TRAIN_TOKENS__
 PERF_BASELINE_LOSS = __PERF_BASELINE_LOSS__
+PERF_TARGET_LOSS = __PERF_TARGET_LOSS__
 BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
 LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
@@ -412,7 +413,7 @@ def main():
         flops = 0.0
     else:
         perf = (
-            max(0.0, min(1.0, (PERF_BASELINE_LOSS - proxy_ce) / PERF_BASELINE_LOSS))
+            (PERF_BASELINE_LOSS - proxy_ce) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
             if BASELINE_RELATIVE_PERF else math.exp(-proxy_ce)
         )
         flops = 6.0 * PARAM_COUNT * trained_tokens
@@ -464,6 +465,7 @@ def render_self_score_script(
         "__DEFAULT_FETCH_CAP__": config.sample_docs_per_source,
         "__TARGET_TRAIN_TOKENS__": config.proxy_student.effective_train_tokens,
         "__PERF_BASELINE_LOSS__": repr(config.perf_baseline_loss),
+        "__PERF_TARGET_LOSS__": repr(config.perf_target_loss),
         "__BASELINE_RELATIVE_PERF__": repr(config.baseline_relative_perf),
         "__ALPHA_PERF__": repr(config.alpha_perf),
         "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),
