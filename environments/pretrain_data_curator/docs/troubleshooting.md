@@ -10,7 +10,7 @@ Check metrics in this order:
 3. `num_sources` and `corpus_tokens`: zero means sources did not materialize.
 4. `perf_loss`: zero may represent the metric's display value for a nonfinite
    trainer loss; use the failure diagnostics with it.
-5. Reward components: cost or leakage can offset positive performance.
+5. Reward components: leakage can offset positive performance (cost is telemetry-only and does not affect reward).
 
 An unfinalized rollout still pays discovery cost. Check that the configured file
 (`/workspace/manifest.json` by default) exists, contains valid UTF-8 JSON, and has
