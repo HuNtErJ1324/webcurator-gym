@@ -74,6 +74,7 @@ from .trainer import (
 from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
+TRAINER_ERROR_STR_LIMIT = 20_000
 
 # --------------------------------------------------------------------------- #
 # manifest parsing (workspace file primary; assistant messages remain fallback)
@@ -1006,7 +1007,9 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> str:
         await self._prepared(trace, runtime)
-        err = (RolloutStore.trainer_error(trace.state) or "")[:500]
+        err = (RolloutStore.trainer_error(trace.state) or "")[
+            :TRAINER_ERROR_STR_LIMIT
+        ]
         if err:
             logger.warning("trainer error: %s", err)
         return err

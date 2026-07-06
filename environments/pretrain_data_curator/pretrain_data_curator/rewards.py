@@ -142,7 +142,7 @@ class CuratorScorer:
             stderr_tail = getattr(exc, "stderr_tail", "")
             message = f"{type(exc).__name__}: {exc}"
             if stderr_tail:
-                message = f"{message} | stderr tail: {stderr_tail}"
+                message = f"{message} | training output: {stderr_tail}"
             logger.warning("[curator] training failed: %s", message)
             RolloutStore.record_tool_error(state, "train")
             RolloutStore.set_external_failure(state, True)
