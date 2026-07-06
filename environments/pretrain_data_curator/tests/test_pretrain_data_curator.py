@@ -547,7 +547,7 @@ async def test_finalize_then_reward_aggregation():
     assert RolloutStore.is_finalized(state)
 
     scoring = await curator.prepared()
-    assert 0.0 <= scoring["perf"] <= 1.0
+    assert math.isfinite(scoring["perf"])
     assert "quality" not in scoring
     assert "diversity" not in scoring
     assert scoring["flops"] > 0.0
@@ -560,6 +560,7 @@ async def test_empty_manifest_scores_zero_perf():
     curator = await _make()
     scoring = await curator.prepared()
     assert scoring["perf"] == 0.0
+    assert scoring["perf_target_loss"] == curator.config.perf_target_loss
     assert scoring["num_sources"] == 0
 
 
@@ -3781,10 +3782,10 @@ def test_docker_image_default_is_shared_across_backends():
 
 # --- Tier S: baseline-relative Perf signal (default-ON) ----------------------
 #
-# The Perf REWARD defaults to the bounded relative val-loss reduction over a
-# neutral baseline (``perf_vs_baseline``), which is always surfaced as a
-# zero-weight diagnostic too.  Setting baseline_relative_perf=False falls back
-# to exp(-loss) — only meaningful for tiny toy models where loss < 1.
+# The Perf REWARD defaults to a linear val-loss scale from a neutral baseline
+# to the nanoGPT speedrun target, while ``perf_vs_baseline`` remains the raw old
+# relative-improvement diagnostic. Setting baseline_relative_perf=False falls
+# back to exp(-loss) — only meaningful for tiny toy models where loss < 1.
 
 
 def test_curator_config_baseline_defaults():
@@ -3793,8 +3794,13 @@ def test_curator_config_baseline_defaults():
     # The neutral reference is the CE of a uniform student over the padded GPT-2
     # vocab (ln(50304)); it is a constant — no extra training run is performed.
     assert cfg.perf_baseline_loss == pytest.approx(math.log(50304))
+    assert cfg.perf_target_loss == pytest.approx(3.28)
     with pytest.raises(ValidationError):
         CuratorConfig(perf_baseline_loss=0.0)
+    with pytest.raises(ValidationError):
+        CuratorConfig(perf_baseline_loss=3.28, perf_target_loss=3.28)
+    with pytest.raises(ValidationError):
+        CuratorTasksetConfig(id="test", perf_baseline_loss=3.0, perf_target_loss=3.28)
 
 
 def test_exp_loss_perf_reward_when_flag_off():
@@ -3819,22 +3825,32 @@ def test_exp_loss_perf_reward_when_flag_off():
 
 
 def test_default_perf_reward_is_baseline_relative_improvement():
-    # Default (baseline_relative_perf=True): _perf == bounded relative loss reduction,
-    # NOT exp(-loss).  For real LMs loss ~ 9 nats so exp(-9) ≈ 0.0001 collapses
-    # reward; the relative formula gives a meaningful signal in [0, 1].
+    # Default (baseline_relative_perf=True): _perf == target-scaled relative loss,
+    # NOT exp(-loss). For real LMs loss ~ 9 nats so exp(-9) ≈ 0.0001 collapses
+    # reward; the scaled formula keeps a meaningful linear signal.
     scorer = _scorer(HeuristicProxyTrainer())  # uses CuratorConfig() defaults
     assert scorer.config.baseline_relative_perf is True
     baseline = scorer.config.perf_baseline_loss
-    r = TrainResult(loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
-    expected = max(0.0, min(1.0, (baseline - r.loss) / baseline))
-    assert scorer._perf(r) == pytest.approx(expected)
+    target = scorer.config.perf_target_loss
+    at_target = TrainResult(
+        loss=target, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x"
+    )
+    assert scorer._perf(at_target) == pytest.approx(1.0)
+    at_baseline = TrainResult(
+        loss=baseline, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+    )
+    assert scorer._perf(at_baseline) == pytest.approx(0.0)
+    better = TrainResult(
+        loss=target - 0.1, accuracy=0.5, flops=0.0, tokens_trained=0, backend="x"
+    )
+    assert scorer._perf(better) > 1.0
     # Must NOT equal exp(-loss) (the old collapsed formula).
-    assert scorer._perf(r) != pytest.approx(math.exp(-r.loss))
-    # Worse-than-baseline clamps to 0; sentinel -> 0.
+    assert scorer._perf(at_target) != pytest.approx(math.exp(-at_target.loss))
+    # Worse-than-baseline is negative; sentinel -> 0.
     worse = TrainResult(
         loss=baseline + 1.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
     )
-    assert scorer._perf(worse) == 0.0
+    assert scorer._perf(worse) < 0.0
     sentinel = TrainResult(
         loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
     )
@@ -3842,16 +3858,20 @@ def test_default_perf_reward_is_baseline_relative_improvement():
 
 
 def test_baseline_relative_perf_reward_when_enabled():
-    cfg = CuratorConfig(baseline_relative_perf=True, perf_baseline_loss=10.0)
+    cfg = CuratorConfig(
+        baseline_relative_perf=True, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
-    # Bounded relative reduction over the baseline: (10 - 2)/10 = 0.8.
+    # Target-scaled relative reduction: (10 - 4)/((10 - 2)) = 0.75.
     r = TrainResult(loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
-    assert scorer._perf(r) == pytest.approx(0.8)
-    # Worse-than-baseline clamps to 0; the infinite-loss sentinel -> 0.
+    assert scorer._perf(r) == pytest.approx(1.0)
+    mid = TrainResult(loss=4.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
+    assert scorer._perf(mid) == pytest.approx(0.75)
+    # Worse-than-baseline is negative; the infinite-loss sentinel -> 0.
     worse = TrainResult(
         loss=20.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
     )
-    assert scorer._perf(worse) == 0.0
+    assert scorer._perf(worse) == pytest.approx(-1.25)
     sentinel = TrainResult(
         loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
     )
@@ -3864,7 +3884,9 @@ async def test_perf_vs_baseline_diagnostic_always_surfaced():
     await _finalized(curator)
     scoring = await curator.prepared()
     baseline = curator.config.perf_baseline_loss
+    target = curator.config.perf_target_loss
     assert scoring["perf_baseline_loss"] == baseline
+    assert scoring["perf_target_loss"] == target
     assert scoring["perf_vs_baseline"] == pytest.approx(
         (baseline - scoring["loss"]) / baseline
     )
@@ -3885,8 +3907,9 @@ async def test_baseline_relative_flag_only_changes_perf_when_off():
     await _finalized(on)
     on_scoring = await on.prepared()
     baseline = on.config.perf_baseline_loss
+    target = on.config.perf_target_loss
     assert on_scoring["perf"] == pytest.approx(
-        max(0.0, min(1.0, (baseline - on_scoring["loss"]) / baseline))
+        (baseline - on_scoring["loss"]) / (baseline - target)
     )
 
     off = await _make(baseline_relative_perf=False)
@@ -3902,9 +3925,13 @@ async def test_baseline_relative_flag_only_changes_perf_when_off():
 
 def test_load_environment_accepts_baseline_relative_overrides(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "test-token")
-    env = load_environment(baseline_relative_perf=True, perf_baseline_loss=7.5)
+    env = load_environment(
+        baseline_relative_perf=True, perf_baseline_loss=7.5, perf_target_loss=2.5
+    )
     assert env.taskset.curator.baseline_relative_perf is True
     assert env.taskset.curator.perf_baseline_loss == 7.5
+    assert env.taskset.curator.perf_target_loss == 2.5
+    assert env.env_args["perf_target_loss"] == 2.5
 
 
 # =============================================================================

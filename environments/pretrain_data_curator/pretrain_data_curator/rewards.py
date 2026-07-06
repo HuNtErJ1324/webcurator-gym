@@ -2,7 +2,14 @@
 
 ``CuratorScorer`` computes
 
-    R(M) = alpha_perf * max(0, Perf_vs_baseline(M)) - lambda_leakage*Leakage(M)
+    R(M) = alpha_perf * Perf_scaled(M) - lambda_leakage*Leakage(M)
+
+where, by default,
+
+    Perf_scaled(M) = (baseline_loss - loss(M)) / (baseline_loss - target_loss)
+
+so the neutral baseline maps to 0.0, the nanoGPT speedrun target maps to 1.0,
+and worse-than-baseline training can make the performance term negative.
 
 where Leakage(M) is a token-weighted contamination scalar from the decon
 Rust n-gram detector run against PUBLIC BENCHMARK eval sets AND, optionally,
@@ -116,6 +123,7 @@ class CuratorScorer:
             "budget_fill_ratio": state.budget_fill_ratio,
             "perf_vs_baseline": self._relative_improvement(train_result),
             "perf_baseline_loss": self.config.perf_baseline_loss,
+            "perf_target_loss": self.config.perf_target_loss,
         }
 
     async def _train(
@@ -163,11 +171,12 @@ class CuratorScorer:
             "budget_fill_ratio": 0.0,
             "perf_vs_baseline": 0.0,
             "perf_baseline_loss": self.config.perf_baseline_loss,
+            "perf_target_loss": self.config.perf_target_loss,
         }
 
     def _perf(self, result: TrainResult) -> float:
         if self.config.baseline_relative_perf:
-            return max(0.0, min(1.0, self._relative_improvement(result)))
+            return self._target_scaled_perf(result)
         return self._perf_from_result(result)
 
     @staticmethod
@@ -181,3 +190,16 @@ class CuratorScorer:
         if not math.isfinite(result.loss) or baseline <= 0:
             return 0.0
         return (baseline - result.loss) / baseline
+
+    def _target_scaled_perf(self, result: TrainResult) -> float:
+        if not math.isfinite(result.loss):
+            return 0.0
+        baseline = self.config.perf_baseline_loss
+        target = self.config.perf_target_loss
+        denom = baseline - target
+        if denom <= 0:
+            raise ValueError(
+                "perf_baseline_loss must be greater than perf_target_loss "
+                f"(got baseline={baseline}, target={target})"
+            )
+        return (baseline - result.loss) / denom

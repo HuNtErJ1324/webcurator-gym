@@ -36,10 +36,11 @@ source while leaving Hub entries unchanged. The byte cap is enforced by
 
 | Argument | Default | Effect |
 | --- | ---: | --- |
-| `alpha_perf` | `1.0` | Multiplier on positive proxy performance |
+| `alpha_perf` | `1.0` | Multiplier on proxy performance |
 | `lambda_leakage` | `1.0` | Multiplier on the leakage penalty |
 | `perf_baseline_loss` | `log(50304)` | No-information loss used by baseline-relative performance |
-| `baseline_relative_perf` | `true` | Use bounded relative loss improvement; otherwise use `exp(-loss)` |
+| `perf_target_loss` | `3.28` | Target loss that maps to `Perf=1.0`; must be below `perf_baseline_loss` |
+| `baseline_relative_perf` | `true` | Use target-scaled relative loss; otherwise use `exp(-loss)` |
 | `decon_binary` | `"decon"` | Path to the decon Rust binary; falls back to the vendored `decon/bin/decon` |
 | `decon_evals_dir` | `None` | Override directory for the bundled benchmark eval sets; defaults to `decon/bundled-evals/` |
 | `decon_threshold` | `0.2` | decon `--contamination-score-threshold` |

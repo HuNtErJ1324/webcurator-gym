@@ -34,6 +34,7 @@ harness_id = "bash"
 alpha_perf = 1.0
 lambda_leakage = 1.0
 perf_baseline_loss = 10.825839875788878  # ln(50304)
+perf_target_loss = 3.28                  # nanoGPT speedrun target
 baseline_relative_perf = true
 
 # External access and concurrency.
