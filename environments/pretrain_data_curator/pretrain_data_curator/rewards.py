@@ -2,7 +2,7 @@
 
 ``CuratorScorer`` computes
 
-    R(M) = alpha_perf * Perf(M) - lambda_cost*Cost(M) - lambda_leakage*Leakage(M)
+    R(M) = alpha_perf * max(0, Perf_vs_baseline(M)) - lambda_leakage*Leakage(M)
 
 where Leakage(M) is a token-weighted contamination scalar from the decon
 Rust n-gram detector run against PUBLIC BENCHMARK eval sets AND, optionally,
@@ -10,7 +10,7 @@ the held-out validation set (detokenised from GPT-2-BPE token IDs back to
 text via tiktoken at scoring time only; the val set is NEVER exposed to the
 agent).
 
-Performance, cost, and leakage derive from one prepared scoring pass over the
+Performance, cost (telemetry-only), and leakage derive from one prepared scoring pass over the
 finalized manifest. The expensive corpus build and proxy-student training run
 happen exactly once per rollout: the taskset wraps this scorer in a per-rollout
 lock and cache so concurrent reward/metric evaluation shares the result.

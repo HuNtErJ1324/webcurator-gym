@@ -37,7 +37,6 @@ source while leaving Hub entries unchanged. The byte cap is enforced by
 | Argument | Default | Effect |
 | --- | ---: | --- |
 | `alpha_perf` | `1.0` | Multiplier on positive proxy performance |
-| `lambda_cost` | `0.1` | Multiplier on the cost penalty |
 | `lambda_leakage` | `1.0` | Multiplier on the leakage penalty |
 | `perf_baseline_loss` | `log(50304)` | No-information loss used by baseline-relative performance |
 | `baseline_relative_perf` | `true` | Use bounded relative loss improvement; otherwise use `exp(-loss)` |

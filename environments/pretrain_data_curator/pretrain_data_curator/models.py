@@ -379,9 +379,8 @@ class CuratorConfig(BaseModel):
         default=33_554_432, ge=1, le=1_073_741_824
     )
 
-    # Reward coefficients: R = a1*CEPerf - l1*Cost - l2*Leakage
+    # Reward coefficients: R = a1*Perf_vs_baseline - l1*Leakage
     alpha_perf: float = Field(default=1.0, ge=0.0)
-    lambda_cost: float = Field(default=0.1, ge=0.0)
     lambda_leakage: float = Field(default=1.0, ge=0.0)
 
     # --- baseline-relative Perf signal (additive; default-on) -----------------

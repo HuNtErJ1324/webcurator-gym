@@ -32,7 +32,6 @@ harness_id = "bash"
 
 # Reward coefficients and performance mapping.
 alpha_perf = 1.0
-lambda_cost = 0.1
 lambda_leakage = 1.0
 perf_baseline_loss = 10.825839875788878  # ln(50304)
 baseline_relative_perf = true

@@ -17,13 +17,14 @@ After generation, ``finalize`` (run before scoring, while the runtime is live):
 Scoring is unchanged from v1: the finalized manifest's datasets are materialized
 and used to train the fixed proxy student, and the composite reward is:
 
-    R(M, H) = alpha_perf*Perf - lambda_cost*Cost - lambda_leakage*Leakage
+    R(M, H) = alpha_perf*max(0, Perf_vs_baseline) - lambda_leakage*Leakage
 
-Leakage is a token-weighted scalar from the decon Rust n-gram detector run
-against PUBLIC BENCHMARK eval sets (bundled under ``decon/bundled-evals/``)
-AND, optionally, the held-out validation set (when ``screen_val_set`` is
-enabled — the default).  The val eval file is detokenised ephemerally at
-scoring time and never persists.
+Cost is recorded as a telemetry-only metric (``cost_total``) with zero weight on
+the reward. Leakage is a token-weighted scalar from the decon Rust n-gram
+detector run against PUBLIC BENCHMARK eval sets (bundled under
+``decon/bundled-evals/``) AND, optionally, the held-out validation set (when
+``screen_val_set`` is enabled — the default).  The val eval file is detokenised
+ephemerally at scoring time and never persists.
 
 The reward coefficients are runtime config, so each ``@vf.reward`` is registered
 with the framework weight ``1.0`` and folds its (signed) coefficient into the
@@ -414,7 +415,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     max_local_source_bytes: int = 33_554_432
     max_turns: int = 64
     alpha_perf: float = 1.0
-    lambda_cost: float = 0.1
     lambda_leakage: float = 1.0
     perf_baseline_loss: float = math.log(50304)
     baseline_relative_perf: bool = True
@@ -471,7 +471,6 @@ class CuratorTaskset(_TasksetBase):
             max_local_source_bytes=config.max_local_source_bytes,
             max_turns=config.max_turns,
             alpha_perf=config.alpha_perf,
-            lambda_cost=config.lambda_cost,
             lambda_leakage=config.lambda_leakage,
             perf_baseline_loss=config.perf_baseline_loss,
             baseline_relative_perf=config.baseline_relative_perf,
@@ -566,7 +565,6 @@ class CuratorTaskset(_TasksetBase):
             manifest_filename=self.config.manifest_filename,
             allow_local_sources=self.curator.allow_local_sources,
             alpha_perf=self.curator.alpha_perf,
-            lambda_cost=self.curator.lambda_cost,
             lambda_leakage=self.curator.lambda_leakage,
         )
         updates: dict[str, Any] = {}
@@ -857,14 +855,6 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
         return self.curator.alpha_perf * (await self._prepared(trace, runtime))["perf"]
-
-    @vf.reward(weight=1.0)
-    async def cost_penalty(
-        self, trace: vf.Trace, runtime: vf.Runtime | None = None
-    ) -> float:
-        return (
-            -self.curator.lambda_cost * (await self._prepared(trace, runtime))["cost"]
-        )
 
     @vf.reward(weight=1.0)
     async def leakage_penalty(

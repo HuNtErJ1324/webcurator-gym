@@ -44,13 +44,13 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 ## Setup
 - The sole curation budget is {token_budget} tokens.
 - Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
-- Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_cost} * cost - {lambda_leakage} * leakage`.
-- For cheap iteration, save a draft manifest and run `python self_score.py draft.json --limit 8`. This development-only heuristic samples candidate-source data and reports estimated proxy CE and reward components; it never uses final held-out validation data.
+- Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_leakage} * leakage`.
+- For cheap iteration, save a draft manifest and run `python self_score.py draft.json --limit 8`. This development-only heuristic samples candidate-source data and reports estimated proxy CE, cost (telemetry), and reward components; it never uses final held-out validation data.
 
 ## Rules
 1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so its cost produces no performance.
 2. Your corpus is checked for data contamination against public benchmark eval sets (AGI Eval, GSM8K, MMLU) AND the held-out validation set using the decon n-gram detector. Contamination against any eval set incurs the leakage penalty in the reward.
-3. Set the manifest's `token_budget` field to exactly {token_budget}, and use data, calls, and training work economically. Fetching or processing beyond what can fill that token allocation increases the cost penalty without increasing the scored corpus.
+3. Set the manifest's `token_budget` field to exactly {token_budget}, and use data, calls, and training work economically. Fetching or processing beyond what can fill that token allocation wastes cost (tracked as a telemetry metric) without increasing the scored corpus.
 4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
 5. Create the final manifest file through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.
 
@@ -72,7 +72,6 @@ def build_tasks(
     manifest_filename: str = MANIFEST_FILENAME,
     allow_local_sources: bool = True,
     alpha_perf: float = 1.0,
-    lambda_cost: float = 0.1,
     lambda_leakage: float = 1.0,
 ) -> list[CuratorTask]:
     """Build one curation task with the single goal substituted into the prompt."""
@@ -91,7 +90,6 @@ def build_tasks(
                 manifest_path=f"/workspace/{manifest_filename}",
                 local_source_status=local_source_status,
                 alpha_perf=alpha_perf,
-                lambda_cost=lambda_cost,
                 lambda_leakage=lambda_leakage,
             ),
             system_prompt=None,

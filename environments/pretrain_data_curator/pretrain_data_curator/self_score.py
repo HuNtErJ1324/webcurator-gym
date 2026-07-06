@@ -40,7 +40,6 @@ TARGET_TRAIN_TOKENS = __TARGET_TRAIN_TOKENS__
 PERF_BASELINE_LOSS = __PERF_BASELINE_LOSS__
 BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
-LAMBDA_COST = __LAMBDA_COST__
 LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
 HUB_CALL_PRICE = __HUB_CALL_PRICE__
 PER_1K_TOKENS_PRICE = __PER_1K_TOKENS_PRICE__
@@ -424,7 +423,7 @@ def main():
     )
 
     leakage_score, num_matches = decon_score(all_docs) if all_docs else (None, None)
-    reward = ALPHA_PERF * perf - LAMBDA_COST * scoring_cost
+    reward = ALPHA_PERF * perf
     if leakage_score is not None:
         reward -= LAMBDA_LEAKAGE * leakage_score
 
@@ -467,7 +466,6 @@ def render_self_score_script(
         "__PERF_BASELINE_LOSS__": repr(config.perf_baseline_loss),
         "__BASELINE_RELATIVE_PERF__": repr(config.baseline_relative_perf),
         "__ALPHA_PERF__": repr(config.alpha_perf),
-        "__LAMBDA_COST__": repr(config.lambda_cost),
         "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),
         "__HUB_CALL_PRICE__": repr(config.prices.hub_call),
         "__PER_1K_TOKENS_PRICE__": repr(config.prices.per_1k_tokens),

@@ -7,10 +7,7 @@ evaluation does not repeat corpus fetches or training.
 ## Composite reward
 
 ```text
-R(M, H) =
-    alpha_perf * Perf(M)
-  - lambda_cost * Cost(M)
-  - lambda_leakage * Leakage(M, H)
+R(M, H) = alpha_perf * max(0, Perf_vs_baseline(M)) - lambda_leakage * Leakage(M, H)
 ```
 
 Default coefficients are:
@@ -18,7 +15,6 @@ Default coefficients are:
 | Component | Config | Default |
 | --- | --- | ---: |
 | Performance | `alpha_perf` | `1.0` |
-| Cost | `lambda_cost` | `0.1` |
 | Leakage | `lambda_leakage` | `1.0` |
 
 Each decorated reward is registered with framework weight `1.0`; the method
@@ -85,8 +81,9 @@ Token accounting includes recognized `hf` output and documents fetched for
 materialization. Parsed local-source documents are billed by the same token
 estimator. Real/heuristic trainer FLOPs are added after training.
 
-Cost is not normalized. The configured `lambda_cost` directly scales the priced
-sum.
+Cost total is recorded as a telemetry-only metric (``cost_total``) and no longer
+enters the reward. The ``cost_total`` metric reports the priced ledger sum,
+allowing runs to remain cost-observable.
 
 ## Leakage
 
@@ -169,7 +166,6 @@ data, or the infrastructure can fail before that data is evaluated.
 | Name | Value |
 | --- | --- |
 | `perf_reward` | `alpha_perf * Perf` |
-| `cost_penalty` | `-lambda_cost * Cost` |
 | `leakage_penalty` | `-lambda_leakage * Leakage` |
 
 ### Metrics
@@ -190,7 +186,7 @@ data, or the infrastructure can fail before that data is evaluated.
 | `leakage_score` | Token-weighted decon contamination scalar in `[0, 1]` |
 | `num_contaminated_matches` | Count of deduplicated contaminated training documents |
 | `decon_error` | `1.0` when the decon detector failed (paired with `external_failure`); `leakage_score` is then `0.0` but not trustworthy |
-| `cost_total` | Priced ledger total before `lambda_cost` |
+| `cost_total` | Priced ledger total (telemetry-only; zero weight on reward) |
 | `finalized` | `1.0` when a usable manifest was recovered |
 | `tool_error_count` | Total classified Hub/trainer errors |
 | `external_failure` | `1.0` when external infrastructure failed |
@@ -210,7 +206,7 @@ A practical order is:
 4. Compare `perf_loss` and `perf_vs_baseline`.
 5. Inspect `leakage_score` and `num_contaminated_matches`, and confirm
    `decon_error=0` before trusting a low leakage score.
-6. Decompose the final reward into the three named reward components.
+6. Decompose the final reward into the two named reward components (perf_reward and leakage_penalty); cost_total is telemetry-only.
 
 This avoids attributing a zero performance score to data quality when the
 manifest never materialized or the trainer failed.
