@@ -36,15 +36,16 @@ and scored.
 ## Reward
 
 ```text
-R(M, H) = alpha_perf * Perf(M)
-        - lambda_cost * Cost(M)
+R(M, H) = alpha_perf * max(0, Perf_vs_baseline(M))
         - lambda_leakage * Leakage(M, H)
 ```
+
+Cost is tracked as a telemetry-only metric (``cost_total``) with zero weight on
+the reward.
 
 | Term | Meaning | Default weight |
 | --- | --- | --- |
 | `Perf` | Proxy-student cross-entropy performance on the curated corpus | `alpha_perf=1.0` |
-| `Cost` | Web queries, hub calls, tokens, training FLOPs (one ledger) | `lambda_cost=0.1` |
 | `Leakage` | Token-weighted [decon](https://github.com/allenai/decon) n-gram contamination vs public benchmarks **and** the held-out val set | `lambda_leakage=1.0` |
 
 Each term is also emitted as a metric (`perf_loss`, `perf_accuracy`,
@@ -274,7 +275,7 @@ but every rollout does.
 | `max_turns` | int | `64` | Generous harness safety cap; absent from the prompt, reward, and metrics. |
 | `harness_id` | str | `"bash"` | Bundled Verifiers harness (`bash`, `codex`, `mini_swe_agent`, etc.). |
 | `alpha_perf` | float | `1.0` | Positive cross-entropy performance weight. |
-| `lambda_cost` / `lambda_leakage` | float | `0.1` / `1.0` | Penalty weights. |
+| `lambda_leakage` | float | `1.0` | Leakage penalty weight. Cost is telemetry-only (no reward term). |
 | `perf_baseline_loss` | float | `log(50304)` | Neutral CE reference for relative performance. |
 | `baseline_relative_perf` | bool | `true` | Use bounded relative loss reduction; `false` uses `exp(-loss)`. |
 | `max_concurrent_fetches` | int | `8` | Bound on concurrent HF fetches (also the corpus-builder fetch limit). |

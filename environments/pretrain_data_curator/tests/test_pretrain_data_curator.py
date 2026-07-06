@@ -1338,7 +1338,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 23  # 3 rewards + 20 diagnostic metrics
+    assert len(funcs) == 22  # 2 rewards + 20 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -1665,6 +1665,7 @@ async def test_reward_unaffected_by_recorded_errors():
     assert trace.reward == pytest.approx(baseline)
     assert trace.metrics["tool_error_count"] == 1.0
     assert trace.metrics["external_failure"] == 1.0
+    assert trace.metrics["cost_total"] >= 0.0
     assert trace.metrics["budget_fill_ratio"] == pytest.approx(
         curator.state.budget_fill_ratio
     )
@@ -1673,10 +1674,51 @@ async def test_reward_unaffected_by_recorded_errors():
 # --- Tier L: reward surface is CE performance minus penalties ---------------
 
 
-def test_reward_surface_has_only_perf_cost_and_leakage():
+def test_reward_surface_has_only_perf_and_leakage():
     taskset = _Curator().taskset
     reward_names = {f.__name__ for f in discover_decorated(taskset, "reward")}
-    assert reward_names == {"perf_reward", "cost_penalty", "leakage_penalty"}
+    assert reward_names == {"perf_reward", "leakage_penalty"}
+
+
+@pytest.mark.asyncio
+async def test_reward_is_invariant_to_cost_total():
+    """The reward must not depend on cost (cost is telemetry-only).
+
+    We start with a baseline reward, then add extra cost to the ledger and
+    recompute scoring. The reward must not change even though cost_total
+    increases.
+    """
+    curator = await _make()
+    await _finalized(curator)
+    trace = await curator.score()
+    baseline_reward = trace.reward
+    baseline_cost = trace.metrics.get("cost_total", 0.0)
+
+    # Add extra cost to the ledger (simulate more hub calls / tokens).
+    ledger = RolloutStore.ledger(curator.state)
+    ledger.hub_calls += 100
+    ledger.tokens += 500_000
+    RolloutStore.set_ledger(curator.state, ledger)
+
+    # Re-score with the inflated cost.
+    trace2 = await curator.score()
+    inflated_cost = trace2.metrics.get("cost_total", 0.0)
+
+    # Cost increased.
+    assert inflated_cost > baseline_cost
+    # But reward must not change — cost is telemetry-only.
+    assert trace2.reward == pytest.approx(baseline_reward)
+
+
+@pytest.mark.asyncio
+async def test_cost_total_still_reported_as_metric():
+    """cost_total remains available as a telemetry metric even though it does
+    not enter the reward."""
+    curator = await _make()
+    await _finalized(curator)
+    trace = await curator.score()
+    assert "cost_total" in trace.metrics
+    assert isinstance(trace.metrics["cost_total"], float)
 
 
 # --- Tier M: single PTB-style prompt + leakage-safe self-score --------------
@@ -1703,7 +1745,7 @@ def test_task_prompt_rules_state_failure_modes_without_dataset_priors_or_recipes
     prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
 
     assert "Contamination against any eval set incurs the leakage penalty" in prompt
-    assert "increases the cost penalty without increasing the scored corpus" in prompt
+    assert "wastes cost (tracked as a telemetry metric) without increasing the scored corpus" in prompt
     assert "there is no positive performance score" in prompt
     assert "hf datasets ls" not in prompt
     assert "pip install" not in prompt
@@ -3390,14 +3432,13 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
             id="test",
             allow_local_sources=False,
             alpha_perf=2.0,
-            lambda_cost=0.25,
             lambda_leakage=3.0,
         )
     ).load_tasks()[0]
 
     assert "Local sources are disabled; use only Hugging Face sources" in task.prompt
     assert (
-        "`2.0 * performance - 0.25 * cost - 3.0 * leakage`"
+        "`2.0 * performance - 3.0 * leakage`"
         in task.prompt
     )
     assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
