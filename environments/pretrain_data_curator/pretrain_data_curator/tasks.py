@@ -45,7 +45,7 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 - The sole curation budget is {token_budget} tokens.
 - Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
 - Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_leakage} * leakage`.
-- Performance is scaled linearly from a neutral baseline: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
+- Performance is scaled from a neutral baseline so progress near the target loss counts more: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
 - For cheap iteration, save a draft manifest and run `python self_score.py draft.json --limit 8`. This development-only heuristic samples candidate-source data and reports estimated proxy CE, cost (telemetry), and reward components; it never uses final held-out validation data.
 
 ## Rules

@@ -40,6 +40,7 @@ source while leaving Hub entries unchanged. The byte cap is enforced by
 | `lambda_leakage` | `1.0` | Multiplier on the leakage penalty |
 | `perf_baseline_loss` | `log(50304)` | No-information loss used by baseline-relative performance |
 | `perf_target_loss` | `3.28` | Target loss that maps to `Perf=1.0`; must be below `perf_baseline_loss` |
+| `perf_scaling_exponent` | `2.0` | Power-law exponent γ: p ≥ 0 is raised to γ for convex near-target amplification; p < 0 stays linear. `γ=1.0` recovers the previous linear formula |
 | `baseline_relative_perf` | `true` | Use target-scaled relative loss; otherwise use `exp(-loss)` |
 | `decon_binary` | `"decon"` | Path to the decon Rust binary; falls back to the vendored `decon/bin/decon` |
 | `decon_evals_dir` | `None` | Override directory for the bundled benchmark eval sets; defaults to `decon/bundled-evals/` |

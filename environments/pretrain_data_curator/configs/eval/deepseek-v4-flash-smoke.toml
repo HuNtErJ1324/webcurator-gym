@@ -35,6 +35,7 @@ alpha_perf = 1.0
 lambda_leakage = 1.0
 perf_baseline_loss = 10.825839875788878  # ln(50304)
 perf_target_loss = 3.28                  # nanoGPT speedrun target
+perf_scaling_exponent = 2.0              # convex near-target amplification
 baseline_relative_perf = true
 
 # External access and concurrency.

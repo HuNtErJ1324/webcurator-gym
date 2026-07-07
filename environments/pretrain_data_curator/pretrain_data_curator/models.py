@@ -394,6 +394,11 @@ class CuratorConfig(BaseModel):
     # Target val cross-entropy that maps to Perf=1.0 under the default
     # baseline-relative path. Default: the nanoGPT speedrun target.
     perf_target_loss: float = Field(default=3.28, gt=0.0)
+    # Convex power-law scaling exponent γ for the baseline-relative perf signal.
+    # When gamma > 1, progress near the target loss is amplified (p >= 0 → p^γ)
+    # while the negative (below-baseline) branch stays linear (p < 0 → p).
+    # γ=1.0 recovers today's linear behavior exactly. Must be finite and > 0.
+    perf_scaling_exponent: float = Field(default=2.0)
     # When True (the default), the Perf REWARD term is the linear improvement
     # from ``perf_baseline_loss`` to ``perf_target_loss`` instead of
     # ``exp(-loss)``.  Set to False only when the absolute loss is meaningful
@@ -425,5 +430,15 @@ class CuratorConfig(BaseModel):
                 "perf_baseline_loss must be greater than perf_target_loss "
                 f"(got baseline={self.perf_baseline_loss}, "
                 f"target={self.perf_target_loss})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_perf_scaling_exponent(self) -> "CuratorConfig":
+        exp = self.perf_scaling_exponent
+        if not math.isfinite(exp) or exp <= 0:
+            raise ValueError(
+                "perf_scaling_exponent must be finite and > 0 "
+                f"(got {exp})"
             )
         return self

@@ -39,6 +39,7 @@ DEFAULT_FETCH_CAP = __DEFAULT_FETCH_CAP__
 TARGET_TRAIN_TOKENS = __TARGET_TRAIN_TOKENS__
 PERF_BASELINE_LOSS = __PERF_BASELINE_LOSS__
 PERF_TARGET_LOSS = __PERF_TARGET_LOSS__
+PERF_SCALING_EXPONENT = __PERF_SCALING_EXPONENT__
 BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
 LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
@@ -412,10 +413,11 @@ def main():
         perf = 0.0
         flops = 0.0
     else:
-        perf = (
-            (PERF_BASELINE_LOSS - proxy_ce) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
-            if BASELINE_RELATIVE_PERF else math.exp(-proxy_ce)
-        )
+        if BASELINE_RELATIVE_PERF:
+            p = (PERF_BASELINE_LOSS - proxy_ce) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
+            perf = p ** PERF_SCALING_EXPONENT if p >= 0 else p
+        else:
+            perf = math.exp(-proxy_ce)
         flops = 6.0 * PARAM_COUNT * trained_tokens
     scoring_cost = (
         hub_calls * HUB_CALL_PRICE
@@ -466,6 +468,7 @@ def render_self_score_script(
         "__TARGET_TRAIN_TOKENS__": config.proxy_student.effective_train_tokens,
         "__PERF_BASELINE_LOSS__": repr(config.perf_baseline_loss),
         "__PERF_TARGET_LOSS__": repr(config.perf_target_loss),
+        "__PERF_SCALING_EXPONENT__": repr(config.perf_scaling_exponent),
         "__BASELINE_RELATIVE_PERF__": repr(config.baseline_relative_perf),
         "__ALPHA_PERF__": repr(config.alpha_perf),
         "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),

@@ -28,8 +28,19 @@ and a backend name. Lower loss is better.
 With the default `baseline_relative_perf=true`:
 
 ```text
-Perf = (perf_baseline_loss - loss) / (perf_baseline_loss - perf_target_loss)
+p = (perf_baseline_loss - loss) / (perf_baseline_loss - perf_target_loss)
+
+           p^γ    if p >= 0
+Perf =
+           p      if p < 0
 ```
+
+where `γ = perf_scaling_exponent` (default `2.0`). The convex power-law branch
+(p ≥ 0) amplifies gains near the target loss — at γ=2, progress at p=0.5
+(halving the gap to target) is worth 0.25, while the last 10% to target is
+worth 0.19, roughly twice the reward-per-unit-loss of the early progress.
+The negative (below-baseline) branch stays linear so a bad corpus is never
+amplified. `γ=1.0` recovers the previous linear formula exactly.
 
 `perf_baseline_loss` defaults to `log(50304)`, the cross-entropy of a uniform
 distribution over the padded vocabulary. It is a constant; the environment does

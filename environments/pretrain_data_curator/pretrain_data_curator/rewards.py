@@ -124,6 +124,7 @@ class CuratorScorer:
             "perf_vs_baseline": self._relative_improvement(train_result),
             "perf_baseline_loss": self.config.perf_baseline_loss,
             "perf_target_loss": self.config.perf_target_loss,
+            "perf_scaling_exponent": self.config.perf_scaling_exponent,
         }
 
     async def _train(
@@ -172,6 +173,7 @@ class CuratorScorer:
             "perf_vs_baseline": 0.0,
             "perf_baseline_loss": self.config.perf_baseline_loss,
             "perf_target_loss": self.config.perf_target_loss,
+            "perf_scaling_exponent": self.config.perf_scaling_exponent,
         }
 
     def _perf(self, result: TrainResult) -> float:
@@ -196,10 +198,14 @@ class CuratorScorer:
             return 0.0
         baseline = self.config.perf_baseline_loss
         target = self.config.perf_target_loss
+        gamma = self.config.perf_scaling_exponent
         denom = baseline - target
         if denom <= 0:
             raise ValueError(
                 "perf_baseline_loss must be greater than perf_target_loss "
                 f"(got baseline={baseline}, target={target})"
             )
-        return (baseline - result.loss) / denom
+        p = (baseline - result.loss) / denom
+        if p >= 0:
+            return p ** gamma
+        return p
