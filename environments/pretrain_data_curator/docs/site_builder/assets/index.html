@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pretrain Data Curator Bench</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="container header-inner">
+      <div>
+        <p class="eyebrow">Benchmark</p>
+        <h1>Pretrain Data Curator Bench</h1>
+        <p class="lede">Full 400M-token curation runs with real GPU proxy-student scoring.</p>
+      </div>
+      <div class="meta-box">
+        <div><span>Runs</span><strong id="run-count">—</strong></div>
+        <div><span>Updated</span><strong id="generated-at">—</strong></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <div class="section-head">
+        <h2>Leaderboard</h2>
+        <p>Ranked by reward. Click a row to inspect the full rollout trace.</p>
+      </div>
+      <div class="controls">
+        <label>
+          Model
+          <select id="filter-model"><option value="">All models</option></select>
+        </label>
+        <label>
+          Harness
+          <select id="filter-harness"><option value="">All harnesses</option></select>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="filter-trace-only" checked />
+          Only runs with traces
+        </label>
+      </div>
+      <div class="table-wrap">
+        <table id="leaderboard">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Model</th>
+              <th>Harness</th>
+              <th>Budget</th>
+              <th>Reward</th>
+              <th>Perf Loss</th>
+              <th>Leakage</th>
+              <th>Fill</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel two-col">
+      <div>
+        <div class="section-head">
+          <h2>Metric Breakdown</h2>
+          <p>Compare agents on individual scoring signals.</p>
+        </div>
+        <label>
+          Metric
+          <select id="metric-select"></select>
+        </label>
+        <div id="metric-chart" class="metric-chart"></div>
+      </div>
+      <div>
+        <div class="section-head">
+          <h2>Time Spent</h2>
+          <p>Generation (curation) vs scoring (training + evaluation).</p>
+        </div>
+        <div id="time-chart" class="time-chart"></div>
+      </div>
+    </section>
+
+    <section class="panel trace-panel">
+      <div class="section-head">
+        <h2>Rollout Trace</h2>
+        <p id="trace-subtitle">Select a leaderboard row to load the conversation and tool history.</p>
+      </div>
+      <div id="trace-meta" class="trace-meta hidden"></div>
+      <div id="trace-view" class="trace-view empty">No trace selected.</div>
+    </section>
+
+    <section class="panel about">
+      <div class="section-head">
+        <h2>About</h2>
+      </div>
+      <p>
+        Each agent receives a 400M-token budget, Hugging Face dataset discovery tools, and a fixed proxy-student
+        trainer on GPU. The reward combines proxy-student performance and leakage penalties. This site is generated
+        from <code>outputs/evals-400m/**/results.jsonl</code> via <code>docs/build_site.py</code>.
+      </p>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="renderer.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

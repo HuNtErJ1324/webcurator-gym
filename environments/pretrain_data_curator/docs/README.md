@@ -1,52 +1,53 @@
-# Documentation map
+# Pretrain Data Curator Bench Site
 
-These pages describe the checked-in `pretrain-data-curator` implementation.
-Start with the package [README](../README.md) if you only need to install and run
-it.
+PostTrainBench-style static site for **full 400M-token** curation evaluations.
 
-## Read by task
+## Layout
 
-| If you want to… | Read |
-| --- | --- |
-| Understand one rollout end to end | [Architecture](architecture.md) |
-| Understand the evaluated agent's shell and prompt | [Agent workflow](agent-workflow.md) |
-| Write or inspect a final manifest | [Manifest and filtering](manifest.md) |
-| Choose arguments or a GPU backend | [Configuration](configuration.md) |
-| Interpret a reward or metric | [Reward and metrics](reward.md) |
-| Understand what the proxy model actually measures | [Proxy student](proxy-student.md) |
-| Diagnose a failed or zero-reward run | [Troubleshooting](troubleshooting.md) |
-| Change or validate the package | [Development](development.md) |
-| Add a filter, trainer, or other extension | [Extending](extending.md) |
+Full 400M eval artifacts live under:
 
-## Core vocabulary
+```text
+outputs/evals-400m/<run-name>/
+  config.toml
+  results.jsonl
+```
 
-- **Taskset**: the verifiers v1 object that supplies tasks, setup/finalization,
-  stopping conditions, rewards, and metrics.
-- **Harness**: the agent loop. Bash is the default; `harness_id` can select
-  compatible bundled CLI harnesses such as Codex or mini-SWE-agent.
-- **Runtime**: where harness commands execute. It is a subprocess by default,
-  or a rollout-owned Docker/Modal runtime for those real-trainer backends.
-- **Manifest**: the agent's final JSON decision: source slices, weights, filters,
-  caps, and a token budget.
-- **Materialization**: streaming selected source documents, filtering them, and
-  enforcing allocation/caps.
-- **Proxy student**: the fixed model and recipe used to measure the selected
-  corpus. The cheap default is only a deterministic surrogate.
-- **Decon reference sets**: public benchmark eval sets (MMLU/GSM8K/AGIEval,
-  bundled under `decon/bundled-evals/`) plus, optionally, the held-out
-  validation set detokenised ephemerally — the reference corpora the decon
-  n-gram detector screens the curated corpus against for contamination.
-- **Validation set**: a fixed GPT-2-token shard used to compute real student
-  cross-entropy after training.
+Smoke tests and smaller budgets stay in `outputs/evals/`.
 
-## Run configuration
+## Build
 
-There is one checked-in local eval run config:
+```bash
+cd environments/pretrain_data_curator
+python docs/build_site.py
+```
 
-- `configs/eval/deepseek-v4-flash-smoke.toml`: exhaustive DeepSeek V4 Flash
-  curation smoke with real local GPU Docker proxy training. It doubles as the
-  authoritative loader/student/validation field reference.
+By default the builder scans `outputs/evals-400m/` and keeps only runs with:
 
-RL training configs live under `configs/rl/` (`curator-gpt20b-modal.toml` and
-`curator-gpt20b-modal-1rollout.toml`) for Hosted Training with a Modal H100.
-Local eval uses the Docker backend in `configs/eval/deepseek-v4-flash-smoke.toml`.
+- `token_budget = 400_000_000`
+- `use_real_trainer = true`
+- `proxy_student.train_token_budget = 400_000_000` when configured
+
+## View
+
+```bash
+cd docs/site
+python -m http.server 8080
+```
+
+Open `http://localhost:8080`.
+
+## Trace rendering
+
+Traces are rendered with:
+
+- **Markdown** for prompts and long assistant replies (via `marked`)
+- **Syntax highlighting** for JSON, shell, and Python (via `highlight.js`)
+- **Pretty JSON** for tool arguments and structured outputs
+
+## Regenerate after new evals
+
+Save new full 400M runs under `outputs/evals-400m/<descriptive-name>/`, then:
+
+```bash
+python docs/build_site.py
+```
