@@ -33,3 +33,8 @@ __pycache__/
 /environments/pretrain_data_curator/scripts/
 /environments/nanogpt_speedrun/
 secrets.env
+
+# Ephemeral local eval / scratch helpers (use configs/ and prime eval run instead)
+/run_eval_*.py
+/scripts/
+.scratch_*.py
