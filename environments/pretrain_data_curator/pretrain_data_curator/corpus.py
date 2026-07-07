@@ -667,8 +667,7 @@ class CorpusBuilder:
         sum of every source's docs across the whole rollout.
         """
         total_weight = sum(s.weight for s in manifest.sources)
-        # The agent's manifest may request its own per-rollout fetch cap (bounded
-        # 1-100_000 by `Manifest.sample_docs_per_source`); it wins over the
+        # The agent's manifest may request its own per-rollout fetch cap; it wins over the
         # human-configured default when set. `n` (derived from this cap) feeds
         # directly into `FetchKey.n` below, so two calls that land on different
         # *effective fetch counts* get distinct cache entries; two different caps

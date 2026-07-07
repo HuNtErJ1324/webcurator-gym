@@ -14,7 +14,7 @@ fields raise `TypeError` instead of being silently ignored.
 | `hf_token_env` | `str` | `"HF_TOKEN"` | Environment variable required during rollout setup |
 | `manifest_filename` | `str` | `"manifest.json"` | Root-level filename read from `/workspace` during finalization |
 | `candidate_limit` | `int` | `8` | Maximum IDs used by trace-based manifest recovery |
-| `sample_docs_per_source` | `int` | `64` | Hard upper bound on rows requested from each source |
+| `sample_docs_per_source` | `int` | `64` | Default rows sampled per source when the manifest omits the override; the corpus is always trimmed to token_budget |
 | `allow_local_sources` | `bool` | `true` | Permit manifests to pull workspace-local text/JSONL files at scoring time |
 | `max_local_source_bytes` | `int` | `33_554_432` | Per-local-source transfer cap; valid range 1 byte through 1 GiB |
 | `max_turns` | `int` | `64` | Harness safety cap; not shown to the agent or used in scoring |

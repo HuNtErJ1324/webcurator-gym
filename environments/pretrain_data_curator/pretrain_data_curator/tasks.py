@@ -22,7 +22,7 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 ```text
 {{
   "token_budget": {token_budget},
-  "sample_docs_per_source": <optional integer, 1-100000>,
+  "sample_docs_per_source": <optional integer >= 1; omit to use the environment default; the corpus is always trimmed to token_budget>,
   "sources": [
     {{
       "id": "<observed Hugging Face owner/name>",

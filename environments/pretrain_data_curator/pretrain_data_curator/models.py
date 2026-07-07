@@ -116,9 +116,8 @@ class Manifest(BaseModel):
     # Agent-chosen override for how many documents are fetched per source from
     # the Hub (the pre-filter fetch cap, distinct from the post-fetch
     # `Sampling.max_docs`/`max_tokens` truncation on `Source`). `None` (default)
-    # keeps the human-configured `CorpusBuilder.sample_docs_per_source`. Bounded
-    # so an agent cannot make a rollout fetch unboundedly.
-    sample_docs_per_source: int | None = Field(default=None, ge=1, le=100_000)
+    # keeps the human-configured `CorpusBuilder.sample_docs_per_source`.
+    sample_docs_per_source: int | None = Field(default=None, ge=1)
 
 
 class CostPrices(BaseModel):
@@ -373,7 +372,7 @@ class CuratorConfig(BaseModel):
             "Maximum dataset IDs used by trace-based manifest recovery/fallback only."
         ),
     )
-    sample_docs_per_source: int = Field(default=64, ge=1, le=100_000)
+    sample_docs_per_source: int = Field(default=64, ge=1)
     allow_local_sources: bool = True
     max_local_source_bytes: int = Field(
         default=33_554_432, ge=1, le=1_073_741_824

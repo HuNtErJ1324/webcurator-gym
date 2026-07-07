@@ -924,7 +924,31 @@ async def test_materialize_without_manifest_override_falls_back_to_configured_de
     assert len(corpus.sources[0].documents) == 8
 
 
-@pytest.mark.parametrize("value", [0, -1, 100_001])
+@pytest.mark.asyncio
+async def test_materialize_large_manifest_override_wins_over_config_default():
+    """A manifest with a large (previously out-of-bounds) value overrides the
+    builder's configured default in `materialize()`."""
+    doc = "a" * 25
+
+    class _UnboundedClient(FakeClient):
+        def sample_documents(self, dataset_id, config, split, text_field, n):
+            return [doc] * n
+
+    client = _UnboundedClient()
+    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    state = CuratorState()
+
+    manifest = Manifest(
+        token_budget=10_000,
+        sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+        sample_docs_per_source=5_000,
+    )
+    corpus = await builder.materialize(manifest, state)
+    # est_docs = 10_000 // 250 = 40, capped at the manifest's override (5_000).
+    assert len(corpus.sources[0].documents) == 40
+
+
+@pytest.mark.parametrize("value", [0, -1])
 def test_manifest_sample_docs_per_source_bounds_rejected(value):
     with pytest.raises(ValidationError):
         Manifest(sources=[Source(dataset_id="a/b")], sample_docs_per_source=value)
@@ -942,6 +966,13 @@ def test_manifest_sample_docs_per_source_bounds_accepted():
             sources=[Source(dataset_id="a/b")], sample_docs_per_source=100_000
         ).sample_docs_per_source
         == 100_000
+    )
+    # Large value (> old 100k cap) must validate.
+    assert (
+        Manifest(
+            sources=[Source(dataset_id="a/b")], sample_docs_per_source=5_000_000
+        ).sample_docs_per_source
+        == 5_000_000
     )
 
 
@@ -1780,7 +1811,7 @@ def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
     assert '"local_path"' in prompt
     assert "min_chars" in prompt
     assert "dedup_exact" in prompt
-    assert '"sample_docs_per_source": <optional integer, 1-100000>' in prompt
+    assert '"sample_docs_per_source": <optional integer >= 1; omit to use the environment default; the corpus is always trimmed to token_budget>' in prompt
     manifest_fields = {
         "token_budget": 1_000,
         "sample_docs_per_source": 8,
@@ -1917,6 +1948,27 @@ def test_self_score_redacts_forbidden_source_from_all_stdout(tmp_path):
         "ValueError: source is reserved for final validation"
     )
     assert config.validation_set.dataset_id not in result.stdout
+
+
+def test_self_score_script_cap_accepts_large_values():
+    """The self_score _SCRIPT cap logic must accept >100k values."""
+    import re as _re
+    from pretrain_data_curator import self_score as _self_score
+
+    script = _self_score._SCRIPT
+    match = _re.search(
+        r'cap = manifest\.get\("sample_docs_per_source"\) or DEFAULT_FETCH_CAP.*?'
+        r'cap = max\(1, int\(cap\)\)',
+        script,
+        _re.DOTALL,
+    )
+    assert match, (
+        "could not extract cap logic from self_score._SCRIPT; "
+        "check that the upper clamp was removed"
+    )
+    assert b"min(int(cap), 100_000)" not in _self_score._SCRIPT.encode(), (
+        "self_score._SCRIPT still has a 100_000 upper clamp"
+    )
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
@@ -2727,12 +2779,12 @@ def test_parse_manifest_non_numeric_sample_docs_per_source_tolerated_as_none():
     assert m.sample_docs_per_source is None
 
 
-def test_parse_manifest_out_of_bounds_sample_docs_per_source_rejects_manifest():
-    # Consistent with the existing token_budget precedent: a top-level field
-    # that fails Manifest's own bounds check invalidates the whole manifest
-    # (graceful zero score), rather than silently clamping a cost-relevant knob.
-    text = json.dumps({"sources": [{"id": "a/b"}], "sample_docs_per_source": 500_000})
-    assert parse_manifest(text) is None
+def test_parse_manifest_large_sample_docs_per_source_accepted():
+    """With the upper bound removed, large values validate."""
+    text = json.dumps({"sources": [{"id": "a/b"}], "sample_docs_per_source": 5_000_000})
+    m = parse_manifest(text)
+    assert m is not None
+    assert m.sample_docs_per_source == 5_000_000
 
 
 def test_parse_manifest_overflow_sample_docs_per_source_tolerated_as_none():
