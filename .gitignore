@@ -27,12 +27,22 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+**/.venv/
+**/.prime/
 /environments/*/docs/
 !/environments/pretrain_data_curator/docs/
-!/environments/pretrain_data_curator/docs/*.md
+!/environments/pretrain_data_curator/docs/**
+/environments/pretrain_data_curator/docs/site/
 /environments/pretrain_data_curator/scripts/
 /environments/nanogpt_speedrun/
 secrets.env
+*.env
+!.env.example
 
 # Local eval / RL / GEPA configs (re-add curated configs when iteration is done)
 /configs/
@@ -42,3 +52,13 @@ secrets.env
 /run_eval_*.py
 /scripts/
 .scratch_*.py
+
+# Editor / OS cruft
+.cursor/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+*.log
