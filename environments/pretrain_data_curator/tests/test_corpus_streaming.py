@@ -182,9 +182,7 @@ async def test_materialize_dedup_exact_at_declared_production_scale():
     only by a running hash set (see `corpus._dedup_exact_iter`) -- not a
     second full document list held alongside the raw fetch.
     """
-    # `Manifest.sample_docs_per_source` is bounded at 100_000 (the exact figure
-    # from the confirmed OOM report) -- split it evenly so the doubled fetch
-    # lands exactly at that bound.
+    # The fetch cap matches the doubled list length.
     n_unique = 50_000
     unique_docs = [f"doc-{i}-" + ("pad " * 6) for i in range(n_unique)]
     doubled = unique_docs + unique_docs  # every document duplicated exactly once

@@ -342,7 +342,7 @@ def main():
         fail("token_budget must equal the task allocation")
 
     cap = manifest.get("sample_docs_per_source") or DEFAULT_FETCH_CAP
-    cap = max(1, min(int(cap), 100_000))
+    cap = max(1, int(cap))
     weights = [max(0.0, float(source.get("weight", 1.0))) for source in sources]
     total_weight = sum(weights)
     if total_weight <= 0:
