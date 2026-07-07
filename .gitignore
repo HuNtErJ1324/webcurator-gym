@@ -34,6 +34,10 @@ __pycache__/
 /environments/nanogpt_speedrun/
 secrets.env
 
+# Local eval / RL / GEPA configs (re-add curated configs when iteration is done)
+/configs/
+/environments/*/configs/
+
 # Ephemeral local eval / scratch helpers (use configs/ and prime eval run instead)
 /run_eval_*.py
 /scripts/
