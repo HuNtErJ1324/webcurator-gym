@@ -216,6 +216,13 @@ import sys
 sys.stderr = open('/workspace/stderr.txt', 'w')
 
 import json, math, os, subprocess, time
+from dataclasses import dataclass
+# The full-vocab logits + tanh-softcap chain (out = softcap * tanh(logits/softcap))
+# allocates several (B*T, 50304) fp32 temporaries; at the largest batch-schedule
+# stage this sits near the 80GB A100 ceiling, where CUDA allocator fragmentation
+# ("reserved but unallocated") can tip an otherwise-fitting run into OOM. Opt into
+# expandable segments (set before torch initializes CUDA) to reclaim that reserve.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch
 import torch.nn as nn
@@ -406,11 +413,19 @@ pathlib.Path("/workspace/result.json").write_text(json.dumps(result))
 def _module_definitions_source(module_filename: str, names: tuple[str, ...]) -> str:
     source = (Path(__file__).with_name(module_filename)).read_text()
     tree = ast.parse(source)
-    by_name = {
-        node.name: ast.get_source_segment(source, node)
-        for node in tree.body
-        if isinstance(node, ast.ClassDef | ast.FunctionDef)
-    }
+    lines = source.splitlines()
+    by_name: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef | ast.FunctionDef):
+            continue
+        # ``node.lineno`` starts at the ``def``/``class`` keyword and excludes
+        # any decorators, so a plain ``ast.get_source_segment`` silently drops
+        # them (e.g. ``@dataclass`` on ``BatchScheduleStage``). Extend the
+        # segment back to the first decorator's line when present.
+        start_line = node.lineno
+        if node.decorator_list:
+            start_line = min(start_line, node.decorator_list[0].lineno)
+        by_name[node.name] = "\n".join(lines[start_line - 1 : node.end_lineno])
     missing = [name for name in names if not by_name.get(name)]
     if missing:
         raise RuntimeError(

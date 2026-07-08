@@ -281,19 +281,43 @@ def _reduce_report(report_lines, total_tokens):
 
 def decon_score(docs):
     """Run decon on sampled documents, return (leakage_score, num_matches) or (None, None)."""
-    binary = DECON_BINARY
-    if not binary or binary == "decon" or not os.path.isfile(binary):
-        paths_to_try = [
-            os.path.join(os.path.dirname(__file__), "..", "decon", "bin", "decon"),
-        ]
-        for p in paths_to_try:
-            if os.path.isfile(p):
-                binary = p
-                break
-        else:
-            print("[self-score] WARNING: decon binary not found, skipping leakage check", file=sys.stderr)
-            return None, None
-    if not DECON_EVALS_DIR or not os.path.isdir(DECON_EVALS_DIR):
+    # ``DECON_BINARY``/``DECON_EVALS_DIR`` are baked as host absolute paths at
+    # render time, but this script runs inside the agent's ``/workspace`` docker
+    # harness runtime where those host paths don't exist. The webcurator-runtime
+    # image bakes decon at ``<workspace>/decon`` (``COPY decon/ decon/``), so also
+    # probe the script-relative, ``/workspace`` and PATH locations before giving up.
+    here = os.path.dirname(os.path.abspath(__file__))
+    binary = next(
+        (
+            p
+            for p in (
+                DECON_BINARY,
+                os.path.join(here, "decon", "bin", "decon"),
+                os.path.join(here, "..", "decon", "bin", "decon"),
+                "/workspace/decon/bin/decon",
+                shutil.which("decon") or "",
+            )
+            if p and os.path.isfile(p)
+        ),
+        None,
+    )
+    if binary is None:
+        print("[self-score] WARNING: decon binary not found, skipping leakage check", file=sys.stderr)
+        return None, None
+    evals_dir = next(
+        (
+            d
+            for d in (
+                DECON_EVALS_DIR,
+                os.path.join(here, "decon", "bundled-evals"),
+                os.path.join(here, "..", "decon", "bundled-evals"),
+                "/workspace/decon/bundled-evals",
+            )
+            if d and os.path.isdir(d)
+        ),
+        None,
+    )
+    if evals_dir is None:
         print("[self-score] WARNING: decon evals dir not found, skipping leakage check", file=sys.stderr)
         return None, None
     tmp = tempfile.mkdtemp(prefix="decon_selfscore_")
@@ -313,7 +337,7 @@ def decon_score(docs):
                 binary, "detect",
                 "--training-dir", tmp,
                 "--content-key", "text",
-                "--evals-dir", DECON_EVALS_DIR,
+                "--evals-dir", evals_dir,
                 "--report-output-dir", report_dir,
                 "--contamination-score-threshold", str(DECON_THRESHOLD),
             ],

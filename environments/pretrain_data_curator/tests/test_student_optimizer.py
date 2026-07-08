@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+
 import pytest
 import torch
 
 from pretrain_data_curator.student_model import StudentModelConfig, GPT
 from pretrain_data_curator.student_optimizer import (
     Muon,
+    _OPTIMIZER_COMPONENTS,
     build_batch_schedule,
     build_speedrun_optimizers,
     classify_speedrun_params,
@@ -183,3 +187,33 @@ def test_step_speedrun_optimizers_reports_whether_adam_stepped():
     assert run_step(0, force_adam=True) is True
     # adam_on_odd_steps=False: Adam steps every step, even on an even step.
     assert run_step(0, adam_on_odd_steps=False) is True
+
+
+def test_sandbox_script_embeds_optimizer_recipe_verbatim():
+    # Regression test: trainer.py's ``_module_definitions_source`` used
+    # ``ast.get_source_segment(source, node)`` on the bare ClassDef/FunctionDef
+    # node, whose ``lineno`` starts at the ``def``/``class`` keyword and
+    # excludes any decorators -- silently dropping ``@dataclass(frozen=True)``
+    # from the embedded ``BatchScheduleStage``, which then raised a TypeError
+    # the moment the sandbox script tried to construct one with keyword args.
+    ast.parse(NANOGPT_TRAIN_SCRIPT)  # assembled script is valid Python
+    for component in _OPTIMIZER_COMPONENTS:
+        assert inspect.getsource(component).rstrip() in NANOGPT_TRAIN_SCRIPT
+    assert "@dataclass(frozen=True)\nclass BatchScheduleStage" in NANOGPT_TRAIN_SCRIPT
+    # ...but a valid parse is not enough: embedding ``@dataclass`` only works if
+    # the assembled script also imports it. Without the import the script parses
+    # fine yet dies at module load with ``NameError: name 'dataclass'`` (caught
+    # by a 10M A100 smoke run: every real-trainer run floored to reward ~0).
+    # Compile-and-exec the header + the embedded ``BatchScheduleStage`` block in
+    # isolation so a missing runtime name for any embedded decorator fails here.
+    tree = ast.parse(NANOGPT_TRAIN_SCRIPT)
+    namespace: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            try:
+                exec(compile(ast.Module([node], []), "<script>", "exec"), namespace)
+            except Exception:  # optional/heavy imports (torch, tqdm) are irrelevant here
+                pass
+        elif isinstance(node, ast.ClassDef) and node.name == "BatchScheduleStage":
+            exec(compile(ast.Module([node], []), "<script>", "exec"), namespace)
+    assert "BatchScheduleStage" in namespace  # decorator resolved at runtime
