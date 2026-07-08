@@ -22,8 +22,6 @@ from .trainer import _nanogpt_train_script
 
 SELF_SCORE_FILENAME = "self_score.py"
 SELF_SCORE_TRAIN_FILENAME = "self_score_train.py"
-SELF_SCORE_MAX_STEPS = 64
-SELF_SCORE_MAX_CORPUS_CHARS = 500_000
 SELF_SCORE_TRAIN_TIMEOUT_SECONDS = 900
 
 _SCRIPT = r'''
@@ -50,9 +48,6 @@ BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
 LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
 USE_REAL_TRAINER = __USE_REAL_TRAINER__
-SELF_SCORE_MAX_STEPS = __SELF_SCORE_MAX_STEPS__
-SELF_SCORE_MAX_CORPUS_CHARS = __SELF_SCORE_MAX_CORPUS_CHARS__
-SELF_SCORE_TRAIN_TIMEOUT = __SELF_SCORE_TRAIN_TIMEOUT__
 TRAIN_SCRIPT_NAME = __TRAIN_SCRIPT_NAME__
 STUDENT_CONFIG = __STUDENT_CONFIG__
 FORBIDDEN_SOURCE_SHA256 = "__FORBIDDEN_SOURCE_SHA256__"
@@ -210,6 +205,8 @@ def apply_filters(docs, filters):
 
 def joined_corpus(docs, cap):
     """Streaming-truncated ``\\n\\n`` join, matching corpus materialization."""
+    if cap is None:
+        return "\n\n".join(doc for doc in docs if doc)
     parts = []
     total = 0
     sep = "\n\n"
@@ -349,7 +346,7 @@ def decon_score(docs):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def train_perf(docs):
+def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
     """Train the fixed proxy student on sampled docs; return (loss, perf, backend)."""
     if not USE_REAL_TRAINER or not docs:
         return None, None, None
@@ -360,13 +357,13 @@ def train_perf(docs):
             file=sys.stderr,
         )
         return None, None, None
-    text = joined_corpus(docs, SELF_SCORE_MAX_CORPUS_CHARS)
+    text = joined_corpus(docs, max_corpus_chars)
     if not text.strip():
         return None, None, None
 
     tmp = tempfile.mkdtemp(prefix="selfscore_train_")
     try:
-        steps = min(int(STUDENT_CONFIG["steps"]), int(SELF_SCORE_MAX_STEPS))
+        steps = int(max_steps if max_steps is not None else STUDENT_CONFIG["steps"])
         warmup_steps = min(int(STUDENT_CONFIG["warmup_steps"]), steps)
         payload = dict(STUDENT_CONFIG)
         payload["steps"] = steps
@@ -380,7 +377,7 @@ def train_perf(docs):
             [sys.executable, str(train_script), tmp],
             capture_output=True,
             text=True,
-            timeout=SELF_SCORE_TRAIN_TIMEOUT,
+            timeout=train_timeout,
         )
         if result.returncode != 0:
             print(
@@ -408,7 +405,7 @@ def train_perf(docs):
     except subprocess.TimeoutExpired:
         print(
             "[self-score] WARNING: proxy training timed out after %ds"
-            % SELF_SCORE_TRAIN_TIMEOUT,
+            % train_timeout,
             file=sys.stderr,
         )
         return None, None, None
@@ -424,9 +421,43 @@ def main():
         description="Leakage-safe development proxy for a draft curator manifest."
     )
     parser.add_argument("manifest", help="draft manifest JSON file")
-    parser.add_argument("--limit", type=int, default=8, choices=range(1, 65),
-                        metavar="N", help="candidate rows sampled per source (1-64)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        metavar="N",
+        help="documents sampled per source (agent-chosen; default 8)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="proxy training steps (default: production student config steps)",
+    )
+    parser.add_argument(
+        "--max-corpus-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help="joined corpus character cap for proxy training (default: all sampled text)",
+    )
+    parser.add_argument(
+        "--train-timeout",
+        type=int,
+        default=900,
+        metavar="SEC",
+        help="proxy training wall-clock timeout in seconds (default 900)",
+    )
     args = parser.parse_args()
+    if args.limit < 1:
+        fail("--limit must be >= 1")
+    if args.max_steps is not None and args.max_steps < 1:
+        fail("--max-steps must be >= 1")
+    if args.max_corpus_chars is not None and args.max_corpus_chars < 1:
+        fail("--max-corpus-chars must be >= 1")
+    if args.train_timeout < 1:
+        fail("--train-timeout must be >= 1")
     try:
         manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -494,7 +525,12 @@ def main():
         })
 
     fill = min(1.0, estimated_total / token_budget)
-    perf_loss, perf, train_backend = train_perf(all_docs)
+    perf_loss, perf, train_backend = train_perf(
+        all_docs,
+        max_corpus_chars=args.max_corpus_chars,
+        max_steps=args.max_steps,
+        train_timeout=args.train_timeout,
+    )
     leakage_score, num_matches = decon_score(all_docs) if all_docs else (None, None)
 
     perf_reward = ALPHA_PERF * (perf or 0.0)
@@ -510,6 +546,12 @@ def main():
             "not the final held-out validation score"
         ),
         "validation_data_used": False,
+        "self_score_settings": {
+            "limit": args.limit,
+            "max_steps": args.max_steps,
+            "max_corpus_chars": args.max_corpus_chars,
+            "train_timeout": args.train_timeout,
+        },
         "perf_loss": perf_loss,
         "perf": perf,
         "perf_reward": perf_reward,
@@ -605,9 +647,6 @@ def render_self_score_script(
         "__ALPHA_PERF__": repr(config.alpha_perf),
         "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),
         "__USE_REAL_TRAINER__": repr(config.use_real_trainer),
-        "__SELF_SCORE_MAX_STEPS__": SELF_SCORE_MAX_STEPS,
-        "__SELF_SCORE_MAX_CORPUS_CHARS__": SELF_SCORE_MAX_CORPUS_CHARS,
-        "__SELF_SCORE_TRAIN_TIMEOUT__": SELF_SCORE_TRAIN_TIMEOUT_SECONDS,
         "__TRAIN_SCRIPT_NAME__": repr(SELF_SCORE_TRAIN_FILENAME),
         "__STUDENT_CONFIG__": repr(_student_train_payload(config)),
         "__FORBIDDEN_SOURCE_SHA256__": hashlib.sha256(

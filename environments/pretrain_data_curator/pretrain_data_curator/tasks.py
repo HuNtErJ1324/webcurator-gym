@@ -5,7 +5,6 @@ from __future__ import annotations
 import verifiers.v1 as vf
 
 from .models import MANIFEST_FILENAME
-from .self_score import SELF_SCORE_MAX_CORPUS_CHARS, SELF_SCORE_MAX_STEPS
 
 _GOALS = [
     "curate the strongest general-purpose pretraining mixture for the fixed student.",
@@ -42,12 +41,25 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 
 `kind` defaults to `"hf"`. A local source instead uses `"kind": "local"`, a workspace-relative `"local_path"`, and optional `"local_format": "auto" | "jsonl" | "txt"`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
 
+## Self-score (you run it)
+Save a draft manifest and score it yourself with the workspace `self_score.py` script. You choose every development knob via CLI flags:
+
+```text
+python self_score.py draft.json [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
+```
+
+- `--limit N` — documents sampled per source (default 8 if omitted).
+- `--max-steps N` — proxy-training steps (default: production student config steps).
+- `--max-corpus-chars N` — character cap on joined training text (default: all sampled text).
+- `--train-timeout SEC` — proxy-training wall clock in seconds (default 900).
+
+The script samples your draft sources, trains the fixed proxy student on that sample (corpus-split cross-entropy), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward shape as final scoring. It never uses final held-out validation data; treat it as a directional dev signal, not a full-budget score.
+
 ## Setup
 - The sole curation budget is {token_budget} tokens.
 - Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
 - Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_leakage} * leakage`.
 - Performance is scaled linearly from a neutral baseline: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
-- For cheap iteration, save a draft manifest and run `python self_score.py draft.json --limit 8`. This development scorer uses limited compute (samples only a small number of documents per source via `--limit`, caps proxy training at {self_score_max_steps} steps and {self_score_max_corpus_chars} chars of sampled text), trains the fixed proxy student on that sample with corpus-split cross-entropy, runs benchmark decon leakage, and reports the same `alpha_perf * performance - lambda_leakage * leakage` reward shape as final scoring; it never uses final held-out validation data and is a directional signal, not a full-budget score.
 
 ## Rules
 1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so its cost produces no performance.
@@ -95,8 +107,6 @@ def build_tasks(
                 alpha_perf=alpha_perf,
                 lambda_leakage=lambda_leakage,
                 perf_target_loss=perf_target_loss,
-                self_score_max_steps=SELF_SCORE_MAX_STEPS,
-                self_score_max_corpus_chars=SELF_SCORE_MAX_CORPUS_CHARS,
             ),
             system_prompt=None,
             answer=cutoff_date,

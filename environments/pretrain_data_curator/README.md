@@ -185,11 +185,12 @@ available without a prescribed command sequence. There are no `curator_*` API
 commands.
 
 Taskset setup also writes `self_score.py` into the rollout workspace. An agent
-can run `python self_score.py draft.json --limit 8` to sample only the candidate
-training sources and estimate proxy CE, token fill, scoring cost, and reward
-excluding leakage/prior discovery. This development signal does not load the
-final validation shard; the configured validation repository is blocked by a
-hash so its identity is not disclosed by the script.
+can run `python self_score.py draft.json` with agent-chosen flags (`--limit`,
+`--max-steps`, `--max-corpus-chars`, `--train-timeout`) to sample candidate
+sources, estimate proxy CE and token fill, and score a draft manifest during
+development. This signal does not load the final validation shard; the configured
+validation repository is blocked by a hash so its identity is not disclosed by
+the script.
 
 | `hf` command | Purpose | Cost |
 | --- | --- | --- |

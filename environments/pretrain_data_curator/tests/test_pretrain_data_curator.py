@@ -1764,7 +1764,9 @@ def test_task_prompt_is_compact_method_open_and_single_budget():
     assert "complete freedom" in prompt
     assert '"token_budget": 1000000' in prompt
     assert '"sources"' in prompt
-    assert "python self_score.py draft.json --limit 8" in prompt
+    assert "python self_score.py draft.json" in prompt
+    assert "--limit N" in prompt
+    assert "--max-steps N" in prompt
     assert "Never ask the user" in prompt
     assert "7 model turns" not in prompt
     assert "turn budget" not in prompt.lower()
@@ -1883,7 +1885,15 @@ def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_
     )
 
     result = subprocess.run(
-        [sys.executable, SELF_SCORE_FILENAME, "draft.json", "--limit", "4"],
+        [
+            sys.executable,
+            SELF_SCORE_FILENAME,
+            "draft.json",
+            "--limit",
+            "4",
+            "--max-steps",
+            "4",
+        ],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -1892,6 +1902,8 @@ def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_
     score = json.loads(result.stdout)
     assert score["ok"] is True
     assert score["validation_data_used"] is False
+    assert score["self_score_settings"]["limit"] == 4
+    assert score["self_score_settings"]["max_steps"] == 4
     assert score["budget_fill_ratio"] > 0.0
     assert score["leakage_score"] is None
     assert "perf_reward" in score
@@ -1960,24 +1972,24 @@ def test_self_score_redacts_forbidden_source_from_all_stdout(tmp_path):
     assert config.validation_set.dataset_id not in result.stdout
 
 
-def test_self_score_script_cap_accepts_large_values():
-    """The self_score _SCRIPT cap logic must accept >100k values."""
+def test_self_score_script_exposes_agent_controlled_cli_flags():
+    """Self-score caps are agent-chosen via CLI flags, not baked into the script."""
     import re as _re
     from pretrain_data_curator import self_score as _self_score
 
     script = _self_score._SCRIPT
+    assert '--limit"' in script
+    assert "--max-steps" in script
+    assert "--max-corpus-chars" in script
+    assert "--train-timeout" in script
+    assert "choices=range" not in script
+    assert b"SELF_SCORE_MAX_STEPS" not in _self_score._SCRIPT.encode()
+    assert b"SELF_SCORE_MAX_CORPUS_CHARS" not in _self_score._SCRIPT.encode()
     match = _re.search(
-        r'raw_cap = manifest\.get\("sample_docs_per_source"\).*?cap = None',
+        r"train_perf\(\s*all_docs,\s*max_corpus_chars=args\.max_corpus_chars",
         script,
-        _re.DOTALL,
     )
-    assert match, (
-        "could not extract cap logic from self_score._SCRIPT; "
-        "check that the upper clamp was removed"
-    )
-    assert b"min(int(cap), 100_000)" not in _self_score._SCRIPT.encode(), (
-        "self_score._SCRIPT still has a 100_000 upper clamp"
-    )
+    assert match, "train_perf must use agent-provided CLI caps"
 
 
 # --- Tier P: held-out validation set (NanoGPT speedrun retarget) ------------
