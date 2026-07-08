@@ -16,6 +16,9 @@ TASK_PROMPT = """We want to train a fixed small language model on the strongest 
 Research and iterate autonomously, then write the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
 
+## Research
+Feel free to explore broadly before you lock in a mixture. Search the web, read papers and technical writeups, and investigate modern pretraining data practice — there is no prescribed recipe. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
+
 ## Deliverable
 When finished, write your final manifest as a single JSON object to `{manifest_path}` with this contract:
 
