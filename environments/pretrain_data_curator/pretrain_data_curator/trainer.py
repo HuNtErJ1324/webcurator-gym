@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from .corpus import CuratedCorpus
 from .hf_access import loop_local_semaphore
 from .models import ProxyStudentConfig
+from .student_model import estimate_instantiated_param_count
 from .val_set import plan_val_windows
 
 logger = logging.getLogger(__name__)
@@ -70,11 +71,17 @@ class ProxyStudentTrainer(Protocol):
 
 
 def estimate_param_count(config: ProxyStudentConfig) -> int:
-    """Rough decoder-only transformer parameter count."""
-    attn = 4 * config.n_embd * config.n_embd
-    mlp = 8 * config.n_embd * config.n_embd
-    per_layer = attn + mlp
-    return config.n_layer * per_layer + 2 * config.n_embd
+    """Exact instantiated parameter count for the modded-nanogpt student."""
+    return estimate_instantiated_param_count(
+        num_layers=config.n_layer,
+        model_dim=config.n_embd,
+        num_heads=config.n_head,
+        mlp_ratio=config.mlp_ratio,
+        softcap=config.lm_head_softcap,
+        num_value_embeds=config.num_value_embeds,
+        attn_scale=config.attn_scale,
+        sliding_window_size=config.sliding_window_size,
+    )
 
 
 def estimate_train_flops(config: ProxyStudentConfig, tokens_trained: int) -> float:
@@ -292,6 +299,8 @@ block = int(cfg["block_size"]); batch = int(cfg["batch_size"])
 
 # __STUDENT_MODEL__  (replaced with the verbatim student_model.py model source)
 
+# __STUDENT_OPTIMIZER__  (replaced with the verbatim student_optimizer.py source)
+
 # __STUDENT_TRAINING__  (replaced with the verbatim student_train.py recipe source)
 
 def build_model():
@@ -305,13 +314,22 @@ def build_model():
         mlp_ratio=int(cfg["mlp_ratio"]),
         softcap=float(cfg["lm_head_softcap"]),
         num_value_embeds=int(cfg["num_value_embeds"]),
+        attn_scale=float(cfg.get("attn_scale", 0.12)),
+        sliding_window_size=cfg.get("sliding_window_size"),
+        # portable feature flags (all default-off)
+        bigram_hash_embed=bool(cfg.get("bigram_hash_embed", False)),
+        smear_embed=bool(cfg.get("smear_embed", False)),
+        partial_key_offset=cfg.get("partial_key_offset"),
+        paired_head=bool(cfg.get("paired_head", False)),
+        mudd_pairs=int(cfg.get("mudd_pairs", 0)),
+        xsa_enabled=bool(cfg.get("xsa_enabled", False)),
+        xsa_pairs=int(cfg.get("xsa_pairs", 0)),
+        single_act_last_k=int(cfg.get("single_act_last_k", 0)),
+        exp_residual_decay=cfg.get("exp_residual_decay"),
+        multi_token_pred=int(cfg.get("multi_token_pred", 0)),
     ).to(device)
 
-# record_01 recipe (single source of truth in student_train.py, embedded above):
-# AdamW(betas, eps, weight_decay) + linear warmup + cosine-to-floor LR + grad-clip,
-# CONTIGUOUS-window batching, AVERAGED over n_train_runs distinct seeds. Any
-# non-finite run collapses to the infinite-loss sentinel (perf -> 0); FLOPs/tokens
-# are summed across runs so cost accounting bills every run.
+# modded-nanogpt speedrun recipe (student_train.py + student_optimizer.py):
 val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     build_model,
     train_data,
@@ -322,15 +340,50 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     block_size=block,
     batch_size=batch,
     steps=int(cfg["steps"]),
-    base_lr=float(cfg["learning_rate"]),
-    warmup_steps=int(cfg["warmup_steps"]),
-    weight_decay=float(cfg["weight_decay"]),
-    grad_clip=float(cfg["grad_clip"]),
-    beta1=float(cfg["adam_beta1"]),
-    beta2=float(cfg["adam_beta2"]),
-    eps=float(cfg["adam_eps"]),
-    lr_min_ratio=float(cfg["lr_min_ratio"]),
     vocab_size=vocab_size,
+    training_recipe=str(cfg.get("training_recipe", "speedrun_muon")),
+    base_lr=float(cfg.get("learning_rate", 3e-4)),
+    warmup_steps=int(cfg.get("warmup_steps", 0)),
+    weight_decay=float(cfg.get("weight_decay", 0.1)),
+    grad_clip=float(cfg.get("grad_clip", 1.0)),
+    beta1=float(cfg.get("adam_beta1", 0.9)),
+    beta2=float(cfg.get("adam_beta2", 0.95)),
+    eps=float(cfg.get("adam_eps", 1e-8)),
+    lr_min_ratio=float(cfg.get("lr_min_ratio", 0.1)),
+    muon_lr=float(cfg.get("muon_lr", 0.023)),
+    muon_weight_decay=float(cfg.get("muon_weight_decay", 0.05)),
+    adam_lr=float(cfg.get("adam_lr", 0.008)),
+    adam_eps=float(cfg.get("adam_eps", 1e-10)),
+    adam_weight_decay=float(cfg.get("adam_weight_decay", 0.005)),
+    embed_lr_mul=float(cfg.get("embed_lr_mul", 1.0)),
+    lm_head_lr_mul=float(cfg.get("lm_head_lr_mul", 1.0)),
+    value_embed_lr_mul=float(cfg.get("value_embed_lr_mul", 75.0)),
+    scalar_lr_mul=float(cfg.get("scalar_lr_mul", 5.0)),
+    embed_wd_mul=float(cfg.get("embed_wd_mul", 150.0)),
+    lm_head_wd_mul=float(cfg.get("lm_head_wd_mul", 150.0)),
+    value_embed_wd_mul=float(cfg.get("value_embed_wd_mul", 5.0)),
+    scalar_wd_mul=float(cfg.get("scalar_wd_mul", 0.0)),
+    batch_schedule_enabled=bool(cfg.get("batch_schedule_enabled", True)),
+    batch_stage_fracs=tuple(cfg.get("batch_stage_fracs", (1/3, 1/3, 1/3))),
+    batch_stage_muls=tuple(cfg.get("batch_stage_muls", (1, 2, 3))),
+    lr_stage_muls=tuple(cfg.get("lr_stage_muls", (1.0, 1.52, 1.73))),
+    lr_cooldown_frac=float(cfg.get("lr_cooldown_frac", 0.60)),
+    lr_cooldown_floor=float(cfg.get("lr_cooldown_floor", 0.15)),
+    muon_momentum_min=float(cfg.get("muon_momentum_min", 0.85)),
+    muon_momentum_max=float(cfg.get("muon_momentum_max", 0.95)),
+    muon_warmup_steps=cfg.get("muon_warmup_steps"),
+    muon_cooldown_steps=cfg.get("muon_cooldown_steps"),
+    adam_on_odd_steps=bool(cfg.get("adam_on_odd_steps", True)),
+    # portable feature hparams (all default-off)
+    eos_positions=cfg.get("eos_positions"),
+    max_doc_len=cfg.get("max_doc_len"),
+    grad_accum_embed_head_steps=int(cfg.get("grad_accum_embed_head_steps", 1)),
+    seq_len_schedule=bool(cfg.get("seq_len_schedule", False)),
+    multi_token_pred=int(cfg.get("multi_token_pred", 0)),
+    untie_at_frac=float(cfg.get("untie_at_frac", 0.0)),
+    cautious_wd=bool(cfg.get("cautious_wd", False)),
+    nor_muon=bool(cfg.get("nor_muon", False)),
+    polar_express=bool(cfg.get("polar_express", False)),
 )
 result = {
     "loss": val_loss, "accuracy": acc, "flops": flops,
@@ -379,11 +432,43 @@ def _nanogpt_train_script() -> str:
                 (
                     "RMSNorm",
                     "Rotary",
+                    "RotaryWithOffset",
+                    "_sliding_window_mask",
                     "CausalSelfAttention",
+                    "PairedHeadAttention",
                     "MLP",
                     "Block",
                     "ValueEmbedding",
+                    "BigramHashEmbedding",
+                    "Smear",
+                    "MUDD",
+                    "XSA",
+                    "MultiTokenHeads",
                     "GPT",
+                ),
+            ),
+        )
+        .replace(
+            "# __STUDENT_OPTIMIZER__  (replaced with the verbatim student_optimizer.py source)",
+            _module_definitions_source(
+                "student_optimizer.py",
+                (
+                    "zeropower_via_newtonschulz5",
+                    "zeropower_via_polar_express",
+                    "muon_update",
+                    "muon_update_normalized",
+                    "Muon",
+                    "BatchScheduleStage",
+                    "build_batch_schedule",
+                    "lookup_batch_stage",
+                    "schedule_lr_multiplier",
+                    "get_muon_momentum",
+                    "classify_speedrun_params",
+                    "build_speedrun_optimizers",
+                    "init_speedrun_weights",
+                    "set_optimizer_lrs",
+                    "capture_initial_lrs",
+                    "step_speedrun_optimizers",
                 ),
             ),
         )
@@ -394,6 +479,11 @@ def _nanogpt_train_script() -> str:
                 (
                     "lr_at_step",
                     "plan_train_windows",
+                    "plan_eos_aligned_windows",
+                    "make_seq_len_schedule",
+                    "_enforce_max_doc_len",
+                    "_eval_val_loss",
+                    "_compute_multi_token_loss",
                     "train_and_eval_student",
                     "averaged_train_and_eval",
                 ),

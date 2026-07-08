@@ -1,34 +1,32 @@
-"""Modern proxy-student TRAINING recipe (nanogpt-speedrun record_01), CPU-runnable.
+"""Modern proxy-student TRAINING recipe (modded-nanogpt speedrun), CPU-runnable.
 
 This module is the **single source of truth** for the real proxy-student trainer's
 optimizer schedule, contiguous-window batching, and multi-run averaging. The same
 function definitions are embedded byte-identically into the GPU sandbox training
 script (``trainer.py``) via :func:`training_source`, so the CPU unit tests in this
-package exercise the *exact* training code the sandbox runs -- the same discipline
-``student_model.py`` uses for the architecture and ``val_set.plan_val_windows``
-uses for the held-out cross-entropy windowing.
+package exercise the *exact* training code the sandbox runs.
 
-The recipe faithfully mirrors ``leloy/nanogpt-speedrun`` record_01 (the AdamW
-GPT-2 reproduction baseline that the speedrun starts from), while inheriting
-``student_model.py``'s deliberate EXCLUSION of the GPU-only training optimizations
-(Muon/NorMuon, FP8, distributed comms, FlexAttention, ``torch.compile``, bf16) so
-everything here runs fp32 on CPU:
+Default recipe (**``speedrun_muon``**) ports the CPU-runnable subset of
+``KellerJordan/modded-nanogpt`` ``train_gpt.py``:
 
-* **AdamW** with record_01 betas ``(0.9, 0.95)``, ``eps=1e-8`` and decoupled
-  ``weight_decay`` (default 0.1).
-* **LR schedule** (:func:`lr_at_step`) -- linear warmup to the peak LR, then a
-  cosine decay to a small floor (``lr_min_ratio`` of the peak); applied per-step
-  like record_01's training loop.
-* **Gradient clipping** -- global-norm clip (default 1.0) before every
-  ``opt.step()``.
-* **Contiguous-window batching** (:func:`plan_train_windows`) -- non-overlapping
-  ``tokens[i:i+block]`` windows drawn sequentially over the tokenized train stream
-  (record_01 ``get_batch`` style), with the window order shuffled per epoch and a
-  cursor advanced across steps -- NOT random offsets sampled with replacement.
-  (More docs/source -> a longer real token stream -> more distinct windows.)
-* **Multiple averaged runs** (:func:`averaged_train_and_eval`) -- train+eval
-  ``n_runs`` times with distinct seeds and average the val loss/accuracy, so the
-  signal is a sharper, lower-variance measure of curated-data quality.
+* **Muon** (Newton–Schulz) on 2-D block weights; **AdamW** on embeddings/scalars.
+* **Heterogeneous stepping** — AdamW only on odd steps.
+* **Batch-size schedule** — 1× → 2× → 3× micro-batch over three equal stages.
+* **LR schedule** — stage LR multipliers + linear cooldown (BatchSizeSchedule record).
+* **Muon momentum warmup/cooldown**.
+
+Legacy recipe (**``record_01_adamw``**) remains for fast CPU tests:
+
+* Plain **AdamW** + linear warmup + cosine cooldown + grad clip.
+
+Portable features (all opt-in):
+
+* **EoS-aligned batch starts** — align training windows to end-of-sequence markers.
+* **Max document length handling** — split over-long documents.
+* **True 2-step gradient accumulation** — accumulate embed+lm_head grads before update.
+* **True max seq length schedule** — warm up sequence length from small to max.
+* **Multi-token prediction** — auxiliary future-token prediction losses.
+* **Untie embed/lm_head** — share weights initially, untie at 2/3 of training.
 """
 
 from __future__ import annotations
@@ -39,29 +37,26 @@ import sys
 import time
 
 import torch
+import torch.nn as nn
 from torch.nn import functional as F
 from tqdm import tqdm
 
+from .student_optimizer import (
+    build_batch_schedule,
+    build_speedrun_optimizers,
+    capture_initial_lrs,
+    get_muon_momentum,
+    init_speedrun_weights,
+    lookup_batch_stage,
+    schedule_lr_multiplier,
+    set_optimizer_lrs,
+    step_speedrun_optimizers,
+)
 from .val_set import plan_val_windows
 
 
 def lr_at_step(step, total_steps, warmup_steps, base_lr, min_ratio):
-    """record_01 learning rate for ``step``: linear warmup, then cosine cooldown.
-
-    Linear warmup over ``warmup_steps`` (``base_lr * (step+1) / warmup_steps``),
-    then a cosine decay from ``base_lr`` down to a floor of ``base_lr * min_ratio``.
-    The training loop runs ``for step in range(total_steps)``, so the LAST executed
-    step is ``total_steps - 1``; the cosine span is measured to that final step
-    (``decay_span = total_steps - warmup_steps - 1``) so the last executed decay
-    step lands EXACTLY on the floor instead of stopping a step short. When at most
-    one decay step exists (``decay_span <= 0`` -- e.g. a one-step cooldown, or a
-    warmup-only/zero-decay run) the span collapses and that single final decay step
-    is pinned to the floor (``progress == 1.0``), never base_lr, and the division is
-    skipped so there is no ZeroDivisionError. ``warmup_steps == 0`` means no warmup
-    (decay starts at step 0). Kept pure (builtins + ``math`` only) so its exact
-    source embeds verbatim into the sandbox training script and the CPU unit tests
-    guard the schedule the GPU loop applies.
-    """
+    """record_01 learning rate for ``step``: linear warmup, then cosine cooldown."""
     step = int(step)
     total_steps = int(total_steps)
     warmup_steps = int(warmup_steps)
@@ -77,22 +72,122 @@ def lr_at_step(step, total_steps, warmup_steps, base_lr, min_ratio):
 
 
 def plan_train_windows(n_tokens, block):
-    """Contiguous, non-overlapping training-window start indices over the stream.
-
-    Returns the start indices of consecutive ``tokens[i:i+block]`` windows (whose
-    paired next-token target is ``tokens[i+1:i+block+1]``), so batching draws
-    CONTIGUOUS windows sequentially -- record_01 ``get_batch`` style -- rather than
-    sampling random offsets with replacement. Every window satisfies
-    ``start + block + 1 <= n_tokens``, so the shifted target never runs off the end.
-    Builtins-only and dependency-free so its exact source embeds verbatim into the
-    sandbox training script and is unit-tested on CPU.
-    """
+    """Contiguous, non-overlapping training-window start indices over the stream."""
     block = int(block)
     n_tokens = int(n_tokens)
     last_start = n_tokens - block - 1
     if last_start < 0:
         return [0]
     return list(range(0, last_start + 1, block))
+
+
+def plan_eos_aligned_windows(n_tokens, block, eos_positions):
+    """Training-window start indices aligned to end-of-sequence markers.
+
+    Windows start at EoS positions (or 0) and proceed contiguously, so each
+    window naturally begins at a document boundary when possible.
+    """
+    block = int(block)
+    n_tokens = int(n_tokens)
+    if not eos_positions:
+        return plan_train_windows(n_tokens, block)
+    starts = [0]
+    for eos in sorted(eos_positions):
+        if eos + 1 < n_tokens - block:
+            starts.append(eos + 1)
+    deduped = sorted(set(s for s in starts if s + block + 1 <= n_tokens))
+    if not deduped:
+        return [0]
+    return deduped
+
+
+def make_seq_len_schedule(total_steps, max_block, warmup_frac=0.25):
+    """Produce a sequence-length schedule that warms up from small to ``max_block``.
+
+    Returns a callable ``block_at_step(step) -> int``.
+    """
+    max_block = int(max_block)
+    warmup_steps = max(1, int(total_steps * warmup_frac))
+    min_block = max(8, max_block // 8)
+
+    def block_at_step(step):
+        step = int(step)
+        if step >= warmup_steps:
+            return max_block
+        frac = step / warmup_steps
+        return int(min_block + frac * (max_block - min_block))
+
+    return block_at_step
+
+
+def _enforce_max_doc_len(starts, n_tokens, max_doc_len, block):
+    """Add synthetic start positions to break up segments longer than ``max_doc_len``.
+
+    When the gap between consecutive window starts exceeds ``max_doc_len``,
+    intermediate starts are inserted so that every position is within
+    ``max_doc_len`` tokens of a window boundary. Out-of-bounds starts are
+    dropped.
+    """
+    if max_doc_len is None:
+        return starts
+    if not starts:
+        return starts
+    refined = [starts[0]]
+    for s in starts[1:]:
+        prev = refined[-1]
+        gap = s - prev
+        if gap > max_doc_len:
+            for mid in range(prev + max_doc_len, s, max_doc_len):
+                if mid + block + 1 <= n_tokens:
+                    refined.append(mid)
+        refined.append(s)
+    return sorted(set(r for r in refined if r + block + 1 <= n_tokens))
+
+
+def _eval_val_loss(model, val_data, *, block, batch, vocab_size, device):
+    model.eval()
+    val_windows = plan_val_windows(len(val_data), block)
+    total = sum(length for _, length in val_windows)
+    loss_sum = 0.0
+    correct = 0
+    with torch.no_grad():
+        wi = 0
+        while wi < len(val_windows):
+            length = val_windows[wi][1]
+            starts = []
+            while wi < len(val_windows) and val_windows[wi][1] == length and len(starts) < batch:
+                starts.append(val_windows[wi][0])
+                wi += 1
+            xb = torch.stack([val_data[s : s + length] for s in starts]).to(device)
+            yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(device)
+            logits = model(xb)
+            loss_sum += F.cross_entropy(
+                logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
+            ).item()
+            correct += (logits.argmax(-1) == yb).sum().item()
+    return loss_sum / total, correct / total
+
+
+def _compute_multi_token_loss(logits, hidden, y, multi_heads, y_future, vocab_size):
+    """Total loss including auxiliary multi-token prediction losses.
+
+    Multi-token heads are applied to the final hidden states (pre-lm_head),
+    not to logits, since the heads are ``nn.Linear(model_dim, vocab_size)``.
+    """
+    main_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+    if multi_heads is None or not hasattr(multi_heads, 'heads') or not multi_heads.heads:
+        return main_loss
+    mt_loss = 0.0
+    mt_weight = 0.3
+    for k, head in enumerate(multi_heads.heads):
+        if k < len(y_future) and y_future[k] is not None:
+            head_logits = head(hidden)
+            mt_loss = mt_loss + F.cross_entropy(
+                head_logits.view(-1, vocab_size), y_future[k].view(-1)
+            )
+    if mt_loss > 0.0:
+        return main_loss + mt_weight * mt_loss
+    return main_loss
 
 
 def train_and_eval_student(
@@ -115,160 +210,394 @@ def train_and_eval_student(
     device,
     generator,
     run_label="",
+    training_recipe="speedrun_muon",
+    muon_lr=0.023,
+    muon_weight_decay=0.05,
+    adam_lr=0.008,
+    adam_eps=1e-10,
+    adam_weight_decay=0.005,
+    embed_lr_mul=1.0,
+    lm_head_lr_mul=1.0,
+    value_embed_lr_mul=75.0,
+    scalar_lr_mul=5.0,
+    embed_wd_mul=150.0,
+    lm_head_wd_mul=150.0,
+    value_embed_wd_mul=5.0,
+    scalar_wd_mul=0.0,
+    batch_schedule_enabled=True,
+    batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+    batch_stage_muls=(1, 2, 3),
+    lr_stage_muls=(1.0, 1.52, 1.73),
+    lr_cooldown_frac=0.60,
+    lr_cooldown_floor=0.15,
+    muon_momentum_min=0.85,
+    muon_momentum_max=0.95,
+    muon_warmup_steps=None,
+    muon_cooldown_steps=None,
+    adam_on_odd_steps=True,
+    # --- portable feature flags ---
+    eos_positions=None,
+    max_doc_len=None,
+    grad_accum_embed_head_steps=1,
+    seq_len_schedule=False,
+    multi_token_pred=0,
+    untie_at_frac=0.0,
+    cautious_wd=False,
+    nor_muon=False,
+    polar_express=False,
 ):
-    """Train ``model`` on ``train_data`` (record_01 recipe) and score held-out CE.
-
-    Optimizes with AdamW(betas=(beta1, beta2), eps, weight_decay) under the
-    :func:`lr_at_step` warmup+cosine schedule and a global-norm gradient clip
-    (``grad_clip``), feeding CONTIGUOUS windows from :func:`plan_train_windows`
-    whose order is reshuffled each epoch via ``generator``. Returns
-    ``(val_loss, accuracy, tokens_trained)`` where ``val_loss`` is the mean
-    cross-entropy (nats/token) over EVERY predictable next-token position of
-    ``val_data`` (via :func:`plan_val_windows`, which raises on a degenerate
-    <=1-token val set rather than scoring a bogus 0.0).
-
-    Purely observational: a live ``tqdm`` bar (step/total, EMA loss, tok/s,
-    elapsed, ETA) tracks the loop -- prefixed with ``run_label`` (e.g.
-    ``"run 2/3 "``) when :func:`averaged_train_and_eval` runs >1 seeded run --
-    plus coarse newline-terminated progress lines on stdout every ``log_every``
-    steps (and always the first/last step) so long unattended runs stay legible
-    from a captured, non-interactive stdout blob. The extra per-step ``.item()``
-    GPU sync this needs is throttled to that same cadence, never every step, so
-    it never touches the training math or the returned values.
-    """
+    """Train ``model`` and score held-out CE; returns ``(val_loss, accuracy, tokens_trained)``."""
     block = int(block_size)
     batch = int(batch_size)
     steps = int(steps)
 
     train_src = train_data
     if len(train_src) <= block + 1:
-        # Tiny-corpus fallback: tile so at least one full contiguous window exists
-        # (the only case where windows wrap; a real token stream never tiles).
         train_src = train_src.repeat(math.ceil((block + 2) / max(len(train_src), 1)))
-    starts = plan_train_windows(len(train_src), block)
+
+    # --- Portable: EoS-aligned windows ---
+    if eos_positions is not None:
+        starts = plan_eos_aligned_windows(len(train_src), block, eos_positions)
+    else:
+        starts = plan_train_windows(len(train_src), block)
+
+    # --- Portable: max doc length enforcement ---
+    if max_doc_len is not None:
+        starts = _enforce_max_doc_len(starts, len(train_src), max_doc_len, block)
+
+    # --- Portable: seq length schedule ---
+    block_fn = make_seq_len_schedule(steps, block) if seq_len_schedule else None
 
     order = []
     cursor = 0
 
-    def next_batch():
+    def next_batch(effective_batch, current_block):
         nonlocal order, cursor
         xs = []
         ys = []
-        for _ in range(batch):
+        batch_starts = []
+        for _ in range(int(effective_batch)):
             if cursor >= len(order):
-                # Epoch boundary: reshuffle the CONTIGUOUS-window order (seeded by
-                # ``generator`` so runs are reproducible and distinct seeds differ).
                 perm = torch.randperm(len(starts), generator=generator)
                 order = [starts[i] for i in perm.tolist()]
                 cursor = 0
             i = order[cursor]
             cursor += 1
-            xs.append(train_src[i : i + block])
-            ys.append(train_src[i + 1 : i + block + 1])
-        return torch.stack(xs).to(device), torch.stack(ys).to(device)
+            batch_starts.append(i)
+            xs.append(train_src[i : i + current_block])
+            ys.append(train_src[i + 1 : i + current_block + 1])
+        return torch.stack(xs).to(device), torch.stack(ys).to(device), batch_starts
 
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=base_lr,
-        betas=(beta1, beta2),
-        eps=eps,
-        weight_decay=weight_decay,
-    )
-    model.train()
-    # Coarse plain-text cadence: every ~2% of steps or every 50 steps, whichever
-    # is COARSER (the larger gap), so a huge run logs a bounded number of lines
-    # and a tiny test-sized run doesn't spam one per step; the first and last
-    # step always log regardless, so even steps<=1 gets at least one line.
     log_every = max(50, max(1, steps // 50))
     ema_loss_tensor = None
     ema_decay = 0.9
     start_time = time.time()
     desc = f"{run_label}train" if run_label else "train"
-    # ``file=sys.stdout``: in the sandbox script (trainer.py) ``sys.stderr`` is
-    # redirected to a file, so a bar left on tqdm's stderr default would never
-    # surface; stdout is what's actually captured, so that's where the live bar
-    # (and the plain lines below, via ``pbar.write``) both go.
     pbar = tqdm(range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout)
-    for step in pbar:
-        lr = lr_at_step(step, steps, warmup_steps, base_lr, lr_min_ratio)
-        for group in opt.param_groups:
-            group["lr"] = lr
-        x, y = next_batch()
-        logits = model(x)
-        loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
+
+    if training_recipe == "record_01_adamw":
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=base_lr,
+            betas=(beta1, beta2),
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+        model.train()
+        tokens_trained = 0
+        for step in pbar:
+            lr = lr_at_step(step, steps, warmup_steps, base_lr, lr_min_ratio)
+            for group in opt.param_groups:
+                group["lr"] = lr
+            current_block = block_fn(step) if block_fn else block
+            x, y, _ = next_batch(batch, current_block)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            tokens_trained += batch * current_block
+            with torch.no_grad():
+                loss_detached = loss.detach()
+                ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
+                    ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                )
+            completed = step + 1
+            if step == 0 or completed == steps or completed % log_every == 0:
+                ema_loss = ema_loss_tensor.item()
+                elapsed = time.time() - start_time
+                tokens_per_sec = tokens_trained / elapsed if elapsed > 0 else 0.0
+                eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+                pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
+                pbar.write(
+                    f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
+                    f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
+                )
+    else:
+        init_speedrun_weights(model)
+
+        # --- Portable: tie embed/lm_head for later untie ---
+        # BigramHashEmbedding does not expose a flat .weight (its learned
+        # token_embed has a different shape), so weight-tying is shape-
+        # incompatible; skip the tie in that case.
+        if untie_at_frac > 0.0 and hasattr(model.embed, "weight"):
+            model.lm_head.weight = model.embed.weight
+
+        muon_opt, adam_opt = build_speedrun_optimizers(
+            model,
+            muon_lr=muon_lr,
+            muon_weight_decay=muon_weight_decay,
+            adam_lr=adam_lr,
+            adam_eps=adam_eps,
+            adam_weight_decay=adam_weight_decay,
+            embed_lr_mul=embed_lr_mul,
+            lm_head_lr_mul=lm_head_lr_mul,
+            value_embed_lr_mul=value_embed_lr_mul,
+            scalar_lr_mul=scalar_lr_mul,
+            embed_wd_mul=embed_wd_mul,
+            lm_head_wd_mul=lm_head_wd_mul,
+            value_embed_wd_mul=value_embed_wd_mul,
+            scalar_wd_mul=scalar_wd_mul,
+            nor_muon=nor_muon,
+            polar_express=polar_express,
+        )
+        initial_muon_lr, initial_adam_lrs = capture_initial_lrs(muon_opt, adam_opt)
+        if batch_schedule_enabled:
+            boundaries, stages, cd_start, cd_floor = build_batch_schedule(
+                steps,
+                stage_fracs=batch_stage_fracs,
+                batch_muls=batch_stage_muls,
+                lr_muls=lr_stage_muls,
+                cooldown_frac=lr_cooldown_frac,
+                cooldown_floor=lr_cooldown_floor,
+            )
+        else:
+            from .student_optimizer import BatchScheduleStage
+
+            boundaries = [(0, steps)]
+            stages = [BatchScheduleStage(batch_mul=1, lr_mul=1.0)]
+            cd_start, cd_floor = steps, lr_cooldown_floor
+        muon_warm = muon_warmup_steps if muon_warmup_steps is not None else min(300, max(1, steps // 5))
+        muon_cd = muon_cooldown_steps if muon_cooldown_steps is not None else min(50, max(1, steps // 20))
+        model.train()
+        tokens_trained = 0
+        accum_buffer_embed_head = None
+        accum_count = 0
+
+        for step in pbar:
+            if batch_schedule_enabled:
+                stage = lookup_batch_stage(step, boundaries, stages)
+                effective_batch = batch * stage.batch_mul
+                lr_scale = schedule_lr_multiplier(
+                    step,
+                    stage,
+                    cd_start=cd_start,
+                    scheduled_steps=steps,
+                    cooldown_floor=cd_floor,
+                )
+            else:
+                effective_batch = batch
+                lr_scale = 1.0
+            set_optimizer_lrs(
+                muon_opt,
+                adam_opt,
+                lr_scale=lr_scale,
+                initial_muon_lr=initial_muon_lr,
+                initial_adam_lrs=initial_adam_lrs,
+            )
+            muon_momentum = get_muon_momentum(
+                step,
+                steps,
+                warmup_steps=muon_warm,
+                cooldown_steps=muon_cd,
+                momentum_min=muon_momentum_min,
+                momentum_max=muon_momentum_max,
+            )
+
+            current_block = block_fn(step) if block_fn else block
+            x, y, batch_starts = next_batch(effective_batch, current_block)
+
+            # --- Portable: multi-token prediction targets ---
+            use_mt = multi_token_pred > 0 and hasattr(model, 'multi_heads') and model.multi_heads is not None
+            y_future = []
+            if use_mt:
+                for k in range(multi_token_pred):
+                    shift = k + 2
+                    future_targets = []
+                    for sidx in batch_starts:
+                        if sidx + shift + current_block <= len(train_src):
+                            future_targets.append(train_src[sidx + shift : sidx + shift + current_block])
+                        else:
+                            n_avail = max(0, len(train_src) - (sidx + shift))
+                            if n_avail > 0:
+                                seg = train_src[sidx + shift:]
+                                seg = torch.cat([seg, torch.zeros(current_block - n_avail, dtype=train_src.dtype)])
+                            else:
+                                seg = torch.zeros(current_block, dtype=train_src.dtype)
+                            future_targets.append(seg)
+                    y_future.append(torch.stack(future_targets).to(device))
+
+            logits = model(x, output_hidden=use_mt)
+
+            # --- Portable: multi-token prediction loss ---
+            if use_mt:
+                hidden = logits[1]
+                loss = _compute_multi_token_loss(logits[0], hidden, y, model.multi_heads, y_future, vocab_size)
+            else:
+                loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+
+            # --- Portable: true N-step gradient accumulation for embed + lm_head ---
+            if grad_accum_embed_head_steps > 1:
+                embed_head_params = []
+                for name, p in model.named_parameters():
+                    if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                        embed_head_params.append(p)
+
+                loss.backward()
+
+                # Accumulate embed/head/multi-head grads into a buffer, then
+                # zero p.grad so the next backward starts fresh (no double-count).
+                if accum_buffer_embed_head is None:
+                    accum_buffer_embed_head = {}
+                    for p in embed_head_params:
+                        if p.grad is not None:
+                            accum_buffer_embed_head[id(p)] = p.grad.clone()
+                            p.grad = None
+                else:
+                    for p in embed_head_params:
+                        if p.grad is not None and id(p) in accum_buffer_embed_head:
+                            accum_buffer_embed_head[id(p)] += p.grad
+                            p.grad = None
+
+                accum_count += 1
+
+                if accum_count >= grad_accum_embed_head_steps:
+                    # Restore accumulated buffer to embed/head/multi-head param grads.
+                    for name, p in model.named_parameters():
+                        if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                            if id(p) in accum_buffer_embed_head:
+                                p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
+                    # Grad clipping — skipped in the original accumulation branch.
+                    if grad_clip and grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    # force_adam=True: a closing cycle always carries freshly
+                    # restored embed/head/multi-head grads that must be applied
+                    # now, regardless of step parity — otherwise the unconditional
+                    # adam_opt.zero_grad() below would silently drop them when the
+                    # cycle happens to close on an even step under adam_on_odd_steps.
+                    step_speedrun_optimizers(
+                        muon_opt,
+                        adam_opt,
+                        step=step,
+                        muon_momentum=muon_momentum,
+                        adam_on_odd_steps=adam_on_odd_steps,
+                        cautious_wd=cautious_wd,
+                        lr_scale=lr_scale,
+                        force_adam=True,
+                    )
+                    accum_buffer_embed_head = None
+                    accum_count = 0
+                    muon_opt.zero_grad(set_to_none=True)
+                    adam_opt.zero_grad(set_to_none=True)
+                else:
+                    muon_opt.step(momentum=muon_momentum, cautious_wd=cautious_wd, lr_scale=lr_scale)
+                    # Zero all grads between micro-steps so stale gradients do
+                    # not accumulate for any param group.  Embed/head/multi-head
+                    # grads are safe in the buffer; everything else must be
+                    # cleared so the next backward produces fresh gradients.
+                    muon_opt.zero_grad(set_to_none=True)
+                    adam_opt.zero_grad(set_to_none=True)
+            else:
+                # Original modded-nanogpt flow: Muon gets a fresh gradient and
+                # is stepped + cleared every step. Adam-managed params (embed,
+                # lm_head, value_embeds, scalars) are only stepped on odd
+                # steps -- on a skipped (even) step their .grad is left alone
+                # rather than zeroed, so the next backward() accumulates on
+                # top of it (PyTorch's default add-into-.grad), matching the
+                # original's "don't clear Adam grads on even steps" behavior
+                # instead of silently discarding the even step's gradient.
+                muon_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                adam_stepped = step_speedrun_optimizers(
+                    muon_opt,
+                    adam_opt,
+                    step=step,
+                    muon_momentum=muon_momentum,
+                    adam_on_odd_steps=adam_on_odd_steps,
+                    cautious_wd=cautious_wd,
+                    lr_scale=lr_scale,
+                )
+                if adam_stepped:
+                    adam_opt.zero_grad(set_to_none=True)
+
+            # --- Portable: untie embed and lm_head at 2/3 of training ---
+            if untie_at_frac > 0.0 and step == int(steps * untie_at_frac):
+                if hasattr(model.embed, "weight") and model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr():
+                    model.lm_head.weight = nn.Parameter(model.lm_head.weight.data.clone())
+                    model.lm_head.weight.data.zero_()
+                    lr_val = adam_lr * lm_head_lr_mul
+                    wd_val = adam_weight_decay * lm_head_wd_mul
+                    adam_opt.add_param_group({
+                        "params": [model.lm_head.weight],
+                        "lr": lr_val,
+                        "weight_decay": wd_val,
+                    })
+
+            tokens_trained += effective_batch * current_block
+            with torch.no_grad():
+                loss_detached = loss.detach()
+                ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
+                    ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                )
+            completed = step + 1
+            if step == 0 or completed == steps or completed % log_every == 0:
+                ema_loss = ema_loss_tensor.item()
+                elapsed = time.time() - start_time
+                tokens_per_sec = tokens_trained / elapsed if elapsed > 0 else 0.0
+                eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+                pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
+                pbar.write(
+                    f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
+                    f"| bs={effective_batch} lr_scale={lr_scale:.3f} "
+                    f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
+                )
+
+    # Flush any remaining partial accumulation cycle so embed/head grads
+    # from the last incomplete cycle are not silently dropped.
+    if training_recipe != "record_01_adamw" and grad_accum_embed_head_steps > 1 and accum_buffer_embed_head is not None:
+        for name, p in model.named_parameters():
+            if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                if id(p) in accum_buffer_embed_head:
+                    p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
         if grad_clip and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        opt.step()
+        step_speedrun_optimizers(
+            muon_opt, adam_opt,
+            step=step,
+            muon_momentum=muon_momentum,
+            adam_on_odd_steps=adam_on_odd_steps,
+            cautious_wd=cautious_wd,
+            lr_scale=lr_scale,
+            force_adam=True,
+        )
+        accum_buffer_embed_head = None
+        accum_count = 0
 
-        # Real per-step EMA, kept on-device as a tensor so this costs no new GPU
-        # sync (`.item()`) -- only converted to a Python float below, and only at
-        # the throttled logging cadence.
-        with torch.no_grad():
-            loss_detached = loss.detach()
-            ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
-                ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
-            )
-
-        completed = step + 1
-        if step == 0 or completed == steps or completed % log_every == 0:
-            # The only GPU sync (`.item()`) added for display; throttled to this
-            # cadence, never on every step.
-            ema_loss = ema_loss_tensor.item()
-            elapsed = time.time() - start_time
-            tokens_per_sec = (completed * batch * block) / elapsed if elapsed > 0 else 0.0
-            eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
-            pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
-            pbar.write(
-                f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
-                f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
-            )
     pbar.close()
-
-    # Cross-entropy (nats/token, mean) over EVERY predictable next-token position of
-    # the held-out val stream, batching consecutive equal-length windows so variable
-    # lengths (full blocks, then the final partial window) never get stacked.
-    model.eval()
-    val_windows = plan_val_windows(len(val_data), block)
-    total = sum(L for _, L in val_windows)
-    loss_sum = 0.0
-    correct = 0
-    with torch.no_grad():
-        wi = 0
-        while wi < len(val_windows):
-            L = val_windows[wi][1]
-            vs = []
-            while wi < len(val_windows) and val_windows[wi][1] == L and len(vs) < batch:
-                vs.append(val_windows[wi][0])
-                wi += 1
-            xb = torch.stack([val_data[s : s + L] for s in vs]).to(device)
-            yb = torch.stack([val_data[s + 1 : s + L + 1] for s in vs]).to(device)
-            logits = model(xb)
-            loss_sum += F.cross_entropy(
-                logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
-            ).item()
-            correct += (logits.argmax(-1) == yb).sum().item()
-    val_loss = loss_sum / total
-    acc = correct / total
-    tokens_trained = steps * batch * block
+    val_loss, acc = _eval_val_loss(
+        model, val_data, block=block, batch=batch, vocab_size=vocab_size, device=device
+    )
     return val_loss, acc, tokens_trained
 
 
 def averaged_train_and_eval(
     build_model, train_data, val_data, *, n_runs, base_seed, device, **hparams
 ):
-    """Train+eval ``n_runs`` times with distinct seeds and average the val signal.
-
-    Each run reseeds the global RNG and the window-shuffle generator to
-    ``base_seed + run`` and trains a FRESH model from ``build_model()``. If ANY run
-    yields a non-finite loss the whole result collapses to the infinite-loss
-    sentinel ``(inf, 0.0, 0.0, 0, 0)`` -- strict completion, exactly like the
-    empty-corpus path -- so a single bad run can never average into a deceptively
-    finite score. Loss and accuracy are AVERAGED; FLOPs and tokens are SUMMED across
-    runs (N runs really spend N x the compute, and cost accounting bills all of it).
-    Returns ``(val_loss, accuracy, flops, tokens_trained, n_params)``.
-    """
+    """Train+eval ``n_runs`` times with distinct seeds and average the val signal."""
     n_runs = max(1, int(n_runs))
     losses = []
     accs = []
@@ -281,8 +610,13 @@ def averaged_train_and_eval(
         model = build_model()
         run_label = f"run {run + 1}/{n_runs} " if n_runs > 1 else ""
         loss, acc, tokens_trained = train_and_eval_student(
-            model, train_data, val_data, device=device, generator=generator,
-            run_label=run_label, **hparams
+            model,
+            train_data,
+            val_data,
+            device=device,
+            generator=generator,
+            run_label=run_label,
+            **hparams,
         )
         if not math.isfinite(loss):
             return float("inf"), 0.0, 0.0, 0, 0
@@ -294,24 +628,19 @@ def averaged_train_and_eval(
     return sum(losses) / len(losses), sum(accs) / len(accs), total_flops, total_tokens, n_params
 
 
-# Source-of-truth training-recipe helpers, in dependency (definition) order. Their
-# exact source is embedded into the sandbox training script in ``trainer.py``.
 _TRAINING_COMPONENTS = (
     lr_at_step,
     plan_train_windows,
+    plan_eos_aligned_windows,
+    make_seq_len_schedule,
+    _enforce_max_doc_len,
+    _eval_val_loss,
+    _compute_multi_token_loss,
     train_and_eval_student,
     averaged_train_and_eval,
 )
 
 
 def training_source() -> str:
-    """The verbatim source of the training-recipe helpers, for byte-identical embed.
-
-    Returns the concatenated source of every recipe function in this module (in
-    definition order). ``trainer.py`` injects this exact string into its sandbox
-    training script -- after the embedded model and ``plan_val_windows`` -- so the
-    GPU-only training run executes the same optimizer schedule, contiguous
-    batching, and multi-run averaging these CPU tests exercise. (``plan_val_windows``
-    is embedded separately and only *called* here, never redefined.)
-    """
+    """The verbatim source of the training-recipe helpers, for byte-identical embed."""
     return "\n\n\n".join(inspect.getsource(c).rstrip() for c in _TRAINING_COMPONENTS)

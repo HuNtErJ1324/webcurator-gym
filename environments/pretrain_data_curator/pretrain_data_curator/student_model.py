@@ -3,79 +3,46 @@
 This module is the **single source of truth** for the proxy-student model. The same
 class definitions are embedded byte-identically into the GPU sandbox training
 script (``trainer.py``) via :func:`model_source`, so the CPU unit tests in this
-package exercise the exact code the sandbox runs (see the verbatim-source test).
+package exercise the exact code the sandbox runs.
 
-The architecture follows the *modern* design from
-``KellerJordan/modded-nanogpt`` — the cleaned-up
-``records/track_3_optimization/train_gpt_simple.py``, the
-``2024-12-08_UNetValueEmbedsTweaks`` record, and the
-``2024-12-17_SparsifyEmbeds`` record (which sparsified the value embeddings) —
-while deliberately EXCLUDING the repo's GPU-specific *training* optimizations
-(Muon/NorMuon, FP8, distributed comms, multi-token prediction, FlexAttention,
-``torch.compile``/triton, and bf16-only assumptions). Everything runs fp32 on CPU.
+The architecture follows ``KellerJordan/modded-nanogpt`` through the SparsifyEmbeds /
+UNet / post-lambda / gated-attention records, while deliberately EXCLUDING GPU-only
+pieces (FlexAttention kernels, FlashAttention varlen, FP8, distributed comms,
+``torch.compile``/triton, and YaRN runtime extension). Training uses the
+CPU-portable speedrun optimizer in ``student_optimizer.py``.
 
 Components implemented (all CPU-runnable):
 
-* **RoPE** — half-truncate, base-frequency rotary embeddings (``Rotary``).
-* **RMSNorm** with a learnable gain (``RMSNorm``), via ``F.rms_norm``.
-* **QK-norm** — unweighted ``F.rms_norm`` on per-head q and k before attention.
-* **ReLU² MLP** — ``F.relu(x).square()`` feed-forward.
-* **SDPA causal attention** — ``F.scaled_dot_product_attention(..., is_causal=
-  True)``. This REPLACES the record's GPU-only FlexAttention (the document/
-  sliding-window block masking is a GPU-path feature and is intentionally
-  dropped; plain causal masking is used instead).
-* **tanh logit softcap** — ``softcap * tanh(logits / softcap)`` (default 30).
-* **U-net encoder/decoder skip connections** with learnable ``skip_weights``.
-* **Sparse value embeddings** (``ValueEmbedding``, the SparsifyEmbeds design):
-  a small number of DISTINCT full-model_dim tables (``num_value_embeds``, default
-  3) applied only to the FIRST and LAST ``num_value_embeds`` layers (U-net mirror)
-  with ``None`` for the middle layers, fed to the per-attention value-residual
-  ``lambdas`` (``v = lambdas[0]*v + lambdas[1]*value_embed``, or ``lambdas[0]*v``
-  when the layer's value embedding is ``None``).
-* **Block lambdas** mixing the current residual with the post-embedding ``x0``.
-* **Untied** ``lm_head`` with zero-init weights; padded vocab 50304.
-
-Linear layers are bias-free (the modern convention); the only biases-equivalent
-learnable scalars are the RMSNorm gains and the residual/value ``lambdas``.
-
-Chosen GPT-2-small-class config (see :data:`GPT2_SMALL`):
-``model_dim=768, num_layers=12, num_heads=6 (head_dim=128), mlp_ratio=4,
-vocab_size=50304, softcap=30, num_value_embeds=3``.
-
-Exact instantiated parameter count: **278,122,038** (~278M), see
-:data:`GPT2_SMALL_PARAM_COUNT`. (The earlier C pass used 6 full per-encoder-layer
-value tables, ~394M; aligning to SparsifyEmbeds' 3 tables both raises fidelity and
-drops ~116M of value-embedding params.) The remaining excess over the canonical
-124M *tied-embedding* GPT-2-small is intrinsic to the modern design:
-
-    embed (wte)              V*d                  =  38,633,472
-    value_embeds (3 tables)  3 * V*d              = 115,900,416   <- dominates
-    12 transformer blocks (attn+mlp+norms+lambdas)=  84,953,136
-    lm_head (UNTIED)         d*V                  =  38,633,472
-    skip_weights + norms + lambdas                =       1,542
-    ---------------------------------------------------------------
-    total                                           278,122,038
-
-The 3 distinct sparse value-embedding tables (115.9M) and the untied head (+38.6M
-over a tied embedding) account for essentially all of the gap. The model
-dimensions are squarely GPT-2-small (768-wide, 12 deep); the parameter *count* is
-larger by construction, and architectural fidelity to modded-nanogpt — not the
-124M number — is the governing criterion. The runtime ``ProxyStudentConfig`` still
-defaults to a tiny config for cheap CPU/sandbox jobs — this preset documents the
-GPT-2-small target the architecture is built for.
-
-Upstream fidelity note: modded-nanogpt's SparsifyEmbeds (``ValueEmbedding`` =
-3 full-width ``nn.Embedding`` tables; ``ve = [v0,v1,v2, None*6, v0,v1,v2]``) totals
-~275.6M at GPT-2-small. This student matches the value-embedding design exactly;
-the ~2.5M difference is documented and intentional: attention is kept on ALL 12
-layers (SparsifyEmbeds drops layer-7 attention, a config-specific micro-opt that
-does not generalize to a configurable depth), the vocab is uniformly padded to
-50304 (SparsifyEmbeds pads only the head), and RMSNorm keeps learnable gains.
+* **RoPE** — half-truncate rotary embeddings (``Rotary``).
+* **RMSNorm** with learnable gains.
+* **QK-norm** before attention.
+* **ReLU² MLP** feed-forward.
+* **SDPA attention** with ``softmax_scale=attn_scale`` (default **0.12**, matching
+  the speedrun records) and optional **sliding-window** masking (SDPA ``attn_mask``,
+  not FlexAttention).
+* **Per-layer gated attention** — ``sigmoid(Linear(x[..., :12])`` per head.
+* **Per-layer residual/post lambdas** — ``resid_lambdas_{attn,mlp}`` and
+  ``post_lambdas`` matching the modern speedrun residual path.
+* **x0 lambdas** — per-layer injection of the post-embed stream.
+* **tanh logit softcap** (default 30).
+* **U-net skips** with **sigmoid skip gates** (replacing raw skip weights).
+* **Sparse value embeddings** (SparsifyEmbeds): 3 distinct tables on first/last bands.
+* **Untied** zero-init ``lm_head``; vocab padded to 50304.
+* **Bigram hash embedding** — 1/4 of ``model_dim`` via hashed bigrams with sign trick.
+* **Smear** — learned 1-token lookback on the embedding stream.
+* **Partial Key Offset** — offset key RoPE positions for context-length extrapolation.
+* **Paired head attention** — shared Q/K across head pairs with separate V/proj.
+* **MUDD** — multi-layer skip connections to residual stream and attention values.
+* **Learnable XSA** — cross-self-attention across layer pairs.
+* **Single activation input** — last 3 attention layers share a single input.
+* **Exponential residual decay** — alternative to per-layer learnable lambdas.
+* **Multi-token prediction heads** — auxiliary future-token prediction heads.
 """
 
 from __future__ import annotations
 
 import inspect
+import math
 from dataclasses import dataclass
 
 import torch
@@ -95,13 +62,7 @@ class RMSNorm(nn.Module):
 
 
 class Rotary(nn.Module):
-    """Half-truncate, base-frequency rotary position embeddings (RoPE).
-
-    The first ``head_dim // 4`` frequencies follow a geometric schedule; the
-    remaining ``head_dim // 4`` are zeroed (the "half-truncate" trick), so only
-    the lower half of each head's channels are rotated. ``head_dim`` must be a
-    multiple of 4.
-    """
+    """Half-truncate, base-frequency rotary position embeddings (RoPE)."""
 
     def __init__(self, head_dim: int, base_inv_freq: float = 1024.0):
         super().__init__()
@@ -123,44 +84,169 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 
+class RotaryWithOffset(nn.Module):
+    """RoPE with configurable position offset (for Partial Key Offset)."""
+
+    def __init__(self, head_dim: int, base_inv_freq: float = 1024.0):
+        super().__init__()
+        if head_dim % 4 != 0:
+            raise ValueError(f"head_dim must be divisible by 4, got {head_dim}")
+        angular_freq = (1.0 / base_inv_freq) ** torch.linspace(
+            0, 1, steps=head_dim // 4, dtype=torch.float32
+        )
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(head_dim // 4)])
+        self.register_buffer("angular_freq", angular_freq, persistent=False)
+
+    def forward(self, x_BTHD: torch.Tensor, pos_offset: float = 0.0) -> torch.Tensor:
+        T = x_BTHD.size(1)
+        pos = torch.arange(T, dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos + pos_offset, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+
+def _sliding_window_mask(seq_len: int, window_size: int, device: torch.device) -> torch.Tensor:
+    """Causal band mask for SDPA: query i attends to keys in [i-window+1, i]."""
+    idx = torch.arange(seq_len, device=device)
+    mask = (idx[None, :] > idx[:, None]) | (idx[None, :] < idx[:, None] - window_size + 1)
+    return mask
+
+
 class CausalSelfAttention(nn.Module):
-    """Causal self-attention with QK-norm, RoPE, and a value-residual mix.
+    """Causal self-attention with QK-norm, RoPE, value-residual mix, and head gating."""
 
-    Uses ``F.scaled_dot_product_attention(is_causal=True)`` (CPU-runnable) in
-    place of the GPU-only FlexAttention kernel from the upstream record.
-    """
-
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.attn_scale = float(attn_scale)
         self.q = nn.Linear(dim, dim, bias=False)
         self.k = nn.Linear(dim, dim, bias=False)
         self.v = nn.Linear(dim, dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
-        self.proj.weight.data.zero_()  # zero-init residual projection
-        # Value-residual mix: v = lambdas[0]*v + lambdas[1]*value_embed.
+        self.proj.weight.data.zero_()
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.attn_gate = nn.Linear(12, num_heads, bias=False)
         self.rotary = Rotary(self.head_dim)
 
-    def forward(self, x: torch.Tensor, value_embed: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        value_embed: torch.Tensor | None,
+        *,
+        window_size: int | None = None,
+        partial_key_offset: float | None = None,
+    ) -> torch.Tensor:
         B, T = x.size(0), x.size(1)
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
         if value_embed is None:
-            v = self.lambdas[0] * v  # sparse: this layer has no value embedding
+            v = self.lambdas[0] * v
         else:
             v = self.lambdas[0] * v + self.lambdas[1] * value_embed.view_as(v)
-        q = F.rms_norm(q, (q.size(-1),))  # QK-norm (unweighted)
+        q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
-        ).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        if partial_key_offset is not None:
+            k_rot = RotaryWithOffset(self.head_dim)
+            k_rot.angular_freq = self.rotary.angular_freq
+            k = k_rot(k, pos_offset=partial_key_offset)
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        if window_size is not None and window_size < T:
+            attn_mask = _sliding_window_mask(T, window_size, x.device)
+            y = F.scaled_dot_product_attention(
+                q_t,
+                k_t,
+                v_t,
+                attn_mask=attn_mask,
+                scale=self.attn_scale,
+            ).transpose(1, 2)
+        else:
+            y = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True, scale=self.attn_scale
+            ).transpose(1, 2)
+        gate = torch.sigmoid(self.attn_gate(x[..., :12])).view(B, T, self.num_heads, 1)
+        y = (y * gate).contiguous().view(B, T, self.num_heads * self.head_dim)
+        return self.proj(y)
+
+
+class PairedHeadAttention(nn.Module):
+    """Paired-head self-attention: pairs of heads share Q/K projections.
+
+    Within each pair, heads have separate V projections and output projections.
+    """
+
+    def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+        if num_heads % 2 != 0:
+            raise ValueError(f"PairedHeadAttention requires even num_heads, got {num_heads}")
+        self.num_heads = num_heads
+        self.num_pairs = num_heads // 2
+        self.head_dim = dim // num_heads
+        self.attn_scale = float(attn_scale)
+        pair_dim = self.num_pairs * self.head_dim
+        self.q = nn.Linear(dim, pair_dim, bias=False)
+        self.k = nn.Linear(dim, pair_dim, bias=False)
+        self.v = nn.Linear(dim, dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.proj.weight.data.zero_()
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.attn_gate = nn.Linear(12, num_heads, bias=False)
+        self.rotary = Rotary(self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        value_embed: torch.Tensor | None,
+        *,
+        window_size: int | None = None,
+        partial_key_offset: float | None = None,
+    ) -> torch.Tensor:
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_pairs, self.head_dim)
+        k = self.k(x).view(B, T, self.num_pairs, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        if value_embed is None:
+            v = self.lambdas[0] * v
+        else:
+            v = self.lambdas[0] * v + self.lambdas[1] * value_embed.view_as(v)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        if partial_key_offset is not None:
+            k_rot = RotaryWithOffset(self.head_dim)
+            k_rot.angular_freq = self.rotary.angular_freq
+            k = k_rot(k, pos_offset=partial_key_offset)
+        # Reshape V to pair structure: (B,T,num_heads,head_dim) -> (B,T,num_pairs,2*head_dim)
+        v_pair = v.view(B, T, self.num_pairs, 2, self.head_dim).reshape(
+            B, T, self.num_pairs, 2 * self.head_dim
+        )
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v_pair.transpose(1, 2)
+        if window_size is not None and window_size < T:
+            attn_mask = _sliding_window_mask(T, window_size, x.device)
+            y = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, attn_mask=attn_mask, scale=self.attn_scale,
+            ).transpose(1, 2)
+        else:
+            y = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True, scale=self.attn_scale
+            ).transpose(1, 2)
+        # y shape: (B, T, num_pairs, 2*head_dim) -> reshape to (B, T, num_heads, head_dim)
+        y = y.reshape(B, T, self.num_heads, self.head_dim)
+        gate = torch.sigmoid(self.attn_gate(x[..., :12])).view(B, T, self.num_heads, 1)
+        y = (y * gate).contiguous().view(B, T, self.num_heads * self.head_dim)
         return self.proj(y)
 
 
@@ -181,39 +267,31 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    """Pre-norm transformer block with a learnable x0 residual mix."""
+    """Pre-norm transformer block (residual/post lambdas live on ``GPT``)."""
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 4):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 4, *, attn_scale: float = 0.12, paired_head: bool = False):
         super().__init__()
-        self.attn = CausalSelfAttention(dim, num_heads)
+        attn_cls = PairedHeadAttention if paired_head else CausalSelfAttention
+        self.attn = attn_cls(dim, num_heads, attn_scale=attn_scale)
         self.mlp = MLP(dim, mlp_ratio)
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
-        # Mix the running residual with the post-embedding x0 (value-residual idea).
-        self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def forward(
-        self, x: torch.Tensor, value_embed: torch.Tensor | None, x0: torch.Tensor
-    ) -> torch.Tensor:
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = x + self.attn(self.norm1(x), value_embed)
-        x = x + self.mlp(self.norm2(x))
-        return x
+        self,
+        x: torch.Tensor,
+        value_embed: torch.Tensor | None,
+        *,
+        window_size: int | None = None,
+        partial_key_offset: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_out = self.attn(self.norm1(x), value_embed, window_size=window_size, partial_key_offset=partial_key_offset)
+        mlp_out = self.mlp(self.norm2(x))
+        return attn_out, mlp_out
 
 
 class ValueEmbedding(nn.Module):
-    """Sparse per-token value embeddings (modded-nanogpt SparsifyEmbeds design).
-
-    Holds ``num_tables`` DISTINCT full-``model_dim`` embedding tables (default 3),
-    applied only to the first and last ``num_tables`` layers — a U-net mirror — with
-    ``None`` for the middle layers, so most layers carry no value-residual. This
-    matches the 2024-12-17 SparsifyEmbeds record, whose 12-layer pattern is
-    ``[v0, v1, v2, None*6, v0, v1, v2]`` from 3 tables.
-
-    ``num_tables`` is clamped to ``num_layers // 2`` so the first/last bands never
-    overlap; ``forward`` returns a list of length ``num_layers`` whose entries are
-    either a ``(B, T, model_dim)`` tensor or ``None``.
-    """
+    """Sparse per-token value embeddings (SparsifyEmbeds design)."""
 
     def __init__(self, vocab_size: int, model_dim: int, num_layers: int, num_tables: int = 3):
         super().__init__()
@@ -229,15 +307,141 @@ class ValueEmbedding(nn.Module):
         return tables + [None] * middle + tables
 
 
-class GPT(nn.Module):
-    """Decoder-only transformer with U-net skips and sparse value embeddings.
+class BigramHashEmbedding(nn.Module):
+    """Bigram hash embedding on 1/4 of model_dim with sign trick.
 
-    ``forward(idx)`` returns tanh-softcapped logits of shape ``(B, T, vocab_size)``
-    (the cross-entropy loss is computed by the caller, so the held-out validation
-    windowing stays in the training script). ``num_layers`` must be even and >= 2
-    so the encoder and decoder halves are symmetric (the U-net pushes one skip per
-    encoder layer and the decoder pops exactly one per layer).
+    For each consecutive pair of tokens, a hash determines whether each element
+    in the embedding is +1 or -1 (sign trick). The remaining 3/4 of model_dim
+    uses a standard token embedding.
     """
+
+    def __init__(self, vocab_size: int, model_dim: int):
+        super().__init__()
+        if model_dim % 4 != 0:
+            raise ValueError(f"BigramHashEmbedding requires model_dim % 4 == 0, got {model_dim}")
+        self.full_dim = model_dim
+        self.hash_dim = model_dim // 4
+        self.token_embed = nn.Embedding(vocab_size, model_dim - self.hash_dim)
+        rng = torch.Generator().manual_seed(42)
+        hash_seed = torch.randint(0, 2 ** 31, (vocab_size,), generator=rng, dtype=torch.long)
+        self.register_buffer("hash_seed", hash_seed, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T = x.shape
+        tok_part = self.token_embed(x)
+        if T < 2:
+            hash_part = torch.zeros(B, T, self.hash_dim, device=x.device, dtype=tok_part.dtype)
+            return torch.cat([tok_part, hash_part], dim=-1)
+        prev = x[:, :-1]
+        curr = x[:, 1:]
+        h = (self.hash_seed[prev] * 2654435761) ^ (self.hash_seed[curr] * 2246822519)
+        sign = (h.float() * (1.0 / 2 ** 31)).fmod(2.0).abs().sub(1.0).sign()
+        sign = sign.unsqueeze(-1).expand(-1, -1, self.hash_dim)
+        pad_first = torch.zeros(B, 1, self.hash_dim, device=x.device, dtype=sign.dtype)
+        hash_part = torch.cat([pad_first, sign], dim=1)
+        return torch.cat([tok_part, hash_part], dim=-1)
+
+
+class Smear(nn.Module):
+    """Learned 1-token lookback smear on the embedding stream.
+
+    Each dimension has a learnable gate controlling how much of the previous
+    token's activation is added to the current token's activation.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.smear_gate = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        prev = torch.cat([x[:, :1], x[:, :-1]], dim=1)
+        gate = torch.sigmoid(self.smear_gate)
+        return x + gate * prev
+
+
+class MUDD(nn.Module):
+    """Multi-layer skip connections feeding residual stream and attention values.
+
+    MUDD connections project from early encoder layers to later decoder layers,
+    contributing to both the residual stream and the attention value input.
+    """
+
+    def __init__(self, dim: int, num_skip_pairs: int = 2):
+        super().__init__()
+        self.num_skip_pairs = num_skip_pairs
+        self.resid_gates = nn.Parameter(torch.zeros(num_skip_pairs))
+        self.value_gates = nn.Parameter(torch.zeros(num_skip_pairs))
+        self.resid_projs = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False) for _ in range(num_skip_pairs)]
+        )
+        self.value_projs = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False) for _ in range(num_skip_pairs)]
+        )
+
+    def forward(
+        self, source: torch.Tensor, layer_idx: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if layer_idx >= self.num_skip_pairs:
+            return None, None
+        resid = torch.sigmoid(self.resid_gates[layer_idx]) * self.resid_projs[layer_idx](source)
+        val = torch.sigmoid(self.value_gates[layer_idx]) * self.value_projs[layer_idx](source)
+        return resid, val
+
+
+class XSA(nn.Module):
+    """Learnable cross-self-attention across layer pairs.
+
+    A lightweight attention module that lets decoder layers attend to encoder
+    layer outputs, with learnable interpolation between XSA and local context.
+    """
+
+    def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.attn_scale = float(attn_scale)
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.k = nn.Linear(dim, dim, bias=False)
+        self.v = nn.Linear(dim, dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.proj.weight.data.zero_()
+        self.gate = nn.Parameter(torch.tensor(0.0))
+        self.norm_kv = RMSNorm(dim)
+        self.rotary = Rotary(self.head_dim)
+
+    def forward(self, x: torch.Tensor, cross_src: torch.Tensor) -> torch.Tensor:
+        B, T = x.shape[0], x.shape[1]
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(self.norm_kv(cross_src)).view(B, -1, self.num_heads, self.head_dim)
+        v = self.v(self.norm_kv(cross_src)).view(B, -1, self.num_heads, self.head_dim)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q_t, k_t, v_t, is_causal=False, scale=self.attn_scale
+        ).transpose(1, 2).contiguous().view(B, T, -1)
+        return torch.tanh(self.gate) * self.proj(y)
+
+
+class MultiTokenHeads(nn.Module):
+    """Extra LM prediction heads for multi-token prediction (future tokens)."""
+
+    def __init__(self, dim: int, vocab_size: int, num_extra_heads: int = 3):
+        super().__init__()
+        self.num_extra_heads = num_extra_heads
+        self.heads = nn.ModuleList(
+            [nn.Linear(dim, vocab_size, bias=False) for _ in range(num_extra_heads)]
+        )
+        for h in self.heads:
+            h.weight.data.zero_()
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return [h(x) for h in self.heads]
+
+
+class GPT(nn.Module):
+    """Decoder-only transformer with U-net skips, sparse value embeddings, and speedrun lambdas."""
 
     def __init__(
         self,
@@ -248,45 +452,181 @@ class GPT(nn.Module):
         mlp_ratio: int = 4,
         softcap: float = 30.0,
         num_value_embeds: int = 3,
+        attn_scale: float = 0.12,
+        sliding_window_size: int | None = None,
+        # ---- portable feature flags (all off by default) ----
+        bigram_hash_embed: bool = False,
+        smear_embed: bool = False,
+        partial_key_offset: float | None = None,
+        paired_head: bool = False,
+        mudd_pairs: int = 0,
+        xsa_enabled: bool = False,
+        xsa_pairs: int = 0,
+        single_act_last_k: int = 0,
+        exp_residual_decay: float | None = None,
+        multi_token_pred: int = 0,
     ):
         super().__init__()
         if num_layers < 2 or num_layers % 2 != 0:
             raise ValueError(f"num_layers must be even and >= 2, got {num_layers}")
         self.num_layers = num_layers
         self.softcap = float(softcap)
+        self.sliding_window_size = sliding_window_size
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        # One learnable weight per decoder layer for the U-net skip connections.
-        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
-        self.embed = nn.Embedding(vocab_size, model_dim)
-        # Sparse value embeddings (SparsifyEmbeds): a few distinct full-width tables
-        # applied only to the first/last layers, None for the middle ones.
+        self.skip_gates = nn.Parameter(torch.ones(self.num_decoder_layers))
+        self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
+        self.resid_lambdas_attn = nn.Parameter(torch.ones(num_layers))
+        self.resid_lambdas_mlp = nn.Parameter(torch.ones(num_layers))
+        self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
+        self.exp_residual_decay = exp_residual_decay
+
+        if bigram_hash_embed:
+            self.embed = BigramHashEmbedding(vocab_size, model_dim)
+        else:
+            self.embed = nn.Embedding(vocab_size, model_dim)
+
+        if smear_embed:
+            self.smear = Smear(model_dim)
+        else:
+            self.smear = None
+
         self.value_embeds = ValueEmbedding(
             vocab_size, model_dim, num_layers, num_value_embeds
         )
+
+        self.partial_key_offset = partial_key_offset
+        self.single_act_last_k = single_act_last_k
+        self.multi_token_pred = multi_token_pred
+
         self.blocks = nn.ModuleList(
-            [Block(model_dim, num_heads, mlp_ratio) for _ in range(num_layers)]
+            [
+                Block(model_dim, num_heads, mlp_ratio, attn_scale=attn_scale, paired_head=paired_head)
+                for _ in range(num_layers)
+            ]
         )
+
+        # MUDD skip connections
+        self.mudd_pairs = mudd_pairs
+        if mudd_pairs > 0:
+            self.mudd = MUDD(model_dim, num_skip_pairs=mudd_pairs)
+        else:
+            self.mudd = None
+
+        # XSA (cross-self-attention)
+        self.xsa_enabled = xsa_enabled
+        self.xsa_pairs = xsa_pairs
+        if xsa_enabled and xsa_pairs > 0:
+            self.xsa_modules = nn.ModuleList(
+                [XSA(model_dim, num_heads, attn_scale=attn_scale) for _ in range(xsa_pairs)]
+            )
+            self.xsa_layer_map: list[tuple[int, int]] = []
+
+        # Multi-token prediction heads
+        if multi_token_pred > 0:
+            self.multi_heads = MultiTokenHeads(model_dim, vocab_size, multi_token_pred)
+        else:
+            self.multi_heads = None
+
         self.norm_in = RMSNorm(model_dim)
         self.norm_out = RMSNorm(model_dim)
         self.lm_head = nn.Linear(model_dim, vocab_size, bias=False)
-        self.lm_head.weight.data.zero_()  # untied, zero-init head
+        self.lm_head.weight.data.zero_()
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def _apply_exp_residual_decay(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
+        if self.exp_residual_decay is not None:
+            alpha = self.exp_residual_decay ** layer_idx
+            return x * alpha
+        return x
+
+    def forward(self, idx: torch.Tensor, *, window_size: int | None = None, output_hidden: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        ws = window_size if window_size is not None else self.sliding_window_size
         x = self.norm_in(self.embed(idx))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
-        ve = self.value_embeds(idx)  # length num_layers; entries are Tensor or None
+        ve = self.value_embeds(idx)
         ve_enc, ve_dec = ve[: self.num_encoder_layers], ve[self.num_encoder_layers :]
-        skip_connections = []
+        skip_connections: list[torch.Tensor] = []
+        encoder_outputs: list[torch.Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, ve_enc[i], x0)
+            attn_out, mlp_out = self.blocks[i](x, ve_enc[i], window_size=ws, partial_key_offset=self.partial_key_offset)
+            x = (
+                self._apply_exp_residual_decay(i, x) if self.exp_residual_decay is not None else x
+            )
+            x = (
+                self.resid_lambdas_attn[i] * x
+                + self.post_lambdas[i, 0] * attn_out
+                + self.x0_lambdas[i] * x0
+            )
+            x = self.resid_lambdas_mlp[i] * x + self.post_lambdas[i, 1] * mlp_out
             skip_connections.append(x)
+            encoder_outputs.append(x)
+
+        single_act = None
+        if self.single_act_last_k > 0:
+            s_start = max(0, self.num_encoder_layers - self.single_act_last_k)
+            single_act = encoder_outputs[s_start] if encoder_outputs else x
+
+        xsa_src: list[torch.Tensor] = list(reversed(encoder_outputs))
         for i in range(self.num_decoder_layers):
-            x = x + self.skip_weights[i] * skip_connections.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0)
+            layer_idx = self.num_encoder_layers + i
+
+            # MUDD contribution
+            mudd_resid, mudd_val = None, None
+            if self.mudd is not None:
+                src_idx = max(0, self.num_encoder_layers - 1 - i)
+                if src_idx < len(encoder_outputs):
+                    mudd_resid, mudd_val = self.mudd(encoder_outputs[src_idx], i)
+
+            x = x + torch.sigmoid(self.skip_gates[i]) * skip_connections.pop()
+
+            # XSA contribution
+            if self.xsa_enabled and self.xsa_pairs > 0 and i < self.xsa_pairs and xsa_src:
+                xsa_out = self.xsa_modules[i](x, xsa_src[i])
+                x = x + xsa_out
+
+            # Determine attention input: single activation for last k layers
+            attn_input = x
+            if self.single_act_last_k > 0 and i >= self.num_decoder_layers - self.single_act_last_k:
+                if single_act is not None:
+                    attn_input = single_act
+
+            # MUDD value contribution to attention
+            ve_i = ve_dec[i]
+            if mudd_val is not None:
+                if ve_i is None:
+                    ve_i = mudd_val
+                else:
+                    ve_i = ve_i + mudd_val
+
+            attn_out, mlp_out = self.blocks[layer_idx](
+                attn_input, ve_i, window_size=ws, partial_key_offset=self.partial_key_offset
+            )
+
+            # MUDD residual contribution
+            if mudd_resid is not None:
+                attn_out = attn_out + mudd_resid
+
+            x = (
+                self._apply_exp_residual_decay(layer_idx, x) if self.exp_residual_decay is not None else x
+            )
+            x = (
+                self.resid_lambdas_attn[layer_idx] * x
+                + self.post_lambdas[layer_idx, 0] * attn_out
+                + self.x0_lambdas[layer_idx] * x0
+            )
+            x = (
+                self.resid_lambdas_mlp[layer_idx] * x
+                + self.post_lambdas[layer_idx, 1] * mlp_out
+            )
         x = self.norm_out(x)
-        logits = self.lm_head(x)
-        return self.softcap * torch.tanh(logits / self.softcap)
+        hidden = x
+        logits = self.lm_head(hidden)
+        out = self.softcap * torch.tanh(logits / self.softcap)
+        if output_hidden:
+            return out, hidden
+        return out
 
 
 @dataclass(frozen=True)
@@ -300,6 +640,19 @@ class StudentModelConfig:
     vocab_size: int = 50304
     softcap: float = 30.0
     num_value_embeds: int = 3
+    attn_scale: float = 0.12
+    sliding_window_size: int | None = None
+    # --- portable feature flags ---
+    bigram_hash_embed: bool = False
+    smear_embed: bool = False
+    partial_key_offset: float | None = None
+    paired_head: bool = False
+    mudd_pairs: int = 0
+    xsa_enabled: bool = False
+    xsa_pairs: int = 0
+    single_act_last_k: int = 0
+    exp_residual_decay: float | None = None
+    multi_token_pred: int = 0
 
     def build(self) -> GPT:
         return GPT(
@@ -310,27 +663,94 @@ class StudentModelConfig:
             mlp_ratio=self.mlp_ratio,
             softcap=self.softcap,
             num_value_embeds=self.num_value_embeds,
+            attn_scale=self.attn_scale,
+            sliding_window_size=self.sliding_window_size,
+            bigram_hash_embed=self.bigram_hash_embed,
+            smear_embed=self.smear_embed,
+            partial_key_offset=self.partial_key_offset,
+            paired_head=self.paired_head,
+            mudd_pairs=self.mudd_pairs,
+            xsa_enabled=self.xsa_enabled,
+            xsa_pairs=self.xsa_pairs,
+            single_act_last_k=self.single_act_last_k,
+            exp_residual_decay=self.exp_residual_decay,
+            multi_token_pred=self.multi_token_pred,
         )
 
 
-# Chosen GPT-2-small-class preset and its EXACT instantiated parameter count.
-# See the module docstring for the full per-component breakdown. The count is
-# pinned by ``test_student_model.py`` (instantiated on the meta device, so no
-# allocation) to guard against silent architectural drift.
 GPT2_SMALL = StudentModelConfig()
-GPT2_SMALL_PARAM_COUNT = 278_122_038
+# Baseline param count without portable features. Portable features add params
+# when enabled, so the pinned count is for the base config only.
+GPT2_SMALL_PARAM_COUNT = 278_122_938
 
-# Source-of-truth model components, in dependency (definition) order. Their exact
-# source is embedded into the sandbox training script in ``trainer.py``.
-_MODEL_COMPONENTS = (RMSNorm, Rotary, CausalSelfAttention, MLP, Block, ValueEmbedding, GPT)
+
+def estimate_instantiated_param_count(
+    *,
+    vocab_size: int = 50304,
+    num_layers: int,
+    model_dim: int,
+    num_heads: int,
+    mlp_ratio: int = 4,
+    softcap: float = 30.0,
+    num_value_embeds: int = 3,
+    attn_scale: float = 0.12,
+    sliding_window_size: int | None = None,
+    bigram_hash_embed: bool = False,
+    smear_embed: bool = False,
+    partial_key_offset: float | None = None,
+    paired_head: bool = False,
+    mudd_pairs: int = 0,
+    xsa_enabled: bool = False,
+    xsa_pairs: int = 0,
+    single_act_last_k: int = 0,
+    exp_residual_decay: float | None = None,
+    multi_token_pred: int = 0,
+) -> int:
+    """Return the exact parameter count ``GPT.build`` would instantiate."""
+    with torch.device("meta"):
+        model = GPT(
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+            model_dim=model_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            softcap=softcap,
+            num_value_embeds=num_value_embeds,
+            attn_scale=attn_scale,
+            sliding_window_size=sliding_window_size,
+            bigram_hash_embed=bigram_hash_embed,
+            smear_embed=smear_embed,
+            partial_key_offset=partial_key_offset,
+            paired_head=paired_head,
+            mudd_pairs=mudd_pairs,
+            xsa_enabled=xsa_enabled,
+            xsa_pairs=xsa_pairs,
+            single_act_last_k=single_act_last_k,
+            exp_residual_decay=exp_residual_decay,
+            multi_token_pred=multi_token_pred,
+        )
+        return sum(p.numel() for p in model.parameters())
+
+
+_MODEL_COMPONENTS = (
+    RMSNorm,
+    Rotary,
+    RotaryWithOffset,
+    _sliding_window_mask,
+    CausalSelfAttention,
+    PairedHeadAttention,
+    MLP,
+    Block,
+    ValueEmbedding,
+    BigramHashEmbedding,
+    Smear,
+    MUDD,
+    XSA,
+    MultiTokenHeads,
+    GPT,
+)
 
 
 def model_source() -> str:
-    """The verbatim source of the model components, for byte-identical embedding.
-
-    Returns the concatenated source of every ``nn.Module`` in this module's model
-    (in definition order). ``trainer.py`` injects this exact string into its
-    sandbox training script, and a unit test asserts the substring is present, so
-    the GPU-only training run executes the same code these CPU tests exercise.
-    """
+    """The verbatim source of the model components, for byte-identical embedding."""
     return "\n\n\n".join(inspect.getsource(c).rstrip() for c in _MODEL_COMPONENTS)

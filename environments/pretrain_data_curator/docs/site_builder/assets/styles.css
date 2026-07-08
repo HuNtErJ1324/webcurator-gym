@@ -217,6 +217,20 @@ tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
   place-items: center;
 }
 
+.trace-banner {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.trace-banner p { margin: 0; }
+
+.trace-steps .step:first-child { margin-top: 0; }
+
 .step {
   border: 1px solid #ece4d9;
   border-radius: 14px;
@@ -334,7 +348,185 @@ tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
 
 .hidden { display: none; }
 
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.badge.debug {
+  background: #fff1d6;
+  color: #8a5a00;
+  border: 1px solid #ecd39a;
+}
+
+.trace-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+}
+.trace-link:hover { text-decoration: underline; }
+.trace-col { white-space: nowrap; }
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  text-decoration: none;
+  font-size: 0.88rem;
+}
+.button.ghost {
+  background: transparent;
+  color: var(--accent);
+}
+
+.breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 0.86rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.breadcrumb a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.breadcrumb a:hover { text-decoration: underline; }
+
+.trace-header {
+  align-items: start;
+}
+.trace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 18px 0;
+}
+.tab-bar .tab {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font: inherit;
+}
+.tab-bar .tab.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: #b8cae6;
+}
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.artifact-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  min-height: 420px;
+}
+.artifact-list {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+.artifact-item {
+  text-align: left;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+.artifact-item.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.artifact-item strong {
+  display: block;
+  font-size: 0.92rem;
+}
+.artifact-item span {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.artifact-view {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  min-height: 420px;
+  overflow: auto;
+  padding: 12px;
+}
+.artifact-view.empty {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.metrics-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.metrics-table th,
+.metrics-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+.metrics-table th {
+  width: 220px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.run-notes {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.notes-block,
+.log-view {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  background: #f6f8fa;
+  border: 1px solid #e1e4e8;
+  border-radius: 12px;
+  padding: 14px;
+  overflow: auto;
+  max-height: 72vh;
+}
+
 @media (max-width: 900px) {
   .header-inner, .two-col { grid-template-columns: 1fr; display: grid; }
   .bar-row, .time-row { grid-template-columns: 1fr; }
+  .artifact-layout { grid-template-columns: 1fr; }
+  .trace-actions { justify-content: flex-start; }
 }

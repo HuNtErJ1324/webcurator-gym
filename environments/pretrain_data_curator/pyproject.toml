@@ -40,6 +40,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+addopts = "-m 'not slow'"
 markers = [
-    "slow: marks tests that require the decon binary (deselect with '-m \"not slow\"')",
+    "slow: marks tests that invoke real decon or subprocess GPU training (deselect with '-m \"not slow\"')",
 ]

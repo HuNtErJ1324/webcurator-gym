@@ -122,29 +122,10 @@ class HarnessRuntimeProxyTrainer:
     def _payload(
         config: ProxyStudentConfig, val_set: HeldOutValSet | None
     ) -> dict[str, Any]:
-        return {
-            "n_layer": config.n_layer,
-            "n_head": config.n_head,
-            "n_embd": config.n_embd,
-            "mlp_ratio": config.mlp_ratio,
-            "lm_head_softcap": config.lm_head_softcap,
-            "num_value_embeds": config.num_value_embeds,
-            "block_size": config.block_size,
-            "batch_size": config.batch_size,
-            "steps": config.effective_steps,
-            "learning_rate": config.learning_rate,
-            "seed": config.seed,
-            "val_fraction": config.val_fraction,
-            "tokenizer": val_set.tokenizer if val_set else NANOGPT_VAL_TOKENIZER,
-            "weight_decay": config.weight_decay,
-            "adam_beta1": config.adam_beta1,
-            "adam_beta2": config.adam_beta2,
-            "adam_eps": config.adam_eps,
-            "grad_clip": config.grad_clip,
-            "warmup_steps": config.effective_warmup_steps,
-            "lr_min_ratio": config.lr_min_ratio,
-            "n_train_runs": config.n_train_runs,
-        }
+        payload = config.training_payload(
+            tokenizer=val_set.tokenizer if val_set else "gpt2"
+        )
+        return payload
 
     async def _write_inputs(
         self,

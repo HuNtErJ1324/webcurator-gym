@@ -34,7 +34,16 @@ cd docs/site
 python -m http.server 8080
 ```
 
-Open `http://localhost:8080`.
+Open `http://localhost:8080`. Rollout traces live on a separate page:
+
+```text
+traces/run.html?id=<run-id>#tab=trace
+```
+
+Tabs: **Trace**, **Metrics**, **Artifacts**, **Log** (PostTrainBench-style).
+
+Debug curation snapshots under `outputs/debug/<run-name>/` are included automatically.
+Rebuild with `python docs/build_site.py` (omit them with `--no-debug`).
 
 ## Trace rendering
 

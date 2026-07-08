@@ -157,9 +157,11 @@ class ProxyStudentConfig(BaseModel):
     sandbox training job.
     """
 
-    n_layer: int = Field(default=4, ge=2, le=64)
-    n_head: int = Field(default=4, ge=1, le=64)
-    n_embd: int = Field(default=256, ge=8, le=4096)
+    # Defaults mirror ``student_model.GPT2_SMALL`` (modded-nanogpt / speedrun record_01
+    # architecture): 12 layers, 768-wide, 6 heads, ~278M instantiated params.
+    n_layer: int = Field(default=12, ge=2, le=64)
+    n_head: int = Field(default=6, ge=1, le=64)
+    n_embd: int = Field(default=768, ge=8, le=4096)
     # Modern (modded-nanogpt) student knobs: ReLU**2 MLP width ratio, the tanh
     # logit-softcap constant, and the number of distinct sparse value-embedding
     # tables (SparsifyEmbeds; clamped to n_layer//2 by the model). The model itself
@@ -167,7 +169,11 @@ class ProxyStudentConfig(BaseModel):
     mlp_ratio: int = Field(default=4, ge=1, le=16)
     lm_head_softcap: float = Field(default=30.0, gt=0.0, le=1000.0)
     num_value_embeds: int = Field(default=3, ge=1, le=32)
-    block_size: int = Field(default=256, ge=8, le=8192)
+    # SDPA softmax scale (speedrun records use 0.12, not 1/sqrt(head_dim)).
+    attn_scale: float = Field(default=0.12, gt=0.0, le=10.0)
+    # Optional causal sliding-window attention (SDPA mask). ``None`` = full context.
+    sliding_window_size: int | None = Field(default=None, ge=2)
+    block_size: int = Field(default=1024, ge=8, le=8192)
     batch_size: int = Field(default=16, ge=1, le=4096)
     steps: int = Field(default=200, ge=1, le=100_000)
     # Token-oriented training budget. When set it OVERRIDES ``steps`` (the real
@@ -178,6 +184,36 @@ class ProxyStudentConfig(BaseModel):
     train_token_budget: int | None = Field(
         default=None, ge=1, le=_MAX_TRAIN_TOKEN_BUDGET
     )
+    # --- training recipe (modded-nanogpt speedrun vs legacy record_01 AdamW) ----
+    training_recipe: Literal["speedrun_muon", "record_01_adamw"] = "speedrun_muon"
+    # Classic Muon (2-D block weights)
+    muon_lr: float = Field(default=0.023, gt=0.0, le=1.0)
+    muon_weight_decay: float = Field(default=0.05, ge=0.0, le=10.0)
+    muon_momentum_min: float = Field(default=0.85, gt=0.0, lt=1.0)
+    muon_momentum_max: float = Field(default=0.95, gt=0.0, lt=1.0)
+    muon_warmup_steps: int | None = Field(default=None, ge=0)
+    muon_cooldown_steps: int | None = Field(default=None, ge=0)
+    # AdamW groups (embed / head / value embeds / scalars)
+    adam_lr: float = Field(default=0.008, gt=0.0, le=1.0)
+    adam_eps: float = Field(default=1e-10, gt=0.0, le=1e-1)
+    adam_weight_decay: float = Field(default=0.005, ge=0.0, le=1.0)
+    embed_lr_mul: float = Field(default=1.0, gt=0.0, le=1000.0)
+    lm_head_lr_mul: float = Field(default=1.0, gt=0.0, le=1000.0)
+    value_embed_lr_mul: float = Field(default=75.0, gt=0.0, le=1000.0)
+    scalar_lr_mul: float = Field(default=5.0, gt=0.0, le=1000.0)
+    embed_wd_mul: float = Field(default=150.0, ge=0.0, le=1000.0)
+    lm_head_wd_mul: float = Field(default=150.0, ge=0.0, le=1000.0)
+    value_embed_wd_mul: float = Field(default=5.0, ge=0.0, le=1000.0)
+    scalar_wd_mul: float = Field(default=0.0, ge=0.0, le=1000.0)
+    adam_on_odd_steps: bool = True
+    # Batch-size + LR schedule (BatchSizeSchedule record defaults)
+    batch_schedule_enabled: bool = True
+    batch_stage_fracs: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3)
+    batch_stage_muls: tuple[int, int, int] = (1, 2, 3)
+    lr_stage_muls: tuple[float, float, float] = (1.0, 1.52, 1.73)
+    lr_cooldown_frac: float = Field(default=0.60, ge=0.0, le=1.0)
+    lr_cooldown_floor: float = Field(default=0.15, ge=0.0, le=1.0)
+    # Legacy record_01 AdamW path (used when training_recipe='record_01_adamw')
     learning_rate: float = Field(default=3e-4, gt=0.0, le=1.0)
     seed: int = Field(default=0, ge=0)
     val_fraction: float = Field(default=0.1, gt=0.0, lt=1.0)
@@ -209,6 +245,42 @@ class ProxyStudentConfig(BaseModel):
     # AND calibration unchanged; >1 multiplies compute (FLOPs/tokens summed across
     # runs, so cost accounting bills every run).
     n_train_runs: int = Field(default=1, ge=1, le=64)
+    # --- portable proxy-student features (all off by default) ----------------
+    # Bigram hash embedding on 1/4 of model_dim with sign trick
+    bigram_hash_embed: bool = False
+    # Learned 1-token lookback smear on the embedding stream
+    smear_embed: bool = False
+    # Partial key offset for RoPE (fractional offset; None = disabled)
+    partial_key_offset: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Paired head attention (even num_heads required)
+    paired_head: bool = False
+    # MUDD multi-layer skip connection pairs
+    mudd_pairs: int = Field(default=0, ge=0, le=16)
+    # Learnable cross-self-attention
+    xsa_enabled: bool = False
+    xsa_pairs: int = Field(default=0, ge=0, le=16)
+    # Single activation input for the last K attention layers
+    single_act_last_k: int = Field(default=0, ge=0, le=16)
+    # Exponential decay factor for residual stream (None = disabled)
+    exp_residual_decay: float | None = Field(default=None, gt=0.0, le=1.0)
+    # Multi-token prediction (number of extra future-token heads)
+    multi_token_pred: int = Field(default=0, ge=0, le=8)
+    # EoS-aligned training batch starts (list of positions or None)
+    eos_positions: list[int] | None = None
+    # Max document length for splitting over-long docs (None = block_size)
+    max_doc_len: int | None = Field(default=None, ge=8)
+    # True 2-step gradient accumulation for embed+lm_head before update
+    grad_accum_embed_head_steps: int = Field(default=1, ge=1, le=8)
+    # True max sequence length schedule (warm up block size)
+    seq_len_schedule: bool = False
+    # Fraction of training at which to untie embed and lm_head (0 = never)
+    untie_at_frac: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Cautious weight decay tied to LR
+    cautious_wd: bool = False
+    # NorMuon (normalized Muon updates)
+    nor_muon: bool = False
+    # Polar Express (ONI-based orthogonalization in Muon)
+    polar_express: bool = False
     # --- real-trainer backend selection (only used when use_real_trainer) -----
     # Static, pre-runtime hint only: shapes ``load_environment``'s harness.runtime
     # and ``load_tasks()``'s task image/resources/timeout declarations, and gates
@@ -223,9 +295,8 @@ class ProxyStudentConfig(BaseModel):
     docker_host: str | None = None
     # Modal GPU type for the modal backend. Maps to a Modal GPU specifier string:
     # ``"H100"`` → ``"H100"``, ``"H200"`` → ``"H200"``, ``"A100"`` → ``"A100-80GB"``,
-    # anything else → ``"L4"`` (default, cheapest; adequate for the 55M-param default
-    # student). L4 billing is ~$0.80/hr per-second; the default 200-step run takes
-    # ~50s ≈ $0.011. Ignored by the docker backend.
+    # anything else → ``"L4"`` (default, cheapest; adequate for smoke budgets on the
+    # ~278M GPT-2-small-class default student). Ignored by the docker backend.
     modal_gpu: str = Field(default="L4", min_length=1)
     # Sandbox/container backend settings (used by both real-trainer backends).
     docker_image: str = Field(default=_DEFAULT_DOCKER_TRAINER_IMAGE, min_length=1)
@@ -256,17 +327,82 @@ class ProxyStudentConfig(BaseModel):
 
     @property
     def effective_warmup_steps(self) -> int:
-        """LR warmup steps actually used by the real trainer.
-
-        An explicit ``warmup_steps`` wins (clamped to the run length so warmup never
-        exceeds ``effective_steps``); otherwise a sensible fraction of the run,
-        ``min(256, max(1, effective_steps // 10))``. Mirrors record_01's short
-        warmup-then-cooldown schedule and stays >= 1 so the linear ramp never
-        divides by zero.
-        """
+        """LR warmup steps for the legacy ``record_01_adamw`` recipe only."""
         if self.warmup_steps is not None:
             return min(self.warmup_steps, self.effective_steps)
         return min(256, max(1, self.effective_steps // 10))
+
+    def training_payload(self, *, tokenizer: str = "gpt2") -> dict[str, object]:
+        """JSON config blob consumed by the sandbox / self-score training scripts."""
+        return {
+            "n_layer": self.n_layer,
+            "n_head": self.n_head,
+            "n_embd": self.n_embd,
+            "mlp_ratio": self.mlp_ratio,
+            "lm_head_softcap": self.lm_head_softcap,
+            "num_value_embeds": self.num_value_embeds,
+            "attn_scale": self.attn_scale,
+            "sliding_window_size": self.sliding_window_size,
+            "block_size": self.block_size,
+            "batch_size": self.batch_size,
+            "steps": self.effective_steps,
+            "seed": self.seed,
+            "val_fraction": self.val_fraction,
+            "tokenizer": tokenizer,
+            "n_train_runs": self.n_train_runs,
+            "training_recipe": self.training_recipe,
+            "muon_lr": self.muon_lr,
+            "muon_weight_decay": self.muon_weight_decay,
+            "muon_momentum_min": self.muon_momentum_min,
+            "muon_momentum_max": self.muon_momentum_max,
+            "muon_warmup_steps": self.muon_warmup_steps,
+            "muon_cooldown_steps": self.muon_cooldown_steps,
+            "adam_lr": self.adam_lr,
+            "adam_eps": self.adam_eps,
+            "adam_weight_decay": self.adam_weight_decay,
+            "embed_lr_mul": self.embed_lr_mul,
+            "lm_head_lr_mul": self.lm_head_lr_mul,
+            "value_embed_lr_mul": self.value_embed_lr_mul,
+            "scalar_lr_mul": self.scalar_lr_mul,
+            "embed_wd_mul": self.embed_wd_mul,
+            "lm_head_wd_mul": self.lm_head_wd_mul,
+            "value_embed_wd_mul": self.value_embed_wd_mul,
+            "scalar_wd_mul": self.scalar_wd_mul,
+            "adam_on_odd_steps": self.adam_on_odd_steps,
+            "batch_schedule_enabled": self.batch_schedule_enabled,
+            "batch_stage_fracs": list(self.batch_stage_fracs),
+            "batch_stage_muls": list(self.batch_stage_muls),
+            "lr_stage_muls": list(self.lr_stage_muls),
+            "lr_cooldown_frac": self.lr_cooldown_frac,
+            "lr_cooldown_floor": self.lr_cooldown_floor,
+            # Legacy record_01 AdamW knobs (ignored by speedrun_muon)
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "adam_beta1": self.adam_beta1,
+            "adam_beta2": self.adam_beta2,
+            "grad_clip": self.grad_clip,
+            "warmup_steps": self.effective_warmup_steps,
+            "lr_min_ratio": self.lr_min_ratio,
+            # Portable feature flags
+            "bigram_hash_embed": self.bigram_hash_embed,
+            "smear_embed": self.smear_embed,
+            "partial_key_offset": self.partial_key_offset,
+            "paired_head": self.paired_head,
+            "mudd_pairs": self.mudd_pairs,
+            "xsa_enabled": self.xsa_enabled,
+            "xsa_pairs": self.xsa_pairs,
+            "single_act_last_k": self.single_act_last_k,
+            "exp_residual_decay": self.exp_residual_decay,
+            "multi_token_pred": self.multi_token_pred,
+            "eos_positions": self.eos_positions,
+            "max_doc_len": self.max_doc_len,
+            "grad_accum_embed_head_steps": self.grad_accum_embed_head_steps,
+            "seq_len_schedule": self.seq_len_schedule,
+            "untie_at_frac": self.untie_at_frac,
+            "cautious_wd": self.cautious_wd,
+            "nor_muon": self.nor_muon,
+            "polar_express": self.polar_express,
+        }
 
     @property
     def effective_train_tokens(self) -> int:

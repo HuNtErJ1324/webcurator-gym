@@ -572,29 +572,7 @@ if __name__ == "__main__":
 
 def _student_train_payload(config: CuratorConfig) -> dict[str, object]:
     ps = config.proxy_student
-    return {
-        "n_layer": ps.n_layer,
-        "n_head": ps.n_head,
-        "n_embd": ps.n_embd,
-        "mlp_ratio": ps.mlp_ratio,
-        "lm_head_softcap": ps.lm_head_softcap,
-        "num_value_embeds": ps.num_value_embeds,
-        "block_size": ps.block_size,
-        "batch_size": ps.batch_size,
-        "steps": ps.effective_steps,
-        "learning_rate": ps.learning_rate,
-        "seed": ps.seed,
-        "val_fraction": ps.val_fraction,
-        "tokenizer": "gpt2",
-        "weight_decay": ps.weight_decay,
-        "adam_beta1": ps.adam_beta1,
-        "adam_beta2": ps.adam_beta2,
-        "adam_eps": ps.adam_eps,
-        "grad_clip": ps.grad_clip,
-        "warmup_steps": ps.effective_warmup_steps,
-        "lr_min_ratio": ps.lr_min_ratio,
-        "n_train_runs": 1,
-    }
+    return ps.training_payload()
 
 
 def render_self_score_train_script() -> bytes:
@@ -636,9 +614,8 @@ def render_self_score_script(
     """Return a configured self-score script without exposing held-out data."""
     import os as _os
 
-    from .leakage import DEFAULT_EVAL_SETS_DIR as _DEFAULT_EVAL_SETS_DIR
+    from .leakage import resolve_decon_binary, resolve_decon_evals_dir
 
-    evals_dir = decon_evals_dir or _DEFAULT_EVAL_SETS_DIR
     replacements: dict[str, object] = {
         "__EXPECTED_TOKEN_BUDGET__": config.token_budget,
         "__PERF_BASELINE_LOSS__": repr(config.perf_baseline_loss),
@@ -653,8 +630,8 @@ def render_self_score_script(
             config.validation_set.dataset_id.encode()
         ).hexdigest(),
         "__HF_TOKEN_ENV__": repr(hf_token_env),
-        "__DECON_BINARY__": repr(decon_binary),
-        "__DECON_EVALS_DIR__": repr(_os.path.abspath(evals_dir) if evals_dir else ""),
+        "__DECON_BINARY__": repr(resolve_decon_binary(decon_binary)),
+        "__DECON_EVALS_DIR__": repr(resolve_decon_evals_dir(decon_evals_dir)),
         "__DECON_THRESHOLD__": repr(decon_threshold),
     }
     script = dedent(_SCRIPT).lstrip()

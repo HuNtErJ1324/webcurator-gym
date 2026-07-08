@@ -97,11 +97,27 @@ function renderRichContent(text, { role = "assistant", hint = null } = {}) {
 }
 
 function renderToolArguments(args) {
-  if (args == null) return "";
+  if (args == null || args === "") {
+    return '<p class="muted">No arguments recorded.</p>';
+  }
   if (typeof args === "string") {
     return renderRichContent(args, { role: "tool", hint: looksLikeJson(args) ? "json" : null });
   }
   return renderCodeBlock(JSON.stringify(args, null, 2), "json");
+}
+
+function renderToolCall(tool) {
+  const args = tool?.arguments;
+  if (tool?.name === "exec_command" && args && typeof args === "object") {
+    const cmd = args.cmd ?? args.command;
+    if (typeof cmd === "string" && cmd.trim()) {
+      return renderCodeBlock(cmd, "bash");
+    }
+    if (Array.isArray(cmd)) {
+      return renderCodeBlock(cmd.map((part) => String(part)).join(" "), "bash");
+    }
+  }
+  return renderToolArguments(args);
 }
 
 configureRenderer();

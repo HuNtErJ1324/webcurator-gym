@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import pkgutil
 from typing import Any
 
@@ -179,6 +180,13 @@ def load_environment(
             disk=float(ps.disk_size_gb),
         )
         timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
+
+    hf_token = os.environ.get(hf_token_env)
+    if hf_token:
+        # Docker/Modal harness runtimes only pass explicit harness env into the
+        # agent shell; subprocess inherits the host env anyway, but setting this
+        # keeps `hf` CLI auth consistent across runtime types.
+        harness_env[hf_token_env] = hf_token
 
     return Environment(
         vf.EnvConfig(

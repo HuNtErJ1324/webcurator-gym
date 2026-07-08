@@ -51,6 +51,26 @@ DEFAULT_DECON_BINARY = "decon"
 DEFAULT_EVAL_SETS_DIR = os.path.join(
     os.path.dirname(__file__), "..", "decon", "bundled-evals"
 )
+_BUNDLED_DECON_BINARY = os.path.join(
+    os.path.dirname(__file__), "..", "decon", "bin", "decon"
+)
+
+
+def resolve_decon_binary(decon_binary: str = DEFAULT_DECON_BINARY) -> str:
+    """Resolve the vendored decon binary to an absolute path when possible."""
+    if decon_binary and decon_binary != DEFAULT_DECON_BINARY and os.path.isfile(
+        decon_binary
+    ):
+        return os.path.abspath(decon_binary)
+    if os.path.isfile(_BUNDLED_DECON_BINARY):
+        return os.path.abspath(_BUNDLED_DECON_BINARY)
+    return decon_binary
+
+
+def resolve_decon_evals_dir(evals_dir: str | None = None) -> str:
+    """Resolve bundled benchmark eval sets to an absolute directory."""
+    path = evals_dir or DEFAULT_EVAL_SETS_DIR
+    return os.path.abspath(path)
 
 # Decon eval-set constants for the ephemeral val-set eval file.
 _VAL_EVAL_KEY = "heldout_val"

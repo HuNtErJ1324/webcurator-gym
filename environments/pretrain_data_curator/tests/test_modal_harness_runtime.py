@@ -1,3 +1,5 @@
+"""Modal-only harness tests (shared runtime behavior lives in test_docker_harness_runtime)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -5,24 +7,15 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import verifiers.v1 as vf
 from pydantic import ValidationError
 from verifiers.v1.runtimes.modal import ModalConfig
 
 from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
 from pretrain_data_curator.modal_backend import ModalProxyTrainer, _modal_gpu_for
-from pretrain_data_curator.models import (
-    CuratorConfig,
-    Manifest,
-    ProxyStudentConfig,
-    Source,
-)
+from pretrain_data_curator.models import ProxyStudentConfig
 from pretrain_data_curator.pretrain_data_curator import load_environment
-from pretrain_data_curator.rewards import CuratorScorer
-from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
-from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
-from pretrain_data_curator.trainer import TrainResult, TrainerError
+from pretrain_data_curator.trainer import TrainerError
 
 
 def _corpus() -> CuratedCorpus:
@@ -31,40 +24,22 @@ def _corpus() -> CuratedCorpus:
     )
 
 
-def _result(
-    *,
-    loss: float = 2.5,
-    accuracy: float = 0.4,
-    flops: float = 1e9,
-    tokens_trained: int = 1000,
-) -> str:
-    return "RESULT_JSON " + json.dumps(
-        {
-            "loss": loss,
-            "accuracy": accuracy,
-            "flops": flops,
-            "tokens_trained": tokens_trained,
-        }
-    )
-
-
-TRACEBACK_STDOUT = """step 0 loss 10.2
-Traceback (most recent call last):
-  File "/workspace/train.py", line 217, in <module>
-    main()
-RuntimeError: loss is non-finite
-"""
-PIP_ROOT_WARNING = "WARNING: Running pip as the 'root' user can result in broken permissions"
-
-
 class FakeRuntime:
     def __init__(self, result=None, runtime_type="modal") -> None:
         self.config = SimpleNamespace(type=runtime_type)
         self.result = result or SimpleNamespace(
-            stdout=_result(), stderr="", exit_code=0
+            stdout="RESULT_JSON "
+            + json.dumps(
+                {
+                    "loss": 2.5,
+                    "accuracy": 0.4,
+                    "flops": 1e9,
+                    "tokens_trained": 1000,
+                }
+            ),
+            stderr="",
+            exit_code=0,
         )
-        self.files: dict[str, bytes] = {}
-        self.commands: list[tuple[list[str], dict[str, str]]] = []
         self.stop_calls = 0
 
     @property
@@ -72,144 +47,13 @@ class FakeRuntime:
         return self.config.type
 
     async def write(self, path: str, data: bytes) -> None:
-        self.files[path] = data
+        pass
 
     async def run(self, argv: list[str], env: dict[str, str]):
-        self.commands.append((argv, env))
         return self.result
 
     async def stop(self) -> None:
         self.stop_calls += 1
-
-
-@pytest.mark.asyncio
-async def test_modal_trainer_writes_and_runs_on_supplied_harness_runtime():
-    runtime = FakeRuntime()
-
-    result = await ModalProxyTrainer().train_and_eval(
-        _corpus(), ProxyStudentConfig(runtime_backend="modal"), runtime=runtime
-    )
-
-    assert result.backend == "modal"
-    assert result.loss == 2.5
-    assert set(runtime.files) == {
-        "/workspace/corpus.txt",
-        "/workspace/config.json",
-        "/workspace/train.py",
-        "/workspace/train_stdout.log",
-        "/workspace/train_stderr.log",
-    }
-    assert runtime.commands == [(["python", "/workspace/train.py"], {})]
-    assert runtime.stop_calls == 0
-    assert runtime.files["/workspace/train_stdout.log"] == _result().encode()
-    assert runtime.files["/workspace/train_stderr.log"] == b""
-
-
-class _CorpusBuilder:
-    async def materialize(self, manifest, state, *, runtime=None):
-        return _corpus()
-
-
-class _Leakage:
-    def score(self, documents, val_set=None):
-        return SimpleNamespace(
-            as_dict=lambda: {
-                "leakage_score": 0.0,
-                "num_contaminated_matches": 0,
-            }
-        )
-
-
-class _RecordingTrainer:
-    def __init__(self) -> None:
-        self.runtime = None
-
-    async def train_and_eval(self, corpus, config, *, runtime=None):
-        self.runtime = runtime
-        return TrainResult(
-            loss=2.0,
-            accuracy=0.5,
-            flops=10.0,
-            tokens_trained=10,
-            backend="modal",
-        )
-
-
-@pytest.mark.asyncio
-async def test_modal_reward_threads_runtime_through_scoring_chain():
-    config = CuratorConfig(
-        use_real_trainer=True,
-        proxy_student=ProxyStudentConfig(runtime_backend="modal"),
-    )
-    trainer = _RecordingTrainer()
-    taskset = CuratorTaskset(
-        CuratorTasksetConfig(
-            id="test",
-            use_real_trainer=True,
-            proxy_student={"runtime_backend": "modal"},
-        )
-    )
-    taskset._scorer = CuratorScorer(config, _CorpusBuilder(), trainer, _Leakage())
-    state = CuratorState()
-    RolloutStore.set_manifest(
-        state, Manifest(sources=[Source(dataset_id="owner/data")])
-    )
-    RolloutStore.set_finalized(state, True)
-    trace = vf.Trace(task=build_tasks("2024-12-31", 1_000_000)[0], state=state)
-    runtime = FakeRuntime()
-
-    await taskset.score(trace, runtime)
-
-    assert trace.rewards["perf_reward"] > 0.0
-    assert trainer.runtime is runtime
-
-
-@pytest.mark.asyncio
-async def test_modal_training_timeout_stops_runtime_without_hanging(monkeypatch):
-    class BlockingRuntime(FakeRuntime):
-        async def run(self, argv, env):
-            await asyncio.Event().wait()
-
-    monkeypatch.setattr(
-        ProxyStudentConfig,
-        "effective_timeout_minutes",
-        property(lambda self: 0.0005),
-    )
-    runtime = BlockingRuntime()
-
-    with pytest.raises(TrainerError, match="timed out"):
-        await asyncio.wait_for(
-            ModalProxyTrainer().train_and_eval(
-                _corpus(),
-                ProxyStudentConfig(runtime_backend="modal"),
-                runtime=runtime,
-            ),
-            timeout=1.0,
-        )
-
-    assert runtime.stop_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_cancelled_modal_training_stops_runtime():
-    class BlockingRuntime(FakeRuntime):
-        async def run(self, argv, env):
-            await asyncio.Event().wait()
-
-    runtime = BlockingRuntime()
-    task = asyncio.create_task(
-        ModalProxyTrainer().train_and_eval(
-            _corpus(),
-            ProxyStudentConfig(runtime_backend="modal"),
-            runtime=runtime,
-        )
-    )
-    await asyncio.sleep(0)
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert runtime.stop_calls == 1
 
 
 @pytest.mark.asyncio
@@ -235,123 +79,6 @@ async def test_swallowed_wait_for_cancellation_is_reraised(monkeypatch):
         )
 
     assert runtime.stop_calls == 1
-    assert runtime.commands == []
-
-
-@pytest.mark.asyncio
-async def test_modal_training_semaphore_bounds_runtime_commands():
-    active = 0
-    max_active = 0
-
-    class ConcurrentRuntime(FakeRuntime):
-        async def run(self, argv, env):
-            nonlocal active, max_active
-            active += 1
-            max_active = max(max_active, active)
-            try:
-                await asyncio.sleep(0.02)
-                return self.result
-            finally:
-                active -= 1
-
-    config = ProxyStudentConfig(runtime_backend="modal")
-    await asyncio.gather(
-        ModalProxyTrainer(concurrency_limit=1).train_and_eval(
-            _corpus(), config, runtime=ConcurrentRuntime()
-        ),
-        ModalProxyTrainer(concurrency_limit=1).train_and_eval(
-            _corpus(), config, runtime=ConcurrentRuntime()
-        ),
-    )
-
-    assert max_active == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("result", "message"),
-    [
-        (
-            SimpleNamespace(stdout="", stderr="CUDA exploded", exit_code=7),
-            "exited with code 7",
-        ),
-        (
-            SimpleNamespace(
-                stdout="RESULT_JSON {not-json", stderr="parse context", exit_code=0
-            ),
-            "malformed RESULT_JSON",
-        ),
-        (
-            SimpleNamespace(stdout="ordinary output", stderr="missing", exit_code=0),
-            "no RESULT_JSON marker",
-        ),
-    ],
-)
-async def test_modal_runtime_failures_raise_clear_trainer_errors(result, message):
-    runtime = FakeRuntime(result)
-
-    with pytest.raises(TrainerError, match=message) as excinfo:
-        await ModalProxyTrainer().train_and_eval(
-            _corpus(),
-            ProxyStudentConfig(runtime_backend="modal"),
-            runtime=runtime,
-        )
-
-    assert runtime.stop_calls == 1
-    assert "--- stdout tail ---" in excinfo.value.stderr_tail
-    assert "--- stderr tail ---" in excinfo.value.stderr_tail
-    assert any(
-        expected in excinfo.value.stderr_tail
-        for expected in ("CUDA exploded", "parse context", "missing")
-    )
-
-
-@pytest.mark.asyncio
-async def test_modal_training_crash_surfaces_stdout_traceback_and_persists_full_logs():
-    result = SimpleNamespace(
-        stdout=f"installing dependencies\n{TRACEBACK_STDOUT}",
-        stderr=PIP_ROOT_WARNING,
-        exit_code=1,
-    )
-    runtime = FakeRuntime(result)
-
-    with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
-        await ModalProxyTrainer().train_and_eval(
-            _corpus(),
-            ProxyStudentConfig(runtime_backend="modal"),
-            runtime=runtime,
-        )
-
-    diagnostic = excinfo.value.stderr_tail
-    assert 'File "/workspace/train.py", line 217, in <module>' in diagnostic
-    assert "RuntimeError: loss is non-finite" in diagnostic
-    assert PIP_ROOT_WARNING in diagnostic
-    assert diagnostic.index("RuntimeError: loss is non-finite") < diagnostic.index(
-        PIP_ROOT_WARNING
-    )
-    assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
-    assert runtime.files["/workspace/train_stderr.log"] == result.stderr.encode()
-
-
-@pytest.mark.asyncio
-async def test_modal_no_result_json_surfaces_stdout_tail():
-    result = SimpleNamespace(
-        stdout="loaded corpus\nlast progress line before crash",
-        stderr=PIP_ROOT_WARNING,
-        exit_code=0,
-    )
-    runtime = FakeRuntime(result)
-
-    with pytest.raises(TrainerError, match="no RESULT_JSON marker") as excinfo:
-        await ModalProxyTrainer().train_and_eval(
-            _corpus(),
-            ProxyStudentConfig(runtime_backend="modal"),
-            runtime=runtime,
-        )
-
-    assert "last progress line before crash" in excinfo.value.stderr_tail
-    assert PIP_ROOT_WARNING in excinfo.value.stderr_tail
-    assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
 
 
 def test_load_environment_uses_modal_config_and_gpu_mapping(monkeypatch):

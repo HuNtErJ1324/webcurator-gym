@@ -30,6 +30,8 @@ def _tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         fn = call.get("function") or {}
         args = fn.get("arguments")
+        if args is None:
+            args = call.get("arguments")
         if isinstance(args, str):
             try:
                 args = json.loads(args)

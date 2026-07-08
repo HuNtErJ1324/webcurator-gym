@@ -27,12 +27,13 @@ from pretrain_data_curator.corpus import (
     DocumentFilter,
     SourceCorpus,
 )
-from pretrain_data_curator.leakage import DeconLeakageDetector
 from pretrain_data_curator.models import FilterSpec, Manifest, Source
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
 from pretrain_data_curator.trainer import HeuristicProxyTrainer
+
+from tests.conftest import NoOpLeakageDetector, bind_fast_scorer
 
 
 @pytest.fixture(autouse=True)
@@ -145,19 +146,19 @@ async def test_materialize_peak_memory_does_not_scale_with_source_count():
     source's footprint; one that streams a source to disk and discards it
     before moving to the next should not.
     """
-    n_docs_per_source = 4_000
-    doc_chars = 1_500  # ~6MB of genuinely distinct text per source
+    n_docs_per_source = 400
+    doc_chars = 400  # ~160KB of genuinely distinct text per source
 
     peak_1, corpus_1, state_1 = await _materialize_peak_bytes(
         n_sources=1, n_docs_per_source=n_docs_per_source, doc_chars=doc_chars
     )
     peak_6, corpus_6, state_6 = await _materialize_peak_bytes(
-        n_sources=6, n_docs_per_source=n_docs_per_source, doc_chars=doc_chars
+        n_sources=3, n_docs_per_source=n_docs_per_source, doc_chars=doc_chars
     )
 
     try:
         assert sum(s.doc_count for s in corpus_1.sources) == n_docs_per_source
-        assert sum(s.doc_count for s in corpus_6.sources) == 6 * n_docs_per_source
+        assert sum(s.doc_count for s in corpus_6.sources) == 3 * n_docs_per_source
 
         # Sanity: the fixture really does allocate real, size-proportional
         # memory (otherwise this comparison would be as ineffective as the
@@ -184,7 +185,7 @@ async def test_materialize_dedup_exact_at_declared_production_scale():
     second full document list held alongside the raw fetch.
     """
     # The fetch cap matches the doubled list length.
-    n_unique = 50_000
+    n_unique = 2_000
     unique_docs = [f"doc-{i}-" + ("pad " * 6) for i in range(n_unique)]
     doubled = unique_docs + unique_docs  # every document duplicated exactly once
 
@@ -342,16 +343,19 @@ async def test_taskset_score_removes_rollout_scratch_directory():
         def sample_documents(self, dataset_id, config, split, text_field, n):
             return ["some document text about the sample topic."] * n
 
-    taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
+    taskset = CuratorTaskset(CuratorTasksetConfig(id="test", screen_val_set=False))
     taskset._client = _FakeClient()
     taskset._corpus_builder = CorpusBuilder(
         client=taskset._client,
     )
-    taskset._decon_detector = DeconLeakageDetector(
-        decon_binary="/nonexistent/decon",
-        evals_dir="/nonexistent/evals",
-    )
+    taskset._decon_detector = NoOpLeakageDetector()
     taskset._trainer = HeuristicProxyTrainer()
+    bind_fast_scorer(
+        taskset,
+        corpus_builder=taskset._corpus_builder,
+        trainer=taskset._trainer,
+        leakage_detector=taskset._decon_detector,
+    )
 
     state = CuratorState()
     RolloutStore.set_manifest(

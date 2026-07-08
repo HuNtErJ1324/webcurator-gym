@@ -9,6 +9,7 @@ from pathlib import Path
 from site_builder.render import build_site
 
 FULL_400M_OUTPUTS = Path(__file__).resolve().parent.parent / "outputs" / "evals-400m"
+DEBUG_OUTPUTS = Path(__file__).resolve().parent.parent / "outputs" / "debug"
 
 
 def main() -> None:
@@ -18,6 +19,17 @@ def main() -> None:
         type=Path,
         default=FULL_400M_OUTPUTS,
         help="Directory containing full 400M eval artifacts (default: outputs/evals-400m)",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=DEBUG_OUTPUTS,
+        help="Directory containing curation debug snapshots (default: outputs/debug)",
+    )
+    parser.add_argument(
+        "--no-debug",
+        action="store_true",
+        help="Exclude outputs/debug snapshots from the site",
     )
     parser.add_argument(
         "--site-dir",
@@ -35,6 +47,7 @@ def main() -> None:
         args.outputs.resolve(),
         args.site_dir.resolve(),
         full_400m_only=not args.include_all,
+        debug_dir=None if args.no_debug else args.debug_dir.resolve(),
     )
     print(f"Wrote {summary['runs']} runs ({summary['traces']} traces) to {summary['site_dir']}")
     print(f"Open: file://{args.site_dir.resolve() / 'index.html'}")
