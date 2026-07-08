@@ -162,7 +162,30 @@ class DeconLeakageDetector:
                 os.path.dirname(__file__), "..", "decon", "bin", "decon"
             )
             if os.path.isfile(resolved):
-                return resolved
+                binary = resolved
+        if not os.path.isfile(binary):
+            return self._binary
+        try:
+            probe = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except OSError as exc:
+            raise DeconError(f"decon binary not executable at {binary}: {exc}") from exc
+        if probe.returncode != 0:
+            detail = (probe.stderr or probe.stdout or "").strip()
+            if "GLIBC_" in detail:
+                raise DeconError(
+                    f"decon at {binary} is incompatible with this host's glibc "
+                    f"({detail[:300]}). Rebuild with "
+                    "environments/pretrain_data_curator/decon/build_from_source.sh "
+                    "on the target machine, or run build_static.sh for a portable binary."
+                )
+            raise DeconError(
+                f"decon at {binary} failed smoke test: {detail[:300]}"
+            )
         return binary
 
     def score(

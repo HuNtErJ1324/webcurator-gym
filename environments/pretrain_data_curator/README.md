@@ -18,7 +18,7 @@ The checked-in smoke config is the single local run configuration. It uses
 DeepSeek V4 Flash for curation and a real Modal H100 proxy trainer, and explicitly
 lists every loader, student, and validation option. `HF_TOKEN`,
 `MODAL_TOKEN_ID`, and `MODAL_TOKEN_SECRET` must be exported. For setup and
-zero-score failures, see [Troubleshooting](docs/troubleshooting.md).
+zero-score failures, inspect rollout traces in the generated bench site under `docs/site/`.
 
 ## Overview
 
@@ -67,7 +67,7 @@ Each term is also emitted as a metric (`perf_loss`, `perf_accuracy`,
 `val_set_access`. Two further zero-weight **diagnostics**,
 `tool_error_count` and `external_failure`, separate bad curation from
 external/infrastructure failure (a flaky Hub or sandbox). See
-[`docs/reward.md`](docs/reward.md).
+[`docs/README.md`](docs/README.md).
 
 ### Proxy-student backends
 
@@ -161,8 +161,8 @@ configuration; raise them deliberately for comparative data-quality work.
 SSH-remote `docker_host` orchestration is intentionally unsupported by this
 single-runtime path; `load_environment` rejects a configured `docker_host`.
 Leave it unset and do not set an ambient remote `DOCKER_HOST`. A local Unix
-socket is valid; Docker Desktop under WSL may require the proxy socket documented
-in [Troubleshooting](docs/troubleshooting.md#docker-desktop-uses-an-invalid-npipe-context).
+socket is valid; Docker Desktop under WSL may require
+`export DOCKER_HOST=unix:///mnt/wsl/docker-desktop/shared-sockets/guest-services/docker.proxy.sock`.
 On Docker Desktop under WSL2, the environment automatically advertises the
 interception server on the WSL interface; `PDC_DOCKER_HOST_IP` can override the
 detected address if necessary.
@@ -222,7 +222,7 @@ token or special final-message format is required. The minimal schema:
 Each source requires `id` (the Hugging Face dataset id) and `weight` (≥ 0).
 For script-backed or otherwise non-streamable datasets, the agent may instead
 download/derive text or JSONL in its bash workspace and use a `kind: "local"`
-source. See [Manifest and filtering](docs/manifest.md#local-sources).
+source with a workspace-relative `local_path`.
 `config`, `split`, `text_field`, `filters`, `max_docs`, and `max_tokens` are
 optional. Supported filter kinds: `min_chars`, `max_chars`, `min_tokens`,
 `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, `dedup_exact`.
@@ -230,22 +230,13 @@ When a multi-config dataset has no default and `config` is omitted, the
 materializer chooses a stable English/default config (for example `en` or a
 config ending in `.en`) before falling back to the first advertised config.
 
-See [`docs/agent-workflow.md`](docs/agent-workflow.md) for the prompt, self-score,
-metering, and manifest-recovery behavior.
+See [`docs/README.md`](docs/README.md) for the eval visualization site and builder.
 
 ## Documentation
 
 | Page | Use it for |
 | --- | --- |
-| [Documentation map](docs/README.md) | Choose the right guide. |
-| [Architecture](docs/architecture.md) | Follow a rollout from task loading through cleanup. |
-| [Agent workflow](docs/agent-workflow.md) | Understand the single prompt, self-score, metering, and manifest recovery. |
-| [Manifest and filtering](docs/manifest.md) | Author or audit the final JSON contract. |
-| [Configuration](docs/configuration.md) | Choose loader arguments, runtime resources, and eval commands. |
-| [Reward and metrics](docs/reward.md) | Interpret scores, costs, leakage, and failure signals. |
-| [Proxy student](docs/proxy-student.md) | Understand the heuristic and GPU training paths. |
-| [Troubleshooting](docs/troubleshooting.md) | Diagnose credentials, Docker/WSL, Modal, and zero rewards. |
-| [Development](docs/development.md) | Test and extend the package without duplicating execution paths. |
+| [Bench site builder](docs/README.md) | Generate a PostTrainBench-style leaderboard from full 400M runs in `outputs/evals-400m/` |
 
 ## Install And Eval
 
@@ -280,7 +271,6 @@ but every rollout does.
 | `hf_token_env` | str | `"HF_TOKEN"` | Env var checked for the HF token before a rollout starts. |
 | `manifest_filename` | str | `"manifest.json"` | Manifest filename under `/workspace`; must be a root-level filename. |
 | `candidate_limit` | int | `8` | Maximum dataset IDs used by trace-based manifest recovery/fallback only. |
-| `sample_docs_per_source` | int | `64` | Docs sampled per source for inspection/scoring. |
 | `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |
 | `max_local_source_bytes` | int | `33554432` | Maximum bytes transferred per local source before parsing. |
 | `max_turns` | int | `64` | Generous harness safety cap; absent from the prompt, reward, and metrics. |

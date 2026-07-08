@@ -1,11 +1,15 @@
 """Render the leakage-safe development self-scoring script for a rollout.
 
-The rendered script is intentionally standalone and standard-library-only so it
-works in subprocess, Docker, and Modal harness workspaces. It samples only
-candidate training sources named in the agent's draft manifest. The configured
-final-validation repository is represented only by a SHA-256 digest and rejected
-before any network request; the script contains no validation filename, tokens,
-decoded leakage reference, or final-scoring implementation.
+The rendered script samples candidate training sources named in the agent's draft
+manifest. The configured final-validation repository is represented only by a
+SHA-256 digest and rejected before any network request; the script contains no
+validation filename, tokens, decoded leakage reference, or final-scoring
+implementation.
+
+When ``use_real_trainer`` is enabled, setup also writes ``self_score_train.py``,
+which runs the same proxy-student training recipe as production scoring (minus
+the held-out validation shard). The dev script scores corpus-split cross-entropy
+plus benchmark decon leakage — the same two reward terms as final scoring.
 """
 
 from __future__ import annotations
@@ -14,19 +18,24 @@ import hashlib
 from textwrap import dedent
 
 from .models import CuratorConfig
-from .trainer import estimate_param_count
+from .trainer import _nanogpt_train_script
 
 SELF_SCORE_FILENAME = "self_score.py"
+SELF_SCORE_TRAIN_FILENAME = "self_score_train.py"
+SELF_SCORE_MAX_STEPS = 64
+SELF_SCORE_MAX_CORPUS_CHARS = 500_000
+SELF_SCORE_TRAIN_TIMEOUT_SECONDS = 900
 
 _SCRIPT = r'''
 #!/usr/bin/env python3
-"""Development-only manifest proxy; does not use final validation data."""
+"""Development sample scorer: corpus-split CE + benchmark decon only."""
 import argparse
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,17 +44,17 @@ import urllib.request
 from pathlib import Path
 
 EXPECTED_TOKEN_BUDGET = __EXPECTED_TOKEN_BUDGET__
-DEFAULT_FETCH_CAP = __DEFAULT_FETCH_CAP__
-TARGET_TRAIN_TOKENS = __TARGET_TRAIN_TOKENS__
 PERF_BASELINE_LOSS = __PERF_BASELINE_LOSS__
 PERF_TARGET_LOSS = __PERF_TARGET_LOSS__
 BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
 LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
-HUB_CALL_PRICE = __HUB_CALL_PRICE__
-PER_1K_TOKENS_PRICE = __PER_1K_TOKENS_PRICE__
-PER_GFLOP_PRICE = __PER_GFLOP_PRICE__
-PARAM_COUNT = __PARAM_COUNT__
+USE_REAL_TRAINER = __USE_REAL_TRAINER__
+SELF_SCORE_MAX_STEPS = __SELF_SCORE_MAX_STEPS__
+SELF_SCORE_MAX_CORPUS_CHARS = __SELF_SCORE_MAX_CORPUS_CHARS__
+SELF_SCORE_TRAIN_TIMEOUT = __SELF_SCORE_TRAIN_TIMEOUT__
+TRAIN_SCRIPT_NAME = __TRAIN_SCRIPT_NAME__
+STUDENT_CONFIG = __STUDENT_CONFIG__
 FORBIDDEN_SOURCE_SHA256 = "__FORBIDDEN_SOURCE_SHA256__"
 HF_TOKEN_ENV = __HF_TOKEN_ENV__
 DECON_BINARY = __DECON_BINARY__
@@ -199,13 +208,35 @@ def apply_filters(docs, filters):
     return result
 
 
-def _reduce_report(report_lines, total_tokens):
-    """Shared reducer: token-weighted contamination from decon report JSONL.
+def joined_corpus(docs, cap):
+    """Streaming-truncated ``\\n\\n`` join, matching corpus materialization."""
+    parts = []
+    total = 0
+    sep = "\n\n"
+    for doc in docs:
+        if not doc:
+            continue
+        piece = doc if not parts else sep + doc
+        if total + len(piece) > cap:
+            remaining = cap - total
+            if remaining > 0:
+                parts.append(piece[:remaining])
+            break
+        parts.append(piece)
+        total += len(piece)
+    return "".join(parts)
 
-    Mirrors leakage._reduce_report exactly so the dev self-score estimate
-    matches the production scorer.  Dedup per (training_file, training_line).
-    Token weight prefers cluster_token_length, falling back to span chars // 4.
-    """
+
+def scaled_perf(loss):
+    if loss is None or not math.isfinite(loss):
+        return 0.0
+    if BASELINE_RELATIVE_PERF:
+        return (PERF_BASELINE_LOSS - loss) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
+    return max(0.0, min(1.0, math.exp(-loss)))
+
+
+def _reduce_report(report_lines, total_tokens):
+    """Shared reducer: token-weighted contamination from decon report JSONL."""
     best_per_doc = {}
     for line in report_lines:
         line = line.strip()
@@ -315,7 +346,76 @@ def decon_score(docs):
         print("[self-score] WARNING: decon failed: %s" % exc, file=sys.stderr)
         return None, None
     finally:
-        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def train_perf(docs):
+    """Train the fixed proxy student on sampled docs; return (loss, perf, backend)."""
+    if not USE_REAL_TRAINER or not docs:
+        return None, None, None
+    train_script = Path(__file__).with_name(TRAIN_SCRIPT_NAME)
+    if not train_script.is_file():
+        print(
+            "[self-score] WARNING: %s not found, skipping CE training" % TRAIN_SCRIPT_NAME,
+            file=sys.stderr,
+        )
+        return None, None, None
+    text = joined_corpus(docs, SELF_SCORE_MAX_CORPUS_CHARS)
+    if not text.strip():
+        return None, None, None
+
+    tmp = tempfile.mkdtemp(prefix="selfscore_train_")
+    try:
+        steps = min(int(STUDENT_CONFIG["steps"]), int(SELF_SCORE_MAX_STEPS))
+        warmup_steps = min(int(STUDENT_CONFIG["warmup_steps"]), steps)
+        payload = dict(STUDENT_CONFIG)
+        payload["steps"] = steps
+        payload["warmup_steps"] = warmup_steps
+        payload["n_train_runs"] = 1
+        with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        with open(os.path.join(tmp, "corpus.txt"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        result = subprocess.run(
+            [sys.executable, str(train_script), tmp],
+            capture_output=True,
+            text=True,
+            timeout=SELF_SCORE_TRAIN_TIMEOUT,
+        )
+        if result.returncode != 0:
+            print(
+                "[self-score] WARNING: proxy training exited %d: %s"
+                % (result.returncode, (result.stderr or result.stdout)[:300]),
+                file=sys.stderr,
+            )
+            return None, None, None
+        marker = "RESULT_JSON "
+        line = next(
+            (x for x in reversed((result.stdout or "").splitlines()) if x.startswith(marker)),
+            None,
+        )
+        if line is None:
+            result_path = os.path.join(tmp, "result.json")
+            if not os.path.isfile(result_path):
+                print("[self-score] WARNING: training produced no result JSON", file=sys.stderr)
+                return None, None, None
+            parsed = json.loads(Path(result_path).read_text(encoding="utf-8"))
+        else:
+            parsed = json.loads(line[len(marker):])
+        loss = float(parsed.get("loss", float("inf")))
+        backend = str(parsed.get("val_source") or "sample_ce")
+        return loss, scaled_perf(loss), backend
+    except subprocess.TimeoutExpired:
+        print(
+            "[self-score] WARNING: proxy training timed out after %ds"
+            % SELF_SCORE_TRAIN_TIMEOUT,
+            file=sys.stderr,
+        )
+        return None, None, None
+    except Exception as exc:
+        print("[self-score] WARNING: proxy training failed: %s" % exc, file=sys.stderr)
+        return None, None, None
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -341,8 +441,10 @@ def main():
     if token_budget != EXPECTED_TOKEN_BUDGET:
         fail("token_budget must equal the task allocation")
 
-    cap = manifest.get("sample_docs_per_source") or DEFAULT_FETCH_CAP
-    cap = max(1, int(cap))
+    raw_cap = manifest.get("sample_docs_per_source")
+    cap = None
+    if raw_cap is not None:
+        cap = max(1, int(raw_cap))
     weights = [max(0.0, float(source.get("weight", 1.0))) for source in sources]
     total_weight = sum(weights)
     if total_weight <= 0:
@@ -350,9 +452,6 @@ def main():
 
     source_stats = []
     estimated_total = 0
-    clean_sum = 0.0
-    clean_count = 0
-    hub_calls = 0
     all_docs: list[str] = []
     for source, weight in zip(sources, weights):
         kind = source.get("kind", "hf")
@@ -369,19 +468,19 @@ def main():
                 if kind == "local"
                 else remote_docs(source, args.limit)
             )
-            if kind != "local":
-                hub_calls += 2 if not source.get("config") else 1
             docs = [x for x in apply_filters(docs, source.get("filters")) if x]
             all_docs.extend(docs)
             sample_tokens = sum(estimate_tokens(x) for x in docs)
             average_tokens = sample_tokens / len(docs) if docs else 0.0
             target = int(token_budget * weight / total_weight)
-            requested = min(max(target // 250, 1), cap) if weight > 0 else 0
+            if weight > 0:
+                requested = max(target // 250, 1)
+                if cap is not None:
+                    requested = min(requested, cap)
+            else:
+                requested = 0
             estimated_tokens = min(target, int(average_tokens * requested))
             error = None
-            for doc in docs:
-                clean_sum += sum(c.isalpha() or c.isspace() for c in doc) / len(doc)
-                clean_count += 1
         except Exception as exc:
             docs, sample_tokens, estimated_tokens = [], 0, 0
             error = f"{type(exc).__name__}: {exc}"
@@ -395,49 +494,30 @@ def main():
         })
 
     fill = min(1.0, estimated_total / token_budget)
-    nonzero = [x["estimated_materialized_tokens"] for x in source_stats
-               if x["estimated_materialized_tokens"] > 0]
-    if len(nonzero) <= 1:
-        diversity = 0.0
-    else:
-        total = sum(nonzero)
-        proportions = [x / total for x in nonzero]
-        diversity = -sum(p * math.log(p) for p in proportions) / math.log(len(nonzero))
-    cleanliness = clean_sum / clean_count if clean_count else 0.0
-    trained_tokens = min(estimated_total, TARGET_TRAIN_TOKENS)
-    scale = math.log1p(trained_tokens) / math.log1p(max(TARGET_TRAIN_TOKENS, 1))
-    quality_gain = 0.6 * scale + 0.25 * cleanliness + 0.15 * diversity
-    proxy_ce = max(0.2, 5.0 * (1.0 - 0.85 * quality_gain)) if nonzero else None
-    if proxy_ce is None:
-        perf = 0.0
-        flops = 0.0
-    else:
-        perf = (
-            (PERF_BASELINE_LOSS - proxy_ce) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
-            if BASELINE_RELATIVE_PERF else math.exp(-proxy_ce)
-        )
-        flops = 6.0 * PARAM_COUNT * trained_tokens
-    scoring_cost = (
-        hub_calls * HUB_CALL_PRICE
-        + estimated_total / 1000.0 * PER_1K_TOKENS_PRICE
-        + flops / 1e9 * PER_GFLOP_PRICE
-    )
-
+    perf_loss, perf, train_backend = train_perf(all_docs)
     leakage_score, num_matches = decon_score(all_docs) if all_docs else (None, None)
-    reward = ALPHA_PERF * perf
-    if leakage_score is not None:
-        reward -= LAMBDA_LEAKAGE * leakage_score
+
+    perf_reward = ALPHA_PERF * (perf or 0.0)
+    leakage_penalty = (
+        -LAMBDA_LEAKAGE * leakage_score if leakage_score is not None else 0.0
+    )
+    reward = perf_reward + leakage_penalty
 
     print(json.dumps({
         "ok": True,
-        "signal": "development-only heuristic; not the final score",
+        "signal": (
+            "development sample; corpus-split cross-entropy + benchmark decon only; "
+            "not the final held-out validation score"
+        ),
         "validation_data_used": False,
-        "estimated_proxy_ce": proxy_ce,
-        "estimated_performance": perf,
-        "estimated_budget_fill_ratio": fill,
-        "estimated_scoring_cost": scoring_cost,
-        "estimated_reward": reward,
-        "leakage_estimate": leakage_score,
+        "perf_loss": perf_loss,
+        "perf": perf,
+        "perf_reward": perf_reward,
+        "leakage_score": leakage_score,
+        "leakage_penalty": leakage_penalty,
+        "reward": reward,
+        "train_backend": train_backend,
+        "budget_fill_ratio": fill,
         "num_contaminated_matches": num_matches,
         "sources": source_stats,
     }, indent=2, sort_keys=True))
@@ -446,6 +526,61 @@ def main():
 if __name__ == "__main__":
     main()
 '''
+
+
+def _student_train_payload(config: CuratorConfig) -> dict[str, object]:
+    ps = config.proxy_student
+    return {
+        "n_layer": ps.n_layer,
+        "n_head": ps.n_head,
+        "n_embd": ps.n_embd,
+        "mlp_ratio": ps.mlp_ratio,
+        "lm_head_softcap": ps.lm_head_softcap,
+        "num_value_embeds": ps.num_value_embeds,
+        "block_size": ps.block_size,
+        "batch_size": ps.batch_size,
+        "steps": ps.effective_steps,
+        "learning_rate": ps.learning_rate,
+        "seed": ps.seed,
+        "val_fraction": ps.val_fraction,
+        "tokenizer": "gpt2",
+        "weight_decay": ps.weight_decay,
+        "adam_beta1": ps.adam_beta1,
+        "adam_beta2": ps.adam_beta2,
+        "adam_eps": ps.adam_eps,
+        "grad_clip": ps.grad_clip,
+        "warmup_steps": ps.effective_warmup_steps,
+        "lr_min_ratio": ps.lr_min_ratio,
+        "n_train_runs": 1,
+    }
+
+
+def render_self_score_train_script() -> bytes:
+    """Return the workspace-local proxy-student trainer used by ``self_score.py``."""
+    body = _nanogpt_train_script()
+    replacements = {
+        "open('/workspace/stderr.txt', 'w')": (
+            "open(os.path.join(WORKDIR, 'stderr.txt'), 'w')"
+        ),
+        'open("/workspace/config.json")': 'open(os.path.join(WORKDIR, "config.json"))',
+        'open("/workspace/corpus.txt", encoding="utf-8")': (
+            'open(os.path.join(WORKDIR, "corpus.txt"), encoding="utf-8")'
+        ),
+        'val_path = "/workspace/val.bin"': 'val_path = os.path.join(WORKDIR, "val.bin")',
+        'pathlib.Path("/workspace/result.json").write_text(json.dumps(result))': (
+            'pathlib.Path(os.path.join(WORKDIR, "result.json")).write_text(json.dumps(result))'
+        ),
+    }
+    for old, new in replacements.items():
+        body = body.replace(old, new)
+    wrapper = (
+        "#!/usr/bin/env python3\n"
+        '"""Workspace-local proxy-student trainer for self_score.py."""\n'
+        "import os\n"
+        "import sys\n\n"
+        'WORKDIR = sys.argv[1] if len(sys.argv) > 1 else "."\n\n'
+    )
+    return (wrapper + body.lstrip()).encode()
 
 
 def render_self_score_script(
@@ -458,21 +593,23 @@ def render_self_score_script(
 ) -> bytes:
     """Return a configured self-score script without exposing held-out data."""
     import os as _os
+
     from .leakage import DEFAULT_EVAL_SETS_DIR as _DEFAULT_EVAL_SETS_DIR
+
     evals_dir = decon_evals_dir or _DEFAULT_EVAL_SETS_DIR
     replacements: dict[str, object] = {
         "__EXPECTED_TOKEN_BUDGET__": config.token_budget,
-        "__DEFAULT_FETCH_CAP__": config.sample_docs_per_source,
-        "__TARGET_TRAIN_TOKENS__": config.proxy_student.effective_train_tokens,
         "__PERF_BASELINE_LOSS__": repr(config.perf_baseline_loss),
         "__PERF_TARGET_LOSS__": repr(config.perf_target_loss),
         "__BASELINE_RELATIVE_PERF__": repr(config.baseline_relative_perf),
         "__ALPHA_PERF__": repr(config.alpha_perf),
         "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),
-        "__HUB_CALL_PRICE__": repr(config.prices.hub_call),
-        "__PER_1K_TOKENS_PRICE__": repr(config.prices.per_1k_tokens),
-        "__PER_GFLOP_PRICE__": repr(config.prices.per_gflop),
-        "__PARAM_COUNT__": estimate_param_count(config.proxy_student),
+        "__USE_REAL_TRAINER__": repr(config.use_real_trainer),
+        "__SELF_SCORE_MAX_STEPS__": SELF_SCORE_MAX_STEPS,
+        "__SELF_SCORE_MAX_CORPUS_CHARS__": SELF_SCORE_MAX_CORPUS_CHARS,
+        "__SELF_SCORE_TRAIN_TIMEOUT__": SELF_SCORE_TRAIN_TIMEOUT_SECONDS,
+        "__TRAIN_SCRIPT_NAME__": repr(SELF_SCORE_TRAIN_FILENAME),
+        "__STUDENT_CONFIG__": repr(_student_train_payload(config)),
         "__FORBIDDEN_SOURCE_SHA256__": hashlib.sha256(
             config.validation_set.dataset_id.encode()
         ).hexdigest(),
@@ -487,4 +624,9 @@ def render_self_score_script(
     return script.encode()
 
 
-__all__ = ["SELF_SCORE_FILENAME", "render_self_score_script"]
+__all__ = [
+    "SELF_SCORE_FILENAME",
+    "SELF_SCORE_TRAIN_FILENAME",
+    "render_self_score_script",
+    "render_self_score_train_script",
+]

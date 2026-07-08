@@ -27,10 +27,12 @@ from pretrain_data_curator.corpus import (
     DocumentFilter,
     SourceCorpus,
 )
+from pretrain_data_curator.leakage import DeconLeakageDetector
 from pretrain_data_curator.models import FilterSpec, Manifest, Source
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
+from pretrain_data_curator.trainer import HeuristicProxyTrainer
 
 
 @pytest.fixture(autouse=True)
@@ -103,7 +105,6 @@ async def _materialize_peak_bytes(
     # increase retained corpus memory.
     builder = CorpusBuilder(
         client=client,
-        sample_docs_per_source=n_docs_per_source,
         fetch_limit=1,
     )
     state = CuratorState()
@@ -188,7 +189,7 @@ async def test_materialize_dedup_exact_at_declared_production_scale():
     doubled = unique_docs + unique_docs  # every document duplicated exactly once
 
     client = _FixedListClient(doubled)
-    builder = CorpusBuilder(client=client, sample_docs_per_source=len(doubled))
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
     manifest = Manifest(
         token_budget=10**9,
@@ -263,7 +264,7 @@ def test_joined_text_stops_reading_once_cap_is_reached():
 @pytest.mark.asyncio
 async def test_doc_cache_stores_file_paths_not_raw_document_text():
     client = _UniqueDocsClient(doc_chars=64)
-    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
     manifest = Manifest(sources=[Source(dataset_id="a/b", weight=1.0)])
 
@@ -296,7 +297,7 @@ def test_scratch_dir_cleaned_up_via_weakref_when_state_is_collected():
 @pytest.mark.asyncio
 async def test_materialize_different_states_get_independent_scratch_dirs():
     client = _UniqueDocsClient(doc_chars=32)
-    builder = CorpusBuilder(client=client, sample_docs_per_source=4)
+    builder = CorpusBuilder(client=client)
     state_a = CuratorState()
     state_b = CuratorState()
     manifest = Manifest(sources=[Source(dataset_id="a/b", weight=1.0)])
@@ -344,11 +345,19 @@ async def test_taskset_score_removes_rollout_scratch_directory():
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
     taskset._client = _FakeClient()
     taskset._corpus_builder = CorpusBuilder(
-        client=taskset._client, sample_docs_per_source=8
+        client=taskset._client,
     )
+    taskset._decon_detector = DeconLeakageDetector(
+        decon_binary="/nonexistent/decon",
+        evals_dir="/nonexistent/evals",
+    )
+    taskset._trainer = HeuristicProxyTrainer()
 
     state = CuratorState()
-    RolloutStore.set_manifest(state, Manifest(sources=[Source(dataset_id="a/b")]))
+    RolloutStore.set_manifest(
+        state,
+        Manifest(token_budget=1_000, sources=[Source(dataset_id="a/b")]),
+    )
     RolloutStore.set_finalized(state, True)
     task = build_tasks("2024-12-31", 1_000_000)[0]
     trace = vf.Trace(task=task, state=state)

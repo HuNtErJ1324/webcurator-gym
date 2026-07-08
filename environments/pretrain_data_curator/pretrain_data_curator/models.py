@@ -113,10 +113,10 @@ class Manifest(BaseModel):
 
     token_budget: int = Field(default=1_000_000, gt=0)
     sources: list[Source] = Field(default_factory=list)
-    # Agent-chosen override for how many documents are fetched per source from
+    # Agent-chosen optional cap on how many documents are fetched per source from
     # the Hub (the pre-filter fetch cap, distinct from the post-fetch
-    # `Sampling.max_docs`/`max_tokens` truncation on `Source`). `None` (default)
-    # keeps the human-configured `CorpusBuilder.sample_docs_per_source`.
+    # `Sampling.max_docs`/`max_tokens` truncation on `Source`). Omit for no cap;
+    # fetches are then sized from each source's weight-proportional token target.
     sample_docs_per_source: int | None = Field(default=None, ge=1)
 
 
@@ -372,7 +372,6 @@ class CuratorConfig(BaseModel):
             "Maximum dataset IDs used by trace-based manifest recovery/fallback only."
         ),
     )
-    sample_docs_per_source: int = Field(default=64, ge=1)
     allow_local_sources: bool = True
     max_local_source_bytes: int = Field(
         default=33_554_432, ge=1, le=1_073_741_824

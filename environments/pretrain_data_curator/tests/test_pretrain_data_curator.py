@@ -49,7 +49,9 @@ from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.self_score import (
     SELF_SCORE_FILENAME,
+    SELF_SCORE_TRAIN_FILENAME,
     render_self_score_script,
+    render_self_score_train_script,
 )
 from pretrain_data_curator.tasks import TASK_PROMPT, build_tasks
 from pretrain_data_curator.taskset import (
@@ -158,7 +160,6 @@ class _Curator:
         # per-rollout document cache + cost ledger (they also share `state`).
         self.corpus_builder = corpus_builder or CorpusBuilder(
             client=self.client,
-            sample_docs_per_source=self.config.sample_docs_per_source,
             retry_policy=RetryPolicy(
                 attempts=self.config.fetch_max_attempts,
                 timeout=self.config.fetch_timeout_seconds,
@@ -582,7 +583,7 @@ def test_document_filter_kinds():
 @pytest.mark.asyncio
 async def test_corpus_builder_applies_filters_and_sampling():
     client = FakeClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=16)
+    builder = CorpusBuilder(client=client)
     manifest = Manifest(
         sources=[
             Source(
@@ -611,7 +612,7 @@ async def test_weight_proportional_sampling_allocates_correct_proportions():
             return [doc] * min(n, n_docs)
 
     client = _FixedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+    builder = CorpusBuilder(client=client)
 
     # 2:1 weight ratio with 3000-token budget -> targets: A=2000, B=1000.
     # est_docs: A = 2000//250 = 8, B = 1000//250 = 4 (both well under n_docs=50).
@@ -647,7 +648,7 @@ async def test_weight_proportional_explicit_max_tokens_overrides_when_tighter():
             return [doc] * min(n, n_docs)
 
     client = _FixedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+    builder = CorpusBuilder(client=client)
 
     # Weight-derived target for source A: (2/3) * 3000 = 2000 tokens.
     # Explicit max_tokens=30 is tighter -> effective cap = 30.
@@ -680,7 +681,7 @@ async def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
             return [doc] * min(n, n_docs)
 
     client = _FixedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+    builder = CorpusBuilder(client=client)
 
     # All sources have weight=0 -> total_weight=0 -> uncapped (current behavior).
     manifest = Manifest(
@@ -700,7 +701,7 @@ async def test_weight_proportional_all_zero_weights_falls_back_to_uncapped():
 @pytest.mark.asyncio
 async def test_zero_weight_source_is_not_fetched_when_other_weights_are_positive():
     client = FakeClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=10)
+    builder = CorpusBuilder(client=client)
     manifest = Manifest(
         token_budget=1_000,
         sources=[
@@ -739,7 +740,7 @@ async def test_materialize_backfills_unused_budget_from_cached_surplus():
             return docs[dataset_id][:n]
 
     client = _BackfillClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=10)
+    builder = CorpusBuilder(client=client)
     manifest = Manifest(
         token_budget=1_000,
         sources=[
@@ -811,7 +812,7 @@ async def test_weight_proportional_single_source_gets_full_budget():
             return [doc] * min(n, n_docs)
 
     client = _FixedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=n_docs)
+    builder = CorpusBuilder(client=client)
 
     # Single source gets 100% of the budget; budget large enough to fetch all n_docs.
     # est_docs = n_docs * 250 // 250 = n_docs, capped at sample_docs_per_source = n_docs.
@@ -837,12 +838,13 @@ async def test_fetch_count_capped_at_sample_docs_per_source_for_large_target():
             return [doc] * n  # return exactly n (unbounded supply)
 
     client = _FixedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=cap)
+    builder = CorpusBuilder(client=client)
 
     # weight_target = 10_000 -> est_docs = 10_000 // 250 = 40 > cap=8 -> capped to 8.
     manifest = Manifest(
         token_budget=10_000,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
+        sample_docs_per_source=cap,
     )
     state = CuratorState()
     corpus = await builder.materialize(manifest, state)
@@ -860,9 +862,9 @@ async def test_fetch_count_proportional_to_small_token_target():
             return [doc] * n
 
     client = _FixedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=cap)
+    builder = CorpusBuilder(client=client)
 
-    # weight_target = 500 -> est_docs = 500 // 250 = 2, well below cap=100.
+    # weight_target = 500 -> est_docs = 500 // 250 = 2.
     manifest = Manifest(
         token_budget=500,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
@@ -877,9 +879,8 @@ async def test_fetch_count_proportional_to_small_token_target():
 
 
 @pytest.mark.asyncio
-async def test_materialize_manifest_sample_docs_per_source_overrides_fetch_cap():
-    """A manifest-level `sample_docs_per_source` wins over the human-configured
-    default for that rollout's fetch-count estimation in `materialize()`."""
+async def test_materialize_manifest_sample_docs_per_source_caps_fetch():
+    """A manifest-level `sample_docs_per_source` caps fetch-count estimation."""
     doc = "a" * 25  # 6 tokens each
 
     class _UnboundedClient(FakeClient):
@@ -887,11 +888,10 @@ async def test_materialize_manifest_sample_docs_per_source_overrides_fetch_cap()
             return [doc] * n
 
     client = _UnboundedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
 
-    # weight_target = 10_000 -> est_docs = 40, capped at the manifest's override
-    # (20), NOT the builder's configured default (8).
+    # weight_target = 10_000 -> est_docs = 40, capped at the manifest value (20).
     manifest = Manifest(
         token_budget=10_000,
         sources=[Source(dataset_id="good/encyclopedia", weight=1.0)],
@@ -902,9 +902,9 @@ async def test_materialize_manifest_sample_docs_per_source_overrides_fetch_cap()
 
 
 @pytest.mark.asyncio
-async def test_materialize_without_manifest_override_falls_back_to_configured_default():
-    """Backward compat: a manifest with `sample_docs_per_source=None` (the
-    default) leaves fetch-count estimation unchanged."""
+async def test_materialize_without_manifest_cap_uses_token_target():
+    """When the manifest omits `sample_docs_per_source`, fetch count follows the
+    weight-proportional token target with no artificial per-source ceiling."""
     doc = "a" * 25
 
     class _UnboundedClient(FakeClient):
@@ -912,7 +912,7 @@ async def test_materialize_without_manifest_override_falls_back_to_configured_de
             return [doc] * n
 
     client = _UnboundedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
 
     manifest = Manifest(
@@ -921,13 +921,12 @@ async def test_materialize_without_manifest_override_falls_back_to_configured_de
     )
     assert manifest.sample_docs_per_source is None
     corpus = await builder.materialize(manifest, state)
-    assert len(corpus.sources[0].documents) == 8
+    assert len(corpus.sources[0].documents) == 40
 
 
 @pytest.mark.asyncio
-async def test_materialize_large_manifest_override_wins_over_config_default():
-    """A manifest with a large (previously out-of-bounds) value overrides the
-    builder's configured default in `materialize()`."""
+async def test_materialize_large_manifest_cap_does_not_bind_below_token_target():
+    """A manifest cap above the token-derived fetch count does not reduce fetches."""
     doc = "a" * 25
 
     class _UnboundedClient(FakeClient):
@@ -935,7 +934,7 @@ async def test_materialize_large_manifest_override_wins_over_config_default():
             return [doc] * n
 
     client = _UnboundedClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
 
     manifest = Manifest(
@@ -990,7 +989,7 @@ async def test_materialize_different_sample_sizes_do_not_share_cache_key():
             return ["a" * 25] * n
 
     client = _RecordingClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
 
     manifest_small = Manifest(
@@ -1242,7 +1241,7 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     client = FakeClient()
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test", cutoff_date="2024-12-31"))
     builder = CorpusBuilder(
-        client=client, sample_docs_per_source=taskset.curator.sample_docs_per_source
+        client=client,
     )
     taskset._client = client
     taskset._corpus_builder = builder
@@ -1310,7 +1309,7 @@ async def test_concurrent_same_key_fetch_coalesces_to_one_fetch_and_one_bill():
     # N concurrent same-key fetches must share ONE underlying Hub fetch and ONE
     # billing event; later callers read the cached result (single-flight).
     client = _SlowCountingClient()
-    builder = CorpusBuilder(client=client, sample_docs_per_source=8)
+    builder = CorpusBuilder(client=client)
     state = CuratorState()
     key = FetchKey("good/encyclopedia", None, "train", "text", 8)
 
@@ -1358,7 +1357,7 @@ class _CountingTrainer(HeuristicProxyTrainer):
 @pytest.mark.asyncio
 async def test_scoring_runs_build_and_training_once_under_concurrency():
     client = FakeClient()
-    builder = _CountingBuilder(client=client, sample_docs_per_source=64)
+    builder = _CountingBuilder(client=client)
     trainer = _CountingTrainer()
     curator = await _make(client=client, corpus_builder=builder, trainer=trainer)
     await _finalized(curator)
@@ -1811,7 +1810,7 @@ def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
     assert '"local_path"' in prompt
     assert "min_chars" in prompt
     assert "dedup_exact" in prompt
-    assert '"sample_docs_per_source": <optional integer >= 1; omit to use the environment default; the corpus is always trimmed to token_budget>' in prompt
+    assert '"sample_docs_per_source": <optional integer >= 1; omit for no per-source fetch cap — fetches are sized from weights and token_budget>' in prompt
     manifest_fields = {
         "token_budget": 1_000,
         "sample_docs_per_source": 8,
@@ -1855,9 +1854,9 @@ def test_self_score_script_is_standalone_and_hides_final_validation_identity():
 
 
 def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_path):
-    (tmp_path / SELF_SCORE_FILENAME).write_bytes(
-        render_self_score_script(CuratorConfig(token_budget=1_000))
-    )
+    config = CuratorConfig(token_budget=1_000, use_real_trainer=True)
+    (tmp_path / SELF_SCORE_FILENAME).write_bytes(render_self_score_script(config))
+    (tmp_path / SELF_SCORE_TRAIN_FILENAME).write_bytes(render_self_score_train_script())
     (tmp_path / "dev.jsonl").write_text(
         "\n".join(
             json.dumps({"text": "Clean development sample text " * 40})
@@ -1893,9 +1892,20 @@ def test_self_score_script_scores_local_dev_samples_without_validation_data(tmp_
     score = json.loads(result.stdout)
     assert score["ok"] is True
     assert score["validation_data_used"] is False
-    assert score["estimated_proxy_ce"] > 0.0
-    assert score["estimated_budget_fill_ratio"] > 0.0
-    assert score["leakage_estimate"] is None
+    assert score["budget_fill_ratio"] > 0.0
+    assert score["leakage_score"] is None
+    assert "perf_reward" in score
+    assert "leakage_penalty" in score
+    assert "reward" in score
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        assert score["perf_loss"] is None
+        assert score["perf"] is None
+    else:
+        assert score["perf_loss"] is not None
+        assert math.isfinite(score["perf_loss"])
+        assert score["perf"] is not None
 
 
 def test_self_score_dataset_id_precedence_matches_taskset():
@@ -1957,8 +1967,7 @@ def test_self_score_script_cap_accepts_large_values():
 
     script = _self_score._SCRIPT
     match = _re.search(
-        r'cap = manifest\.get\("sample_docs_per_source"\) or DEFAULT_FETCH_CAP.*?'
-        r'cap = max\(1, int\(cap\)\)',
+        r'raw_cap = manifest\.get\("sample_docs_per_source"\).*?cap = None',
         script,
         _re.DOTALL,
     )
@@ -2961,11 +2970,11 @@ def _trace_with_final(task, state, final_text):
 
 @pytest.mark.asyncio
 async def test_finalize_warns_when_fetch_cap_cannot_reach_token_budget(caplog):
-    curator = await _make(sample_docs_per_source=2)
+    curator = await _make()
     trace = _trace_with_final(
         curator.task,
         curator.state,
-        '```json\n{"token_budget": 1000, "sources": [{"id": "a/b"}]}\n```',
+        '```json\n{"token_budget": 1000, "sample_docs_per_source": 2, "sources": [{"id": "a/b"}]}\n```',
     )
 
     with caplog.at_level("WARNING"):
@@ -3554,6 +3563,14 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
     assert taskset.curator.validation_set.dataset_id.encode() not in runtime.files[
         SELF_SCORE_FILENAME
     ]
+    assert SELF_SCORE_TRAIN_FILENAME not in runtime.files
+
+
+def test_self_score_train_script_renders_and_compiles():
+    script = render_self_score_train_script()
+    assert b"WORKDIR" in script
+    assert b"/workspace" not in script
+    compile(script.decode("utf-8"), SELF_SCORE_TRAIN_FILENAME, "exec")
 
 
 @pytest.mark.asyncio

@@ -63,7 +63,12 @@ from .models import (
 )
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
-from .self_score import SELF_SCORE_FILENAME, render_self_score_script
+from .self_score import (
+    SELF_SCORE_FILENAME,
+    SELF_SCORE_TRAIN_FILENAME,
+    render_self_score_script,
+    render_self_score_train_script,
+)
 from .tasks import CuratorTask, build_tasks
 from .trainer import (
     HeuristicProxyTrainer,
@@ -411,7 +416,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     hf_token_env: str = "HF_TOKEN"
     manifest_filename: str = MANIFEST_FILENAME
     candidate_limit: int = 8
-    sample_docs_per_source: int = 64
     allow_local_sources: bool = True
     max_local_source_bytes: int = 33_554_432
     max_turns: int = 64
@@ -478,7 +482,6 @@ class CuratorTaskset(_TasksetBase):
             cutoff_date=config.cutoff_date,
             token_budget=config.token_budget,
             candidate_limit=config.candidate_limit,
-            sample_docs_per_source=config.sample_docs_per_source,
             allow_local_sources=config.allow_local_sources,
             max_local_source_bytes=config.max_local_source_bytes,
             max_turns=config.max_turns,
@@ -516,7 +519,6 @@ class CuratorTaskset(_TasksetBase):
         if self._corpus_builder is None:
             self._corpus_builder = CorpusBuilder(
                 client=self._client,
-                sample_docs_per_source=self.curator.sample_docs_per_source,
                 retry_policy=self._fetch_policy(),
                 fetch_limit=self.curator.max_concurrent_fetches,
                 allow_local_sources=self.curator.allow_local_sources,
@@ -648,6 +650,11 @@ class CuratorTaskset(_TasksetBase):
                 decon_threshold=self.config.decon_threshold,
             ),
         )
+        if self.curator.use_real_trainer:
+            await runtime.write(
+                SELF_SCORE_TRAIN_FILENAME,
+                render_self_score_train_script(),
+            )
 
     @vf.stop
     async def max_turns_reached(self, trace: vf.Trace) -> bool:
@@ -785,21 +792,22 @@ class CuratorTaskset(_TasksetBase):
         if manifest is None:
             manifest = self._manifest_from_trace_ids(task, trace)
         if manifest is not None and manifest.sources:
-            fetch_cap = (
-                manifest.sample_docs_per_source or self.curator.sample_docs_per_source
-            )
-            reachable_tokens = len(manifest.sources) * fetch_cap * EST_TOKENS_PER_DOC
-            if manifest.token_budget > reachable_tokens:
-                logger.warning(
-                    "TOKEN BUDGET IS NOT REACHABLE with the configured fetch cap: "
-                    "token_budget=%d sources=%d fetch_cap=%d "
-                    "estimated_tokens_per_doc=%d estimated_max_tokens=%d",
-                    manifest.token_budget,
-                    len(manifest.sources),
-                    fetch_cap,
-                    EST_TOKENS_PER_DOC,
-                    reachable_tokens,
+            if manifest.sample_docs_per_source is not None:
+                fetch_cap = manifest.sample_docs_per_source
+                reachable_tokens = (
+                    len(manifest.sources) * fetch_cap * EST_TOKENS_PER_DOC
                 )
+                if manifest.token_budget > reachable_tokens:
+                    logger.warning(
+                        "TOKEN BUDGET IS NOT REACHABLE with the configured fetch cap: "
+                        "token_budget=%d sources=%d fetch_cap=%d "
+                        "estimated_tokens_per_doc=%d estimated_max_tokens=%d",
+                        manifest.token_budget,
+                        len(manifest.sources),
+                        fetch_cap,
+                        EST_TOKENS_PER_DOC,
+                        reachable_tokens,
+                    )
             RolloutStore.set_manifest(state, manifest)
             RolloutStore.set_finalized(state, True)
         else:

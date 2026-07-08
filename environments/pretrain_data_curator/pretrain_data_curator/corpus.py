@@ -391,12 +391,16 @@ def _weight_token_target(
     return int((source.weight / total_weight) * token_budget)
 
 
-def _est_fetch_docs(token_target: int, cap: int) -> int:
+def _est_fetch_docs(token_target: int, cap: int | None) -> int:
     """Estimate docs needed to reach `token_target`, conservatively at 250 tokens/doc.
 
-    Capped at `cap` (sample_docs_per_source) so we never over-fetch.
+    When the agent sets ``sample_docs_per_source`` on the manifest, never over-fetch
+    past that cap; otherwise fetch enough to cover the weight-proportional target.
     """
-    return min(max(token_target // EST_TOKENS_PER_DOC, 1), cap)
+    est = max(token_target // EST_TOKENS_PER_DOC, 1)
+    if cap is None:
+        return est
+    return min(est, cap)
 
 
 def _iter_unsampled(
@@ -434,7 +438,6 @@ class CorpusBuilder:
     def __init__(
         self,
         client: DatasetSearchClient,
-        sample_docs_per_source: int = 64,
         document_filter: DocumentFilter | None = None,
         retry_policy: RetryPolicy | None = None,
         fetch_limit: int = 8,
@@ -442,7 +445,6 @@ class CorpusBuilder:
         max_local_source_bytes: int = 33_554_432,
     ) -> None:
         self._client = client
-        self._sample_docs_per_source = sample_docs_per_source
         self._filter = document_filter or DocumentFilter()
         self._retry = retry_policy or RetryPolicy()
         self._fetch_limit = fetch_limit
@@ -674,7 +676,7 @@ class CorpusBuilder:
         # that happen to estimate the same `n` (e.g. both are well above a small
         # weight-derived token target) correctly share one cache entry, since the
         # underlying fetch parameters are then identical.
-        cap = manifest.sample_docs_per_source or self._sample_docs_per_source
+        cap = manifest.sample_docs_per_source
         dest_dir = RolloutStore.scratch_dir(state)
 
         async def materialize_source(
@@ -698,11 +700,12 @@ class CorpusBuilder:
                 key = self._local_fetch_key(source)
                 raw, error = await self.fetch_local_docs(state, source, runtime)
             else:
-                n = (
-                    _est_fetch_docs(weight_target, cap)
-                    if weight_target is not None
-                    else cap
-                )
+                if weight_target is not None:
+                    n = _est_fetch_docs(weight_target, cap)
+                elif cap is not None:
+                    n = cap
+                else:
+                    n = max(manifest.token_budget // EST_TOKENS_PER_DOC, 1)
                 key = FetchKey(
                     dataset_id=source.dataset_id,
                     config=source.config,

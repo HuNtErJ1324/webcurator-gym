@@ -311,7 +311,7 @@ async def test_materialize_mixes_hf_and_local_with_weighted_allocation():
     client = FakeClient({"hub/data": [doc] * 8})
     local_content = "\n".join(json.dumps(doc) for _ in range(4)).encode()
     runtime = FakeRuntime({"data/local.jsonl": local_content})
-    builder = CorpusBuilder(client, sample_docs_per_source=50)
+    builder = CorpusBuilder(client)
     manifest = Manifest(
         token_budget=3_000,
         sources=[
@@ -341,7 +341,7 @@ async def test_materialize_backfills_from_cached_local_surplus():
     local_content = "\n".join(json.dumps(doc) for doc in docs).encode()
     client = FakeClient({"filtered/out": ["x" * 1_200, "y" * 1_200]})
     runtime = FakeRuntime({"data/local.jsonl": local_content})
-    builder = CorpusBuilder(client, sample_docs_per_source=10)
+    builder = CorpusBuilder(client)
     manifest = Manifest(
         token_budget=1_000,
         sources=[
