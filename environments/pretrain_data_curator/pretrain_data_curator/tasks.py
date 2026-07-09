@@ -65,9 +65,9 @@ The script samples your draft sources, trains the fixed proxy student on that sa
 - Performance is scaled from a neutral baseline so progress near the target loss counts more: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
 
 ## Rules
-1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so its cost produces no performance.
+1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so it produces no performance.
 2. Your corpus is checked for data contamination against public benchmark eval sets (AGI Eval, GSM8K, MMLU) AND the held-out validation set using the decon n-gram detector. Contamination against any eval set incurs the leakage penalty in the reward.
-3. Set the manifest's `token_budget` field to exactly {token_budget}, and use data, calls, and training work economically. Fetching or processing beyond what can fill that token allocation wastes cost (tracked as a telemetry metric) without increasing the scored corpus.
+3. Set the manifest's `token_budget` field to exactly {token_budget}. Fetching or processing beyond what can fill that token allocation does not increase the scored corpus.
 4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
 5. Create the final manifest file through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.
 

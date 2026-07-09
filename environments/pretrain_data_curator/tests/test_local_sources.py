@@ -485,5 +485,5 @@ def test_initial_prompt_discloses_local_source_safety_and_cost():
     assert '"kind": "local"' in prompt
     assert "workspace-relative" in prompt
     assert "no leading `/` or `..`" in prompt
-    assert "wastes cost (tracked as a telemetry metric)" in prompt
+    assert "does not increase the scored corpus" in prompt
     assert "Fabricated data" in prompt

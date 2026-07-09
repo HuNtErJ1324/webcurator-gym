@@ -1793,7 +1793,11 @@ def test_task_prompt_contract():
     assert "discovery budget" not in prompt.lower()
     assert "discovery round" not in prompt.lower()
     assert "Contamination against any eval set incurs the leakage penalty" in prompt
-    assert "wastes cost (tracked as a telemetry metric) without increasing the scored corpus" in prompt
+    assert "does not increase the scored corpus" in prompt
+    # Cost is telemetry-only and not part of the reward; the prompt must not
+    # frame curation as a cost-economy tradeoff.
+    assert "cost" not in prompt.lower()
+    assert "telemetry" not in prompt.lower()
     assert "there is no positive performance score" in prompt
     assert "hf datasets ls" not in prompt
     assert "pip install" not in prompt
