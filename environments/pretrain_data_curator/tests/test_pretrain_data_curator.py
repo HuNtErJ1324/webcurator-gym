@@ -340,6 +340,55 @@ def test_source_defaults_to_auto_detected_text_field():
     assert Source(dataset_id="owner/name").text_field is None
 
 
+def test_package_imports_without_torch_installed():
+    """Hub integration installs project deps only; torch stays a dev extra.
+
+    ``import pretrain_data_curator`` must succeed without torch on the path,
+    matching ``test_install_and_import`` on Prime Hub.
+    """
+    code = r"""
+import importlib.abc
+import importlib.machinery
+import sys
+
+
+class _TorchMissingLoader(importlib.abc.Loader):
+    def create_module(self, spec):
+        raise ModuleNotFoundError(spec.name)
+
+    def exec_module(self, module):
+        raise ModuleNotFoundError(module.__name__)
+
+
+class _TorchMissingFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            return importlib.machinery.ModuleSpec(fullname, _TorchMissingLoader())
+        return None
+
+
+sys.meta_path.insert(0, _TorchMissingFinder())
+for name in list(sys.modules):
+    if name == "torch" or name.startswith("torch."):
+        del sys.modules[name]
+    if name == "pretrain_data_curator" or name.startswith("pretrain_data_curator."):
+        del sys.modules[name]
+
+import pretrain_data_curator  # noqa: F401
+
+assert "pretrain_data_curator.student_model" not in sys.modules
+assert "torch" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_package_bootstraps_full_v1_over_stale_cached_path():
     code = """
 import importlib
@@ -449,6 +498,115 @@ def test_single_smoke_config_exhaustively_matches_source_options():
     assert set(args["proxy_student"]) == expected_proxy_fields
     assert ProxyStudentConfig.model_validate(args["proxy_student"])
     assert ValidationSetConfig.model_validate(args["validation_set"])
+
+
+def _400m_eval_config_names() -> list[str]:
+    """Every on-disk *400M* eval TOML (docker-backed agent runs)."""
+    eval_dir = Path(__file__).resolve().parents[1] / "configs" / "eval"
+    names = sorted(p.name for p in eval_dir.glob("*400M*.toml"))
+    assert names, f"expected *400M*.toml under {eval_dir}"
+    return names
+
+
+@pytest.mark.parametrize("config_name", _400m_eval_config_names())
+def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
+    """Every *400M* eval config must use the baked hf+decon image, not bare pytorch."""
+    config_path = (
+        Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
+    )
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    proxy = config["args"]["proxy_student"]
+    assert proxy["runtime_backend"] == "docker"
+    assert proxy["docker_image"] == "webcurator-runtime:latest"
+    assert "pytorch/pytorch" not in proxy["docker_image"]
+
+
+def _extract_bash_function(script: str, name: str) -> str:
+    """Return the body of ``name() { ... }`` (outermost braces), or raise."""
+    header = f"{name}()"
+    start = script.find(header)
+    assert start != -1, f"missing function {name}()"
+    brace = script.find("{", start)
+    assert brace != -1, f"missing opening brace for {name}()"
+    depth = 0
+    for idx in range(brace, len(script)):
+        ch = script[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return script[brace + 1 : idx]
+    raise AssertionError(f"unclosed function body for {name}()")
+
+
+def _assert_ordered_runtime_provision(body: str, *, label: str) -> None:
+    """Each provision path must verify/build decon, then image, then preflight."""
+    decon_verify = body.find('"$DECON_BIN" --version')
+    if decon_verify < 0:
+        decon_verify = body.find("$DECON_BIN --version")
+    decon_fallback = body.find("build_from_source.sh")
+    image_build = body.find(
+        "docker build -f Dockerfile.runtime -t webcurator-runtime:latest"
+    )
+    if image_build < 0:
+        image_build = body.find(
+            'docker build -f Dockerfile.runtime -t "$RUNTIME_IMAGE"'
+        )
+    preflight = body.find("command -v hf")
+    hub_import = body.find("import huggingface_hub")
+    decon_exec = body.find("test -x /workspace/decon/bin/decon")
+    if decon_exec < 0:
+        decon_exec = body.find("test -x ${AGENT_DECON_BIN}")
+    decon_run = body.find("/workspace/decon/bin/decon --version")
+    if decon_run < 0:
+        decon_run = body.find("${AGENT_DECON_BIN} --version")
+
+    assert decon_verify >= 0, f"{label}: missing decon --version verification"
+    assert decon_fallback >= 0, f"{label}: missing decon build_from_source fallback"
+    assert image_build >= 0, f"{label}: missing webcurator-runtime:latest build"
+    assert preflight >= 0, f"{label}: missing in-container hf preflight"
+    assert hub_import >= 0, f"{label}: missing huggingface_hub import preflight"
+    assert decon_exec >= 0, f"{label}: missing executable /workspace/decon check"
+    assert decon_run >= 0, f"{label}: missing /workspace/decon --version preflight"
+    assert "/workspace/decon/bin/decon" in body or (
+        'AGENT_DECON_BIN="/workspace/decon/bin/decon"' in body
+    ), f"{label}: preflight must target agent-mounted /workspace/decon"
+
+    # Order: decon verify/fallback → image build → hf → hub → executable decon.
+    assert decon_verify < image_build, f"{label}: decon verify before image build"
+    assert decon_fallback < image_build, f"{label}: decon fallback before image build"
+    assert image_build < preflight, f"{label}: image build before hf preflight"
+    assert preflight < hub_import, f"{label}: hf before huggingface_hub"
+    assert hub_import < decon_exec, f"{label}: huggingface_hub before decon test -x"
+    assert decon_exec <= decon_run, f"{label}: test -x before decon --version"
+
+
+def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
+    """GPU and CPU A100 paths each own decon→image→preflight; on-pod tees eval."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    on_pod = (scripts_dir / "run_400m_eval_on_pod.sh").read_text(encoding="utf-8")
+
+    cpu_body = _extract_bash_function(a100, "remote_provision_cpu")
+    gpu_body = _extract_bash_function(a100, "remote_provision_gpu")
+    assert cpu_body != gpu_body, "CPU and GPU provision bodies must be distinct"
+    _assert_ordered_runtime_provision(cpu_body, label="a100.cpu")
+    _assert_ordered_runtime_provision(gpu_body, label="a100.gpu")
+
+    # on-pod is a linear script (no named provision fn); validate the same order.
+    _assert_ordered_runtime_provision(on_pod, label="on_pod")
+    assert 'RUNTIME_IMAGE="webcurator-runtime:latest"' in on_pod
+    assert 'AGENT_DECON_BIN="/workspace/decon/bin/decon"' in on_pod
+
+    # LOG_FILE must capture the actual eval pipeline, not a dead declaration.
+    assert 'LOG_FILE="$LOG_DIR/' in on_pod or "LOG_FILE=" in on_pod
+    eval_pipeline = (
+        'uv run eval @ configs/eval/deepseek-v4-pro-400M-300turn-codex.toml'
+        ' 2>&1 | tee "$LOG_FILE"'
+    )
+    assert eval_pipeline in on_pod, "eval must pipe into tee \"$LOG_FILE\""
+    assert "exec uv run eval" not in on_pod
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])

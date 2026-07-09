@@ -1,0 +1,121 @@
+# 400M-token target budget with DeepSeek V4 Pro, 300-turn cap, codex harness.
+# Prefer the swappable base config:
+#   uv run eval -m deepseek/deepseek-v4-pro @ configs/eval/400M-300turn-codex.toml
+# This file is kept as a convenience alias for that model.
+
+id = "pretrain-data-curator"
+model = "deepseek/deepseek-v4-pro"
+num_tasks = 1
+num_rollouts = 1
+max_concurrent = 1
+max_turns = 300
+multiplex = 1
+verbose = true
+rich = true
+
+[sampling]
+temperature = 0.6
+top_p = 0.9
+top_k = 0.9
+
+[args]
+cutoff_date = "2024-12-31"
+token_budget = 400_000_000               # 400M-token target budget
+hf_token_env = "HF_TOKEN"
+manifest_filename = "manifest.json"
+candidate_limit = 64
+allow_local_sources = true
+max_local_source_bytes = 134_217_728
+max_turns = 300                          # raised cap so agent can fill 400M
+harness_id = "codex"
+
+alpha_perf = 1.0
+lambda_leakage = 1.0
+perf_baseline_loss = 10.825839875788878  # ln(50304)
+perf_target_loss = 3.28                  # nanoGPT speedrun target
+baseline_relative_perf = true
+
+max_concurrent_fetches = 8
+max_concurrent_training = 1
+fetch_timeout_seconds = 120.0
+fetch_timeout_per_doc_seconds = 0.02
+fetch_max_attempts = 5
+
+use_real_trainer = true
+decon_binary = "decon"
+decon_evals_dir = ""
+decon_threshold = 0.2
+screen_val_set = true
+
+[args.proxy_student]
+n_layer = 12
+n_head = 6
+n_embd = 768
+mlp_ratio = 4
+lm_head_softcap = 30.0
+num_value_embeds = 3
+attn_scale = 0.12
+
+block_size = 1024
+batch_size = 16
+steps = 200
+train_token_budget = 400_000_000         # scaled to the 400M corpus target
+learning_rate = 0.0003
+seed = 0
+val_fraction = 0.1
+weight_decay = 0.1
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+adam_eps = 0.0000000001
+grad_clip = 1.0
+warmup_steps = 256
+lr_min_ratio = 0.1
+n_train_runs = 1
+
+training_recipe = "speedrun_muon"
+muon_lr = 0.023
+muon_weight_decay = 0.05
+muon_momentum_min = 0.85
+muon_momentum_max = 0.95
+muon_warmup_steps = 300
+muon_cooldown_steps = 50
+adam_lr = 0.008
+adam_weight_decay = 0.005
+embed_lr_mul = 1.0
+lm_head_lr_mul = 1.0
+value_embed_lr_mul = 75.0
+scalar_lr_mul = 5.0
+embed_wd_mul = 150.0
+lm_head_wd_mul = 150.0
+value_embed_wd_mul = 5.0
+scalar_wd_mul = 0.0
+adam_on_odd_steps = true
+batch_schedule_enabled = true
+batch_stage_fracs = [0.3333333333, 0.3333333333, 0.3333333334]
+batch_stage_muls = [1, 2, 3]
+lr_stage_muls = [1.0, 1.52, 1.73]
+lr_cooldown_frac = 0.60
+lr_cooldown_floor = 0.15
+
+runtime_backend = "docker"
+# Custom image built from environments/pretrain_data_curator/Dockerfile.runtime
+# (bare pytorch + huggingface-hub/tiktoken/tqdm/uv + baked decon binary & evals).
+# The codex AGENT runs INSIDE this harness-runtime container, so using the bare
+# pytorch image left its self_score.py with no decon (leakage check skipped) and
+# no hf. Provisioning builds this tag after decon is compiled; see
+# scripts/run_400m_eval_a100.sh and scripts/run_400m_eval_on_pod.sh.
+docker_image = "webcurator-runtime:latest"
+gpu_count = 1
+cpu_cores = 8
+memory_gb = 48                           # keep same as 100M (same model)
+disk_size_gb = 60
+max_corpus_chars = 1_600_000_000         # four chars per 400M-token allocation
+timeout_minutes = 720                    # ~2x training wall-clock headroom for 4x data
+upload_timeout_seconds = 600.0
+
+[args.validation_set]
+dataset_id = "kjj0/fineweb10B-gpt2"
+filename = "fineweb_val_000000.bin"
+repo_type = "dataset"
+tokenizer = "gpt2"
+val_tokens = 10_485_760
