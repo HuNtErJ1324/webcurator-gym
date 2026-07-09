@@ -30,7 +30,6 @@ from pydantic import BaseModel
 from .corpus import CuratedCorpus
 from .hf_access import loop_local_semaphore
 from .models import ProxyStudentConfig
-from .student_model import estimate_instantiated_param_count
 from .val_set import plan_val_windows
 
 logger = logging.getLogger(__name__)
@@ -71,7 +70,15 @@ class ProxyStudentTrainer(Protocol):
 
 
 def estimate_param_count(config: ProxyStudentConfig) -> int:
-    """Exact instantiated parameter count for the modded-nanogpt student."""
+    """Exact instantiated parameter count for the modded-nanogpt student.
+
+    ``student_model`` (and therefore ``torch``) is imported lazily so the
+    package can load for Hub integration / heuristic scoring without a
+    runtime torch dependency. Real GPU training embeds the model source into
+    the sandbox script and never needs this import path.
+    """
+    from .student_model import estimate_instantiated_param_count
+
     return estimate_instantiated_param_count(
         num_layers=config.n_layer,
         model_dim=config.n_embd,

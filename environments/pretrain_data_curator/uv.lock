@@ -1558,7 +1558,7 @@ wheels = [
 
 [[package]]
 name = "pretrain-data-curator"
-version = "0.8.6"
+version = "0.8.8"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },

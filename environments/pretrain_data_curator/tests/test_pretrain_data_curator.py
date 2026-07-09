@@ -340,6 +340,55 @@ def test_source_defaults_to_auto_detected_text_field():
     assert Source(dataset_id="owner/name").text_field is None
 
 
+def test_package_imports_without_torch_installed():
+    """Hub integration installs project deps only; torch stays a dev extra.
+
+    ``import pretrain_data_curator`` must succeed without torch on the path,
+    matching ``test_install_and_import`` on Prime Hub.
+    """
+    code = r"""
+import importlib.abc
+import importlib.machinery
+import sys
+
+
+class _TorchMissingLoader(importlib.abc.Loader):
+    def create_module(self, spec):
+        raise ModuleNotFoundError(spec.name)
+
+    def exec_module(self, module):
+        raise ModuleNotFoundError(module.__name__)
+
+
+class _TorchMissingFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            return importlib.machinery.ModuleSpec(fullname, _TorchMissingLoader())
+        return None
+
+
+sys.meta_path.insert(0, _TorchMissingFinder())
+for name in list(sys.modules):
+    if name == "torch" or name.startswith("torch."):
+        del sys.modules[name]
+    if name == "pretrain_data_curator" or name.startswith("pretrain_data_curator."):
+        del sys.modules[name]
+
+import pretrain_data_curator  # noqa: F401
+
+assert "pretrain_data_curator.student_model" not in sys.modules
+assert "torch" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_package_bootstraps_full_v1_over_stale_cached_path():
     code = """
 import importlib
