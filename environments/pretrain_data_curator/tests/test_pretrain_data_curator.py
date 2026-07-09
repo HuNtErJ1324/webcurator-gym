@@ -500,6 +500,48 @@ def test_single_smoke_config_exhaustively_matches_source_options():
     assert ValidationSetConfig.model_validate(args["validation_set"])
 
 
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "400M-300turn-codex.toml",
+        "deepseek-v4-pro-400M-300turn-codex.toml",
+        "400M-300turn-codex-curation.toml",
+    ],
+)
+def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
+    """Full 400M agent runs must use the baked hf+decon image, not bare pytorch."""
+    config_path = (
+        Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
+    )
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    proxy = config["args"]["proxy_student"]
+    assert proxy["runtime_backend"] == "docker"
+    assert proxy["docker_image"] == "webcurator-runtime:latest"
+    assert "pytorch/pytorch" not in proxy["docker_image"]
+
+
+def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
+    """Provisioning must compile decon, then build+preflight webcurator-runtime."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    on_pod = (scripts_dir / "run_400m_eval_on_pod.sh").read_text(encoding="utf-8")
+
+    for text, label in ((a100, "a100"), (on_pod, "on_pod")):
+        assert "Dockerfile.runtime" in text, label
+        assert "webcurator-runtime:latest" in text, label
+        assert "huggingface_hub" in text, label
+        assert "command -v hf" in text, label
+        decon_idx = text.find("decon/bin/decon")
+        build_idx = text.find("docker build -f Dockerfile.runtime")
+        assert decon_idx != -1 and build_idx != -1, label
+        assert decon_idx < build_idx, f"{label}: build must follow decon compile"
+        # GPU provision path (a100) and on-pod both preflight inside the image.
+        assert "webcurator-runtime:latest bash -lc" in text or (
+            'RUNTIME_IMAGE="webcurator-runtime:latest"' in text
+            and "preflight inside" in text
+        ), label
+
+
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
 def test_load_environment_uses_one_initial_prompt_for_all_harnesses(
     monkeypatch, harness_id
