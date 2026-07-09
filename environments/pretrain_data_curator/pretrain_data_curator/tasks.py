@@ -62,7 +62,7 @@ The script samples your draft sources, trains the fixed proxy student on that sa
 - The sole curation budget is {token_budget} tokens.
 - Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
 - Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_leakage} * leakage`.
-- Performance is scaled linearly from a neutral baseline: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
+- Performance is scaled from a neutral baseline so progress near the target loss counts more: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
 
 ## Rules
 1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so its cost produces no performance.

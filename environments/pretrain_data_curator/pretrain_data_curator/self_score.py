@@ -44,6 +44,7 @@ from pathlib import Path
 EXPECTED_TOKEN_BUDGET = __EXPECTED_TOKEN_BUDGET__
 PERF_BASELINE_LOSS = __PERF_BASELINE_LOSS__
 PERF_TARGET_LOSS = __PERF_TARGET_LOSS__
+PERF_SCALING_EXPONENT = __PERF_SCALING_EXPONENT__
 BASELINE_RELATIVE_PERF = __BASELINE_RELATIVE_PERF__
 ALPHA_PERF = __ALPHA_PERF__
 LAMBDA_LEAKAGE = __LAMBDA_LEAKAGE__
@@ -228,7 +229,8 @@ def scaled_perf(loss):
     if loss is None or not math.isfinite(loss):
         return 0.0
     if BASELINE_RELATIVE_PERF:
-        return (PERF_BASELINE_LOSS - loss) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
+        p = (PERF_BASELINE_LOSS - loss) / (PERF_BASELINE_LOSS - PERF_TARGET_LOSS)
+        return p ** PERF_SCALING_EXPONENT if p >= 0 else p
     return max(0.0, min(1.0, math.exp(-loss)))
 
 
@@ -644,6 +646,7 @@ def render_self_score_script(
         "__EXPECTED_TOKEN_BUDGET__": config.token_budget,
         "__PERF_BASELINE_LOSS__": repr(config.perf_baseline_loss),
         "__PERF_TARGET_LOSS__": repr(config.perf_target_loss),
+        "__PERF_SCALING_EXPONENT__": repr(config.perf_scaling_exponent),
         "__BASELINE_RELATIVE_PERF__": repr(config.baseline_relative_perf),
         "__ALPHA_PERF__": repr(config.alpha_perf),
         "__LAMBDA_LEAKAGE__": repr(config.lambda_leakage),

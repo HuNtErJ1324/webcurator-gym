@@ -3739,7 +3739,9 @@ def test_default_perf_reward_is_baseline_relative_improvement():
 
 
 def test_baseline_relative_perf_reward_when_enabled():
+    # Uses γ=1.0 so the linear assertions match the pre-gamma formula exactly.
     cfg = CuratorConfig(
+        perf_scaling_exponent=1.0,
         baseline_relative_perf=True, perf_baseline_loss=10.0, perf_target_loss=2.0
     )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
@@ -3761,7 +3763,8 @@ def test_baseline_relative_perf_reward_when_enabled():
 
 @pytest.mark.asyncio
 async def test_baseline_relative_flag_only_changes_perf_when_off():
-    on = await _make(baseline_relative_perf=True)
+    # Both curators use γ=1.0 so the linear-vs-exp relationship holds exactly.
+    on = await _make(baseline_relative_perf=True, perf_scaling_exponent=1.0)
     await _finalized(on)
     on_scoring = await on.prepared()
     baseline = on.config.perf_baseline_loss
@@ -3770,7 +3773,7 @@ async def test_baseline_relative_flag_only_changes_perf_when_off():
         (baseline - on_scoring["loss"]) / (baseline - target)
     )
 
-    off = await _make(baseline_relative_perf=False)
+    off = await _make(baseline_relative_perf=False, perf_scaling_exponent=1.0)
     await _finalized(off)
     off_scoring = await off.prepared()
     abs_perf = min(1.0, math.exp(-off_scoring["loss"]))
@@ -4230,3 +4233,145 @@ def test_reduce_report_parity_clamp():
     assert prod == dev, f"prod={prod} dev={dev}"
     assert prod[0] == 1.0, f"expected clamp to 1.0, got {prod[0]}"
     assert prod[1] == 2, f"expected 2 matches, got {prod[1]}"
+
+
+# ---------------------------------------------------------------------------
+# perf_scaling_exponent (gamma) tests
+# ---------------------------------------------------------------------------
+
+
+def test_gamma_anchors_are_invariant():
+    """p=0 → 0.0 and p=1 → 1.0 for any valid gamma (indep of exponent)."""
+    for gamma in [1.0, 2.0, 3.0, 0.5]:
+        cfg = CuratorConfig(perf_scaling_exponent=gamma,
+                            perf_baseline_loss=10.0, perf_target_loss=2.0)
+        scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+        # at target: loss=2.0 → p=(10-2)/(10-2)=1.0
+        at_target = TrainResult(loss=2.0, accuracy=0.4, flops=0.0,
+                                tokens_trained=0, backend="x")
+        assert scorer._perf(at_target) == pytest.approx(1.0)
+        # at baseline: loss=10.0 → p=0.0
+        at_baseline = TrainResult(loss=10.0, accuracy=0.0, flops=0.0,
+                                  tokens_trained=0, backend="x")
+        assert scorer._perf(at_baseline) == pytest.approx(0.0)
+
+
+def test_gamma_curvature():
+    """γ=2, p=0.5 → 0.25 (exact)."""
+    cfg = CuratorConfig(perf_scaling_exponent=2.0,
+                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+    r = TrainResult(loss=6.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
+    # p = (10-6)/(10-2) = 4/8 = 0.5 → 0.5**2 = 0.25
+    assert scorer._perf(r) == pytest.approx(0.25)
+
+
+def test_gamma_linear_when_one():
+    """γ=1.0 recovers the previous linear values exactly."""
+    cfg = CuratorConfig(perf_scaling_exponent=1.0,
+                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+    r = TrainResult(loss=6.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
+    # p = 0.5 → 0.5**1 = 0.5
+    assert scorer._perf(r) == pytest.approx(0.5)
+    worse = TrainResult(loss=14.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    # p = (10-14)/8 = -0.5 → -0.5 (linear branch)
+    assert scorer._perf(worse) == pytest.approx(-0.5)
+
+
+def test_gamma_negative_stays_linear():
+    """p<0 stays linear regardless of γ."""
+    cfg = CuratorConfig(perf_scaling_exponent=2.0,
+                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+    # loss=10.8 → p = (10-10.8)/8 = -0.1
+    r = TrainResult(loss=10.8, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    assert scorer._perf(r) == pytest.approx(-0.1)
+
+
+def test_gamma_beyond_target():
+    """p>1 (beating the target) is amplified: γ=2, p=1.2 → 1.44."""
+    cfg = CuratorConfig(perf_scaling_exponent=2.0,
+                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+    r = TrainResult(loss=0.4, accuracy=0.9, flops=0.0, tokens_trained=0, backend="x")
+    # p = (10-0.4)/8 = 9.6/8 = 1.2 → 1.2**2 = 1.44
+    assert scorer._perf(r) == pytest.approx(1.44)
+
+
+def test_gamma_sentinel_still_zero():
+    """Nonfinite loss → 0.0 regardless of gamma."""
+    cfg = CuratorConfig(perf_scaling_exponent=2.0,
+                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+    sentinel = TrainResult(loss=float("inf"), accuracy=0.0, flops=0.0,
+                           tokens_trained=0, backend="error")
+    assert scorer._perf(sentinel) == 0.0
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), float("nan")])
+def test_gamma_config_rejection(bad):
+    """Exponent 0, negative, inf, nan all raise at config load."""
+    with pytest.raises(ValidationError):
+        CuratorConfig(perf_scaling_exponent=bad,
+                      perf_baseline_loss=10.0, perf_target_loss=2.0)
+    with pytest.raises(ValidationError):
+        CuratorTasksetConfig(id="test", perf_scaling_exponent=bad,
+                             perf_baseline_loss=10.0, perf_target_loss=2.0)
+
+
+def test_gamma_default_is_two():
+    """Default perf_scaling_exponent is 2.0 on both config models."""
+    cfg = CuratorConfig()
+    assert cfg.perf_scaling_exponent == 2.0
+    tscfg = CuratorTasksetConfig(id="test")
+    assert tscfg.perf_scaling_exponent == 2.0
+
+
+def test_load_environment_accepts_perf_scaling_exponent(monkeypatch):
+    """load_environment threads perf_scaling_exponent correctly."""
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    env = load_environment(perf_scaling_exponent=1.5,
+                           perf_baseline_loss=10.0, perf_target_loss=2.0)
+    assert env.taskset.curator.perf_scaling_exponent == pytest.approx(1.5)
+    assert env.env_args["perf_scaling_exponent"] == 1.5
+
+
+def _perf_selfscore(config, loss):
+    """Exec the *rendered* self_score script's ``scaled_perf`` and call it.
+
+    Unlike a hand-copied formula, this executes the exact script that
+    ``render_self_score_script`` writes into the rollout workspace, so the
+    dev-time perf curve is verified to stay in parity with production
+    ``CuratorScorer._target_scaled_perf`` across p and γ.
+    """
+    from pretrain_data_curator.self_score import render_self_score_script
+
+    script = render_self_score_script(config).decode()
+    ns: dict[str, object] = {"__name__": "_self_score_perf_parity"}
+    exec(compile(script, "<rendered self_score.py>", "exec"), ns)
+    return ns["scaled_perf"](loss)
+
+
+def test_self_score_perf_parity():
+    """Rendered self_score ``scaled_perf`` matches production across p and γ."""
+    baselines = [(10.0, 2.0), (12.0, 3.0)]
+    gammas = [1.0, 2.0]
+    p_values = [-0.5, 0.0, 0.3, 0.7, 1.0, 1.2]
+    for bl, tl in baselines:
+        for gamma in gammas:
+            cfg = CuratorConfig(
+                perf_scaling_exponent=gamma,
+                perf_baseline_loss=bl, perf_target_loss=tl,
+            )
+            scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+            for p in p_values:
+                loss = bl - p * (bl - tl)
+                r = TrainResult(loss=loss, accuracy=0.4, flops=0.0,
+                                tokens_trained=0, backend="x")
+                prod_perf = scorer._perf(r)
+                script_perf = _perf_selfscore(cfg, loss)
+                assert prod_perf == pytest.approx(script_perf), (
+                    f"mismatch at bl={bl} tl={tl} γ={gamma} p={p}: "
+                    f"prod={prod_perf} script={script_perf}"
+                )

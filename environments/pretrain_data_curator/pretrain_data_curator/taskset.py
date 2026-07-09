@@ -423,6 +423,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     lambda_leakage: float = 1.0
     perf_baseline_loss: float = math.log(50304)
     perf_target_loss: float = 3.28
+    perf_scaling_exponent: float = 2.0
     baseline_relative_perf: bool = True
     max_concurrent_fetches: int = 8
     max_concurrent_training: int = 1
@@ -452,6 +453,16 @@ class CuratorTasksetConfig(vf.TasksetConfig):
                 "perf_baseline_loss must be greater than perf_target_loss "
                 f"(got baseline={self.perf_baseline_loss}, "
                 f"target={self.perf_target_loss})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_perf_scaling_exponent(self) -> "CuratorTasksetConfig":
+        exp = self.perf_scaling_exponent
+        if not math.isfinite(exp) or exp <= 0:
+            raise ValueError(
+                "perf_scaling_exponent must be finite and > 0 "
+                f"(got {exp})"
             )
         return self
 
@@ -489,6 +500,7 @@ class CuratorTaskset(_TasksetBase):
             lambda_leakage=config.lambda_leakage,
             perf_baseline_loss=config.perf_baseline_loss,
             perf_target_loss=config.perf_target_loss,
+            perf_scaling_exponent=config.perf_scaling_exponent,
             baseline_relative_perf=config.baseline_relative_perf,
             max_concurrent_fetches=config.max_concurrent_fetches,
             max_concurrent_training=config.max_concurrent_training,

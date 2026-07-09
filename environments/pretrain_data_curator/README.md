@@ -43,16 +43,18 @@ R(M, H) = alpha_perf * Perf(M)
 Cost is tracked as a telemetry-only metric (``cost_total``) with zero weight on
 the reward.
 
-By default, `Perf(M)` is scaled linearly from the neutral loss baseline to the
-nanoGPT speedrun target:
+By default, `Perf(M)` uses a convex power-law scaling (`perf_scaling_exponent`,
+default `2.0`) from the neutral loss baseline to the nanoGPT speedrun target:
 
 ```text
-Perf = (perf_baseline_loss - loss) / (perf_baseline_loss - perf_target_loss)
+p = (perf_baseline_loss - loss) / (perf_baseline_loss - perf_target_loss)
+Perf = p^γ  if p ≥ 0;  Perf = p  if p < 0   (γ = perf_scaling_exponent)
 ```
 
 `perf_target_loss` defaults to `3.28`, which maps to exactly `1.0`. The value is
 not clamped: it is negative when loss is worse than the baseline and greater
-than `1.0` when loss beats the target.
+than `1.0` when loss beats the target. Setting `γ=1.0` recovers the previous
+linear formula.
 
 | Term | Meaning | Default weight |
 | --- | --- | --- |
@@ -280,6 +282,7 @@ but every rollout does.
 | `lambda_leakage` | float | `1.0` | Leakage penalty weight. Cost is telemetry-only (no reward term). |
 | `perf_baseline_loss` | float | `log(50304)` | Neutral CE reference for relative performance. |
 | `perf_target_loss` | float | `3.28` | Target CE that maps to `Perf=1.0` under baseline-relative scoring. |
+| `perf_scaling_exponent` | float | `2.0` | Power-law exponent for near-target amplification; `1.0` recovers linear. |
 | `baseline_relative_perf` | bool | `true` | Use target-scaled relative loss; `false` uses `exp(-loss)`. |
 | `max_concurrent_fetches` | int | `8` | Bound on concurrent HF fetches (also the corpus-builder fetch limit). |
 | `max_concurrent_training` | int | `1` | Bound on concurrent sandbox-training jobs (real trainer). |
