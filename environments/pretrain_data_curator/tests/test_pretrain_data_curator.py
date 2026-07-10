@@ -36,7 +36,6 @@ from pretrain_data_curator.hf_access import (
     loop_local_semaphore,
     run_blocking_with_retry,
 )
-from pretrain_data_curator.leakage import DeconLeakageDetector
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
@@ -488,8 +487,9 @@ def test_single_smoke_config_exhaustively_matches_source_options():
         "single_act_last_k",
         "exp_residual_decay",
         "multi_token_pred",
-        "eos_positions",
-        "max_doc_len",
+        "eos_aligned_batches",
+        "max_document_tokens",
+        "record_adam_eps",
         "grad_accum_embed_head_steps",
         "seq_len_schedule",
         "untie_at_frac",
@@ -1797,7 +1797,8 @@ def test_proxy_student_recipe_defaults_mirror_record01():
     assert cfg.muon_lr == 0.023
     assert cfg.batch_schedule_enabled is True
     assert cfg.batch_stage_muls == (1, 2, 3)
-    assert (cfg.adam_beta1, cfg.adam_beta2, cfg.adam_eps) == (0.9, 0.95, 1e-8)
+    assert (cfg.adam_beta1, cfg.adam_beta2, cfg.record_adam_eps) == (0.9, 0.95, 1e-8)
+    assert cfg.adam_eps == 1e-10
     assert cfg.weight_decay == 0.1
     assert cfg.grad_clip == 1.0
     assert cfg.lr_min_ratio == 0.1
@@ -1808,6 +1809,32 @@ def test_proxy_student_recipe_defaults_mirror_record01():
     )
     # An explicit warmup is clamped to the run length so it never exceeds steps.
     assert ProxyStudentConfig(steps=5, warmup_steps=999).effective_warmup_steps == 5
+
+
+def test_proxy_student_payload_routes_document_and_epsilon_fields():
+    cfg = ProxyStudentConfig(
+        adam_eps=1e-10,
+        record_adam_eps=2e-8,
+        max_document_tokens=2048,
+        eos_aligned_batches=True,
+    )
+    payload = cfg.training_payload()
+    assert payload["adam_eps"] == 1e-10
+    assert payload["record_adam_eps"] == 2e-8
+    assert payload["max_document_tokens"] == 2048
+    assert payload["eos_aligned_batches"] is True
+    assert "max_doc_len" not in payload and "eos_positions" not in payload
+
+
+def test_proxy_student_legacy_training_names_remain_safe():
+    cfg = ProxyStudentConfig(max_doc_len=512)
+    assert cfg.max_document_tokens == cfg.max_doc_len == 512
+    legacy_record = ProxyStudentConfig(
+        training_recipe="record_01_adamw", adam_eps=3e-8
+    )
+    assert legacy_record.record_adam_eps == 3e-8
+    with pytest.raises(ValidationError, match="eos_positions is no longer accepted"):
+        ProxyStudentConfig(eos_positions=[10, 20])
 
 
 def test_estimate_param_count_matches_gpt2_small_default():
@@ -1822,6 +1849,7 @@ def test_estimate_param_count_matches_gpt2_small_default():
         {"adam_beta1": 1.0},
         {"adam_beta2": 0.0},
         {"adam_eps": 0.0},
+        {"record_adam_eps": 0.0},
         {"grad_clip": -1.0},
         {"warmup_steps": -1},
         {"lr_min_ratio": 1.5},
@@ -2029,6 +2057,20 @@ def test_self_score_script_is_standalone_and_hides_final_validation_identity():
     assert b"decon/bundled-evals" in script
     assert b"decon/bin/decon" in script
     compile(script, SELF_SCORE_FILENAME, "exec")
+
+
+def test_self_score_preserves_training_document_boundaries():
+    config = CuratorConfig(token_budget=1_000)
+    namespace = {"__name__": "self_score_document_test"}
+    exec(
+        compile(render_self_score_script(config), SELF_SCORE_FILENAME, "exec"),
+        namespace,
+    )
+    payload = json.loads(namespace["joined_corpus"](["first", "", "a\n\nb"], 100))
+    assert payload == {
+        "format": "document-list-v1",
+        "documents": ["first", "", "a\n\nb"],
+    }
 
 
 @pytest.mark.slow

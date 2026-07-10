@@ -45,6 +45,7 @@ from .student_optimizer import (
     build_batch_schedule,
     build_speedrun_optimizers,
     capture_initial_lrs,
+    clip_optimizer_grads,
     get_muon_momentum,
     init_speedrun_weights,
     lookup_batch_stage,
@@ -81,24 +82,53 @@ def plan_train_windows(n_tokens, block):
     return list(range(0, last_start + 1, block))
 
 
-def plan_eos_aligned_windows(n_tokens, block, eos_positions):
-    """Training-window start indices aligned to end-of-sequence markers.
+def encode_document_tokens(documents, encoder, max_document_tokens=None):
+    """Encode source documents with a leading EOT/BOS and exact token ranges.
 
-    Windows start at EoS positions (or 0) and proceed contiguously, so each
-    window naturally begins at a document boundary when possible.
+    Each returned half-open range covers one real source document, including its
+    leading boundary token. Blank and embedded-newline documents remain distinct;
+    no text delimiter is interpreted as structure.
+    """
+    token_ids = []
+    document_ranges = []
+    cap = None if max_document_tokens is None else int(max_document_tokens)
+    if cap is not None and cap < 1:
+        raise ValueError("max_document_tokens must be positive")
+    for document in documents:
+        start = len(token_ids)
+        encoded = list(encoder.encode_ordinary(document))
+        if cap is not None:
+            encoded = encoded[: max(0, cap - 1)]
+        token_ids.append(int(encoder.eot_token))
+        token_ids.extend(encoded)
+        document_ranges.append((start, len(token_ids)))
+    return token_ids, document_ranges
+
+
+def plan_eos_aligned_windows(n_tokens, block, document_ranges, lookahead=1):
+    """Plan non-overlapping windows wholly contained in source documents.
+
+    An empty/too-short document set returns no windows. There is deliberately no
+    flat-stream fallback because that would cross an EOT/BOS boundary silently.
     """
     block = int(block)
     n_tokens = int(n_tokens)
-    if not eos_positions:
-        return plan_train_windows(n_tokens, block)
-    starts = [0]
-    for eos in sorted(eos_positions):
-        if eos + 1 < n_tokens - block:
-            starts.append(eos + 1)
-    deduped = sorted(set(s for s in starts if s + block + 1 <= n_tokens))
-    if not deduped:
-        return [0]
-    return deduped
+    lookahead = max(1, int(lookahead))
+    starts = []
+    previous_end = 0
+    for raw_start, raw_end in document_ranges or ():
+        start, end = int(raw_start), int(raw_end)
+        if start < previous_end or end < start or end > n_tokens:
+            raise ValueError("document ranges must be sorted, disjoint, and in bounds")
+        previous_end = end
+        starts.extend(range(start, end - block - lookahead + 1, block))
+    return starts
+
+
+def shuffled_window_starts(starts, generator):
+    """Return one fixed-seed-deterministic permutation of planned starts."""
+    permutation = torch.randperm(len(starts), generator=generator)
+    return [starts[index] for index in permutation.tolist()]
 
 
 def make_seq_len_schedule(total_steps, max_block, warmup_frac=0.25):
@@ -118,30 +148,6 @@ def make_seq_len_schedule(total_steps, max_block, warmup_frac=0.25):
         return int(min_block + frac * (max_block - min_block))
 
     return block_at_step
-
-
-def _enforce_max_doc_len(starts, n_tokens, max_doc_len, block):
-    """Add synthetic start positions to break up segments longer than ``max_doc_len``.
-
-    When the gap between consecutive window starts exceeds ``max_doc_len``,
-    intermediate starts are inserted so that every position is within
-    ``max_doc_len`` tokens of a window boundary. Out-of-bounds starts are
-    dropped.
-    """
-    if max_doc_len is None:
-        return starts
-    if not starts:
-        return starts
-    refined = [starts[0]]
-    for s in starts[1:]:
-        prev = refined[-1]
-        gap = s - prev
-        if gap > max_doc_len:
-            for mid in range(prev + max_doc_len, s, max_doc_len):
-                if mid + block + 1 <= n_tokens:
-                    refined.append(mid)
-        refined.append(s)
-    return sorted(set(r for r in refined if r + block + 1 <= n_tokens))
 
 
 def _eval_val_loss(model, val_data, *, block, batch, vocab_size, device):
@@ -236,8 +242,7 @@ def train_and_eval_student(
     muon_cooldown_steps=None,
     adam_on_odd_steps=True,
     # --- portable feature flags ---
-    eos_positions=None,
-    max_doc_len=None,
+    document_ranges=None,
     grad_accum_embed_head_steps=1,
     seq_len_schedule=False,
     multi_token_pred=0,
@@ -252,18 +257,25 @@ def train_and_eval_student(
     steps = int(steps)
 
     train_src = train_data
-    if len(train_src) <= block + 1:
+    if document_ranges is None and len(train_src) <= block + 1:
         train_src = train_src.repeat(math.ceil((block + 2) / max(len(train_src), 1)))
 
-    # --- Portable: EoS-aligned windows ---
-    if eos_positions is not None:
-        starts = plan_eos_aligned_windows(len(train_src), block, eos_positions)
+    # Document-aware training never tiles or falls back to flat windows: every
+    # selected input/target pair must remain inside one real source document.
+    if document_ranges is not None:
+        starts = plan_eos_aligned_windows(
+            len(train_src),
+            block,
+            document_ranges,
+            lookahead=max(1, int(multi_token_pred) + 1),
+        )
+        if not starts:
+            raise ValueError(
+                "no document is long enough for block_size + 1 tokens; "
+                "lower block_size or provide longer documents"
+            )
     else:
         starts = plan_train_windows(len(train_src), block)
-
-    # --- Portable: max doc length enforcement ---
-    if max_doc_len is not None:
-        starts = _enforce_max_doc_len(starts, len(train_src), max_doc_len, block)
 
     # --- Portable: seq length schedule ---
     block_fn = make_seq_len_schedule(steps, block) if seq_len_schedule else None
@@ -278,8 +290,7 @@ def train_and_eval_student(
         batch_starts = []
         for _ in range(int(effective_batch)):
             if cursor >= len(order):
-                perm = torch.randperm(len(starts), generator=generator)
-                order = [starts[i] for i in perm.tolist()]
+                order = shuffled_window_starts(starts, generator)
                 cursor = 0
             i = order[cursor]
             cursor += 1
@@ -479,9 +490,7 @@ def train_and_eval_student(
                         if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
                             if id(p) in accum_buffer_embed_head:
                                 p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
-                    # Grad clipping — skipped in the original accumulation branch.
-                    if grad_clip and grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    # Per-optimizer clipping occurs inside the actual updates below.
                     # force_adam=True: a closing cycle always carries freshly
                     # restored embed/head/multi-head grads that must be applied
                     # now, regardless of step parity — otherwise the unconditional
@@ -496,12 +505,14 @@ def train_and_eval_student(
                         cautious_wd=cautious_wd,
                         lr_scale=lr_scale,
                         force_adam=True,
+                        grad_clip=grad_clip,
                     )
                     accum_buffer_embed_head = None
                     accum_count = 0
                     muon_opt.zero_grad(set_to_none=True)
                     adam_opt.zero_grad(set_to_none=True)
                 else:
+                    clip_optimizer_grads(muon_opt, grad_clip)
                     muon_opt.step(momentum=muon_momentum, cautious_wd=cautious_wd, lr_scale=lr_scale)
                     # Zero all grads between micro-steps so stale gradients do
                     # not accumulate for any param group.  Embed/head/multi-head
@@ -520,8 +531,6 @@ def train_and_eval_student(
                 # instead of silently discarding the even step's gradient.
                 muon_opt.zero_grad(set_to_none=True)
                 loss.backward()
-                if grad_clip and grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 adam_stepped = step_speedrun_optimizers(
                     muon_opt,
                     adam_opt,
@@ -530,6 +539,7 @@ def train_and_eval_student(
                     adam_on_odd_steps=adam_on_odd_steps,
                     cautious_wd=cautious_wd,
                     lr_scale=lr_scale,
+                    grad_clip=grad_clip,
                 )
                 if adam_stepped:
                     adam_opt.zero_grad(set_to_none=True)
@@ -573,8 +583,6 @@ def train_and_eval_student(
             if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
                 if id(p) in accum_buffer_embed_head:
                     p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
-        if grad_clip and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         step_speedrun_optimizers(
             muon_opt, adam_opt,
             step=step,
@@ -583,6 +591,7 @@ def train_and_eval_student(
             cautious_wd=cautious_wd,
             lr_scale=lr_scale,
             force_adam=True,
+            grad_clip=grad_clip,
         )
         accum_buffer_embed_head = None
         accum_count = 0
@@ -631,9 +640,10 @@ def averaged_train_and_eval(
 _TRAINING_COMPONENTS = (
     lr_at_step,
     plan_train_windows,
+    encode_document_tokens,
     plan_eos_aligned_windows,
+    shuffled_window_starts,
     make_seq_len_schedule,
-    _enforce_max_doc_len,
     _eval_val_loss,
     _compute_multi_token_loss,
     train_and_eval_student,

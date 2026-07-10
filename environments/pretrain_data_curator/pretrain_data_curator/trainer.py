@@ -273,7 +273,17 @@ torch.set_float32_matmul_precision("high")
 with open("/workspace/config.json") as f:
     cfg = json.load(f)
 with open("/workspace/corpus.txt", encoding="utf-8") as f:
-    text = f.read()
+    corpus_text = f.read()
+try:
+    corpus_payload = json.loads(corpus_text)
+except json.JSONDecodeError:
+    corpus_payload = None
+if isinstance(corpus_payload, dict) and corpus_payload.get("format") == "document-list-v1":
+    documents = corpus_payload.get("documents")
+    if not isinstance(documents, list) or not all(isinstance(doc, str) for doc in documents):
+        raise ValueError("invalid document-list-v1 corpus payload")
+else:
+    documents = None
 
 seed = int(cfg["seed"])
 torch.manual_seed(seed)
@@ -290,9 +300,26 @@ except ImportError:
 enc = tiktoken.get_encoding(str(cfg.get("tokenizer", "gpt2")))
 vocab_size = enc.n_vocab
 
-corpus_ids = enc.encode_ordinary(text)
-if len(corpus_ids) < 64:
-    corpus_ids = (corpus_ids * math.ceil(64 / max(len(corpus_ids), 1)))[:64] or [0] * 64
+# __DOCUMENT_ENCODING__  (replaced with tested encode_document_tokens source)
+
+eos_aligned_batches = bool(cfg.get("eos_aligned_batches", True))
+if eos_aligned_batches:
+    if documents is None:
+        raise ValueError(
+            "EOS-aligned training requires a document-list-v1 corpus payload; "
+            "flat text cannot recover source document boundaries safely"
+        )
+    corpus_ids, document_ranges = encode_document_tokens(
+        documents,
+        enc,
+        cfg.get("max_document_tokens", cfg.get("max_doc_len")),
+    )
+else:
+    flat_text = corpus_text if documents is None else "\n\n".join(documents)
+    corpus_ids = enc.encode_ordinary(flat_text)
+    document_ranges = None
+    if len(corpus_ids) < 64:
+        corpus_ids = (corpus_ids * math.ceil(64 / max(len(corpus_ids), 1)))[:64] or [0] * 64
 corpus = torch.tensor(corpus_ids, dtype=torch.long)
 
 val_path = "/workspace/val.bin"
@@ -307,6 +334,8 @@ else:
     # Fallback (no external val supplied): a tail split of the curated corpus.
     n_val = max(1, int(len(corpus) * float(cfg["val_fraction"])))
     train_data, val_data = corpus[:-n_val], corpus[-n_val:]
+    if document_ranges is not None:
+        document_ranges = [bounds for bounds in document_ranges if bounds[1] <= len(train_data)]
     val_source = "corpus_split"
 
 block = int(cfg["block_size"]); batch = int(cfg["batch_size"])
@@ -362,7 +391,7 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     grad_clip=float(cfg.get("grad_clip", 1.0)),
     beta1=float(cfg.get("adam_beta1", 0.9)),
     beta2=float(cfg.get("adam_beta2", 0.95)),
-    eps=float(cfg.get("adam_eps", 1e-8)),
+    eps=float(cfg.get("record_adam_eps", cfg.get("adam_eps", 1e-8))),
     lr_min_ratio=float(cfg.get("lr_min_ratio", 0.1)),
     muon_lr=float(cfg.get("muon_lr", 0.023)),
     muon_weight_decay=float(cfg.get("muon_weight_decay", 0.05)),
@@ -389,8 +418,7 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     muon_cooldown_steps=cfg.get("muon_cooldown_steps"),
     adam_on_odd_steps=bool(cfg.get("adam_on_odd_steps", True)),
     # portable feature hparams (all default-off)
-    eos_positions=cfg.get("eos_positions"),
-    max_doc_len=cfg.get("max_doc_len"),
+    document_ranges=document_ranges,
     grad_accum_embed_head_steps=int(cfg.get("grad_accum_embed_head_steps", 1)),
     seq_len_schedule=bool(cfg.get("seq_len_schedule", False)),
     multi_token_pred=int(cfg.get("multi_token_pred", 0)),
@@ -442,10 +470,16 @@ def _module_definitions_source(module_filename: str, names: tuple[str, ...]) -> 
 
 
 def _nanogpt_train_script() -> str:
+    from .student_train import encode_document_tokens
+
     return (
         _NANOGPT_TRAIN_SCRIPT_TEMPLATE.replace(
             "# __PLAN_VAL_WINDOWS__  (replaced with the tested plan_val_windows source)",
             inspect.getsource(plan_val_windows).rstrip(),
+        )
+        .replace(
+            "# __DOCUMENT_ENCODING__  (replaced with tested encode_document_tokens source)",
+            inspect.getsource(encode_document_tokens).rstrip(),
         )
         .replace(
             "# __STUDENT_MODEL__  (replaced with the verbatim student_model.py model source)",
@@ -490,6 +524,7 @@ def _nanogpt_train_script() -> str:
                     "init_speedrun_weights",
                     "set_optimizer_lrs",
                     "capture_initial_lrs",
+                    "clip_optimizer_grads",
                     "step_speedrun_optimizers",
                 ),
             ),
@@ -502,8 +537,8 @@ def _nanogpt_train_script() -> str:
                     "lr_at_step",
                     "plan_train_windows",
                     "plan_eos_aligned_windows",
+                    "shuffled_window_starts",
                     "make_seq_len_schedule",
-                    "_enforce_max_doc_len",
                     "_eval_val_loss",
                     "_compute_multi_token_loss",
                     "train_and_eval_student",

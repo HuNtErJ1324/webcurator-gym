@@ -47,7 +47,7 @@ from .corpus import CorpusBuilder, CuratedCorpus
 from .models import Manifest, ProxyStudentConfig
 from .rollout_state import CuratorState
 from .student_model import GPT
-from .student_train import averaged_train_and_eval
+from .student_train import averaged_train_and_eval, encode_document_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -265,16 +265,16 @@ def materialize_bundle(
 
 
 def _write_corpus(corpus: CuratedCorpus, path: Path) -> None:
-    """Stream documents to disk joined by blank lines (mirrors ``joined_text``)."""
-    first = True
+    """Stream the tagged document-list payload consumed by the trainer."""
     with path.open("w", encoding="utf-8") as fh:
+        fh.write('{"format":"document-list-v1","documents":[')
+        first = True
         for doc in corpus.iter_documents():
-            if not doc:
-                continue
-            fh.write(doc if first else "\n\n" + doc)
+            if not first:
+                fh.write(",")
+            json.dump(doc, fh, ensure_ascii=False)
             first = False
-        if not first:
-            fh.write("\n")
+        fh.write("]}")
 
 
 # --------------------------------------------------------------------------- #
@@ -375,20 +375,39 @@ def prepare_training_data(
     *,
     tokenizer: str = "gpt2",
     val_fraction: float = DEFAULT_VAL_FRACTION,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """GPT-2-BPE tokenize ``corpus.txt`` and split into train/val tensors.
-
-    This is the exact token stream handed to the trainer; ``corpus_path`` is the
-    bundle's ``corpus.txt``, so the trainer always trains on the curated bundle.
-    """
-    text = Path(corpus_path).read_text(encoding="utf-8")
+    eos_aligned_batches: bool = True,
+    max_document_tokens: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]] | None]:
+    """Tokenize the preserved source-document list and split train/validation."""
+    raw = Path(corpus_path).read_text(encoding="utf-8")
     enc = tiktoken.get_encoding(tokenizer)
-    ids = enc.encode_ordinary(text)
-    if len(ids) < 64:
-        ids = (ids * math.ceil(64 / max(len(ids), 1)))[:64] or [0] * 64
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+    documents = (
+        payload.get("documents")
+        if isinstance(payload, dict) and payload.get("format") == "document-list-v1"
+        else None
+    )
+    if eos_aligned_batches:
+        if not isinstance(documents, list) or not all(isinstance(doc, str) for doc in documents):
+            raise ValueError("EOS-aligned training requires document-list-v1 corpus data")
+        ids, document_ranges = encode_document_tokens(
+            documents, enc, max_document_tokens
+        )
+    else:
+        text = raw if documents is None else "\n\n".join(documents)
+        ids = enc.encode_ordinary(text)
+        document_ranges = None
+        if len(ids) < 64:
+            ids = (ids * math.ceil(64 / max(len(ids), 1)))[:64] or [0] * 64
     corpus = torch.tensor(ids, dtype=torch.long)
     n_val = max(1, int(len(corpus) * val_fraction))
-    return corpus[:-n_val], corpus[-n_val:]
+    train_data, val_data = corpus[:-n_val], corpus[-n_val:]
+    if document_ranges is not None:
+        document_ranges = [bounds for bounds in document_ranges if bounds[1] <= len(train_data)]
+    return train_data, val_data, document_ranges
 
 
 def _training_kwargs(config: ProxyStudentConfig, vocab_size: int) -> dict[str, Any]:
@@ -411,7 +430,7 @@ def _training_kwargs(config: ProxyStudentConfig, vocab_size: int) -> dict[str, A
         "grad_clip": config.grad_clip,
         "beta1": config.adam_beta1,
         "beta2": config.adam_beta2,
-        "eps": config.adam_eps,
+        "eps": config.record_adam_eps,
         "lr_min_ratio": config.lr_min_ratio,
         "muon_lr": config.muon_lr,
         "muon_weight_decay": config.muon_weight_decay,
@@ -438,8 +457,6 @@ def _training_kwargs(config: ProxyStudentConfig, vocab_size: int) -> dict[str, A
         "lr_cooldown_frac": config.lr_cooldown_frac,
         "lr_cooldown_floor": config.lr_cooldown_floor,
         # portable feature flags (all default-off)
-        "eos_positions": config.eos_positions,
-        "max_doc_len": config.max_doc_len,
         "grad_accum_embed_head_steps": config.grad_accum_embed_head_steps,
         "seq_len_schedule": config.seq_len_schedule,
         "multi_token_pred": config.multi_token_pred,
@@ -473,8 +490,12 @@ def train_debug(
                 child.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_data, val_data = prepare_training_data(
-        corpus_path, tokenizer=tokenizer, val_fraction=config.val_fraction
+    train_data, val_data, document_ranges = prepare_training_data(
+        corpus_path,
+        tokenizer=tokenizer,
+        val_fraction=config.val_fraction,
+        eos_aligned_batches=config.eos_aligned_batches,
+        max_document_tokens=config.max_document_tokens,
     )
     vocab_size = tiktoken.get_encoding(tokenizer).n_vocab
 
@@ -502,6 +523,7 @@ def train_debug(
         ).to(device)
 
     kwargs = _training_kwargs(config, vocab_size)
+    kwargs["document_ranges"] = document_ranges
     result = train_fn(
         build_model,
         train_data,

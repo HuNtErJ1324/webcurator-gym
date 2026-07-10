@@ -239,27 +239,30 @@ class CuratedCorpus:
         return all(source.doc_count == 0 for source in self.sources)
 
     def joined_text(self, cap: int) -> str:
-        """Streaming-truncated equivalent of ``"\\n\\n".join(all_docs)[:cap]``.
+        """Serialize the capped source document list for trainer upload.
 
-        Reads documents off disk in order and stops as soon as the accumulated
-        length reaches `cap`, instead of joining the full (potentially huge)
-        corpus into one string first and slicing it -- so building the capped
-        upload blob costs at most ``O(cap)``, not ``O(total corpus size)``.
-        Byte-identical to the eager join+slice for the documents actually
-        consumed, since a slice's first `cap` characters never depend on what
-        comes after it in the joined string.
+        The historical method name is retained for backend compatibility, but
+        the payload is tagged JSON rather than blank-line-joined prose. Keeping
+        documents as explicit list entries preserves first/blank/embedded-newline
+        boundaries and lets the tokenizer insert EOT/BOS without guessing via
+        ``text.split``. ``cap`` bounds source-document characters; the final
+        document may be truncated, but no synthetic boundary is introduced.
         """
-        parts: list[str] = []
-        total = 0
-        first = True
+        documents: list[str] = []
+        remaining = max(0, int(cap))
         for doc in self.iter_documents():
-            piece = doc if first else "\n\n" + doc
-            first = False
-            parts.append(piece)
-            total += len(piece)
-            if total >= cap:
+            if remaining == 0:
                 break
-        return "".join(parts)[:cap]
+            piece = doc[:remaining]
+            documents.append(piece)
+            remaining -= len(piece)
+            if len(piece) < len(doc):
+                break
+        return json.dumps(
+            {"format": "document-list-v1", "documents": documents},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 def _iter_sampling(

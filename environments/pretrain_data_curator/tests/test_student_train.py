@@ -18,18 +18,20 @@ import random
 import sys
 
 import pytest
+import tiktoken
 import torch
 
 from pretrain_data_curator.student_model import StudentModelConfig
 from pretrain_data_curator.student_train import (
     _TRAINING_COMPONENTS,
     averaged_train_and_eval,
+    encode_document_tokens,
     lr_at_step,
     plan_train_windows,
     plan_eos_aligned_windows,
+    shuffled_window_starts,
     make_seq_len_schedule,
     train_and_eval_student,
-    training_source,
 )
 from pretrain_data_curator.trainer import NANOGPT_TRAIN_SCRIPT
 
@@ -456,63 +458,50 @@ def test_discriminative_signal_requires_contiguous_recipe_not_replacement(monkey
     assert collections.Counter(replacement_starts) != {s: epochs for s in starts}  # not uniform
 
 
-# --- (8) max_doc_len enforcement ---
+# --- (8) document-aware portable training feature tests ---
+
+def test_real_document_tokenization_preserves_boundaries():
+    enc = tiktoken.get_encoding("gpt2")
+    documents = ["first", "", "line one\n\nline two"]
+    token_ids, ranges = encode_document_tokens(documents, enc)
+
+    assert len(ranges) == len(documents)
+    for (start, end), document in zip(ranges, documents, strict=True):
+        assert token_ids[start] == enc.eot_token
+        assert token_ids[start + 1 : end] == enc.encode_ordinary(document)
+    assert ranges[0][0] == 0
+    assert ranges[1][1] - ranges[1][0] == 1  # blank document is still explicit
 
 
-def test_enforce_max_doc_len_basic():
-    from pretrain_data_curator.student_train import _enforce_max_doc_len
-    starts = [0, 64, 128]
-    n_tokens = 200
-    # max_doc_len > gap: no change
-    assert _enforce_max_doc_len(starts, n_tokens, max_doc_len=80, block=16) == starts
-    # max_doc_len < gap: synthetic starts inserted
-    result = _enforce_max_doc_len(starts, n_tokens, max_doc_len=30, block=16)
-    assert 0 in result
-    assert all(s + 16 + 1 <= n_tokens for s in result)
-    # Every gap between consecutive starts must be <= max_doc_len
-    for a, b in zip(result, result[1:]):
-        assert b - a <= 30, f"gap {b - a} > 30 between {a} and {b}"
+def test_eos_aligned_windows_never_cross_document_boundaries():
+    ranges = [(0, 20), (20, 29), (29, 65)]
+    starts = plan_eos_aligned_windows(65, 8, ranges)
+    assert starts == [0, 8, 20, 29, 37, 45, 53]
+    assert all(
+        any(start >= doc_start and start + 8 + 1 <= doc_end for doc_start, doc_end in ranges)
+        for start in starts
+    )
 
 
-def test_enforce_max_doc_len_none_max():
-    from pretrain_data_curator.student_train import _enforce_max_doc_len
-    starts = [0, 16, 32, 48]
-    assert _enforce_max_doc_len(starts, 100, max_doc_len=None, block=16) == starts
+def test_eos_aligned_windows_reserve_multi_token_lookahead():
+    ranges = [(0, 12), (12, 24)]
+    assert plan_eos_aligned_windows(24, 8, ranges, lookahead=1) == [0, 12]
+    assert plan_eos_aligned_windows(24, 8, ranges, lookahead=4) == [0, 12]
+    assert plan_eos_aligned_windows(22, 8, [(0, 10), (10, 22)], lookahead=4) == [10]
 
 
-def test_enforce_max_doc_len_empty_starts():
-    from pretrain_data_curator.student_train import _enforce_max_doc_len
-    assert _enforce_max_doc_len([], 100, max_doc_len=32, block=16) == []
+def test_eos_aligned_windows_have_no_flat_fallback():
+    assert plan_eos_aligned_windows(100, 16, []) == []
+    assert plan_eos_aligned_windows(10, 8, [(0, 8), (8, 10)]) == []
 
 
-def test_enforce_max_doc_len_drops_out_of_bounds():
-    from pretrain_data_curator.student_train import _enforce_max_doc_len
-    starts = [0, 200]
-    n_tokens = 180
-    result = _enforce_max_doc_len(starts, n_tokens, max_doc_len=80, block=16)
-    assert all(s + 16 + 1 <= n_tokens for s in result)
-    # 200 + 16 + 1 = 217 > 180, so 200 should be dropped
-    assert 200 not in result
-    # 0 and 80 should remain
-    assert 0 in result
-    assert 80 in result or 160 in result
-
-
-# --- portable training feature tests ---
-
-def test_eos_aligned_windows_basic():
-    eos = [5, 15, 30]
-    starts = plan_eos_aligned_windows(100, 16, eos)
-    assert len(starts) >= 3
-    assert all(s + 16 + 1 <= 100 for s in starts)
-    # First start should be 0
-    assert starts[0] == 0
-
-
-def test_eos_aligned_windows_empty_eos():
-    starts = plan_eos_aligned_windows(100, 16, [])
-    baseline = plan_train_windows(100, 16)
-    assert starts == baseline
+def test_eos_aligned_window_selection_is_fixed_seed_deterministic():
+    starts = plan_eos_aligned_windows(80, 8, [(0, 40), (40, 80)])
+    first = shuffled_window_starts(starts, torch.Generator().manual_seed(123))
+    second = shuffled_window_starts(starts, torch.Generator().manual_seed(123))
+    different = shuffled_window_starts(starts, torch.Generator().manual_seed(124))
+    assert first == second
+    assert first != different
 
 
 def test_seq_len_schedule_warmup():
@@ -545,10 +534,48 @@ def test_training_with_eos_aligned_windows():
         base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
         beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
         device="cpu", generator=gen, training_recipe="record_01_adamw",
-        eos_positions=[10, 30, 60],
+        document_ranges=[(0, 30), (30, 60), (60, 120)],
     )
     assert math.isfinite(loss)
     assert tokens > 0
+
+
+def test_eos_selection_integrates_with_odd_step_adam_cadence(monkeypatch):
+    V = 16
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (120,))
+    adam_steps = 0
+    real_step = torch.optim.AdamW.step
+
+    def spy_step(self, *args, **kwargs):
+        nonlocal adam_steps
+        adam_steps += 1
+        return real_step(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", spy_step)
+    train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=4,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=torch.Generator().manual_seed(7),
+        training_recipe="speedrun_muon",
+        document_ranges=[(0, 40), (40, 80), (80, 120)],
+        adam_on_odd_steps=True,
+    )
+    assert adam_steps == 2
 
 
 def test_training_with_seq_len_schedule():
@@ -623,23 +650,15 @@ def test_full_training_with_speedrun_and_nor_muon():
     assert tokens > 0
 
 
-def test_training_with_max_doc_len_enforced():
-    """Training with eos_positions and max_doc_len must split long documents,
-    not silently ignore the cap."""
-    V = 16
-    model = _tiny_cfg(V).build()
-    data = torch.randint(0, V, (500,))
-    gen = torch.Generator().manual_seed(0)
-    loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=16, batch_size=2, steps=5,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
-        eos_positions=[20, 50, 100, 200],
-        max_doc_len=32,
+def test_max_document_tokens_truncates_without_synthesizing_boundaries():
+    enc = tiktoken.get_encoding("gpt2")
+    token_ids, ranges = encode_document_tokens(
+        ["one " * 100, "two " * 100], enc, max_document_tokens=32
     )
-    assert math.isfinite(loss)
-    assert tokens > 0
+    assert ranges == [(0, 32), (32, 64)]
+    assert len(token_ids) == 64
+    starts = plan_eos_aligned_windows(len(token_ids), 16, ranges)
+    assert starts == [0, 32]
 
 
 def test_multi_token_pred_targets_shifted_correctly(monkeypatch):
@@ -690,9 +709,6 @@ def test_untie_embed_lm_head_at_frac(monkeypatch):
     model = cfg.build()
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
-
-    # Track when the untie condition fires
-    untie_fired = []
 
     def spy_train(model, train_data, val_data, **kw):
         # After init_speedrun_weights and weight tying, before training starts:
@@ -1027,10 +1043,8 @@ def test_grad_accum_embed_head_clip_called(monkeypatch):
         grad_accum_embed_head_steps=2,
     )
 
-    # With 6 steps and accum=2, the final micro-step fires 3 times (steps
-    # 1,3,5; step 0 is the first in a cycle so clip fires on steps 1,3,5
-    # when embed/head accumulate → 3 clip calls).
-    assert len(clip_calls) == 3, f"Expected 3 clip calls, got {len(clip_calls)}: {clip_calls}"
+    # Muon clips at all six updates; Adam clips only at its three updates.
+    assert len(clip_calls) == 9, f"Expected 9 clip calls, got {len(clip_calls)}: {clip_calls}"
     assert all(c == 1.0 for c in clip_calls)
 
 
@@ -1129,10 +1143,9 @@ def test_grad_accum_embed_head_produces_correct_weight_changes(monkeypatch):
 
 
 def test_sandbox_script_embeds_training_recipe_verbatim():
-    # The GPU-only script must run the SAME training recipe these CPU tests exercise:
-    # the exact recipe source appears byte-identically in the assembled script.
+    # The GPU-only script must run the SAME tested components. Document encoding
+    # is embedded before corpus construction; the remaining recipe follows later.
     ast.parse(NANOGPT_TRAIN_SCRIPT)  # assembled script is valid Python
-    assert training_source() in NANOGPT_TRAIN_SCRIPT
     for component in _TRAINING_COMPONENTS:
         assert inspect.getsource(component).rstrip() in NANOGPT_TRAIN_SCRIPT
     # The record_01 recipe is wired: AdamW(betas/eps/weight_decay), warmup+cosine LR,
@@ -1144,6 +1157,8 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     assert "lr_at_step(step" in NANOGPT_TRAIN_SCRIPT
     assert "plan_train_windows(" in NANOGPT_TRAIN_SCRIPT
     assert "averaged_train_and_eval(" in NANOGPT_TRAIN_SCRIPT
+    assert 'text.split("\\n\\n")' not in NANOGPT_TRAIN_SCRIPT
+    assert "flat text cannot recover source document boundaries safely" in NANOGPT_TRAIN_SCRIPT
     # ...and the OLD constant-LR plain-AdamW + random-with-replacement sampler is gone.
     assert "torch.randint(len(src) - block - 1" not in NANOGPT_TRAIN_SCRIPT
     assert "opt = torch.optim.AdamW(model.parameters(), lr=float(cfg" not in NANOGPT_TRAIN_SCRIPT
