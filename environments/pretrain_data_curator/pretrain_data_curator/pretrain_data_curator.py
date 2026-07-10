@@ -207,8 +207,11 @@ def load_environment(
         ),
         env_args=env_args,
     )
-    # Cap agent-visible bash/tool results at the harness program boundary. Lazy
-    # wrap keeps package import safe when a stub Verifiers install is present.
+    # Cap agent-visible tool results:
+    # - bash: patch the uv program so run_bash/tool appends are capped in-runtime
+    # - codex: TruncatingClient on Environment.episode caps Responses
+    #   function_call_output items at the interception→provider boundary
+    # Lazy imports keep package import safe when a stub Verifiers install is present.
     if harness_id == "bash":
         from .bash_harness import wrap_bash_harness
 
