@@ -40,6 +40,7 @@ import logging
 import math
 import os
 import re
+from importlib import resources
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -80,6 +81,12 @@ from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 TRAINER_ERROR_STR_LIMIT = 20_000
+HF_CLI_SKILL_FILENAME = "hf_cli_skill.md"
+_HF_CLI_SKILL = (
+    resources.files("pretrain_data_curator")
+    .joinpath(HF_CLI_SKILL_FILENAME)
+    .read_bytes()
+)
 
 # --------------------------------------------------------------------------- #
 # manifest parsing (workspace file primary; assistant messages remain fallback)
@@ -662,6 +669,7 @@ class CuratorTaskset(_TasksetBase):
                 decon_threshold=self.config.decon_threshold,
             ),
         )
+        await runtime.write(HF_CLI_SKILL_FILENAME, _HF_CLI_SKILL)
         if self.curator.use_real_trainer:
             await runtime.write(
                 SELF_SCORE_TRAIN_FILENAME,
