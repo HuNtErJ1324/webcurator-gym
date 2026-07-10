@@ -33,7 +33,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import shlex
 import sys
 import types
@@ -378,7 +377,7 @@ def prepare_training_data(
     eos_aligned_batches: bool = True,
     max_document_tokens: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]] | None]:
-    """Tokenize the preserved source-document list and split train/validation."""
+    """Build the FineWeb-style document stream and split train/validation."""
     raw = Path(corpus_path).read_text(encoding="utf-8")
     enc = tiktoken.get_encoding(tokenizer)
     try:
@@ -390,18 +389,14 @@ def prepare_training_data(
         if isinstance(payload, dict) and payload.get("format") == "document-list-v1"
         else None
     )
-    if eos_aligned_batches:
-        if not isinstance(documents, list) or not all(isinstance(doc, str) for doc in documents):
+    if documents is None:
+        if eos_aligned_batches:
             raise ValueError("EOS-aligned training requires document-list-v1 corpus data")
-        ids, document_ranges = encode_document_tokens(
-            documents, enc, max_document_tokens
-        )
-    else:
-        text = raw if documents is None else "\n\n".join(documents)
-        ids = enc.encode_ordinary(text)
-        document_ranges = None
-        if len(ids) < 64:
-            ids = (ids * math.ceil(64 / max(len(ids), 1)))[:64] or [0] * 64
+        documents = [raw]
+    if not isinstance(documents, list) or not all(isinstance(doc, str) for doc in documents):
+        raise ValueError("invalid document-list-v1 corpus data")
+    ids, encoded_ranges = encode_document_tokens(documents, enc, max_document_tokens)
+    document_ranges = encoded_ranges if eos_aligned_batches else None
     corpus = torch.tensor(ids, dtype=torch.long)
     n_val = max(1, int(len(corpus) * val_fraction))
     train_data, val_data = corpus[:-n_val], corpus[-n_val:]

@@ -12,6 +12,7 @@ import asyncio
 import json
 
 import pytest
+import tiktoken
 import torch
 
 from pretrain_data_curator.debug_train import (
@@ -185,6 +186,7 @@ async def test_corpus_handoff_to_trainer_is_exact(base_dir, manifest, tmp_path):
         recorded["train"] = train_data
         recorded["val"] = val_data
         recorded["document_ranges"] = kwargs["document_ranges"]
+        recorded["device"] = kwargs["device"]
         return (3.0, 0.5, 0.0, int(len(train_data)), 1_000_000)
 
     config = build_debug_config(steps=10, block_size=64, batch_size=4)
@@ -199,8 +201,44 @@ async def test_corpus_handoff_to_trainer_is_exact(base_dir, manifest, tmp_path):
     assert torch.equal(recorded["train"], expected_train)
     assert torch.equal(recorded["val"], expected_val)
     assert recorded["document_ranges"] == expected_ranges
+    assert recorded["device"] == "cpu"
     assert result["tokens_trained"] == int(len(expected_train))
     assert (output_dir / "result.json").is_file()
+
+
+def test_prepare_training_data_uses_same_eot_stream_with_or_without_aligned_planning(
+    tmp_path,
+):
+    documents = ["alpha", "", "line one\n\nline two", "omega"]
+    corpus_path = _write(
+        tmp_path / "corpus.txt",
+        json.dumps({"format": "document-list-v1", "documents": documents}),
+    )
+    enc = tiktoken.get_encoding("gpt2")
+    expected = torch.tensor(
+        [
+            token
+            for document in documents
+            for token in [50256, *enc.encode_ordinary(document)]
+        ],
+        dtype=torch.long,
+    )
+
+    aligned_train, aligned_val, aligned_ranges = prepare_training_data(
+        corpus_path, val_fraction=0.25, eos_aligned_batches=True
+    )
+    flat_train, flat_val, flat_ranges = prepare_training_data(
+        corpus_path, val_fraction=0.25, eos_aligned_batches=False
+    )
+
+    assert torch.equal(torch.cat((aligned_train, aligned_val)), expected)
+    assert torch.equal(flat_train, aligned_train)
+    assert torch.equal(flat_val, aligned_val)
+    assert flat_ranges is None
+    assert aligned_ranges is not None
+    assert expected[0].item() == 50256
+    assert aligned_train[0].item() == 50256
+    assert int((expected == 50256).sum()) == len(documents)
 
 
 @pytest.mark.slow

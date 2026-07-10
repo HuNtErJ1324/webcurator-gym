@@ -303,23 +303,19 @@ vocab_size = enc.n_vocab
 # __DOCUMENT_ENCODING__  (replaced with tested encode_document_tokens source)
 
 eos_aligned_batches = bool(cfg.get("eos_aligned_batches", True))
-if eos_aligned_batches:
-    if documents is None:
+if documents is None:
+    if eos_aligned_batches:
         raise ValueError(
             "EOS-aligned training requires a document-list-v1 corpus payload; "
             "flat text cannot recover source document boundaries safely"
         )
-    corpus_ids, document_ranges = encode_document_tokens(
-        documents,
-        enc,
-        cfg.get("max_document_tokens", cfg.get("max_doc_len")),
-    )
-else:
-    flat_text = corpus_text if documents is None else "\n\n".join(documents)
-    corpus_ids = enc.encode_ordinary(flat_text)
-    document_ranges = None
-    if len(corpus_ids) < 64:
-        corpus_ids = (corpus_ids * math.ceil(64 / max(len(corpus_ids), 1)))[:64] or [0] * 64
+    documents = [corpus_text]
+corpus_ids, encoded_document_ranges = encode_document_tokens(
+    documents,
+    enc,
+    cfg.get("max_document_tokens", cfg.get("max_doc_len")),
+)
+document_ranges = encoded_document_ranges if eos_aligned_batches else None
 corpus = torch.tensor(corpus_ids, dtype=torch.long)
 
 val_path = "/workspace/val.bin"
