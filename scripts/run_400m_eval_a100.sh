@@ -335,6 +335,7 @@ POD_ID=""
 SSH_USER="root"
 SSH_HOST=""
 SSH_PORT="22"
+POD_PROVIDER=""
 # Per-launch SSH ControlMaster socket dir (set after auth). Collision-safe via mktemp.
 SSH_CONTROL_DIR=""
 SSH_CONTROL_PATH=""
@@ -601,11 +602,16 @@ PY
         # non-root user (ubuntu) whose home is /home/$SSH_USER, not /root. Derive
         # the remote repo root so all remote paths land somewhere the user can write.
         set_remote_root_for_user "$SSH_USER"
+        POD_PROVIDER="$(python3 - <<'PY' "$status_json"
+import json, sys
+print((json.loads(sys.argv[1]).get("provider") or "").lower())
+PY
+)"
         # Cloud IPs get recycled across pods; a stale known_hosts entry from a
         # prior pod at this same IP makes even StrictHostKeyChecking=no refuse
         # to connect (observed 2026-07-08 after a spot-instance reclaim).
         ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$SSH_HOST" >/dev/null 2>&1 || true
-        log "Pod ready: ssh -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@${SSH_HOST} (REMOTE_ROOT=$REMOTE_ROOT)"
+        log "Pod ready: ssh -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@${SSH_HOST} (REMOTE_ROOT=$REMOTE_ROOT provider=${POD_PROVIDER:-unknown})"
         return 0
       fi
     fi
@@ -711,6 +717,283 @@ remote_sync_repo() {
   done
   die "tar-over-SSH repository sync failed after 5 attempts"
 }
+
+# --- MassedCompute single-remote-shell path (2b9a785 evidence) ----------------
+# Live MassedCompute: ControlMaster affinity can pass, tar-sync can "succeed",
+# then a subsequent exec cannot see /home/ubuntu/webcurator-gym (secrets upload
+# → No such file). Fix: one remote bash process extracts a staged archive
+# (repo excludes + secrets.env mode 600 + driver), provisions, runs eval, and
+# emits the result tar on stdout only; logs go to stderr.
+
+repo_tar_exclude_args() {
+  # Shared excludes for staged archives / sync (equivalent to former rsync filters).
+  printf '%s\n' \
+    --exclude='.git' \
+    --exclude='.venv' \
+    --exclude='*/.venv' \
+    --exclude='outputs' \
+    --exclude='*/outputs' \
+    --exclude='__pycache__' \
+    --exclude='*/__pycache__' \
+    --exclude='.pytest_cache' \
+    --exclude='*/.pytest_cache' \
+    --exclude='.mypy_cache' \
+    --exclude='*/.mypy_cache' \
+    --exclude='docs/site/data'
+}
+
+prepare_secrets_env_file() {
+  # Write secrets to $1 with mode 0600. Values never printed/logged by caller.
+  local dest="$1"
+  local tmp
+  tmp="$(mktemp)"
+  cp "$SECRETS_FILE" "$tmp"
+  if ! grep -q '^PRIME_API_KEY=' "$tmp"; then
+    log "Injecting PRIME_API_KEY from local prime CLI config into staged secrets.env"
+    printf 'PRIME_API_KEY=%s\n' "$(prime_api_key_from_cli)" >> "$tmp"
+  fi
+  install -m 600 "$tmp" "$dest"
+  rm -f "$tmp"
+}
+
+write_massedcompute_single_shell_driver() {
+  # Driver lives INSIDE the staged archive. Logs → stderr; success → result tar on stdout.
+  local dest="$1"
+  local curation_flag=0
+  [[ "$CURATION_ONLY" -eq 1 ]] && curation_flag=1
+  cat > "$dest" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+# MassedCompute single-shell driver (no second SSH exec for artifacts).
+log() { printf '[remote %s] %s\n' "\$(date -u +%H:%M:%S)" "\$*" >&2; }
+die() { log "FATAL: \$*"; exit 1; }
+
+SELF_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export PATH="\$SELF_DIR/environments/pretrain_data_curator/decon/bin:\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
+cd "\$SELF_DIR"
+
+[[ -f secrets.env ]] || die "staged secrets.env missing"
+chmod 600 secrets.env
+
+set -a
+# shellcheck disable=SC1091
+source secrets.env
+set +a
+: "\${HF_TOKEN:?HF_TOKEN missing in secrets.env}"
+: "\${PRIME_API_KEY:?PRIME_API_KEY missing in secrets.env}"
+# Never echo secret values.
+log "secrets.env sourced (keys present; values not logged)"
+
+CURATION_ONLY=${curation_flag}
+MODEL=$(printf '%q' "$MODEL")
+EVAL_CONFIG=$(printf '%q' "$EVAL_CONFIG")
+RUN_NAME=$(printf '%q' "$RUN_NAME")
+
+if [[ "\$CURATION_ONLY" -eq 1 ]]; then
+  log "Provisioning CPU stack in-session"
+else
+  log "Provisioning GPU stack in-session"
+fi
+
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
+
+if [[ "\$CURATION_ONLY" -eq 0 ]]; then
+  log "=== GPU ==="
+  nvidia-smi -L >&2
+fi
+
+log "=== Docker ==="
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sh >&2
+fi
+systemctl start docker || true
+
+if [[ "\$CURATION_ONLY" -eq 0 ]]; then
+  log "=== NVIDIA container toolkit ==="
+  if ! command -v nvidia-ctk >/dev/null 2>&1; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \\
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \\
+      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit
+  fi
+  nvidia-ctk runtime configure --runtime=docker >&2
+  systemctl restart docker
+  log "=== GPU docker smoke ==="
+  docker pull pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime >&2
+  docker run --rm --gpus all pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime nvidia-smi -L >&2
+fi
+
+log "=== uv + python env ==="
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh >&2
+fi
+rm -rf .venv
+uv venv -p 3.12 >&2
+# shellcheck disable=SC1091
+source .venv/bin/activate
+uv pip install prime >&2
+cd environments/pretrain_data_curator
+uv pip install -e . >&2
+uv run python -c "import pretrain_data_curator; print('import OK', __import__('sys').version.split()[0])" >&2
+
+log "=== decon ==="
+DECON_BIN="\$SELF_DIR/environments/pretrain_data_curator/decon/bin/decon"
+if ! "\$DECON_BIN" --version >/dev/null 2>&1; then
+  log "Vendored decon missing or incompatible; building natively"
+  bash "\$SELF_DIR/environments/pretrain_data_curator/decon/build_from_source.sh" >&2
+fi
+"\$DECON_BIN" --version >&2
+file "\$DECON_BIN" >&2
+
+log "=== build webcurator-runtime ==="
+docker build -f Dockerfile.runtime -t webcurator-runtime:latest . >&2
+log "=== runtime preflight ==="
+docker run --rm -w /workspace webcurator-runtime:latest bash -lc \\
+  'command -v hf && python -c "import huggingface_hub; print(\\"huggingface_hub\\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version' >&2
+if [[ "\$CURATION_ONLY" -eq 0 ]]; then
+  docker run --rm --gpus all webcurator-runtime:latest nvidia-smi -L >&2
+fi
+log "=== PROVISION DONE ==="
+
+LOG_FILE="\$SELF_DIR/wcg-eval-\${RUN_NAME}.log"
+log "Launching eval (stream → stderr + \$LOG_FILE)"
+# Eval progress to stderr AND log file; never to stdout (stdout reserved for result tar).
+set +e
+uv run eval -m "\${MODEL}" @ \${EVAL_CONFIG} 2>&1 | tee "\$LOG_FILE" >&2
+EVAL_RC=\${PIPESTATUS[0]}
+set -e
+if [[ "\$EVAL_RC" -ne 0 ]]; then
+  die "eval failed with exit code \$EVAL_RC (see stderr log; no result tar emitted)"
+fi
+
+RESULTS_REL=""
+if RESULTS_LINE="\$(grep -Eo 'results: outputs/[^[:space:]]+' "\$LOG_FILE" | tail -1 || true)"; then
+  if [[ -n "\$RESULTS_LINE" ]]; then
+    RESULTS_REL="\${RESULTS_LINE#results: }"
+  fi
+fi
+if [[ -z "\$RESULTS_REL" ]]; then
+  RESULTS_REL="\$(python3 - <<'PY'
+import json
+from pathlib import Path
+root = Path("outputs")
+candidates = []
+for path in root.rglob("results.jsonl"):
+    try:
+        if path.stat().st_size <= 0:
+            continue
+        row = json.loads(path.read_text().splitlines()[0])
+        if row.get("is_completed"):
+            candidates.append((path.stat().st_mtime, path.parent))
+    except Exception:
+        continue
+if not candidates:
+    raise SystemExit(1)
+candidates.sort()
+print(candidates[-1][1].relative_to(root))
+PY
+)" || die "could not locate results directory after eval"
+fi
+
+RESULTS_DIR="\$SELF_DIR/environments/pretrain_data_curator/\${RESULTS_REL}"
+[[ -d "\$RESULTS_DIR" ]] || die "results dir missing: \$RESULTS_DIR"
+[[ -s "\$RESULTS_DIR/results.jsonl" ]] || die "results.jsonl empty in \$RESULTS_DIR"
+# Bundle results + eval log for local persistence (still no secrets).
+BUNDLE="\$(mktemp -d)"
+cp -a "\$RESULTS_DIR/." "\$BUNDLE/"
+cp -f "\$LOG_FILE" "\$BUNDLE/eval-stream.log"
+log "Emitting result archive on stdout (logs were on stderr)"
+# stdout ONLY: the result tar. No log lines after this.
+tar -czf - -C "\$BUNDLE" .
+RC=\$?
+rm -rf "\$BUNDLE"
+exit "\$RC"
+EOF
+  chmod 700 "$dest"
+}
+
+stage_massedcompute_workspace() {
+  # Build a temp dir: excluded repo tree + secrets.env (0600) + single-shell driver.
+  # Prints the stage directory path on stdout (not secret contents).
+  local stage
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/wcg-mc-stage.XXXXXX")"
+  # shellcheck disable=SC2046
+  tar -cf - $(repo_tar_exclude_args) -C "$ROOT" . | tar -xf - -C "$stage"
+  prepare_secrets_env_file "$stage/secrets.env"
+  write_massedcompute_single_shell_driver "$stage/wcg_single_shell_driver.sh"
+  # Ensure secrets mode survived copy/install.
+  chmod 600 "$stage/secrets.env"
+  printf '%s\n' "$stage"
+}
+
+massedcompute_single_shell_bootstrap_cmd() {
+  # Secret-free remote bootstrap as ONE shell string (%q discipline for paths
+  # is N/A here — no user paths; fixed mktemp + relative driver name).
+  # stdin = staged tar.gz; stdout = result tar (from driver); stderr = logs.
+  printf '%s\n' \
+    'set -euo pipefail' \
+    'STAGE="$(mktemp -d "${TMPDIR:-/tmp}/wcg-mc.XXXXXX")"' \
+    'tar -xzf - -C "$STAGE"' \
+    'exec bash "$STAGE/wcg_single_shell_driver.sh"'
+}
+
+run_massedcompute_single_shell_eval() {
+  # One remote shell: stdin=staged archive, stderr=logs, stdout=result tar on success.
+  # On failure: nonzero rc, preserve local stderr log; no follow-up remote exec.
+  local stage archive stderr_log bootstrap_cmd rc bundle_tar
+  [[ -n "${SSH_USER:-}" && -n "${SSH_HOST:-}" ]] || die "SSH target unset; cannot run MassedCompute single-shell eval"
+  mkdir -p "$LOCAL_OUT_DIR"
+  stderr_log="$LOCAL_OUT_DIR/remote-single-shell.stderr.log"
+  bundle_tar="$LOCAL_OUT_DIR/results-bundle.tar.gz"
+  stage="$(stage_massedcompute_workspace)"
+  archive="$(mktemp "${TMPDIR:-/tmp}/wcg-mc-archive.XXXXXX.tar.gz")"
+  tar -czf "$archive" -C "$stage" .
+  rm -rf "$stage"
+  stage=""
+  bootstrap_cmd="$(massedcompute_single_shell_bootstrap_cmd)"
+  # Hygiene: bootstrap must never contain secret material (only in the archive).
+  if grep -E 'HF_TOKEN=|PRIME_API_KEY=|sk-' <<<"$bootstrap_cmd" >/dev/null 2>&1; then
+    rm -f "$archive"
+    die "internal error: bootstrap cmd leaked secret-like tokens"
+  fi
+  log "MassedCompute single-shell path: one remote bash extracts staged archive, provisions, evals, emits result tar on stdout"
+  log "Remote logs → $stderr_log ; result archive ← stdout (success only)"
+  set +e
+  # One remote bash session: bootstrap is a single %q-safe command string; stdin
+  # is the staged archive (secrets only inside the tar — never argv/logs).
+  # Prefer bash -c over bash -s so stdin remains the archive (bash -s would
+  # consume stdin as the script). OpenSSH argv-flattening: one string only.
+  remote "bash -c $(printf '%q' "$bootstrap_cmd")" <"$archive" >"$bundle_tar" 2>"$stderr_log"
+  rc=$?
+  set -e
+  rm -f "$archive"
+  archive=""
+
+  if [[ "$rc" -ne 0 ]]; then
+    log "MassedCompute single-shell eval FAILED (rc=$rc). Preserving stderr log: $stderr_log"
+    rm -f "$bundle_tar"
+    # Never fetch diagnostics via a second remote exec (MassedCompute affinity).
+    die "MassedCompute single-shell eval failed (rc=$rc); see $stderr_log"
+  fi
+  [[ -s "$bundle_tar" ]] || die "success rc but empty result archive at $bundle_tar"
+  tar -xzf "$bundle_tar" -C "$LOCAL_OUT_DIR"
+  rm -f "$bundle_tar"
+  [[ -s "$LOCAL_OUT_DIR/results.jsonl" ]] || die "Downloaded results.jsonl is empty"
+  write_resolved_config "$LOCAL_OUT_DIR/config.toml"
+  if [[ "$CURATION_ONLY" -eq 1 ]]; then
+    cat > "$LOCAL_OUT_DIR/README.txt" <<EOF
+${MODEL} 400M curation-only eval ($(date -u +%Y-%m-%d))
+
+use_real_trainer=false — heuristic proxy trainer for fast curation iteration.
+Full conversation trace is in results.jsonl. Perf metrics are not meaningful.
+
+Config: ${EVAL_CONFIG}
+EOF
+  fi
+  log "MassedCompute single-shell eval OK; artifacts in $LOCAL_OUT_DIR"
+}
+
 
 remote_provision_cpu() {
   log "Provisioning CPU pod software stack (uv, py3.12, decon, webcurator-runtime)"
@@ -1020,22 +1303,29 @@ rm -f "$CREATE_LOG"
 log "Created pod $POD_ID ($POD_NAME)"
 wait_for_pod "$POD_ID"
 wait_for_ssh_auth
-setup_ssh_control_master
-verify_ssh_connection_affinity
 
-log "Syncing repository to pod"
-remote_sync_repo
-upload_secrets
-
-if [[ "$CURATION_ONLY" -eq 1 ]]; then
-  remote_provision_cpu
+# MassedCompute (2b9a785): post-sync separate exec cannot see checkout even with
+# ControlMaster. Scope the true single-remote-shell path to that provider;
+# other providers keep the multi-step sync/provision/eval path.
+if [[ "${POD_PROVIDER:-}" == "massedcompute" ]]; then
+  log "Provider=massedcompute → single-remote-shell path (staged archive + one bash session)"
+  setup_ssh_control_master
+  run_massedcompute_single_shell_eval
 else
-  remote_provision_gpu
+  setup_ssh_control_master
+  verify_ssh_connection_affinity
+  log "Syncing repository to pod"
+  remote_sync_repo
+  upload_secrets
+  if [[ "$CURATION_ONLY" -eq 1 ]]; then
+    remote_provision_cpu
+  else
+    remote_provision_gpu
+  fi
+  run_remote_eval
+  RESULTS_REL="$(find_remote_results_dir)" || die "Could not locate remote results directory"
+  download_results "$RESULTS_REL"
 fi
-run_remote_eval
-
-RESULTS_REL="$(find_remote_results_dir)" || die "Could not locate remote results directory"
-download_results "$RESULTS_REL"
 
 log "Eval summary:"
 summarize_results

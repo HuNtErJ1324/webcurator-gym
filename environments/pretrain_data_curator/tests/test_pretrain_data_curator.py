@@ -708,15 +708,23 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
     assert "test_remote_file_cmd" in download_log_body
     assert "eval-stream.log" in download_body
 
-    # Main flow order: remote_sync_repo → upload_secrets (no separate ensure).
+    # Non-MassedCompute main flow: remote_sync_repo → upload_secrets.
+    # MassedCompute uses run_massedcompute_single_shell_eval instead (2b9a785).
+    assert 'POD_PROVIDER' in a100
+    assert 'run_massedcompute_single_shell_eval' in a100
+    assert 'massedcompute' in a100
     sync_marker = a100.find("Syncing repository to pod")
     assert sync_marker >= 0
     main_sync = a100.find("remote_sync_repo", sync_marker)
     main_upload = a100.find("upload_secrets", sync_marker)
     assert main_sync >= 0 and main_upload >= 0
-    assert main_sync < main_upload, "must sync, then upload secrets"
+    assert main_sync < main_upload, "non-MC path must sync, then upload secrets"
     assert a100.find("ensure_remote_repo_dir", sync_marker) == -1
     assert a100.find("remote_rsync", sync_marker) == -1
+    # MassedCompute branch must not fall through to multi-step sync.
+    mc_branch = a100.find('POD_PROVIDER:-}" == "massedcompute"')
+    assert mc_branch >= 0
+    assert a100.find("run_massedcompute_single_shell_eval", mc_branch) > mc_branch
 
     # Both login paths must derive REMOTE_ROOT correctly.
     assert "set_remote_root_for_user" in wait_pod_body
@@ -1118,14 +1126,15 @@ def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote():
     assert "ssh_rsync_transport" not in a100
     assert "remote_rsync" not in a100
 
-    # Main flow: auth → ControlMaster → affinity preflight → sync (before provision).
+    # Non-MC main flow keeps affinity + sync; MC uses single-shell eval.
     created = a100.find('log "Created pod')
     assert created >= 0
-    setup_idx = a100.find("setup_ssh_control_master", created)
-    affinity_idx = a100.find("verify_ssh_connection_affinity", created)
-    sync_idx = a100.find("Syncing repository to pod", created)
-    provision_idx = a100.find("remote_provision_gpu", created)
-    assert setup_idx < affinity_idx < sync_idx < provision_idx
+    assert a100.find("run_massedcompute_single_shell_eval", created) > created
+    else_sync = a100.find("Syncing repository to pod", created)
+    assert else_sync > created
+    assert "verify_ssh_connection_affinity" in a100[else_sync - 500 : else_sync + 80]
+    provision_idx = a100.find("remote_provision_gpu", else_sync)
+    assert else_sync < provision_idx
 
     # Deterministic opts construction with/without ControlPath.
     snippet = "\n".join(
@@ -1300,6 +1309,247 @@ def test_400m_a100_affinity_preflight_cmds_preserve_paths_and_fail_loudly(tmp_pa
     assert "affinity-preflight: missing marker" in (
         fail_read_run.stderr + fail_read_run.stdout
     )
+
+
+def test_400m_a100_massedcompute_staged_archive_excludes_and_secrets_mode(tmp_path, monkeypatch):
+    """Staged MC archive: excludes, secrets.env mode 600, no secret argv/logs."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    assert "stage_massedcompute_workspace" in a100
+    assert "prepare_secrets_env_file" in a100
+    assert "repo_tar_exclude_args" in a100
+    assert "run_massedcompute_single_shell_eval" in a100
+    assert 'POD_PROVIDER:-}" == "massedcompute"' in a100 or '== "massedcompute"' in a100
+
+    # Tiny fake repo + secrets for staging.
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    (fake_root / "keep.txt").write_text("keep\n", encoding="utf-8")
+    (fake_root / ".git").mkdir()
+    (fake_root / ".git" / "obj").write_text("secret-git\n", encoding="utf-8")
+    (fake_root / ".venv").mkdir()
+    (fake_root / ".venv" / "py").write_text("venv\n", encoding="utf-8")
+    (fake_root / "outputs").mkdir()
+    (fake_root / "outputs" / "old.jsonl").write_text("old\n", encoding="utf-8")
+    (fake_root / "environments").mkdir()
+    (fake_root / "environments" / "pretrain_data_curator").mkdir()
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text(
+        "HF_TOKEN=hf-test-secret-value\nPRIME_API_KEY=prime-test-secret\n",
+        encoding="utf-8",
+    )
+
+    # Source only the staging helpers under controlled env (no pod side effects).
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            f"ROOT={fake_root}",
+            f"SECRETS_FILE={secrets}",
+            "CURATION_ONLY=0",
+            'MODEL="deepseek/deepseek-v4-pro"',
+            'EVAL_CONFIG="configs/eval/400M-300turn-codex.toml"',
+            'RUN_NAME="test-run"',
+            "log() { printf '%s\\n' \"$*\" >&2; }",
+            "die() { printf 'FATAL: %s\\n' \"$*\" >&2; exit 1; }",
+            "prime_api_key_from_cli() { echo 'should-not-be-called'; exit 1; }",
+            "repo_tar_exclude_args() {",
+            _extract_bash_function(a100, "repo_tar_exclude_args"),
+            "}",
+            "prepare_secrets_env_file() {",
+            _extract_bash_function(a100, "prepare_secrets_env_file"),
+            "}",
+            "write_massedcompute_single_shell_driver() {",
+            # Lightweight stub: real driver is huge; staging only needs the file present.
+            '  printf "%s\\n" "#!/usr/bin/env bash" "echo driver-stub" > "$1"',
+            "  chmod 700 \"$1\"",
+            "}",
+            "stage_massedcompute_workspace() {",
+            _extract_bash_function(a100, "stage_massedcompute_workspace"),
+            "}",
+            "stage_massedcompute_workspace",
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stage = Path(built.stdout.strip().splitlines()[-1])
+    assert stage.is_dir()
+    assert (stage / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+    assert not (stage / ".git").exists()
+    assert not (stage / ".venv").exists()
+    assert not (stage / "outputs").exists()
+    sec = stage / "secrets.env"
+    assert sec.is_file()
+    assert (sec.stat().st_mode & 0o777) == 0o600
+    assert "hf-test-secret-value" in sec.read_text(encoding="utf-8")
+    assert (stage / "wcg_single_shell_driver.sh").is_file()
+    # Staging logs/stdout must not print secret values.
+    combined = built.stdout + built.stderr
+    assert "hf-test-secret-value" not in combined
+    assert "prime-test-secret" not in combined
+
+    # Bootstrap cmd is secret-free.
+    boot_snip = "\n".join(
+        [
+            "set -euo pipefail",
+            "massedcompute_single_shell_bootstrap_cmd() {",
+            _extract_bash_function(a100, "massedcompute_single_shell_bootstrap_cmd"),
+            "}",
+            "massedcompute_single_shell_bootstrap_cmd",
+        ]
+    )
+    boot = subprocess.run(
+        ["bash", "-c", boot_snip],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "tar -xzf -" in boot.stdout
+    assert "wcg_single_shell_driver.sh" in boot.stdout
+    assert "HF_TOKEN=" not in boot.stdout
+    assert "PRIME_API_KEY=" not in boot.stdout
+    assert "hf-test-secret-value" not in boot.stdout
+
+
+def test_400m_a100_massedcompute_stdout_artifact_vs_stderr_log_protocol(tmp_path):
+    """Success: result tar on stdout only; logs on stderr. Failure: nonzero, no tar."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    boot_body = _extract_bash_function(a100, "massedcompute_single_shell_bootstrap_cmd")
+    runner_body = _extract_bash_function(a100, "run_massedcompute_single_shell_eval")
+    driver_writer = _extract_bash_function(a100, "write_massedcompute_single_shell_driver")
+
+    assert "remote-single-shell.stderr.log" in runner_body
+    assert "results-bundle.tar.gz" in runner_body
+    assert "bash -c" in runner_body
+    assert "Preserving stderr log" in runner_body
+    # No follow-up remote fetch on failure.
+    fail_section = runner_body[runner_body.find("FAILED") :]
+    assert "download_results" not in fail_section
+    assert "find_remote_results_dir" not in fail_section
+    # Driver protocol: logs >&2, result tar on stdout.
+    assert ">&2" in driver_writer
+    assert "tar -czf -" in driver_writer
+    assert "tee" in driver_writer
+
+    # Local simulate SUCCESS protocol: bootstrap extracts archive, driver writes
+    # logs to stderr and a tiny result tar to stdout.
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "secrets.env").write_text("HF_TOKEN=x\nPRIME_API_KEY=y\n", encoding="utf-8")
+    (stage / "secrets.env").chmod(0o600)
+    driver = stage / "wcg_single_shell_driver.sh"
+    driver.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "echo 'progress line' >&2\n"
+        "BUNDLE=$(mktemp -d)\n"
+        "echo '{\"ok\":true}' > \"$BUNDLE/results.jsonl\"\n"
+        "echo 'eval log' > \"$BUNDLE/eval-stream.log\"\n"
+        "tar -czf - -C \"$BUNDLE\" .\n"
+        "rm -rf \"$BUNDLE\"\n",
+        encoding="utf-8",
+    )
+    driver.chmod(0o700)
+    archive = tmp_path / "staged.tar.gz"
+    subprocess.run(
+        ["tar", "-czf", str(archive), "-C", str(stage), "."],
+        check=True,
+    )
+    bootstrap = subprocess.check_output(
+        [
+            "bash",
+            "-c",
+            "massedcompute_single_shell_bootstrap_cmd() {\n"
+            + boot_body
+            + "\n}\nmassedcompute_single_shell_bootstrap_cmd\n",
+        ],
+        text=True,
+    )
+    out_tar = tmp_path / "out.tar.gz"
+    err_log = tmp_path / "err.log"
+    # Run bootstrap locally (same as remote cmd) with archive on stdin.
+    proc = subprocess.run(
+        ["bash", "-c", bootstrap],
+        stdin=archive.open("rb"),
+        stdout=out_tar.open("wb"),
+        stderr=err_log.open("wb"),
+    )
+    assert proc.returncode == 0
+    assert b"progress line" in err_log.read_bytes()
+    # stdout file must be a valid tar, not log text.
+    assert b"progress line" not in out_tar.read_bytes()
+    extract = tmp_path / "extracted"
+    extract.mkdir()
+    subprocess.run(
+        ["tar", "-xzf", str(out_tar), "-C", str(extract)],
+        check=True,
+    )
+    assert (extract / "results.jsonl").read_text(encoding="utf-8") == '{"ok":true}\n'
+    assert (extract / "eval-stream.log").read_text(encoding="utf-8") == "eval log\n"
+
+    # Local simulate FAILURE: driver exits nonzero → no usable result tar.
+    bad_stage = tmp_path / "bad-stage"
+    bad_stage.mkdir()
+    (bad_stage / "secrets.env").write_text("HF_TOKEN=x\nPRIME_API_KEY=y\n", encoding="utf-8")
+    bad_driver = bad_stage / "wcg_single_shell_driver.sh"
+    bad_driver.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'boom' >&2\n"
+        "exit 7\n",
+        encoding="utf-8",
+    )
+    bad_driver.chmod(0o700)
+    bad_archive = tmp_path / "bad.tar.gz"
+    subprocess.run(
+        ["tar", "-czf", str(bad_archive), "-C", str(bad_stage), "."],
+        check=True,
+    )
+    bad_out = tmp_path / "bad-out.tar.gz"
+    bad_err = tmp_path / "bad-err.log"
+    fail = subprocess.run(
+        ["bash", "-c", bootstrap],
+        stdin=bad_archive.open("rb"),
+        stdout=bad_out.open("wb"),
+        stderr=bad_err.open("wb"),
+    )
+    assert fail.returncode == 7
+    assert b"boom" in bad_err.read_bytes()
+    # Failure must not produce a valid results.jsonl archive.
+    if bad_out.stat().st_size > 0:
+        bad_extract = tmp_path / "bad-extract"
+        bad_extract.mkdir()
+        unpack = subprocess.run(
+            ["tar", "-xzf", str(bad_out), "-C", str(bad_extract)],
+            capture_output=True,
+        )
+        assert unpack.returncode != 0 or not (bad_extract / "results.jsonl").exists()
+
+
+def test_400m_a100_massedcompute_cleanup_never_logs_secrets():
+    """cleanup() terminates pod without echoing secret values."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    cleanup_body = _extract_bash_function(a100, "cleanup")
+    assert "prime pods terminate" in cleanup_body
+    assert "HF_TOKEN" not in cleanup_body
+    assert "PRIME_API_KEY" not in cleanup_body
+    assert "secrets.env" not in cleanup_body
+    runner = _extract_bash_function(a100, "run_massedcompute_single_shell_eval")
+    # Runner logs paths/status only — never dumps secrets.env contents.
+    assert "cat secrets" not in runner
+    # Strip the intentional hygiene grep pattern line before asserting.
+    runner_code = "\n".join(
+        ln
+        for ln in runner.splitlines()
+        if "HF_TOKEN=" not in ln and "PRIME_API_KEY=" not in ln
+    )
+    assert "sk-" not in runner_code or "sk-" in "grep"  # only in hygiene pattern
+    assert "echo \"$SECRETS" not in runner
+    assert "cat \"$SECRETS" not in runner
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
