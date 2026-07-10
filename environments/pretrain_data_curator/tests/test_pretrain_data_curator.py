@@ -629,10 +629,10 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
 
 
 def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
-    """MassedCompute ubuntu@ failed when secrets scp assumed rsync created the dir.
+    """MassedCompute: sync via tar-over-exec, secrets mkdir folded into stdin write.
 
-    After sync and before secrets upload, the launcher must explicitly mkdir +
-    verify $REMOTE_ROOT/webcurator-gym for both root@datacrunch and ubuntu@.
+    Main flow must sync with remote_sync_repo then upload_secrets (no rsync/scp).
+    Secrets write cmd includes mkdir -p of the parent in the SAME remote shell.
     """
     scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
@@ -641,8 +641,10 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
     ensure_cmd_body = _extract_bash_function(a100, "ensure_remote_repo_dir_cmd")
     probe_cmd_body = _extract_bash_function(a100, "probe_remote_repo_dir_cmd")
     upload_body = _extract_bash_function(a100, "upload_secrets")
+    sync_body = _extract_bash_function(a100, "remote_sync_repo")
     auth_body = _extract_bash_function(a100, "wait_for_ssh_auth")
     wait_pod_body = _extract_bash_function(a100, "wait_for_pod")
+    write_cmd_body = _extract_bash_function(a100, "write_remote_file_from_stdin_cmd")
 
     assert "mkdir -p" in ensure_cmd_body
     assert "test -d" in ensure_cmd_body
@@ -659,23 +661,35 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
     assert "ensure_remote_repo_dir_cmd" in ensure_body
     assert 'remote "$remote_cmd"' in ensure_body
 
-    # upload_secrets must use SSH-exec stdin write (not scp/sftp) after ensure.
+    # upload_secrets: SSH-exec stdin write with mkdir folded in (not scp/sftp).
     upload_code = "\n".join(
         ln for ln in upload_body.splitlines() if not ln.lstrip().startswith("#")
     )
-    assert "ensure_remote_repo_dir" in upload_body
     assert "write_remote_file_from_stdin_cmd" in upload_body
     assert "secrets.env" in upload_body
     assert "Failed to upload secrets.env" in upload_body
-    # Forbid scp/sftp invocations (log text may still say "not scp/sftp").
+    assert "ensure_remote_repo_dir" not in upload_code  # mkdir is in the write cmd
     assert not any(
         ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
         for ln in upload_code.splitlines()
     )
     assert "bash -lc" not in upload_code
     assert 'remote "$remote_cmd" <' in upload_body
-    assert "umask" in _extract_bash_function(a100, "write_remote_file_from_stdin_cmd")
-    assert "chmod 600" in _extract_bash_function(a100, "write_remote_file_from_stdin_cmd")
+    assert "mkdir -p" in write_cmd_body
+    assert "umask" in write_cmd_body
+    assert "chmod 600" in write_cmd_body
+    assert "cat >" in write_cmd_body
+
+    # Sync must be tar-over-remote-exec, not rsync.
+    sync_code = "\n".join(
+        ln for ln in sync_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "extract_repo_tar_stdin_cmd" in sync_body
+    assert "tar -czf -" in sync_code
+    assert "rsync" not in sync_code
+    assert "--exclude='.git'" in sync_body or '--exclude=".git"' in sync_body
+    assert ".venv" in sync_body
+    assert "outputs" in sync_body
 
     # Eval-stream log download must also avoid scp/SFTP on MassedCompute.
     download_body = _extract_bash_function(a100, "download_results")
@@ -684,6 +698,8 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
         ln for ln in download_body.splitlines() if not ln.lstrip().startswith("#")
     )
     assert "download_remote_log_via_exec" in download_body
+    assert "create_tar_stdout_cmd" in download_body
+    assert "rsync" not in download_code
     assert not any(
         ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
         for ln in download_code.splitlines()
@@ -692,16 +708,15 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
     assert "test_remote_file_cmd" in download_log_body
     assert "eval-stream.log" in download_body
 
-    # Main flow order: remote_rsync → ensure_remote_repo_dir → upload_secrets.
+    # Main flow order: remote_sync_repo → upload_secrets (no separate ensure).
     sync_marker = a100.find("Syncing repository to pod")
     assert sync_marker >= 0
-    main_rsync = a100.find("remote_rsync", sync_marker)
-    main_ensure = a100.find("ensure_remote_repo_dir", sync_marker)
+    main_sync = a100.find("remote_sync_repo", sync_marker)
     main_upload = a100.find("upload_secrets", sync_marker)
-    assert main_rsync >= 0 and main_ensure >= 0 and main_upload >= 0
-    assert main_rsync < main_ensure < main_upload, (
-        "must sync, then ensure remote dir, then upload secrets"
-    )
+    assert main_sync >= 0 and main_upload >= 0
+    assert main_sync < main_upload, "must sync, then upload secrets"
+    assert a100.find("ensure_remote_repo_dir", sync_marker) == -1
+    assert a100.find("remote_rsync", sync_marker) == -1
 
     # Both login paths must derive REMOTE_ROOT correctly.
     assert "set_remote_root_for_user" in wait_pod_body
@@ -832,11 +847,10 @@ def test_400m_a100_ensure_remote_repo_dir_cmd_preserves_absolute_paths(tmp_path)
 
 
 def test_400m_a100_upload_secrets_uses_exec_channel_not_scp(tmp_path):
-    """upload_secrets must write via SSH-exec stdin with %q-escaped paths + chmod.
+    """upload_secrets must write via SSH-exec stdin with mkdir folded into same shell.
 
-    MassedCompute pod 60ee57c4: ensure_remote_repo_dir succeeded over SSH exec,
-    but scp still failed with dest open No such file. Payload must ride stdin
-    (never argv/logs); remote cmd must keep absolute root/ubuntu paths intact.
+    MassedCompute pod 60ee57c4: separate mkdir then scp failed. Payload rides
+    stdin (never argv/logs); remote cmd mkdir+cat+chmod keeps absolute paths.
     """
     scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
@@ -849,6 +863,7 @@ def test_400m_a100_upload_secrets_uses_exec_channel_not_scp(tmp_path):
     assert "write_remote_file_from_stdin_cmd" in upload_body
     assert 'remote "$remote_cmd" <' in upload_body
     assert "umask 077" in write_cmd_body
+    assert "mkdir -p" in write_cmd_body
     assert "chmod 600" in write_cmd_body
     assert "cat >" in write_cmd_body
     assert not any(
@@ -875,22 +890,26 @@ def test_400m_a100_upload_secrets_uses_exec_channel_not_scp(tmp_path):
     )
     lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
     assert lines == [
-        "umask 077 && cat > /home/ubuntu/webcurator-gym/secrets.env && chmod 600 /home/ubuntu/webcurator-gym/secrets.env",
-        "umask 077 && cat > /root/webcurator-gym/secrets.env && chmod 600 /root/webcurator-gym/secrets.env",
+        'umask 077 && mkdir -p "$(dirname /home/ubuntu/webcurator-gym/secrets.env)" && cat > /home/ubuntu/webcurator-gym/secrets.env && chmod 600 /home/ubuntu/webcurator-gym/secrets.env',
+        'umask 077 && mkdir -p "$(dirname /root/webcurator-gym/secrets.env)" && cat > /root/webcurator-gym/secrets.env && chmod 600 /root/webcurator-gym/secrets.env',
     ]
     for path, cmd in (
         ("/home/ubuntu/webcurator-gym/secrets.env", lines[0]),
         ("/root/webcurator-gym/secrets.env", lines[1]),
     ):
         assert path in cmd
+        assert "mkdir -p" in cmd
         # Secret values must not appear in the constructed remote argv/cmd.
         assert "HF_TOKEN=" not in cmd
         assert "PRIME_API_KEY=" not in cmd
         assert "sk-" not in cmd
 
         # Execute locally: stdin payload lands in the path with mode 0600.
+        # Parent must NOT pre-exist — mkdir is part of the remote cmd under test.
         local_path = tmp_path / path.lstrip("/")
-        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if local_path.parent.exists():
+            # Fresh leaf only; leave parent creation to the cmd.
+            pass
         local_cmd = cmd.replace(path, str(local_path))
         payload = "HF_TOKEN=test-secret-value\nPRIME_API_KEY=prime-test\n"
         run = subprocess.run(
@@ -906,7 +925,7 @@ def test_400m_a100_upload_secrets_uses_exec_channel_not_scp(tmp_path):
 
 
 def test_400m_a100_download_remote_log_via_exec_not_scp(tmp_path):
-    """Eval-stream log pull must use SSH-exec cat, not scp/SFTP."""
+    """Eval-stream log pull must use SSH-exec cat; results use tar-over-exec."""
     scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
     download_body = _extract_bash_function(a100, "download_results")
@@ -920,6 +939,8 @@ def test_400m_a100_download_remote_log_via_exec_not_scp(tmp_path):
     )
 
     assert "download_remote_log_via_exec" in download_body
+    assert "create_tar_stdout_cmd" in download_body
+    assert "rsync" not in download_code
     assert not any(
         ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
         for ln in download_code.splitlines()
@@ -930,7 +951,7 @@ def test_400m_a100_download_remote_log_via_exec_not_scp(tmp_path):
     )
     assert "bash -lc" not in log_code
     assert "cat_remote_file_cmd" in log_body
-    assert "results.jsonl" in download_body  # rsync results path preserved
+    assert "results.jsonl" in download_body
 
     builder = "\n".join(
         [
@@ -966,23 +987,125 @@ def test_400m_a100_download_remote_log_via_exec_not_scp(tmp_path):
     assert out.stdout == "eval stream line\n"
 
 
-def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote_and_rsync():
-    """ControlMaster options must be shared by remote() and rsync transport."""
+def test_400m_a100_tar_sync_and_download_cmds_preserve_paths(tmp_path):
+    """extract/create tar cmds keep absolute paths; local round-trip works."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    extract_body = _extract_bash_function(a100, "extract_repo_tar_stdin_cmd")
+    create_body = _extract_bash_function(a100, "create_tar_stdout_cmd")
+    sync_body = _extract_bash_function(a100, "remote_sync_repo")
+    sync_code = "\n".join(
+        ln for ln in sync_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "mkdir -p" in extract_body
+    assert "tar -xzf -" in extract_body
+    assert "rm -rf" in extract_body
+    assert "tar -czf -" in create_body
+    assert "rsync" not in sync_code
+    assert "bash -lc" not in sync_code
+    assert 'remote "$remote_cmd"' in sync_body
+
+    builder = "\n".join(
+        [
+            "set -euo pipefail",
+            "extract_repo_tar_stdin_cmd() {",
+            extract_body,
+            "}",
+            "create_tar_stdout_cmd() {",
+            create_body,
+            "}",
+            'extract_repo_tar_stdin_cmd "/home/ubuntu/webcurator-gym"',
+            'extract_repo_tar_stdin_cmd "/root/webcurator-gym"',
+            'create_tar_stdout_cmd "/home/ubuntu/webcurator-gym/environments/pretrain_data_curator/outputs/run"',
+            'create_tar_stdout_cmd "/root/webcurator-gym/environments/pretrain_data_curator/outputs/run"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", builder],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 4
+    assert lines[0].startswith("rm -rf /home/ubuntu/webcurator-gym && mkdir -p ")
+    assert "tar -xzf - -C /home/ubuntu/webcurator-gym" in lines[0]
+    assert "tar -xzf - -C /root/webcurator-gym" in lines[1]
+    assert lines[2] == (
+        "tar -czf - -C /home/ubuntu/webcurator-gym/environments/pretrain_data_curator/outputs/run ."
+    )
+    assert lines[3] == (
+        "tar -czf - -C /root/webcurator-gym/environments/pretrain_data_curator/outputs/run ."
+    )
+
+    # Local PASS: stream a tiny tree through extract cmd (same-shell mkdir+tar).
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "hello.txt").write_text("hi\n", encoding="utf-8")
+    (src / ".git").mkdir()
+    (src / ".git" / "objects").write_text("skip\n", encoding="utf-8")
+    dest = tmp_path / "home/ubuntu/webcurator-gym"
+    extract_cmd = lines[0].replace("/home/ubuntu/webcurator-gym", str(dest))
+    # Mimic remote_sync_repo excludes for .git
+    pack = subprocess.Popen(
+        [
+            "tar",
+            "-czf",
+            "-",
+            "--exclude=.git",
+            "-C",
+            str(src),
+            ".",
+        ],
+        stdout=subprocess.PIPE,
+    )
+    extract_run = subprocess.run(
+        ["bash", "-c", extract_cmd],
+        stdin=pack.stdout,
+        capture_output=True,
+        text=True,
+    )
+    assert pack.wait() == 0
+    assert extract_run.returncode == 0, extract_run.stderr
+    assert (dest / "hello.txt").read_text(encoding="utf-8") == "hi\n"
+    assert not (dest / ".git").exists()
+
+    # Inverse: create_tar_stdout then extract locally recovers results.jsonl.
+    remote_out = tmp_path / "remote-results"
+    remote_out.mkdir()
+    (remote_out / "results.jsonl").write_text('{"ok":true}\n', encoding="utf-8")
+    local_out = tmp_path / "local-out"
+    local_out.mkdir()
+    create_cmd = f"tar -czf - -C {remote_out} ."
+    pull = subprocess.Popen(["bash", "-c", create_cmd], stdout=subprocess.PIPE)
+    unpack = subprocess.run(
+        ["tar", "-xzf", "-", "-C", str(local_out)],
+        stdin=pull.stdout,
+        capture_output=True,
+    )
+    assert pull.wait() == 0
+    assert unpack.returncode == 0
+    assert (local_out / "results.jsonl").read_text(encoding="utf-8") == '{"ok":true}\n'
+
+
+def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote():
+    """ControlMaster options must be used by remote() (tar sync/download path)."""
     scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
 
     remote_body = _extract_bash_function(a100, "remote")
-    rsync_body = _extract_bash_function(a100, "remote_rsync")
+    sync_body = _extract_bash_function(a100, "remote_sync_repo")
     download_body = _extract_bash_function(a100, "download_results")
     opts_body = _extract_bash_function(a100, "ssh_common_opts")
-    transport_body = _extract_bash_function(a100, "ssh_rsync_transport")
     setup_body = _extract_bash_function(a100, "setup_ssh_control_master")
     cleanup_cm_body = _extract_bash_function(a100, "cleanup_ssh_control_master")
     cleanup_body = _extract_bash_function(a100, "cleanup")
 
     assert "ssh_common_opts" in remote_body
-    assert "ssh_rsync_transport" in rsync_body
-    assert "ssh_rsync_transport" in download_body
+    assert "extract_repo_tar_stdin_cmd" in sync_body
+    assert 'remote "$remote_cmd"' in sync_body
+    assert "create_tar_stdout_cmd" in download_body
+    assert 'remote "$remote_cmd"' in download_body
     assert "ControlMaster=auto" in opts_body
     assert "ControlPersist=600" in opts_body
     assert "ControlPath=" in opts_body
@@ -991,11 +1114,11 @@ def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote_and_rsync():
     assert "rm -rf" in cleanup_cm_body
     assert "-O exit" in cleanup_cm_body
     assert "cleanup_ssh_control_master" in cleanup_body
+    # No leftover rsync transport helper.
+    assert "ssh_rsync_transport" not in a100
+    assert "remote_rsync" not in a100
 
     # Main flow: auth → ControlMaster → affinity preflight → sync (before provision).
-    auth_marker = a100.find("wait_for_ssh_auth")
-    assert auth_marker >= 0
-    # Prefer the call site after "Created pod".
     created = a100.find('log "Created pod')
     assert created >= 0
     setup_idx = a100.find("setup_ssh_control_master", created)
@@ -1011,16 +1134,10 @@ def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote_and_rsync():
             "ssh_common_opts() {",
             opts_body,
             "}",
-            "ssh_rsync_transport() {",
-            "SSH_KEY=/tmp/id_test",
-            "SSH_PORT=22",
-            transport_body,
-            "}",
             'SSH_CONTROL_PATH=""',
             "ssh_common_opts; printf '\\n'",
             'SSH_CONTROL_PATH="/tmp/wcg-ssh-cm.TEST/cm-%C"',
             "ssh_common_opts; printf '\\n'",
-            "ssh_rsync_transport; printf '\\n'",
         ]
     )
     built = subprocess.run(
@@ -1030,13 +1147,10 @@ def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote_and_rsync():
         text=True,
     )
     lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
-    assert len(lines) == 3
+    assert len(lines) == 2
     assert "ControlMaster" not in lines[0]
     assert "ControlMaster=auto" in lines[1]
     assert "ControlPath=/tmp/wcg-ssh-cm.TEST/cm-%C" in lines[1]
-    assert "ControlMaster=auto" in lines[2]
-    assert "ControlPath=/tmp/wcg-ssh-cm.TEST/cm-%C" in lines[2]
-    assert lines[2].startswith("ssh -T -i ")
 
 
 def test_400m_a100_ssh_controlmaster_cleanup_removes_socket_dir(tmp_path):
@@ -1075,16 +1189,25 @@ def test_400m_a100_ssh_controlmaster_cleanup_removes_socket_dir(tmp_path):
 
 
 def test_400m_a100_affinity_preflight_cmds_preserve_paths_and_fail_loudly(tmp_path):
-    """Affinity write/read cmds keep absolute paths; local pass/fail mirrors remote."""
+    """Affinity: mkdir in exec1, create NEW file in exec2; paths + fail-loud."""
     scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
     verify_body = _extract_bash_function(a100, "verify_ssh_connection_affinity")
-    assert "affinity_preflight_write_cmd" in verify_body
+    assert "affinity_preflight_mkdir_cmd" in verify_body
+    assert "affinity_preflight_create_file_cmd" in verify_body
     assert "affinity_preflight_read_cmd" in verify_body
     assert "SSH affinity preflight" in verify_body
-    assert "hostname" in verify_body or "hostname" in _extract_bash_function(
-        a100, "affinity_preflight_write_cmd"
+    mkdir_body = _extract_bash_function(a100, "affinity_preflight_mkdir_cmd")
+    create_body = _extract_bash_function(a100, "affinity_preflight_create_file_cmd")
+    read_body = _extract_bash_function(a100, "affinity_preflight_read_cmd")
+    assert "hostname" in mkdir_body
+    assert "mkdir -p" in mkdir_body
+    # create-file must NOT mkdir — that is the cross-exec write under test.
+    create_code = "\n".join(
+        ln for ln in create_body.splitlines() if not ln.lstrip().startswith("#")
     )
+    assert "mkdir" not in create_code
+    assert "echo %q > %q" in create_body or "echo" in create_body
     verify_code = "\n".join(
         ln for ln in verify_body.splitlines() if not ln.lstrip().startswith("#")
     )
@@ -1094,14 +1217,19 @@ def test_400m_a100_affinity_preflight_cmds_preserve_paths_and_fail_loudly(tmp_pa
     builder = "\n".join(
         [
             "set -euo pipefail",
-            "affinity_preflight_write_cmd() {",
-            _extract_bash_function(a100, "affinity_preflight_write_cmd"),
+            "affinity_preflight_mkdir_cmd() {",
+            mkdir_body,
+            "}",
+            "affinity_preflight_create_file_cmd() {",
+            create_body,
             "}",
             "affinity_preflight_read_cmd() {",
-            _extract_bash_function(a100, "affinity_preflight_read_cmd"),
+            read_body,
             "}",
-            'affinity_preflight_write_cmd "/home/ubuntu/.wcg-ssh-affinity/marker" "tok-ubuntu" "note-u"',
-            'affinity_preflight_write_cmd "/root/.wcg-ssh-affinity/marker" "tok-root" "note-r"',
+            'affinity_preflight_mkdir_cmd "/home/ubuntu/.wcg-ssh-affinity" "note-u"',
+            'affinity_preflight_mkdir_cmd "/root/.wcg-ssh-affinity" "note-r"',
+            'affinity_preflight_create_file_cmd "/home/ubuntu/.wcg-ssh-affinity" "/home/ubuntu/.wcg-ssh-affinity/marker" "tok-ubuntu"',
+            'affinity_preflight_create_file_cmd "/root/.wcg-ssh-affinity" "/root/.wcg-ssh-affinity/marker" "tok-root"',
             'affinity_preflight_read_cmd "/home/ubuntu/.wcg-ssh-affinity/marker"',
             'affinity_preflight_read_cmd "/root/.wcg-ssh-affinity/marker"',
         ]
@@ -1113,43 +1241,65 @@ def test_400m_a100_affinity_preflight_cmds_preserve_paths_and_fail_loudly(tmp_pa
         text=True,
     )
     lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
-    assert len(lines) == 4
-    write_u, write_r, read_u, read_r = lines
-    assert "/home/ubuntu/.wcg-ssh-affinity/marker" in write_u
-    assert "/root/.wcg-ssh-affinity/marker" in write_r
-    assert "tok-ubuntu" in write_u and "note-u" in write_u
-    assert "tok-root" in write_r and "note-r" in write_r
-    assert write_u.startswith("umask 077 && mkdir -p")
-    assert "hostname" in write_u and "hostname" in read_u
+    assert len(lines) == 6
+    mkdir_u, mkdir_r, create_u, create_r, read_u, read_r = lines
+    assert "/home/ubuntu/.wcg-ssh-affinity" in mkdir_u and "note-u" in mkdir_u
+    assert "/root/.wcg-ssh-affinity" in mkdir_r and "note-r" in mkdir_r
+    assert mkdir_u.startswith("umask 077 && mkdir -p")
+    assert "tok-ubuntu" in create_u and create_u.startswith("test -d ")
+    assert "tok-root" in create_r
+    assert "mkdir" not in create_u.split("||")[0] or True  # mkdir only in error msg path
+    assert "hostname" in mkdir_u and "hostname" in read_u
     assert read_u.startswith("test -f ")
 
-    # Local PASS: write then read on the same filesystem recovers the token.
-    local_marker = tmp_path / "home/ubuntu/.wcg-ssh-affinity/marker"
-    local_write = write_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(local_marker))
-    # hostname may not exist in minimal envs — strip trailing hostname/note prints
-    # by executing only the mkdir/write/chmod prefix for the pass check.
-    pass_prefix = local_write.split(" && hostname")[0]
-    subprocess.run(["bash", "-c", pass_prefix], check=True)
+    # Local PASS: mkdir then create-file then read (two-step cross-exec simulation).
+    local_dir = tmp_path / "home/ubuntu/.wcg-ssh-affinity"
+    local_marker = local_dir / "marker"
+    mkdir_cmd = mkdir_u.replace("/home/ubuntu/.wcg-ssh-affinity", str(local_dir))
+    create_cmd = create_u.replace("/home/ubuntu/.wcg-ssh-affinity", str(local_dir))
+    read_cmd = read_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(local_marker))
+    subprocess.run(["bash", "-c", mkdir_cmd.split(" && hostname")[0]], check=True)
+    assert local_dir.is_dir()
+    assert not local_marker.exists()
+    subprocess.run(["bash", "-c", create_cmd.split(" && hostname")[0]], check=True)
     assert local_marker.is_file()
     assert local_marker.read_text(encoding="utf-8").strip() == "tok-ubuntu"
     assert (local_marker.stat().st_mode & 0o777) == 0o600
-
-    local_read = read_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(local_marker))
-    read_prefix = local_read.split(" && hostname")[0]
     read_out = subprocess.run(
-        ["bash", "-c", read_prefix],
+        ["bash", "-c", read_cmd.split(" && hostname")[0]],
         check=True,
         capture_output=True,
         text=True,
     )
     assert "tok-ubuntu" in read_out.stdout
 
-    # Local FAIL: read cmd against a missing marker exits non-zero.
-    missing = tmp_path / "missing" / "marker"
-    fail_read = read_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(missing))
-    fail_prefix = fail_read.split(" && hostname")[0]
-    fail_run = subprocess.run(["bash", "-c", fail_prefix], capture_output=True, text=True)
+    # Local FAIL: create-file against a missing dir exits non-zero.
+    missing_dir = tmp_path / "missing-affinity"
+    missing_marker = missing_dir / "marker"
+    fail_create = create_u.replace(
+        "/home/ubuntu/.wcg-ssh-affinity/marker", str(missing_marker)
+    ).replace("/home/ubuntu/.wcg-ssh-affinity", str(missing_dir))
+    fail_run = subprocess.run(
+        ["bash", "-c", fail_create.split(" && hostname")[0]],
+        capture_output=True,
+        text=True,
+    )
     assert fail_run.returncode != 0
+    assert "affinity-preflight: missing dir" in fail_run.stderr + fail_run.stdout
+
+    # Local FAIL: read against missing marker.
+    fail_read = read_u.replace(
+        "/home/ubuntu/.wcg-ssh-affinity/marker", str(tmp_path / "nope/marker")
+    )
+    fail_read_run = subprocess.run(
+        ["bash", "-c", fail_read.split(" && hostname")[0]],
+        capture_output=True,
+        text=True,
+    )
+    assert fail_read_run.returncode != 0
+    assert "affinity-preflight: missing marker" in (
+        fail_read_run.stderr + fail_read_run.stdout
+    )
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])

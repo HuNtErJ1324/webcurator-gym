@@ -131,7 +131,7 @@ if [[ "$CURATION_ONLY" -eq 1 ]]; then
 fi
 
 command -v prime >/dev/null || die "prime CLI not found"
-command -v rsync >/dev/null || die "rsync not found"
+command -v tar >/dev/null || die "tar not found"
 command -v ssh >/dev/null || die "ssh not found"
 [[ -f "$SECRETS_FILE" ]] || die "Missing $SECRETS_FILE (need at least HF_TOKEN)"
 
@@ -179,10 +179,13 @@ probe_remote_repo_dir_cmd() {
 
 # Write a remote file from SSH stdin (exec channel). Avoids scp/SFTP, which on
 # MassedCompute can fail to open paths that SSH-exec mkdir/test just verified
-# (pod 60ee57c4). Payload stays on stdin — never in argv or launcher logs.
+# (pod 60ee57c4). mkdir of the parent is folded into THIS same remote shell so
+# a later cross-exec write is not required. Payload stays on stdin — never in
+# argv or launcher logs.
 write_remote_file_from_stdin_cmd() {
   local remote_path="$1"
-  printf 'umask 077 && cat > %q && chmod 600 %q\n' "$remote_path" "$remote_path"
+  printf 'umask 077 && mkdir -p "$(dirname %q)" && cat > %q && chmod 600 %q\n' \
+    "$remote_path" "$remote_path" "$remote_path"
 }
 
 cat_remote_file_cmd() {
@@ -195,18 +198,25 @@ test_remote_file_cmd() {
   printf 'test -f %q\n' "$remote_path"
 }
 
-# Fail-fast affinity probe: create a marker via one multiplexed remote() call,
-# then read it back on a subsequent call. MassedCompute (pod 8b009f19) showed
-# mkdir+test succeeding on one SSH session while the next session lacked the
-# parent dir — ControlMaster + this probe catch that before provision/eval.
-affinity_preflight_write_cmd() {
-  local marker_path="$1"
-  local token="$2"
-  local host_note="$3"
-  # Single remote string: mkdir parent, write token+newline, print hostname + note.
-  # Use echo (not nested printf %%s\\n) so %q escaping stays simple and correct.
-  printf 'umask 077 && mkdir -p "$(dirname %q)" && echo %q > %q && chmod 600 %q && hostname && echo %q\n' \
-    "$marker_path" "$token" "$marker_path" "$marker_path" "$host_note"
+# Fail-fast cross-exec affinity probe (MassedCompute pod 8b009f19): mkdir in
+# one remote() exec, then create a NEW file inside that dir in a second exec.
+# ControlMaster keeps the TCP session; this proves durable path visibility
+# across multiplexed writes before expensive provision/eval.
+affinity_preflight_mkdir_cmd() {
+  local marker_dir="$1"
+  local host_note="$2"
+  printf 'umask 077 && mkdir -p %q && test -d %q && test -w %q && hostname && echo %q\n' \
+    "$marker_dir" "$marker_dir" "$marker_dir" "$host_note"
+}
+
+affinity_preflight_create_file_cmd() {
+  local marker_dir="$1"
+  local marker_path="$2"
+  local token="$3"
+  # Second exec: do NOT mkdir here — require the prior exec's directory to exist,
+  # then create a brand-new file inside it (the cross-exec write under test).
+  printf 'test -d %q || { echo "affinity-preflight: missing dir at %q" >&2; exit 1; }; umask 077 && echo %q > %q && chmod 600 %q && hostname\n' \
+    "$marker_dir" "$marker_dir" "$token" "$marker_path" "$marker_path"
 }
 
 affinity_preflight_read_cmd() {
@@ -217,29 +227,32 @@ affinity_preflight_read_cmd() {
 }
 
 verify_ssh_connection_affinity() {
-  # Prove a file created through the shared ControlMaster session persists and
-  # is readable on a subsequent multiplexed remote() call. Fail before any
-  # expensive provision/eval if affinity is broken.
-  local marker_dir marker_path token host_note write_out read_out write_cmd read_cmd
+  # Exec1: mkdir. Exec2: create NEW file in that dir. Exec3: read token back.
+  local marker_dir marker_path token host_note mkdir_out create_out read_out
+  local mkdir_cmd create_cmd read_cmd
   [[ -n "${SSH_CONTROL_PATH:-}" ]] || die "SSH ControlMaster not configured; cannot verify connection affinity"
   [[ -n "${REMOTE_ROOT:-}" ]] || die "REMOTE_ROOT unset; cannot verify connection affinity"
   marker_dir="${REMOTE_ROOT}/.wcg-ssh-affinity"
   marker_path="${marker_dir}/marker.$$.$RANDOM"
   token="wcg-affinity-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   host_note="control_path=${SSH_CONTROL_DIR:-unset}"
-  write_cmd="$(affinity_preflight_write_cmd "$marker_path" "$token" "$host_note")"
+  mkdir_cmd="$(affinity_preflight_mkdir_cmd "$marker_dir" "$host_note")"
+  create_cmd="$(affinity_preflight_create_file_cmd "$marker_dir" "$marker_path" "$token")"
   read_cmd="$(affinity_preflight_read_cmd "$marker_path")"
-  log "SSH affinity preflight: write marker via ControlMaster, then re-read (${SSH_USER}@${SSH_HOST})"
-  if ! write_out="$(remote "$write_cmd")"; then
-    die "SSH affinity preflight WRITE failed on ${SSH_USER}@${SSH_HOST} (${host_note}). Multiplexed session cannot create durable paths; refusing provision/eval."
+  log "SSH affinity preflight: mkdir then create-file across ControlMaster execs (${SSH_USER}@${SSH_HOST})"
+  if ! mkdir_out="$(remote "$mkdir_cmd")"; then
+    die "SSH affinity preflight MKDIR failed on ${SSH_USER}@${SSH_HOST} (${host_note}). Refusing provision/eval."
+  fi
+  if ! create_out="$(remote "$create_cmd")"; then
+    die "SSH affinity preflight CREATE-FILE failed on ${SSH_USER}@${SSH_HOST} after mkdir (${host_note}). Cross-exec write into ${marker_dir} failed; mkdir evidence: ${mkdir_out}"
   fi
   if ! read_out="$(remote "$read_cmd")"; then
-    die "SSH affinity preflight READ failed on ${SSH_USER}@${SSH_HOST} after successful write (${host_note}). Marker ${marker_path} missing on subsequent multiplexed call; hostname/write evidence: ${write_out}"
+    die "SSH affinity preflight READ failed on ${SSH_USER}@${SSH_HOST} after create (${host_note}). Marker ${marker_path} missing; mkdir=[${mkdir_out}] create=[${create_out}]"
   fi
   if [[ "$read_out" != *"$token"* ]]; then
-    die "SSH affinity preflight token mismatch on ${SSH_USER}@${SSH_HOST}. write=[${write_out}] read=[${read_out}] (${host_note})"
+    die "SSH affinity preflight token mismatch on ${SSH_USER}@${SSH_HOST}. mkdir=[${mkdir_out}] create=[${create_out}] read=[${read_out}] (${host_note})"
   fi
-  log "SSH affinity preflight OK (hostname/session evidence): $(printf '%s' "$write_out" | tr '\n' ' ' | head -c 200)"
+  log "SSH affinity preflight OK (hostname/session evidence): $(printf '%s' "$mkdir_out" | tr '\n' ' ' | head -c 200)"
   # Best-effort cleanup of the probe marker (ignore failures).
   remote "$(printf 'rm -f %q\n' "$marker_path")" >/dev/null 2>&1 || true
 }
@@ -273,12 +286,12 @@ ensure_remote_repo_dir() {
 upload_secrets() {
   # MassedCompute: scp/SFTP can fail with "No such file or directory" even after
   # SSH-exec mkdir+test succeeds (pod 60ee57c4). Upload via the same SSH exec
-  # channel as `remote()`: stdin → `cat > secrets.env` with umask 077 / chmod 600.
+  # channel as `remote()`: stdin → mkdir parent + `cat > secrets.env` + chmod 600
+  # in ONE remote shell (mkdir folded into the write — no cross-exec parent create).
   # Secret contents never appear in argv or log lines.
   local tmp remote_dir secrets_path remote_cmd
   remote_dir="$(remote_repo_dir)"
   secrets_path="${remote_dir}/secrets.env"
-  ensure_remote_repo_dir
   tmp="$(mktemp)"
   cp "$SECRETS_FILE" "$tmp"
   if ! grep -q '^PRIME_API_KEY=' "$tmp"; then
@@ -327,19 +340,14 @@ SSH_CONTROL_DIR=""
 SSH_CONTROL_PATH=""
 
 ssh_common_opts() {
-  # Echo space-separated shared SSH options for remote()/rsync. When
-  # ControlPath is set, ControlMaster=auto reuses one TCP session so
-  # MassedCompute mkdir/write affinity holds across remote() calls (8b009f19).
+  # Echo space-separated shared SSH options for remote(). When ControlPath is
+  # set, ControlMaster=auto reuses one TCP session so MassedCompute mkdir/write
+  # affinity holds across remote() calls (8b009f19).
   local opts="-o StrictHostKeyChecking=no -o BatchMode=yes"
   if [[ -n "${SSH_CONTROL_PATH:-}" ]]; then
     opts+=" -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=${SSH_CONTROL_PATH}"
   fi
   printf '%s' "$opts"
-}
-
-ssh_rsync_transport() {
-  # Single -e string for rsync; must include the same ControlPath as remote().
-  printf 'ssh -T -i %q -p %q %s' "$SSH_KEY" "$SSH_PORT" "$(ssh_common_opts)"
 }
 
 setup_ssh_control_master() {
@@ -616,7 +624,7 @@ wait_for_ssh_auth() {
   # ready, but publickey auth returned "Permission denied" for ~90s straight
   # before the script gave up) -- authorized_keys can propagate after the
   # instance is otherwise reachable. Probe real SSH auth directly, separately
-  # from the rsync retry loop below, before trusting the pod is usable.
+  # from the tar-sync retry loop below, before trusting the pod is usable.
   #
   # Also a pragmatic safety net for a related failure: observed 2026-07-08 on
   # crusoecloud's a100-80gb.1x, the parsed SSH_USER (root, the previous
@@ -655,28 +663,53 @@ wait_for_ssh_auth() {
   die "SSH auth never became usable at ${SSH_HOST}:${SSH_PORT} (tried users: ${candidates[*]}) after 20 attempts"
 }
 
-remote_rsync() {
-  local attempt
-  local ssh_cmd
-  ssh_cmd="$(ssh_rsync_transport)"
+# Remote shell: wipe + mkdir + extract stdin tar in ONE exec (MassedCompute
+# cross-exec write fix). Paths %q-escaped; no bash -lc.
+extract_repo_tar_stdin_cmd() {
+  local remote_dir="$1"
+  printf 'rm -rf %q && mkdir -p %q && tar -xzf - -C %q\n' \
+    "$remote_dir" "$remote_dir" "$remote_dir"
+}
+
+# Inverse: stream a remote directory as a tar archive on stdout (artifact pull).
+create_tar_stdout_cmd() {
+  local remote_dir="$1"
+  printf 'tar -czf - -C %q .\n' "$remote_dir"
+}
+
+remote_sync_repo() {
+  # Stream a local tar of $ROOT through one `remote` exec that mkdir+extracts
+  # in the SAME shell. Replaces rsync/scp so MassedCompute cannot split
+  # directory creation from file writes across sessions (8b009f19 / 60ee57c4).
+  # Excludes mirror the former rsync filters (.git/.venv/outputs/caches/site data).
+  local remote_dir remote_cmd attempt
+  [[ -n "${REMOTE_ROOT:-}" ]] || die "REMOTE_ROOT is unset; cannot sync repository"
+  [[ -n "${SSH_USER:-}" && -n "${SSH_HOST:-}" ]] || die "SSH target unset; cannot sync repository"
+  remote_dir="$(remote_repo_dir)"
+  remote_cmd="$(extract_repo_tar_stdin_cmd "$remote_dir")"
+  log "Syncing repository via tar-over-SSH-exec to ${SSH_USER}@${SSH_HOST}:${remote_dir}"
   for attempt in 1 2 3 4 5; do
-    if rsync -az --delete \
-      --exclude '.git/' \
-      --exclude '.venv/' \
-      --exclude '**/.venv/' \
-      --exclude 'outputs/' \
-      --exclude '**/__pycache__/' \
-      --exclude '**/.pytest_cache/' \
-      --exclude '**/.mypy_cache/' \
-      --exclude 'docs/site/data/' \
-      -e "$ssh_cmd" \
-      "$ROOT/" "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/"; then
+    if tar -czf - \
+      --exclude='.git' \
+      --exclude='.venv' \
+      --exclude='*/.venv' \
+      --exclude='outputs' \
+      --exclude='*/outputs' \
+      --exclude='__pycache__' \
+      --exclude='*/__pycache__' \
+      --exclude='.pytest_cache' \
+      --exclude='*/.pytest_cache' \
+      --exclude='.mypy_cache' \
+      --exclude='*/.mypy_cache' \
+      --exclude='docs/site/data' \
+      -C "$ROOT" . \
+      | remote "$remote_cmd"; then
       return 0
     fi
-    log "rsync attempt $attempt failed; retrying in 20s"
+    log "tar-over-SSH sync attempt $attempt failed; retrying in 20s"
     sleep 20
   done
-  die "rsync failed after 5 attempts"
+  die "tar-over-SSH repository sync failed after 5 attempts"
 }
 
 remote_provision_cpu() {
@@ -871,12 +904,14 @@ REMOTE
 
 download_results() {
   local rel_dir="$1"
-  log "Downloading results from outputs/$rel_dir"
+  local remote_results remote_cmd
+  remote_results="$REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator/outputs/${rel_dir}"
+  log "Downloading results from outputs/$rel_dir via tar-over-SSH-exec"
   mkdir -p "$LOCAL_OUT_DIR"
-  rsync -az \
-    -e "$(ssh_rsync_transport)" \
-    "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator/outputs/${rel_dir}/" \
-    "$LOCAL_OUT_DIR/"
+  remote_cmd="$(create_tar_stdout_cmd "$remote_results")"
+  if ! remote "$remote_cmd" | tar -xzf - -C "$LOCAL_OUT_DIR"; then
+    die "Failed to download results via tar-over-SSH-exec from ${SSH_USER}@${SSH_HOST}:${remote_results}"
+  fi
   [[ -s "$LOCAL_OUT_DIR/results.jsonl" ]] || die "Downloaded results.jsonl is empty"
   write_resolved_config "$LOCAL_OUT_DIR/config.toml"
   local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
@@ -989,10 +1024,7 @@ setup_ssh_control_master
 verify_ssh_connection_affinity
 
 log "Syncing repository to pod"
-remote_rsync
-# Explicit create/verify: do not trust rsync alone to materialize the remote
-# repo directory before secrets upload (MassedCompute ubuntu@ failure mode).
-ensure_remote_repo_dir
+remote_sync_repo
 upload_secrets
 
 if [[ "$CURATION_ONLY" -eq 1 ]]; then
