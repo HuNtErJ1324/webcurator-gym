@@ -71,6 +71,11 @@ class FakeRuntime:
     async def write(self, path: str, data: bytes) -> None:
         self.files[path] = data
 
+    async def read(self, path: str) -> bytes:
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return self.files[path]
+
     async def run(self, argv: list[str], env: dict[str, str]):
         self.commands.append((argv, env))
         return self.result
@@ -96,12 +101,14 @@ async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
         "/workspace/train.py",
         "/workspace/train_stdout.log",
         "/workspace/train_stderr.log",
+        "/workspace/train_stderr_redirect.log",
     }
     assert runtime.commands == [(["python", "/workspace/train.py"], {})]
     # The rollout owns the successful runtime until all scoring finishes.
     assert runtime.stop_calls == 0
     assert runtime.files["/workspace/train_stdout.log"] == _result().encode()
     assert runtime.files["/workspace/train_stderr.log"] == b""
+    assert runtime.files["/workspace/train_stderr_redirect.log"] == b""
 
 
 class _CorpusBuilder:
@@ -306,6 +313,29 @@ async def test_training_crash_surfaces_stdout_traceback_and_persists_full_logs()
     )
     assert runtime.files["/workspace/train_stdout.log"] == result.stdout.encode()
     assert runtime.files["/workspace/train_stderr.log"] == result.stderr.encode()
+    assert runtime.files["/workspace/train_stderr_redirect.log"] == b""
+
+
+@pytest.mark.asyncio
+async def test_training_crash_surfaces_redirected_stderr_file():
+    """Trainer redirects sys.stderr to /workspace/stderr.txt; harness must read it."""
+    result = SimpleNamespace(stdout="step 0", stderr="", exit_code=1)
+    runtime = FakeRuntime(result)
+    runtime.files["/workspace/stderr.txt"] = (
+        b"CUDA out of memory. Tried to allocate 9.20 GiB\n"
+        b"RuntimeError: CUDA error: out of memory\n"
+    )
+
+    with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
+        await HarnessRuntimeProxyTrainer().train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(runtime_backend="docker"),
+            runtime=runtime,
+        )
+
+    assert "CUDA out of memory" in excinfo.value.stderr_tail
+    assert "out of memory" in runtime.files["/workspace/train_stderr.log"].decode()
+    assert b"CUDA out of memory" in runtime.files["/workspace/train_stderr_redirect.log"]
 
 
 @pytest.mark.asyncio
