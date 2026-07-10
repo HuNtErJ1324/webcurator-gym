@@ -52,6 +52,7 @@ def load_environment(
     decon_evals_dir: str | None = None,
     decon_threshold: float = 0.2,
     screen_val_set: bool = True,
+    max_tool_output_chars: int = 20_000,
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -103,6 +104,7 @@ def load_environment(
         decon_evals_dir=decon_evals_dir,
         decon_threshold=decon_threshold,
         screen_val_set=screen_val_set,
+        max_tool_output_chars=max_tool_output_chars,
     )
     env_args = {
         "cutoff_date": cutoff_date,
@@ -132,8 +134,11 @@ def load_environment(
         "decon_evals_dir": decon_evals_dir,
         "decon_threshold": decon_threshold,
         "screen_val_set": screen_val_set,
+        "max_tool_output_chars": max_tool_output_chars,
     }
-    harness_env: dict[str, str] = {}
+    harness_env: dict[str, str] = {
+        "MAX_TOOL_OUTPUT_CHARS": str(max_tool_output_chars),
+    }
     harness_runtime: vf.RuntimeConfig = vf.SubprocessConfig()
     timeout = vf.TimeoutConfig()
     ps = ProxyStudentConfig(**config.proxy_student)
@@ -191,7 +196,7 @@ def load_environment(
         # keeps `hf` CLI auth consistent across runtime types.
         harness_env[hf_token_env] = hf_token
 
-    return Environment(
+    env = Environment(
         vf.EnvConfig(
             taskset=config,
             max_turns=max_turns,
@@ -202,3 +207,10 @@ def load_environment(
         ),
         env_args=env_args,
     )
+    # Cap agent-visible bash/tool results at the harness program boundary. Lazy
+    # wrap keeps package import safe when a stub Verifiers install is present.
+    if harness_id == "bash":
+        from .bash_harness import wrap_bash_harness
+
+        env.harness = wrap_bash_harness(env.harness.config)
+    return env

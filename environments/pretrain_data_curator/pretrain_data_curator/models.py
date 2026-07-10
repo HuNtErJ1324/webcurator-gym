@@ -597,6 +597,8 @@ class CuratorConfig(BaseModel):
     # tokens). Consumed by the real (sandbox) proxy-student trainer.
     validation_set: ValidationSetConfig = Field(default_factory=ValidationSetConfig)
     use_real_trainer: bool = False
+    # Cap on tool / bash output captured from runtimes; <=0 disables truncation.
+    max_tool_output_chars: int = Field(default=20_000, ge=-1)
 
     @model_validator(mode="after")
     def _check_perf_target_below_baseline(self) -> "CuratorConfig":
