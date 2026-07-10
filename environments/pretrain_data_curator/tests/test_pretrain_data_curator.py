@@ -1460,6 +1460,9 @@ def test_400m_a100_massedcompute_stage_cmdsub_no_log_contamination(tmp_path):
             "prepare_secrets_env_file() {",
             prepare_body,
             "}",
+            "wcg_emit_docker_provision_bash() {",
+            _extract_bash_function(a100, "wcg_emit_docker_provision_bash"),
+            "}",
             "write_massedcompute_single_shell_driver() {",
             _extract_bash_function(a100, "write_massedcompute_single_shell_driver"),
             "}",
@@ -1507,6 +1510,9 @@ def test_400m_a100_massedcompute_stage_cmdsub_no_log_contamination(tmp_path):
         ["bash", "-n", str(driver)], capture_output=True, text=True
     )
     assert syntax.returncode == 0, syntax.stderr
+    driver_text = driver.read_text(encoding="utf-8")
+    assert "wcg_provision_docker_rootless" in driver_text
+    assert "uv run eval" in driver_text
     archive = tmp_path / "staged.tar.gz"
     assert archive.is_file() and archive.stat().st_size > 0
 
@@ -1659,9 +1665,11 @@ def test_400m_a100_massedcompute_real_driver_bash_n_and_stage_trap(tmp_path):
     scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
     writer_body = _extract_bash_function(a100, "write_massedcompute_single_shell_driver")
+    emit_body = _extract_bash_function(a100, "wcg_emit_docker_provision_bash")
     assert "trap cleanup_stage EXIT" in writer_body
     assert "rm -rf --" in writer_body
     assert "wcg-mc-results" in writer_body  # external bundle, not under SELF_DIR
+    assert "wcg_emit_docker_provision_bash" in writer_body
 
     dest = tmp_path / "wcg_single_shell_driver.sh"
     snippet = "\n".join(
@@ -1671,6 +1679,9 @@ def test_400m_a100_massedcompute_real_driver_bash_n_and_stage_trap(tmp_path):
             'MODEL="deepseek/deepseek-v4-pro"',
             'EVAL_CONFIG="configs/eval/400M-300turn-codex.toml"',
             'RUN_NAME="test-run"',
+            "wcg_emit_docker_provision_bash() {",
+            emit_body,
+            "}",
             "write_massedcompute_single_shell_driver() {",
             writer_body,
             "}",
@@ -1791,6 +1802,141 @@ def test_400m_a100_massedcompute_real_driver_bash_n_and_stage_trap(tmp_path):
     fail = subprocess.run(["bash", "-c", fail_sim], capture_output=True, text=True)
     assert fail.returncode == 9
     assert not self_dir2.exists()
+
+
+def test_400m_a100_massedcompute_nonroot_docker_provision_invariants(tmp_path):
+    """Non-root MC path: rootless DOCKER_HOST + user daemon.json; rootful preserved.
+
+    Deterministic static + generated-driver gates (no live GPU / no pod):
+    - shared emitter defines rootful and rootless branches
+    - rootless never invokes systemctl(1) and never writes /etc/docker/daemon.json
+    - rootless configures $HOME/.config/docker/daemon.json and exports DOCKER_HOST
+    - rootless installs uidmap/fuse-overlayfs/slirp4netns when missing
+    - GPU path includes fail-fast container smoke (nvidia-smi -L)
+    - rootful still uses systemctl + default nvidia-ctk ( /etc/docker/daemon.json )
+    - generated MC driver embeds the emitter and calls wcg_provision_docker
+    """
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+
+    emit_body = _extract_bash_function(a100, "wcg_emit_docker_provision_bash")
+    assert "wcg_provision_docker_rootful" in emit_body
+    assert "wcg_provision_docker_rootless" in emit_body
+    assert "wcg_gpu_container_smoke" in emit_body
+    assert "dockerd-rootless.sh" in emit_body
+    assert "DOCKER_HOST" in emit_body
+    assert "$HOME/.config/docker/daemon.json" in emit_body
+    assert "uidmap" in emit_body
+    assert "fuse-overlayfs" in emit_body
+    assert "slirp4netns" in emit_body
+    assert "nvidia-smi -L" in emit_body
+    assert "GPU container smoke failed" in emit_body
+
+    # Materialize the SNIP payload the same way the launcher does.
+    snip = subprocess.check_output(
+        [
+            "bash",
+            "-c",
+            "wcg_emit_docker_provision_bash() {\n"
+            + emit_body
+            + "\n}\nwcg_emit_docker_provision_bash\n",
+        ],
+        text=True,
+    )
+    rootless = _extract_bash_function(snip, "wcg_provision_docker_rootless")
+    rootful = _extract_bash_function(snip, "wcg_provision_docker_rootful")
+    configure = _extract_bash_function(snip, "wcg_configure_nvidia_rootless")
+    smoke = _extract_bash_function(snip, "wcg_gpu_container_smoke")
+
+    # Non-root arm: no systemctl(1) invocations.
+    assert not any(
+        ln.lstrip().startswith("systemctl ")
+        or ln.lstrip().startswith("systemctl\t")
+        for ln in rootless.splitlines()
+    ), "rootless provision must not invoke systemctl"
+    # No write/open of the system daemon.json path (comment mentions are ok only
+    # if they do not appear as a configure --config target).
+    assert "/etc/docker/daemon.json" not in configure
+    assert not any(
+        "/etc/docker/daemon.json" in ln and not ln.lstrip().startswith("#")
+        for ln in rootless.splitlines()
+    )
+    assert "--config=\"$cfg\"" in configure or '--config="$cfg"' in configure
+    assert "$HOME/.config/docker/daemon.json" in configure
+    assert "export DOCKER_HOST" in rootless
+    assert "wcg_ensure_rootless_deps" in rootless
+    assert "wcg_gpu_container_smoke" in rootless
+    assert "docker pull" in smoke
+    assert "--gpus all" in smoke
+    assert ">&2" in smoke  # MassedCompute stdout = result tar
+
+    # Rootful arm preserved for root-capable providers.
+    assert any(ln.lstrip().startswith("systemctl ") for ln in rootful.splitlines())
+    assert "nvidia-ctk runtime configure --runtime=docker" in rootful
+    # Default nvidia-ctk (no --config) writes /etc/docker/daemon.json on rootful.
+    assert "--config=" not in rootful.split("nvidia-ctk runtime configure --runtime=docker", 1)[1].splitlines()[0]
+    assert "wcg_gpu_container_smoke" in rootful
+
+    # Dispatcher branches on uid.
+    dispatcher = _extract_bash_function(snip, "wcg_provision_docker")
+    assert 'id -u' in dispatcher
+    assert "wcg_provision_docker_rootful" in dispatcher
+    assert "wcg_provision_docker_rootless" in dispatcher
+
+    # Generated MC driver embeds emitter + calls provision (stderr-safe).
+    writer_body = _extract_bash_function(a100, "write_massedcompute_single_shell_driver")
+    assert "wcg_emit_docker_provision_bash" in writer_body
+    assert "wcg_provision_docker" in writer_body
+    dest = tmp_path / "wcg_single_shell_driver.sh"
+    built = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "\n".join(
+                [
+                    "set -euo pipefail",
+                    "CURATION_ONLY=0",
+                    'MODEL="deepseek/deepseek-v4-pro"',
+                    'EVAL_CONFIG="configs/eval/400M-300turn-codex.toml"',
+                    'RUN_NAME="test-run"',
+                    "wcg_emit_docker_provision_bash() {",
+                    emit_body,
+                    "}",
+                    "write_massedcompute_single_shell_driver() {",
+                    writer_body,
+                    "}",
+                    f'write_massedcompute_single_shell_driver "{dest}"',
+                ]
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert built.returncode == 0
+    driver = dest.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["bash", "-n", str(dest)], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    assert "wcg_provision_docker_rootless" in driver
+    assert "wcg_provision_docker 1 >&2" in driver
+    assert "dockerd-rootless.sh" in driver
+    assert "$HOME/.config/docker/daemon.json" in driver
+    # Driver must still keep rootful path for root-capable images.
+    assert "systemctl start docker" in driver or "systemctl restart docker" in driver
+
+    # remote_provision_gpu/cpu must also call the shared provisioner.
+    cpu = _extract_bash_function(a100, "remote_provision_cpu")
+    gpu = _extract_bash_function(a100, "remote_provision_gpu")
+    assert "wcg_emit_docker_provision_bash" in cpu
+    assert "wcg_provision_docker 0" in cpu
+    assert "wcg_emit_docker_provision_bash" in gpu
+    assert "wcg_provision_docker 1" in gpu
+    # Old root-only inline systemctl docker block removed from GPU provision body
+    # (now only inside the emitted rootful helper, not duplicated inline).
+    assert "systemctl start docker || true" not in gpu
+    assert "systemctl start docker || true" not in cpu
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])

@@ -758,6 +758,208 @@ prepare_secrets_env_file() {
   rm -f "$tmp"
 }
 
+
+# Emit bash that provisions Docker for root OR non-root (MassedCompute ubuntu@).
+# Call as: wcg_provision_docker <need_gpu:0|1>
+# Rootful: systemctl + /etc/docker/daemon.json (unchanged for root-capable providers).
+# Non-root: NEVER systemctl / NEVER /etc/docker/daemon.json; rootless dockerd +
+# user daemon.json + DOCKER_HOST; fail-fast GPU container smoke when need_gpu=1.
+wcg_emit_docker_provision_bash() {
+  cat <<'SNIP'
+wcg_log() { if declare -F log >/dev/null 2>&1; then log "$@"; else printf '[wcg] %s\n' "$*" >&2; fi; }
+wcg_die() { if declare -F die >/dev/null 2>&1; then die "$@"; else printf '[wcg] FATAL: %s\n' "$*" >&2; exit 1; fi; }
+
+wcg_apt_install() {
+  # Install packages non-interactively when missing. Prefer root apt; else sudo -n.
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -eq 0 ]] && return 0
+  if [[ "$(id -u)" -eq 0 ]]; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n apt-get update -qq
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+    return 0
+  fi
+  wcg_die "missing packages (${pkgs[*]}) and cannot apt-get without root/passwordless sudo"
+}
+
+wcg_ensure_docker_cli() {
+  if command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+  wcg_log "docker CLI missing; installing via get.docker.com"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    curl -fsSL https://get.docker.com | sh
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com | sudo -n sh
+  else
+    wcg_die "docker not installed and cannot run get.docker.com without root/passwordless sudo"
+  fi
+  command -v docker >/dev/null 2>&1 || wcg_die "docker CLI still missing after install"
+}
+
+wcg_ensure_rootless_deps() {
+  # Required for dockerd-rootless.sh (uid map + net/fs helpers).
+  local need=()
+  command -v newuidmap >/dev/null 2>&1 || need+=(uidmap)
+  command -v fuse-overlayfs >/dev/null 2>&1 || need+=(fuse-overlayfs)
+  command -v slirp4netns >/dev/null 2>&1 || need+=(slirp4netns)
+  if [[ ${#need[@]} -gt 0 ]]; then
+    wcg_log "Installing rootless Docker deps: ${need[*]}"
+    wcg_apt_install "${need[@]}"
+  fi
+  command -v newuidmap >/dev/null 2>&1 || wcg_die "newuidmap missing after dep install"
+  command -v dockerd-rootless.sh >/dev/null 2>&1 \
+    || wcg_die "dockerd-rootless.sh missing (install docker-ce-rootless-extras / docker rootless package)"
+  # subuid/subgid required for rootless; fail fast with a clear message.
+  local me
+  me="$(id -un)"
+  grep -q "^${me}:" /etc/subuid 2>/dev/null \
+    || wcg_die "no /etc/subuid entry for ${me}; rootless Docker cannot start"
+  grep -q "^${me}:" /etc/subgid 2>/dev/null \
+    || wcg_die "no /etc/subgid entry for ${me}; rootless Docker cannot start"
+}
+
+wcg_rootless_docker_host() {
+  local xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  printf 'unix://%s/docker.sock' "$xdg"
+}
+
+wcg_start_rootless_dockerd() {
+  # Start dockerd-rootless.sh in-process tree (no systemctl — MassedCompute ubuntu@).
+  local xdg logf host
+  xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  export XDG_RUNTIME_DIR="$xdg"
+  mkdir -p "$xdg" "$HOME/.config/docker" "$HOME/.docker"
+  host="$(wcg_rootless_docker_host)"
+  export DOCKER_HOST="$host"
+  if docker info >/dev/null 2>&1; then
+    wcg_log "Rootless Docker already reachable at DOCKER_HOST=$DOCKER_HOST"
+    return 0
+  fi
+  logf="$HOME/.docker/wcg-rootless-dockerd.log"
+  wcg_log "Starting dockerd-rootless.sh (log: $logf)"
+  nohup dockerd-rootless.sh >>"$logf" 2>&1 &
+  local i
+  for i in $(seq 1 60); do
+    if docker info >/dev/null 2>&1; then
+      wcg_log "Rootless Docker ready (DOCKER_HOST=$DOCKER_HOST)"
+      return 0
+    fi
+    sleep 1
+  done
+  wcg_die "rootless dockerd failed to become ready within 60s (see $logf)"
+}
+
+wcg_restart_rootless_dockerd() {
+  # Re-read user daemon.json after nvidia-ctk configure (no systemctl).
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  export DOCKER_HOST="$(wcg_rootless_docker_host)"
+  if pgrep -u "$(id -u)" -f 'dockerd-rootless|rootlesskit.*dockerd' >/dev/null 2>&1; then
+    wcg_log "Stopping existing rootless dockerd to reload config"
+    pkill -u "$(id -u)" -f 'dockerd-rootless.sh' >/dev/null 2>&1 || true
+    pkill -u "$(id -u)" -f 'rootlesskit.*dockerd' >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  # Drop stale socket so start path does not short-circuit on a dead sock.
+  rm -f "${XDG_RUNTIME_DIR}/docker.sock" >/dev/null 2>&1 || true
+  wcg_start_rootless_dockerd
+}
+
+wcg_configure_nvidia_rootless() {
+  # User-owned daemon.json ONLY (never the system docker config path).
+  local cfg="$HOME/.config/docker/daemon.json"
+  mkdir -p "$(dirname "$cfg")"
+  command -v nvidia-ctk >/dev/null 2>&1 \
+    || wcg_die "nvidia-ctk missing; cannot configure rootless GPU runtime"
+  wcg_log "nvidia-ctk runtime configure → $cfg"
+  nvidia-ctk runtime configure --runtime=docker --config="$cfg"
+  # Rootless GPU needs no-cgroups. Prefer in-place system config when writable /
+  # passwordless sudo; else write a user override and point the toolkit at it.
+  if [[ -w /etc/nvidia-container-runtime/config.toml ]] 2>/dev/null; then
+    nvidia-ctk config --set nvidia-container-cli.no-cgroups --in-place
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n nvidia-ctk config --set nvidia-container-cli.no-cgroups --in-place
+  else
+    local ncfg="$HOME/.config/nvidia-container-runtime/config.toml"
+    mkdir -p "$(dirname "$ncfg")"
+    if [[ ! -f "$ncfg" ]]; then
+      if [[ -r /etc/nvidia-container-runtime/config.toml ]]; then
+        cp /etc/nvidia-container-runtime/config.toml "$ncfg"
+      else
+        printf '# wcg rootless nvidia-container-runtime override\n' >"$ncfg"
+      fi
+    fi
+    nvidia-ctk config --config="$ncfg" --set nvidia-container-cli.no-cgroups --in-place
+    export NVIDIA_CONTAINER_RUNTIME_CONFIG_OVERRIDE="$ncfg"
+    wcg_log "Using NVIDIA_CONTAINER_RUNTIME_CONFIG_OVERRIDE=$ncfg (no-cgroups)"
+  fi
+}
+
+wcg_gpu_container_smoke() {
+  # Fail-fast: container must see the GPU before image build / eval.
+  # stdout must stay clean for MassedCompute result-tar protocol → everything on stderr.
+  local img="pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
+  wcg_log "=== GPU docker smoke (fail-fast) ==="
+  docker pull "$img" >&2
+  docker run --rm --gpus all "$img" nvidia-smi -L >&2 \
+    || wcg_die "GPU container smoke failed (docker run --gpus all nvidia-smi -L)"
+}
+
+wcg_provision_docker_rootful() {
+  local need_gpu="$1"
+  wcg_log "=== Docker (rootful) ==="
+  wcg_ensure_docker_cli
+  systemctl start docker || true
+  if [[ "$need_gpu" -eq 1 ]]; then
+    wcg_log "=== NVIDIA container toolkit (rootful) ==="
+    if ! command -v nvidia-ctk >/dev/null 2>&1; then
+      curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+      curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit
+    fi
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+    wcg_gpu_container_smoke
+  fi
+}
+
+wcg_provision_docker_rootless() {
+  local need_gpu="$1"
+  wcg_log "=== Docker (rootless / non-root) ==="
+  # Hard invariants for MassedCompute ubuntu@: no systemctl(1) invocations and
+  # no writes under /etc/docker/ (user config + DOCKER_HOST only).
+  wcg_ensure_docker_cli
+  wcg_ensure_rootless_deps
+  wcg_start_rootless_dockerd
+  if [[ "$need_gpu" -eq 1 ]]; then
+    wcg_log "=== NVIDIA container toolkit (rootless) ==="
+    wcg_configure_nvidia_rootless
+    wcg_restart_rootless_dockerd
+    wcg_gpu_container_smoke
+  fi
+  # Persist for subsequent docker build / eval in this shell.
+  export DOCKER_HOST
+  wcg_log "DOCKER_HOST=$DOCKER_HOST"
+}
+
+wcg_provision_docker() {
+  local need_gpu="${1:-0}"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    wcg_provision_docker_rootful "$need_gpu"
+  else
+    wcg_provision_docker_rootless "$need_gpu"
+  fi
+}
+SNIP
+}
+
 write_massedcompute_single_shell_driver() {
   # Driver lives INSIDE the staged archive. Logs → stderr; success → result tar on stdout.
   local dest="$1"
@@ -816,26 +1018,14 @@ if [[ "\$CURATION_ONLY" -eq 0 ]]; then
   nvidia-smi -L >&2
 fi
 
-log "=== Docker ==="
-if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | sh >&2
-fi
-systemctl start docker || true
+EOF
+  wcg_emit_docker_provision_bash >> "$dest"
+  cat >> "$dest" <<'EOF'
 
-if [[ "\$CURATION_ONLY" -eq 0 ]]; then
-  log "=== NVIDIA container toolkit ==="
-  if ! command -v nvidia-ctk >/dev/null 2>&1; then
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-    curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \\
-      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \\
-      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-    apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit
-  fi
-  nvidia-ctk runtime configure --runtime=docker >&2
-  systemctl restart docker
-  log "=== GPU docker smoke ==="
-  docker pull pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime >&2
-  docker run --rm --gpus all pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime nvidia-smi -L >&2
+if [[ "$CURATION_ONLY" -eq 1 ]]; then
+  wcg_provision_docker 0 >&2
+else
+  wcg_provision_docker 1 >&2
 fi
 
 log "=== uv + python env ==="
@@ -852,43 +1042,43 @@ uv pip install -e . >&2
 uv run python -c "import pretrain_data_curator; print('import OK', __import__('sys').version.split()[0])" >&2
 
 log "=== decon ==="
-DECON_BIN="\$SELF_DIR/environments/pretrain_data_curator/decon/bin/decon"
-if ! "\$DECON_BIN" --version >/dev/null 2>&1; then
+DECON_BIN="$SELF_DIR/environments/pretrain_data_curator/decon/bin/decon"
+if ! "$DECON_BIN" --version >/dev/null 2>&1; then
   log "Vendored decon missing or incompatible; building natively"
-  bash "\$SELF_DIR/environments/pretrain_data_curator/decon/build_from_source.sh" >&2
+  bash "$SELF_DIR/environments/pretrain_data_curator/decon/build_from_source.sh" >&2
 fi
-"\$DECON_BIN" --version >&2
-file "\$DECON_BIN" >&2
+"$DECON_BIN" --version >&2
+file "$DECON_BIN" >&2
 
 log "=== build webcurator-runtime ==="
 docker build -f Dockerfile.runtime -t webcurator-runtime:latest . >&2
 log "=== runtime preflight ==="
-docker run --rm -w /workspace webcurator-runtime:latest bash -lc \\
-  'command -v hf && python -c "import huggingface_hub; print(\\"huggingface_hub\\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version' >&2
-if [[ "\$CURATION_ONLY" -eq 0 ]]; then
+docker run --rm -w /workspace webcurator-runtime:latest bash -lc \
+  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version' >&2
+if [[ "$CURATION_ONLY" -eq 0 ]]; then
   docker run --rm --gpus all webcurator-runtime:latest nvidia-smi -L >&2
 fi
 log "=== PROVISION DONE ==="
 
-LOG_FILE="\$SELF_DIR/wcg-eval-\${RUN_NAME}.log"
-log "Launching eval (stream → stderr + \$LOG_FILE)"
+LOG_FILE="$SELF_DIR/wcg-eval-${RUN_NAME}.log"
+log "Launching eval (stream → stderr + $LOG_FILE)"
 # Eval progress to stderr AND log file; never to stdout (stdout reserved for result tar).
 set +e
-uv run eval -m "\${MODEL}" @ \${EVAL_CONFIG} 2>&1 | tee "\$LOG_FILE" >&2
-EVAL_RC=\${PIPESTATUS[0]}
+uv run eval -m "${MODEL}" @ ${EVAL_CONFIG} 2>&1 | tee "$LOG_FILE" >&2
+EVAL_RC=${PIPESTATUS[0]}
 set -e
-if [[ "\$EVAL_RC" -ne 0 ]]; then
-  die "eval failed with exit code \$EVAL_RC (see stderr log; no result tar emitted)"
+if [[ "$EVAL_RC" -ne 0 ]]; then
+  die "eval failed with exit code $EVAL_RC (see stderr log; no result tar emitted)"
 fi
 
 RESULTS_REL=""
-if RESULTS_LINE="\$(grep -Eo 'results: outputs/[^[:space:]]+' "\$LOG_FILE" | tail -1 || true)"; then
-  if [[ -n "\$RESULTS_LINE" ]]; then
-    RESULTS_REL="\${RESULTS_LINE#results: }"
+if RESULTS_LINE="$(grep -Eo 'results: outputs/[^[:space:]]+' "$LOG_FILE" | tail -1 || true)"; then
+  if [[ -n "$RESULTS_LINE" ]]; then
+    RESULTS_REL="${RESULTS_LINE#results: }"
   fi
 fi
-if [[ -z "\$RESULTS_REL" ]]; then
-  RESULTS_REL="\$(python3 - <<'PY'
+if [[ -z "$RESULTS_REL" ]]; then
+  RESULTS_REL="$(python3 - <<'PY'
 import json
 from pathlib import Path
 root = Path("outputs")
@@ -910,21 +1100,21 @@ PY
 )" || die "could not locate results directory after eval"
 fi
 
-RESULTS_DIR="\$SELF_DIR/environments/pretrain_data_curator/\${RESULTS_REL}"
-[[ -d "\$RESULTS_DIR" ]] || die "results dir missing: \$RESULTS_DIR"
-[[ -s "\$RESULTS_DIR/results.jsonl" ]] || die "results.jsonl empty in \$RESULTS_DIR"
+RESULTS_DIR="$SELF_DIR/environments/pretrain_data_curator/${RESULTS_REL}"
+[[ -d "$RESULTS_DIR" ]] || die "results dir missing: $RESULTS_DIR"
+[[ -s "$RESULTS_DIR/results.jsonl" ]] || die "results.jsonl empty in $RESULTS_DIR"
 # Bundle results + eval log OUTSIDE SELF_DIR so EXIT trap can wipe staging
 # (including secrets.env) after the result tar is fully written to stdout.
-BUNDLE="\$(mktemp -d "\${TMPDIR:-/tmp}/wcg-mc-results.XXXXXX")"
-cp -a "\$RESULTS_DIR/." "\$BUNDLE/"
-cp -f "\$LOG_FILE" "\$BUNDLE/eval-stream.log"
+BUNDLE="$(mktemp -d "${TMPDIR:-/tmp}/wcg-mc-results.XXXXXX")"
+cp -a "$RESULTS_DIR/." "$BUNDLE/"
+cp -f "$LOG_FILE" "$BUNDLE/eval-stream.log"
 log "Emitting result archive on stdout (logs were on stderr)"
 # stdout ONLY: the result tar. No log lines after this.
-tar -czf - -C "\$BUNDLE" .
-RC=\$?
-rm -rf -- "\$BUNDLE"
+tar -czf - -C "$BUNDLE" .
+RC=$?
+rm -rf -- "$BUNDLE"
 # EXIT trap removes SELF_DIR (secrets) after artifacts are already on stdout.
-exit "\$RC"
+exit "$RC"
 EOF
   chmod 700 "$dest"
 }
@@ -1014,17 +1204,17 @@ EOF
 
 remote_provision_cpu() {
   log "Provisioning CPU pod software stack (uv, py3.12, decon, webcurator-runtime)"
-  remote bash -s <<'REMOTE'
+  {
+  cat <<'REMOTE'
 set -euo pipefail
 [ "$(id -u)" = "0" ] && REMOTE_ROOT=/root || REMOTE_ROOT=/home/$(whoami)
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 exec > $REMOTE_ROOT/wcg-provision.log 2>&1
 
-echo "=== Docker (agent harness runtime; no GPU) ==="
-if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | sh
-fi
-systemctl start docker || true
+REMOTE
+  wcg_emit_docker_provision_bash
+  cat <<'REMOTE'
+wcg_provision_docker 0
 
 echo "=== uv + python env ==="
 if ! command -v uv >/dev/null 2>&1; then
@@ -1065,11 +1255,13 @@ docker run --rm -w /workspace webcurator-runtime:latest bash -lc \
 
 echo "=== PROVISION DONE ==="
 REMOTE
+} | remote bash -s
 }
 
 remote_provision_gpu() {
   log "Provisioning pod software stack (docker, uv, py3.12, decon)"
-  remote bash -s <<'REMOTE'
+  {
+  cat <<'REMOTE'
 set -euo pipefail
 [ "$(id -u)" = "0" ] && REMOTE_ROOT=/root || REMOTE_ROOT=/home/$(whoami)
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
@@ -1078,26 +1270,10 @@ exec > $REMOTE_ROOT/wcg-provision.log 2>&1
 echo "=== GPU ==="
 nvidia-smi -L
 
-echo "=== Docker ==="
-if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | sh
-fi
-systemctl start docker || true
-
-echo "=== NVIDIA container toolkit ==="
-if ! command -v nvidia-ctk >/dev/null 2>&1; then
-  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-  curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-  apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit
-fi
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
-
-echo "=== GPU docker smoke + base image pull ==="
-docker pull pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
-docker run --rm --gpus all pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime nvidia-smi -L
+REMOTE
+  wcg_emit_docker_provision_bash
+  cat <<'REMOTE'
+wcg_provision_docker 1
 
 echo "=== uv + python env ==="
 if ! command -v uv >/dev/null 2>&1; then
@@ -1144,6 +1320,7 @@ docker run --rm --gpus all webcurator-runtime:latest nvidia-smi -L
 
 echo "=== PROVISION DONE ==="
 REMOTE
+} | remote bash -s
 }
 
 run_remote_eval() {
