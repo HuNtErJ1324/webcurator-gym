@@ -36,6 +36,9 @@ include = [
 num_examples = 1
 rollouts_per_example = 1
 
+[project.scripts]
+pdc-debug-train = "pretrain_data_curator.debug_train:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
