@@ -1552,6 +1552,150 @@ def test_400m_a100_massedcompute_cleanup_never_logs_secrets():
     assert "cat \"$SECRETS" not in runner
 
 
+def test_400m_a100_massedcompute_real_driver_bash_n_and_stage_trap(tmp_path):
+    """Write/extract the REAL generated driver; bash -n + EXIT wipe of secrets stage.
+
+    Catches nested-heredoc/escaping bugs that a stub driver would miss. Also
+    proves cleanup_stage removes SELF_DIR (secrets) on exit without touching an
+    already-exported result bundle outside the stage (keep-pod safe).
+    """
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    writer_body = _extract_bash_function(a100, "write_massedcompute_single_shell_driver")
+    assert "trap cleanup_stage EXIT" in writer_body
+    assert "rm -rf --" in writer_body
+    assert "wcg-mc-results" in writer_body  # external bundle, not under SELF_DIR
+
+    dest = tmp_path / "wcg_single_shell_driver.sh"
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            "CURATION_ONLY=0",
+            'MODEL="deepseek/deepseek-v4-pro"',
+            'EVAL_CONFIG="configs/eval/400M-300turn-codex.toml"',
+            'RUN_NAME="test-run"',
+            "write_massedcompute_single_shell_driver() {",
+            writer_body,
+            "}",
+            f'write_massedcompute_single_shell_driver "{dest}"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert dest.is_file()
+    assert (dest.stat().st_mode & 0o700) == 0o700
+    driver_text = dest.read_text(encoding="utf-8")
+    # Real driver — not a stub.
+    assert "nvidia-smi" in driver_text or "CURATION_ONLY" in driver_text
+    assert "trap cleanup_stage EXIT" in driver_text
+    assert "uv run eval" in driver_text
+    assert "tar -czf -" in driver_text
+    assert ">&2" in driver_text
+    # Nested python heredoc survived generation.
+    assert "from pathlib import Path" in driver_text
+    assert "results.jsonl" in driver_text
+    # Secret values must not appear in the generated driver source.
+    assert "hf-test-secret" not in driver_text
+    assert built.stderr == "" or "FATAL" not in built.stderr
+
+    syntax = subprocess.run(
+        ["bash", "-n", str(dest)],
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    # Also bash -n after a tar round-trip (as on the remote extract path).
+    archive = tmp_path / "driver-only.tar.gz"
+    stage = tmp_path / "stage-roundtrip"
+    stage.mkdir()
+    (stage / "wcg_single_shell_driver.sh").write_bytes(dest.read_bytes())
+    (stage / "wcg_single_shell_driver.sh").chmod(0o700)
+    (stage / "secrets.env").write_text(
+        "HF_TOKEN=hf-roundtrip-secret\nPRIME_API_KEY=prime-roundtrip\n",
+        encoding="utf-8",
+    )
+    (stage / "secrets.env").chmod(0o600)
+    subprocess.run(
+        ["tar", "-czf", str(archive), "-C", str(stage), "."],
+        check=True,
+    )
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    subprocess.run(
+        ["tar", "-xzf", str(archive), "-C", str(extracted)],
+        check=True,
+    )
+    extracted_driver = extracted / "wcg_single_shell_driver.sh"
+    assert extracted_driver.is_file()
+    roundtrip = subprocess.run(
+        ["bash", "-n", str(extracted_driver)],
+        capture_output=True,
+        text=True,
+    )
+    assert roundtrip.returncode == 0, roundtrip.stderr
+
+    # Simulate EXIT trap: wipe SELF_DIR after exporting results to an external bundle.
+    self_dir = tmp_path / "remote-stage"
+    self_dir.mkdir()
+    (self_dir / "secrets.env").write_text(
+        "HF_TOKEN=hf-trap-secret\nPRIME_API_KEY=prime-trap\n", encoding="utf-8"
+    )
+    (self_dir / "secrets.env").chmod(0o600)
+    (self_dir / "keep-marker").write_text("x\n", encoding="utf-8")
+    external_bundle = tmp_path / "exported-results"
+    external_bundle.mkdir()
+    (external_bundle / "results.jsonl").write_text('{"ok":true}\n', encoding="utf-8")
+    trap_sim = "\n".join(
+        [
+            "set -euo pipefail",
+            f'SELF_DIR="{self_dir}"',
+            "cleanup_stage() {",
+            '  if [[ -n "${SELF_DIR:-}" && -d "$SELF_DIR" ]]; then',
+            '    rm -rf -- "$SELF_DIR" >/dev/null 2>&1 || true',
+            "  fi",
+            "}",
+            "trap cleanup_stage EXIT",
+            # Mimic success path: artifacts already outside SELF_DIR, then exit 0.
+            f'test -f "{external_bundle}/results.jsonl"',
+            "exit 0",
+        ]
+    )
+    sim = subprocess.run(
+        ["bash", "-c", trap_sim],
+        capture_output=True,
+        text=True,
+    )
+    assert sim.returncode == 0, sim.stderr
+    assert not self_dir.exists(), "EXIT trap must remove staging dir with secrets"
+    assert (external_bundle / "results.jsonl").read_text(encoding="utf-8") == '{"ok":true}\n'
+
+    # Failure path: nonzero exit still wipes secrets stage.
+    self_dir2 = tmp_path / "remote-stage-fail"
+    self_dir2.mkdir()
+    (self_dir2 / "secrets.env").write_text("HF_TOKEN=hf-fail\n", encoding="utf-8")
+    fail_sim = "\n".join(
+        [
+            "set -euo pipefail",
+            f'SELF_DIR="{self_dir2}"',
+            "cleanup_stage() {",
+            '  if [[ -n "${SELF_DIR:-}" && -d "$SELF_DIR" ]]; then',
+            '    rm -rf -- "$SELF_DIR" >/dev/null 2>&1 || true',
+            "  fi",
+            "}",
+            "trap cleanup_stage EXIT",
+            "exit 9",
+        ]
+    )
+    fail = subprocess.run(["bash", "-c", fail_sim], capture_output=True, text=True)
+    assert fail.returncode == 9
+    assert not self_dir2.exists()
+
+
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
 def test_load_environment_uses_one_initial_prompt_for_all_harnesses(
     monkeypatch, harness_id

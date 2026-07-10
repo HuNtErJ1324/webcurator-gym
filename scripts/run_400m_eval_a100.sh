@@ -769,6 +769,18 @@ log() { printf '[remote %s] %s\n' "\$(date -u +%H:%M:%S)" "\$*" >&2; }
 die() { log "FATAL: \$*"; exit 1; }
 
 SELF_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+# Wipe the staging tree (secrets.env + checkout) on every exit — success,
+# failure, or local --keep-pod (pod may remain; secrets must not). Result
+# artifacts are copied to an external mktemp BUNDLE before stdout export, so
+# this never deletes the result tar payload mid-stream.
+cleanup_stage() {
+  # Preserve the driver's exit status: do not `exit`/`return` nonzero from here.
+  if [[ -n "\${SELF_DIR:-}" && -d "\$SELF_DIR" ]]; then
+    rm -rf -- "\$SELF_DIR" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_stage EXIT
+
 export PATH="\$SELF_DIR/environments/pretrain_data_curator/decon/bin:\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
 cd "\$SELF_DIR"
 
@@ -899,15 +911,17 @@ fi
 RESULTS_DIR="\$SELF_DIR/environments/pretrain_data_curator/\${RESULTS_REL}"
 [[ -d "\$RESULTS_DIR" ]] || die "results dir missing: \$RESULTS_DIR"
 [[ -s "\$RESULTS_DIR/results.jsonl" ]] || die "results.jsonl empty in \$RESULTS_DIR"
-# Bundle results + eval log for local persistence (still no secrets).
-BUNDLE="\$(mktemp -d)"
+# Bundle results + eval log OUTSIDE SELF_DIR so EXIT trap can wipe staging
+# (including secrets.env) after the result tar is fully written to stdout.
+BUNDLE="\$(mktemp -d "\${TMPDIR:-/tmp}/wcg-mc-results.XXXXXX")"
 cp -a "\$RESULTS_DIR/." "\$BUNDLE/"
 cp -f "\$LOG_FILE" "\$BUNDLE/eval-stream.log"
 log "Emitting result archive on stdout (logs were on stderr)"
 # stdout ONLY: the result tar. No log lines after this.
 tar -czf - -C "\$BUNDLE" .
 RC=\$?
-rm -rf "\$BUNDLE"
+rm -rf -- "\$BUNDLE"
+# EXIT trap removes SELF_DIR (secrets) after artifacts are already on stdout.
 exit "\$RC"
 EOF
   chmod 700 "$dest"
