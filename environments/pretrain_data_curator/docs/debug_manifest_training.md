@@ -79,6 +79,17 @@ A console script alias is also installed: `pdc-debug-train` (same arguments).
   `token_budget` disagrees with the bundle, `resolve_corpus` raises
   `ManifestMismatchError` — a stale/wrong bundle is never silently reused. Use
   `--expected-token-budget` to assert the budget explicitly.
+- **Explicit positive token-budget validation.** `validate_token_budget` rejects
+  a non-positive or non-integer `token_budget` (raising `TokenBudgetError`)
+  before any curation or training, in addition to the manifest schema's own
+  `gt=0` gate.
+- **Unsafe output directories are rejected before deletion/overwrite.**
+  `validate_output_dir` refuses the filesystem root (`/`), protected system
+  directories (`/etc`, `/usr`, `/var`, ...), the current working directory (or
+  its ancestor), and the curation source `base_dir` (or its ancestor) as an
+  output/bundle path — raising `UnsafeOutputError` *before* any file is deleted
+  or overwritten. Pass an ordinary subdirectory (e.g. the defaults
+  `./pdc-debug-bundle` / `./pdc-debug-out`) to proceed.
 - **Exact corpus handoff.** The trainer trains on the tokens of the bundle's
   `corpus.txt` (GPT-2-BPE, then a tail `val_fraction` split). No other data is
   ever fed to the trainer.

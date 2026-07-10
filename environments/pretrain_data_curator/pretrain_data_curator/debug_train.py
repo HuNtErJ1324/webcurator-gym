@@ -20,6 +20,15 @@ reproducible local debug loop:
    sandbox script) on CPU with a small bounded budget, writing a clear result
    dir. The handoff is exact: the trainer sees the tokens of ``corpus.txt``.
 
+**Safety gates (failure is loud, before any side effect):**
+- ``validate_token_budget`` rejects a non-positive / non-integer manifest
+  token budget with :class:`TokenBudgetError`.
+- ``validate_output_dir`` rejects output/bundle directories that would be
+  destructive to clear or overwrite — the filesystem root, protected system
+  dirs (``/etc``, ``/usr``, ``/var`` ...), the current working directory (or
+  its ancestor), and the source ``base_dir`` (or its ancestor) — with
+  :class:`UnsafeOutputError`, *before* any file is deleted or overwritten.
+
 Nothing here touches production 400M configs, provider/launcher code, pods,
 Hub benchmarks, or external state. Local sources are read directly from disk
 through a tiny ``LocalProcessRuntime`` that emulates the ``wc -c`` / ``head -c``
@@ -85,6 +94,45 @@ class BundleError(DebugError):
     """The bundle directory is missing expected artifacts or is unusable."""
 
 
+class TokenBudgetError(DebugError):
+    """The manifest token budget is missing, non-positive, or otherwise invalid."""
+
+
+class UnsafeOutputError(DebugError):
+    """The output/bundle directory is unsafe to clear or overwrite.
+
+    Raised *before* any file is deleted, overwritten, or created so a wrong
+    path can never destroy the workspace, system dirs, or source data.
+    """
+
+
+# Smallest token budget the curation path can meaningfully satisfy. Kept as an
+# explicit, debug-layer floor on top of the schema's ``gt=0`` so a budget that
+# slips past model construction is still rejected with a clear message.
+MIN_TOKEN_BUDGET = 1
+
+# Absolute filesystem roots whose contents must never be cleared/overwritten by
+# the debug workflow. Exactly these paths, or any path *under* them, are
+# rejected before any deletion/overwrite. ``/`` is treated exact-only so normal
+# subpaths (``/tmp/...``, ``/home/...``) remain usable.
+UNSAFE_OUTPUT_ROOTS = frozenset(
+    {
+        Path("/"),
+        Path("/etc"),
+        Path("/usr"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/boot"),
+        Path("/sys"),
+        Path("/proc"),
+        Path("/dev"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/var"),
+    }
+)
+
+
 # --------------------------------------------------------------------------- #
 # Manifest identity / provenance
 # --------------------------------------------------------------------------- #
@@ -106,6 +154,69 @@ def source_fingerprint(manifest: Manifest) -> list[dict[str, Any]]:
     ]
 
 
+def validate_token_budget(budget: int) -> int:
+    """Reject a non-positive or non-integer manifest token budget.
+
+    This is an explicit, debug-layer positive-budget gate. It runs in addition
+    to the schema's ``gt=0`` so a degenerate budget is caught with a clear,
+    debug-specific error even if a manifest is built via ``model_construct`` or
+    otherwise bypasses schema validation.
+    """
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        raise TokenBudgetError(
+            f"token_budget must be an int, got {type(budget).__name__}"
+        )
+    if budget < MIN_TOKEN_BUDGET:
+        raise TokenBudgetError(
+            f"token_budget must be a positive integer (>= {MIN_TOKEN_BUDGET}), "
+            f"got {budget}"
+        )
+    return budget
+
+
+def validate_output_dir(path: Path, *, base_dir: Path | None = None) -> Path:
+    """Reject output/bundle directories that would be destructive to clear.
+
+    The caller must run this *before* deleting files, overwriting artifacts, or
+    creating the directory. A path is rejected when it is:
+
+    - the filesystem root (``/``) or inside a protected system root
+      (``/etc``, ``/usr``, ``/bin``, ...);
+    - the current working directory or an ancestor of it (would wipe the
+      project);
+    - equal to ``base_dir`` or an ancestor of it (would wipe curation sources).
+
+    A safe, resolved path is returned on success.
+    """
+    path = Path(path).resolve()
+    cwd = Path.cwd().resolve()
+
+    if path == Path("/"):
+        raise UnsafeOutputError(
+            f"refusing to use filesystem root as output directory: {path}"
+        )
+    for root in UNSAFE_OUTPUT_ROOTS:
+        if root == Path("/"):
+            continue
+        if path == root or root in path.parents:
+            raise UnsafeOutputError(
+                f"refusing to use protected system directory as output: {path}"
+            )
+    if path == cwd or path in cwd.parents:
+        raise UnsafeOutputError(
+            f"refusing to use the current working directory (or its ancestor) "
+            f"as output: {path}"
+        )
+    if base_dir is not None:
+        base_dir = Path(base_dir).resolve()
+        if path == base_dir or path in base_dir.parents:
+            raise UnsafeOutputError(
+                f"refusing to use the source base directory (or its ancestor) "
+                f"as output: {path}"
+            )
+    return path
+
+
 def load_manifest(path: Path) -> Manifest:
     """Read and validate an explicit manifest file."""
     path = Path(path)
@@ -113,9 +224,22 @@ def load_manifest(path: Path) -> Manifest:
         raise ManifestValidationError(f"manifest not found: {path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return Manifest.model_validate(data)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, OSError) as exc:
         raise ManifestValidationError(f"invalid manifest {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ManifestValidationError(
+            f"invalid manifest {path}: expected a JSON object"
+        )
+    # Explicit positive budget gate before schema validation so a degenerate
+    # budget fails with TokenBudgetError rather than a generic schema error.
+    if "token_budget" in data:
+        validate_token_budget(data["token_budget"])
+    try:
+        manifest = Manifest.model_validate(data)
+    except ValueError as exc:
+        raise ManifestValidationError(f"invalid manifest {path}: {exc}") from exc
+    validate_token_budget(manifest.token_budget)
+    return manifest
 
 
 def bundle_paths(bundle_dir: Path) -> dict[str, Path]:
@@ -184,7 +308,10 @@ class LocalProcessRuntime:
 
     def _resolve(self, raw: str) -> Path:
         path = (self.base_dir / raw).resolve()
-        if self.base_dir.resolve() not in path.parents and path != self.base_dir.resolve():
+        if (
+            self.base_dir.resolve() not in path.parents
+            and path != self.base_dir.resolve()
+        ):
             raise FileNotFoundError(f"path escapes base_dir: {raw}")
         return path
 
@@ -195,9 +322,7 @@ class LocalProcessRuntime:
             if command[:2] == ["wc", "-c"] and "<" in command:
                 path = self._resolve(command[command.index("<") + 1])
                 size = path.stat().st_size
-                return types.SimpleNamespace(
-                    exit_code=0, stdout=f"{size}\n", stderr=""
-                )
+                return types.SimpleNamespace(exit_code=0, stdout=f"{size}\n", stderr="")
             if command[:2] == ["head", "-c"]:
                 cap = int(command[2])
                 path = self._resolve(command[-1])
@@ -230,6 +355,7 @@ def materialize_bundle(
     and ``provenance.json`` into ``bundle_dir``.
     """
     bundle_dir = Path(bundle_dir)
+    validate_output_dir(bundle_dir, base_dir=base_dir)
     bundle_dir.mkdir(parents=True, exist_ok=True)
     if runtime is None:
         runtime = LocalProcessRuntime(base_dir)
@@ -296,11 +422,18 @@ def resolve_corpus(
       :class:`ManifestMismatchError` *before* any training/curation.
     """
     bundle_dir = Path(bundle_dir)
+    # Validate the manifest's positive budget early (defense-in-depth beyond the
+    # schema), and refuse to touch an unsafe bundle directory before any write.
+    validate_token_budget(manifest.token_budget)
+    validate_output_dir(bundle_dir, base_dir=materialize_kwargs.get("base_dir"))
     bundle_dir.mkdir(parents=True, exist_ok=True)
     paths = bundle_paths(bundle_dir)
     provenance_path = paths["provenance"]
 
-    if expected_token_budget is not None and manifest.token_budget != expected_token_budget:
+    if (
+        expected_token_budget is not None
+        and manifest.token_budget != expected_token_budget
+    ):
         raise ManifestMismatchError(
             f"manifest token_budget {manifest.token_budget} != "
             f"expected {expected_token_budget}"
@@ -391,9 +524,13 @@ def prepare_training_data(
     )
     if documents is None:
         if eos_aligned_batches:
-            raise ValueError("EOS-aligned training requires document-list-v1 corpus data")
+            raise ValueError(
+                "EOS-aligned training requires document-list-v1 corpus data"
+            )
         documents = [raw]
-    if not isinstance(documents, list) or not all(isinstance(doc, str) for doc in documents):
+    if not isinstance(documents, list) or not all(
+        isinstance(doc, str) for doc in documents
+    ):
         raise ValueError("invalid document-list-v1 corpus data")
     ids, encoded_ranges = encode_document_tokens(documents, enc, max_document_tokens)
     document_ranges = encoded_ranges if eos_aligned_batches else None
@@ -401,7 +538,9 @@ def prepare_training_data(
     n_val = max(1, int(len(corpus) * val_fraction))
     train_data, val_data = corpus[:-n_val], corpus[-n_val:]
     if document_ranges is not None:
-        document_ranges = [bounds for bounds in document_ranges if bounds[1] <= len(train_data)]
+        document_ranges = [
+            bounds for bounds in document_ranges if bounds[1] <= len(train_data)
+        ]
     return train_data, val_data, document_ranges
 
 
@@ -471,14 +610,19 @@ def train_debug(
     tokenizer: str = "gpt2",
     device: str = "cpu",
     clear_output: bool = True,
+    base_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Train on the bundle's ``corpus.txt`` with a bounded CPU budget.
 
     Returns the result dict and writes ``result.json`` into ``output_dir``. The
     ``train_fn`` is injectable (defaults to the real ``averaged_train_and_eval``)
     so tests can record the exact corpus handed off.
+
+    The output directory is validated *before* any file is deleted or overwritten
+    so a destructive path can never wipe the workspace, system dirs, or sources.
     """
     output_dir = Path(output_dir)
+    validate_output_dir(output_dir, base_dir=base_dir)
     if output_dir.exists() and clear_output:
         for child in output_dir.iterdir():
             if child.is_file():
@@ -605,7 +749,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Fail if the manifest token_budget differs from this value.",
     )
-    parser.add_argument("--no-train", action="store_true", help="Only materialize; skip training.")
+    parser.add_argument(
+        "--no-train", action="store_true", help="Only materialize; skip training."
+    )
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -636,7 +782,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if args.expected_token_budget is not None and manifest.token_budget != args.expected_token_budget:
+    if (
+        args.expected_token_budget is not None
+        and manifest.token_budget != args.expected_token_budget
+    ):
         print(
             f"error: manifest token_budget {manifest.token_budget} != "
             f"--expected-token-budget {args.expected_token_budget}",
@@ -652,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_token_budget=args.expected_token_budget,
             base_dir=args.base_dir,
         )
-    except (ManifestMismatchError, BundleError, ManifestValidationError) as exc:
+    except DebugError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -674,7 +823,9 @@ def main(argv: list[str] | None = None) -> int:
         val_fraction=args.val_fraction,
     )
     try:
-        result = train_debug(corpus_path, args.output_dir, config)
+        result = train_debug(
+            corpus_path, args.output_dir, config, base_dir=args.base_dir
+        )
     except DebugError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

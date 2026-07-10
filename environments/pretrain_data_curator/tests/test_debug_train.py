@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 import tiktoken
@@ -17,12 +18,16 @@ import torch
 
 from pretrain_data_curator.debug_train import (
     ManifestMismatchError,
+    TokenBudgetError,
+    UnsafeOutputError,
     build_debug_config,
     load_manifest,
     materialize_bundle,
     prepare_training_data,
     resolve_corpus,
     train_debug,
+    validate_output_dir,
+    validate_token_budget,
 )
 from pretrain_data_curator.models import Manifest, Source
 
@@ -57,7 +62,9 @@ def _make_sources(base_dir, *, docs_a, docs_b):
     ]
 
 
-def _make_manifest(base_dir, *, budget=10_000, docs_a=("alpha", "beta"), docs_b=("gamma", "delta")):
+def _make_manifest(
+    base_dir, *, budget=10_000, docs_a=("alpha", "beta"), docs_b=("gamma", "delta")
+):
     sources = _make_sources(base_dir, docs_a=docs_a, docs_b=docs_b)
     return Manifest(token_budget=budget, sources=sources)
 
@@ -69,7 +76,9 @@ class _Recorder:
 
     def __call__(self, manifest, bundle_dir, **kwargs):
         self.calls += 1
-        return materialize_bundle(manifest, bundle_dir, base_dir=self.base_dir, **kwargs)
+        return materialize_bundle(
+            manifest, bundle_dir, base_dir=self.base_dir, **kwargs
+        )
 
 
 @pytest.fixture
@@ -91,6 +100,206 @@ def test_load_manifest_rejects_bad_schema(tmp_path):
     bad = _write(tmp_path / "bad.json", '{"token_budget": -5, "sources": []}')
     with pytest.raises(Exception):
         load_manifest(bad)
+
+
+# --------------------------------------------------------------------------- #
+# Hardening: explicit positive token-budget validation
+# --------------------------------------------------------------------------- #
+def test_validate_token_budget_rejects_non_positive():
+    for bad in (0, -1, -100):
+        with pytest.raises(TokenBudgetError):
+            validate_token_budget(bad)
+
+
+def test_validate_token_budget_rejects_non_int():
+    for bad in (True, False, 1.0, "20000", None):
+        with pytest.raises(TokenBudgetError):
+            validate_token_budget(bad)
+
+
+def test_validate_token_budget_accepts_positive():
+    assert validate_token_budget(1) == 1
+    assert validate_token_budget(20_000) == 20_000
+
+
+def test_load_manifest_rejects_zero_token_budget(tmp_path):
+    bad = _write(tmp_path / "bad.json", '{"token_budget": 0, "sources": []}')
+    with pytest.raises(TokenBudgetError):
+        load_manifest(bad)
+
+
+def test_load_manifest_rejects_negative_token_budget(tmp_path):
+    bad = _write(tmp_path / "bad.json", '{"token_budget": -5, "sources": []}')
+    with pytest.raises(TokenBudgetError):
+        load_manifest(bad)
+
+
+def test_load_manifest_rejects_bool_token_budget(tmp_path):
+    bad = _write(tmp_path / "bad.json", '{"token_budget": true, "sources": []}')
+    with pytest.raises(TokenBudgetError):
+        load_manifest(bad)
+
+
+def test_load_manifest_accepts_positive_token_budget(tmp_path):
+    good = _write(
+        tmp_path / "good.json",
+        '{"token_budget": 20000, "sources": []}',
+    )
+    manifest = load_manifest(good)
+    assert manifest.token_budget == 20000
+
+
+@pytest.mark.asyncio
+async def test_resolve_corpus_rejects_non_positive_budget_before_materialize(
+    base_dir, tmp_path
+):
+    # Bypass schema gt=0 so the debug-layer gate is what rejects the budget.
+    manifest = Manifest.model_construct(token_budget=0, sources=[])
+    calls = {"n": 0}
+
+    def boom(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError("materialize must not run for an invalid budget")
+
+    with pytest.raises(TokenBudgetError):
+        await asyncio.to_thread(
+            resolve_corpus,
+            manifest,
+            tmp_path / "bundle",
+            materialize_fn=boom,
+            base_dir=base_dir,
+        )
+    assert calls["n"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Hardening: reject unsafe/destructive output directories before any deletion
+# --------------------------------------------------------------------------- #
+def test_validate_output_dir_rejects_system_roots():
+    for unsafe in (Path("/"), Path("/etc"), Path("/usr/bin"), Path("/var/log")):
+        with pytest.raises(UnsafeOutputError):
+            validate_output_dir(unsafe)
+
+
+def test_validate_output_dir_rejects_cwd_and_ancestor(monkeypatch, tmp_path):
+    nested = tmp_path / "proj"
+    nested.mkdir()
+    monkeypatch.chdir(nested)
+    with pytest.raises(UnsafeOutputError):
+        validate_output_dir(Path.cwd())
+    # Ancestor of cwd would wipe the project tree.
+    with pytest.raises(UnsafeOutputError):
+        validate_output_dir(tmp_path)
+
+
+def test_validate_output_dir_rejects_base_dir_collision(tmp_path):
+    base = tmp_path / "ws"
+    base.mkdir()
+    out = base  # output == source root must be rejected
+    with pytest.raises(UnsafeOutputError):
+        validate_output_dir(out, base_dir=base)
+    # output above the source root (ancestor) must also be rejected
+    with pytest.raises(UnsafeOutputError):
+        validate_output_dir(tmp_path, base_dir=base)
+
+
+def test_validate_output_dir_allows_safe_subdir(tmp_path):
+    out = tmp_path / "pdc-debug-out"
+    assert validate_output_dir(out) == out.resolve()
+    assert validate_output_dir(out, base_dir=tmp_path / "ws") == out.resolve()
+    # A subdirectory under base_dir is allowed (defaults live under the workspace).
+    under = tmp_path / "ws" / "pdc-debug-out"
+    assert validate_output_dir(under, base_dir=tmp_path / "ws") == under.resolve()
+
+
+@pytest.mark.asyncio
+async def test_train_debug_rejects_unsafe_output_before_deletion(monkeypatch, tmp_path):
+    corpus_path = _write(
+        tmp_path / "corpus.txt",
+        json.dumps({"format": "document-list-v1", "documents": ["alpha"]}),
+    )
+    config = build_debug_config(steps=3, block_size=16, batch_size=2)
+    marker = tmp_path / "keep_me.txt"
+    marker.write_text("alive", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    trained = {"n": 0}
+
+    def fake_train(*args, **kwargs):
+        trained["n"] += 1
+        raise AssertionError("train_fn must not run for an unsafe output dir")
+
+    # CWD is unsafe: rejection must happen before clearing marker or training.
+    with pytest.raises(UnsafeOutputError):
+        await asyncio.to_thread(
+            train_debug, corpus_path, tmp_path, config, train_fn=fake_train
+        )
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "alive"
+    assert trained["n"] == 0
+
+    # Protected system path is also rejected before any side effect.
+    with pytest.raises(UnsafeOutputError):
+        await asyncio.to_thread(
+            train_debug, corpus_path, Path("/etc"), config, train_fn=fake_train
+        )
+    assert trained["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_corpus_rejects_unsafe_bundle_before_materialize(
+    base_dir, manifest, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "keep_me.txt"
+    marker.write_text("alive", encoding="utf-8")
+    calls = {"n": 0}
+
+    def boom(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError("materialize must not run for an unsafe bundle dir")
+
+    with pytest.raises(UnsafeOutputError):
+        await asyncio.to_thread(
+            resolve_corpus,
+            manifest,
+            tmp_path,  # cwd / base-dir ancestor hazard
+            materialize_fn=boom,
+            base_dir=base_dir,
+        )
+    assert calls["n"] == 0
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "alive"
+
+
+@pytest.mark.asyncio
+async def test_train_debug_safe_output_is_cleared_then_written(
+    base_dir, manifest, tmp_path
+):
+    bundle_dir = tmp_path / "bundle"
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    (output_dir / "stale.json").write_text("old", encoding="utf-8")
+
+    recorder = _Recorder(base_dir)
+    cp, prov, _ = await asyncio.to_thread(
+        resolve_corpus, manifest, bundle_dir, materialize_fn=recorder
+    )
+
+    def fake_train(build_model, train_data, val_data, **kwargs):
+        return (3.0, 0.5, 0.0, int(len(train_data)), 1_000_000)
+
+    result = await asyncio.to_thread(
+        train_debug,
+        cp,
+        output_dir,
+        build_debug_config(steps=3, block_size=16, batch_size=2),
+        train_fn=fake_train,
+    )
+    # stale file cleared, fresh result written
+    assert not (output_dir / "stale.json").exists()
+    assert (output_dir / "result.json").is_file()
+    assert result["loss"] == 3.0
 
 
 @pytest.mark.asyncio
@@ -117,7 +326,9 @@ async def test_cache_hit_does_not_recurate(base_dir, manifest, tmp_path):
 async def test_mismatch_rejected_before_training(base_dir, manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     recorder = _Recorder(base_dir)
-    await asyncio.to_thread(resolve_corpus, manifest, bundle_dir, materialize_fn=recorder)
+    await asyncio.to_thread(
+        resolve_corpus, manifest, bundle_dir, materialize_fn=recorder
+    )
 
     # A genuinely different manifest (different budget + source set) -> different
     # digest -> must be rejected before any curation/training (never silently reused).
@@ -135,7 +346,9 @@ async def test_mismatch_rejected_before_training(base_dir, manifest, tmp_path):
         ],
     )
     with pytest.raises(ManifestMismatchError):
-        await asyncio.to_thread(resolve_corpus, other, bundle_dir, materialize_fn=_Recorder(base_dir))
+        await asyncio.to_thread(
+            resolve_corpus, other, bundle_dir, materialize_fn=_Recorder(base_dir)
+        )
 
 
 @pytest.mark.asyncio
@@ -152,7 +365,9 @@ async def test_explicit_refresh_recurates(base_dir, manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     recorder = _Recorder(base_dir)
 
-    await asyncio.to_thread(resolve_corpus, manifest, bundle_dir, materialize_fn=recorder)
+    await asyncio.to_thread(
+        resolve_corpus, manifest, bundle_dir, materialize_fn=recorder
+    )
     assert recorder.calls == 1
 
     cp, prov, curated = await asyncio.to_thread(
