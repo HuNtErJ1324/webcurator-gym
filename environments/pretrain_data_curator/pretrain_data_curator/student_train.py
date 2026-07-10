@@ -22,7 +22,7 @@ Legacy recipe (**``record_01_adamw``**) remains for fast CPU tests:
 Portable features (all opt-in):
 
 * **EoS-aligned batch starts** — align training windows to end-of-sequence markers.
-* **Max document length handling** — split over-long documents.
+* **Max document length handling** — reject over-long documents explicitly.
 * **True 2-step gradient accumulation** — accumulate embed+lm_head grads before update.
 * **True max seq length schedule** — warm up sequence length from small to max.
 * **Multi-token prediction** — auxiliary future-token prediction losses.
@@ -83,23 +83,29 @@ def plan_train_windows(n_tokens, block):
 
 
 def encode_document_tokens(documents, encoder, max_document_tokens=None):
-    """Encode source documents with a leading EOT/BOS and exact token ranges.
+    """Build the official FineWeb document token stream and exact ranges.
 
-    Each returned half-open range covers one real source document, including its
-    leading boundary token. Blank and embedded-newline documents remain distinct;
-    no text delimiter is interpreted as structure.
+    KellerJordan/modded-nanogpt prefixes every source document, including an empty
+    one, with the GPT-2 EOT token 50256 and then appends
+    ``encoder.encode_ordinary(document)``. No text delimiter represents a boundary.
+    ``max_document_tokens`` is an explicit per-document validation limit (including
+    EOT); over-long documents are rejected rather than truncated.
     """
     token_ids = []
     document_ranges = []
     cap = None if max_document_tokens is None else int(max_document_tokens)
     if cap is not None and cap < 1:
         raise ValueError("max_document_tokens must be positive")
-    for document in documents:
+    for index, document in enumerate(documents):
         start = len(token_ids)
         encoded = list(encoder.encode_ordinary(document))
-        if cap is not None:
-            encoded = encoded[: max(0, cap - 1)]
-        token_ids.append(int(encoder.eot_token))
+        document_tokens = 1 + len(encoded)
+        if cap is not None and document_tokens > cap:
+            raise ValueError(
+                f"document {index} has {document_tokens} tokens including EOT, "
+                f"exceeding max_document_tokens={cap}; documents are never truncated"
+            )
+        token_ids.append(50256)
         token_ids.extend(encoded)
         document_ranges.append((start, len(token_ids)))
     return token_ids, document_ranges

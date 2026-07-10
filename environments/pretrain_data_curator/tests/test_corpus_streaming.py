@@ -236,14 +236,29 @@ def test_document_filter_apply_iter_dedup_exact_preserves_order_and_uniqueness()
     assert f.apply(docs, [FilterSpec(kind="dedup_exact", params={})]) == kept
 
 
-def test_joined_text_preserves_document_list_at_every_cap():
+def test_joined_text_caps_at_whole_document_boundaries():
     docs = ["alpha", "", "a longer beta\n\ndocument", "gamma"]
     corpus = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, docs)])
     for cap in [0, 1, 3, 5, 6, 7, sum(map(len, docs)) - 1, sum(map(len, docs)), 100]:
         payload = json.loads(corpus.joined_text(cap))
         assert payload["format"] == "document-list-v1"
-        assert "".join(payload["documents"]) == "".join(docs)[:cap]
+        expected = []
+        remaining = cap
+        for document in docs:
+            if len(document) > remaining:
+                break
+            expected.append(document)
+            remaining -= len(document)
+        assert payload["documents"] == expected
+        assert sum(map(len, payload["documents"])) <= cap
         assert all(isinstance(document, str) for document in payload["documents"])
+
+    empty_payload = json.loads(
+        CuratedCorpus(
+            sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["", "x"])]
+        ).joined_text(0)
+    )
+    assert empty_payload["documents"] == [""]
 
 
 def test_joined_text_stops_reading_once_cap_is_reached():
@@ -258,8 +273,9 @@ def test_joined_text_stops_reading_once_cap_is_reached():
     corpus = CuratedCorpus(sources=[])
     corpus.iter_documents = _tracking_docs  # type: ignore[method-assign]
     payload = json.loads(corpus.joined_text(250))
-    assert sum(len(document) for document in payload["documents"]) == 250
-    # Only enough documents to cover the cap were pulled from the generator.
+    assert sum(len(document) for document in payload["documents"]) == 200
+    assert all(len(document) == 100 for document in payload["documents"])
+    # One lookahead document establishes that adding it would cross the cap.
     assert len(read_docs) <= 3
 
 

@@ -245,19 +245,18 @@ class CuratedCorpus:
         the payload is tagged JSON rather than blank-line-joined prose. Keeping
         documents as explicit list entries preserves first/blank/embedded-newline
         boundaries and lets the tokenizer insert EOT/BOS without guessing via
-        ``text.split``. ``cap`` bounds source-document characters; the final
-        document may be truncated, but no synthetic boundary is introduced.
+        ``text.split``. ``cap`` bounds source-document characters at whole-document
+        granularity: the longest prefix whose documents fit is serialized, and the
+        first document that would cross the cap stops the stream. Documents are
+        never truncated, so their eventual EOT prefixes cannot be lost or detached.
         """
         documents: list[str] = []
         remaining = max(0, int(cap))
         for doc in self.iter_documents():
-            if remaining == 0:
+            if len(doc) > remaining:
                 break
-            piece = doc[:remaining]
-            documents.append(piece)
-            remaining -= len(piece)
-            if len(piece) < len(doc):
-                break
+            documents.append(doc)
+            remaining -= len(doc)
         return json.dumps(
             {"format": "document-list-v1", "documents": documents},
             ensure_ascii=False,

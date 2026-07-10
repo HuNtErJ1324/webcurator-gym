@@ -464,10 +464,18 @@ def test_real_document_tokenization_preserves_boundaries():
     enc = tiktoken.get_encoding("gpt2")
     documents = ["first", "", "line one\n\nline two"]
     token_ids, ranges = encode_document_tokens(documents, enc)
+    expected = [
+        token
+        for document in documents
+        for token in [50256, *enc.encode_ordinary(document)]
+    ]
 
+    assert token_ids == expected
+    assert token_ids[0] == 50256
+    assert token_ids.count(50256) == len(documents)
     assert len(ranges) == len(documents)
     for (start, end), document in zip(ranges, documents, strict=True):
-        assert token_ids[start] == enc.eot_token
+        assert token_ids[start] == 50256
         assert token_ids[start + 1 : end] == enc.encode_ordinary(document)
     assert ranges[0][0] == 0
     assert ranges[1][1] - ranges[1][0] == 1  # blank document is still explicit
@@ -650,15 +658,14 @@ def test_full_training_with_speedrun_and_nor_muon():
     assert tokens > 0
 
 
-def test_max_document_tokens_truncates_without_synthesizing_boundaries():
+def test_max_document_tokens_rejects_instead_of_splitting_a_document():
     enc = tiktoken.get_encoding("gpt2")
-    token_ids, ranges = encode_document_tokens(
-        ["one " * 100, "two " * 100], enc, max_document_tokens=32
-    )
-    assert ranges == [(0, 32), (32, 64)]
-    assert len(token_ids) == 64
-    starts = plan_eos_aligned_windows(len(token_ids), 16, ranges)
-    assert starts == [0, 32]
+    with pytest.raises(ValueError, match="documents are never truncated"):
+        encode_document_tokens(["one " * 100], enc, max_document_tokens=32)
+
+    token_ids, ranges = encode_document_tokens(["", "short"], enc, max_document_tokens=32)
+    assert token_ids == [50256, 50256, *enc.encode_ordinary("short")]
+    assert ranges == [(0, 1), (1, len(token_ids))]
 
 
 def test_multi_token_pred_targets_shifted_correctly(monkeypatch):
@@ -1158,6 +1165,8 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     assert "plan_train_windows(" in NANOGPT_TRAIN_SCRIPT
     assert "averaged_train_and_eval(" in NANOGPT_TRAIN_SCRIPT
     assert 'text.split("\\n\\n")' not in NANOGPT_TRAIN_SCRIPT
+    assert '"\\n\\n".join(documents)' not in NANOGPT_TRAIN_SCRIPT
+    assert "corpus_ids, encoded_document_ranges = encode_document_tokens(" in NANOGPT_TRAIN_SCRIPT
     assert "flat text cannot recover source document boundaries safely" in NANOGPT_TRAIN_SCRIPT
     # ...and the OLD constant-LR plain-AdamW + random-with-replacement sampler is gone.
     assert "torch.randint(len(src) - block - 1" not in NANOGPT_TRAIN_SCRIPT
