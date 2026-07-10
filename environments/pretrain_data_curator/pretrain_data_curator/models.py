@@ -175,6 +175,15 @@ class ProxyStudentConfig(BaseModel):
     sliding_window_size: int | None = Field(default=None, ge=2)
     block_size: int = Field(default=1024, ge=8, le=8192)
     batch_size: int = Field(default=16, ge=1, le=4096)
+    # Held-out validation microbatch. Separate from training ``batch_size`` so the
+    # final CE pass can stay under the A100-80GB ceiling after Muon/Adam state is
+    # still resident. ``None`` (default) reuses ``batch_size`` for backwards
+    # compatibility; set explicitly (e.g. 1) for large single-GPU runs.
+    val_batch_size: int | None = Field(default=None, ge=1, le=4096)
+    # Max tokens scored per lm_head/softcap chunk during validation. Caps the
+    # (N, vocab) fp32 temporaries without changing mean CE / accuracy semantics.
+    # ``None`` scores a whole microbatch at once (legacy behavior).
+    val_logit_chunk_tokens: int | None = Field(default=None, ge=1, le=1_048_576)
     steps: int = Field(default=200, ge=1, le=100_000)
     # Token-oriented training budget. When set it OVERRIDES ``steps`` (the real
     # training length becomes ``effective_steps`` = ceil(budget / (batch*block))),
@@ -345,6 +354,8 @@ class ProxyStudentConfig(BaseModel):
             "sliding_window_size": self.sliding_window_size,
             "block_size": self.block_size,
             "batch_size": self.batch_size,
+            "val_batch_size": self.val_batch_size,
+            "val_logit_chunk_tokens": self.val_logit_chunk_tokens,
             "steps": self.effective_steps,
             "seed": self.seed,
             "val_fraction": self.val_fraction,

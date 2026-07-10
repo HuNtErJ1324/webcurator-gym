@@ -453,6 +453,24 @@ def test_gpt_multi_token_output_hidden_shape():
     assert out.shape == (2, 8, 64)
 
 
+def test_forward_hidden_and_apply_lm_head_match_forward():
+    """Chunked validation path must be numerically identical to ``forward``."""
+    model = GPT(64, num_layers=4, model_dim=32, num_heads=2).eval()
+    _randomize(model)
+    idx = torch.randint(0, 64, (3, 7))
+    with torch.no_grad():
+        full = model(idx)
+        hidden = model.forward_hidden(idx)
+        rebuilt = model.apply_lm_head(hidden)
+        chunked = torch.cat(
+            [model.apply_lm_head(hidden[i : i + 1]) for i in range(hidden.size(0))],
+            dim=0,
+        )
+    assert hidden.shape == (3, 7, 32)
+    assert torch.allclose(full, rebuilt, atol=1e-6)
+    assert torch.allclose(full, chunked, atol=1e-6)
+
+
 def test_gpt_multi_token_heads_use_hidden_not_logits():
     """The multi-token heads are ``nn.Linear(model_dim, vocab_size)`` so their
     input must be the hidden states (model_dim), not the logits (vocab_size),

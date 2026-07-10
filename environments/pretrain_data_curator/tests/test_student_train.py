@@ -1819,3 +1819,154 @@ def test_non_accum_path_adam_grad_accumulates_across_even_odd_pair(monkeypatch):
         "AdamW.step() must not consume only the odd step's own gradient -- "
         "that would mean the even step's gradient was silently dropped"
     )
+
+
+# --- Held-out validation microbatch / chunked lm_head scoring (A100 OOM fix) -
+
+
+def test_eval_val_loss_respects_microbatch_cap(monkeypatch):
+    """Validation must never forward more than ``batch`` windows at once."""
+    from pretrain_data_curator.student_train import _eval_val_loss
+
+    V, block, n_tokens = 64, 8, 65  # 64 targets -> 8 full-length windows
+    model = _tiny_cfg(V).build().eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    val = torch.randint(0, V, (n_tokens,), dtype=torch.long)
+    seen = []
+    real_forward_hidden = model.forward_hidden
+
+    def capped_forward_hidden(xb, **kwargs):
+        seen.append(int(xb.size(0)))
+        assert xb.size(0) <= 2, f"validation microbatch exceeded cap: {xb.size(0)}"
+        return real_forward_hidden(xb, **kwargs)
+
+    monkeypatch.setattr(model, "forward_hidden", capped_forward_hidden)
+    loss, acc = _eval_val_loss(
+        model, val, block=block, batch=2, vocab_size=V, device="cpu", logit_chunk_tokens=16
+    )
+    assert math.isfinite(loss)
+    assert 0.0 <= acc <= 1.0
+    assert seen, "expected at least one validation forward"
+    assert all(b <= 2 for b in seen)
+    assert sum(seen) == 8  # every full-length window scored
+
+
+def test_eval_val_loss_chunked_matches_full_vocab_semantics():
+    """Chunked lm_head scoring must match a single full-vocab pass exactly."""
+    from pretrain_data_curator.student_train import _eval_val_loss
+
+    V, block, n_tokens = 64, 8, 41
+    torch.manual_seed(0)
+    model = _tiny_cfg(V).build().eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    val = torch.randint(0, V, (n_tokens,), dtype=torch.long)
+
+    full_loss, full_acc = _eval_val_loss(
+        model, val, block=block, batch=4, vocab_size=V, device="cpu", logit_chunk_tokens=None
+    )
+    chunked_loss, chunked_acc = _eval_val_loss(
+        model, val, block=block, batch=1, vocab_size=V, device="cpu", logit_chunk_tokens=7
+    )
+    assert chunked_loss == pytest.approx(full_loss, rel=0, abs=1e-6)
+    assert chunked_acc == pytest.approx(full_acc, rel=0, abs=1e-12)
+
+
+def test_eval_val_loss_processes_all_validation_targets_under_cap():
+    """Every predictable target is scored even when microbatch + chunk caps are tiny."""
+    from pretrain_data_curator.student_train import _eval_val_loss
+    from pretrain_data_curator.val_set import plan_val_windows
+
+    V, block, n_tokens = 48, 5, 23
+    model = _tiny_cfg(V).build().eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    val = torch.arange(n_tokens, dtype=torch.long) % V
+    windows = plan_val_windows(n_tokens, block)
+    expected_targets = sum(length for _, length in windows)
+    assert expected_targets == n_tokens - 1
+
+    loss, acc = _eval_val_loss(
+        model,
+        val,
+        block=block,
+        batch=1,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=3,
+    )
+    assert math.isfinite(loss)
+    assert 0.0 <= acc <= 1.0
+    # Sanity: scoring the same stream twice is stable (all targets visited).
+    loss2, acc2 = _eval_val_loss(
+        model,
+        val,
+        block=block,
+        batch=1,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=3,
+    )
+    assert loss2 == pytest.approx(loss, rel=0, abs=0.0)
+    assert acc2 == pytest.approx(acc, rel=0, abs=0.0)
+
+
+def test_train_and_eval_honors_separate_val_batch_size(monkeypatch):
+    """``val_batch_size`` must drive validation, not training ``batch_size``."""
+    from pretrain_data_curator import student_train as st
+
+    V = 64
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (128,), dtype=torch.long)
+    gen = torch.Generator().manual_seed(0)
+    captured = {}
+
+    def fake_eval(model, val_data, *, block, batch, vocab_size, device, logit_chunk_tokens=None):
+        captured["batch"] = batch
+        captured["logit_chunk_tokens"] = logit_chunk_tokens
+        return 1.23, 0.45
+
+    monkeypatch.setattr(st, "_eval_val_loss", fake_eval)
+    loss, acc, tokens = train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=4,
+        steps=2,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
+        val_batch_size=1,
+        val_logit_chunk_tokens=32,
+    )
+    assert captured["batch"] == 1
+    assert captured["logit_chunk_tokens"] == 32
+    assert loss == pytest.approx(1.23)
+    assert acc == pytest.approx(0.45)
+    assert tokens > 0
+
+
+def test_proxy_payload_and_sandbox_script_carry_val_microbatch_knobs():
+    from pretrain_data_curator.models import ProxyStudentConfig
+
+    payload = ProxyStudentConfig(
+        val_batch_size=1, val_logit_chunk_tokens=1024
+    ).training_payload()
+    assert payload["val_batch_size"] == 1
+    assert payload["val_logit_chunk_tokens"] == 1024
+    assert "val_batch_size=cfg.get(\"val_batch_size\")" in NANOGPT_TRAIN_SCRIPT
+    assert "val_logit_chunk_tokens=cfg.get(\"val_logit_chunk_tokens\")" in NANOGPT_TRAIN_SCRIPT
+    assert "def _score_hidden_chunked(" in NANOGPT_TRAIN_SCRIPT
+    assert "def forward_hidden(" in NANOGPT_TRAIN_SCRIPT
+    assert "def apply_lm_head(" in NANOGPT_TRAIN_SCRIPT

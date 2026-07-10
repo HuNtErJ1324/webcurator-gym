@@ -144,27 +144,105 @@ def _enforce_max_doc_len(starts, n_tokens, max_doc_len, block):
     return sorted(set(r for r in refined if r + block + 1 <= n_tokens))
 
 
-def _eval_val_loss(model, val_data, *, block, batch, vocab_size, device):
+def _score_hidden_chunked(model, hidden, targets, *, vocab_size, logit_chunk_tokens):
+    """Sum CE + correct counts over ``hidden`` without a full (N, vocab) allocation.
+
+    When ``logit_chunk_tokens`` is set, projects ``lm_head``/softcap in row chunks so
+    peak activation memory stays O(chunk * vocab) instead of O(N * vocab). Mean CE
+    and accuracy over the full set are identical to a single full-vocab pass.
+    """
+    flat_h = hidden.reshape(-1, hidden.size(-1))
+    flat_y = targets.reshape(-1)
+    n = int(flat_h.size(0))
+    chunk = int(logit_chunk_tokens) if logit_chunk_tokens is not None else n
+    if chunk < 1:
+        raise ValueError(f"logit_chunk_tokens must be >= 1, got {logit_chunk_tokens}")
+    loss_sum = 0.0
+    correct = 0
+    apply_head = getattr(model, "apply_lm_head", None)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        h = flat_h[start:end]
+        y = flat_y[start:end]
+        if apply_head is not None:
+            logits = apply_head(h)
+        else:
+            logits = model.softcap * torch.tanh(model.lm_head(h) / model.softcap)
+        loss_sum += F.cross_entropy(logits, y, reduction="sum").item()
+        correct += (logits.argmax(-1) == y).sum().item()
+        del logits
+    return loss_sum, correct
+
+
+def _eval_val_loss(
+    model,
+    val_data,
+    *,
+    block,
+    batch,
+    vocab_size,
+    device,
+    logit_chunk_tokens=None,
+):
+    """Mean held-out CE / accuracy over every predictable val target.
+
+    ``batch`` is the validation microbatch (independent of training batch size).
+    When the model exposes ``forward_hidden``, the trunk runs once per microbatch
+    and ``lm_head``/softcap are applied in ``logit_chunk_tokens``-sized chunks so
+    oversized full-vocab logit tensors are never materialized.
+    """
     model.eval()
     val_windows = plan_val_windows(len(val_data), block)
     total = sum(length for _, length in val_windows)
     loss_sum = 0.0
     correct = 0
+    val_batch = max(1, int(batch))
+    forward_hidden = getattr(model, "forward_hidden", None)
     with torch.no_grad():
         wi = 0
         while wi < len(val_windows):
             length = val_windows[wi][1]
             starts = []
-            while wi < len(val_windows) and val_windows[wi][1] == length and len(starts) < batch:
+            while (
+                wi < len(val_windows)
+                and val_windows[wi][1] == length
+                and len(starts) < val_batch
+            ):
                 starts.append(val_windows[wi][0])
                 wi += 1
             xb = torch.stack([val_data[s : s + length] for s in starts]).to(device)
             yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(device)
-            logits = model(xb)
-            loss_sum += F.cross_entropy(
-                logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
-            ).item()
-            correct += (logits.argmax(-1) == yb).sum().item()
+            if forward_hidden is not None:
+                hidden = forward_hidden(xb)
+                chunk_loss, chunk_correct = _score_hidden_chunked(
+                    model,
+                    hidden,
+                    yb,
+                    vocab_size=vocab_size,
+                    logit_chunk_tokens=logit_chunk_tokens,
+                )
+                loss_sum += chunk_loss
+                correct += chunk_correct
+                del hidden
+            else:
+                logits = model(xb)
+                if logit_chunk_tokens is None:
+                    loss_sum += F.cross_entropy(
+                        logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
+                    ).item()
+                    correct += (logits.argmax(-1) == yb).sum().item()
+                else:
+                    flat_logits = logits.reshape(-1, vocab_size)
+                    flat_y = yb.reshape(-1)
+                    chunk = int(logit_chunk_tokens)
+                    for start in range(0, flat_logits.size(0), chunk):
+                        end = min(start + chunk, flat_logits.size(0))
+                        sl = flat_logits[start:end]
+                        sy = flat_y[start:end]
+                        loss_sum += F.cross_entropy(sl, sy, reduction="sum").item()
+                        correct += (sl.argmax(-1) == sy).sum().item()
+                del logits
+            del xb, yb
     return loss_sum / total, correct / total
 
 
@@ -245,11 +323,16 @@ def train_and_eval_student(
     cautious_wd=False,
     nor_muon=False,
     polar_express=False,
+    val_batch_size=None,
+    val_logit_chunk_tokens=None,
 ):
     """Train ``model`` and score held-out CE; returns ``(val_loss, accuracy, tokens_trained)``."""
     block = int(block_size)
     batch = int(batch_size)
     steps = int(steps)
+    eval_batch = int(batch_size if val_batch_size is None else val_batch_size)
+    if eval_batch < 1:
+        raise ValueError(f"val_batch_size must be >= 1, got {val_batch_size}")
 
     train_src = train_data
     if len(train_src) <= block + 1:
@@ -588,8 +671,25 @@ def train_and_eval_student(
         accum_count = 0
 
     pbar.close()
+    # Drop optimizer state before the held-out pass so validation activations are
+    # not competing with Muon/Adam buffers for the last ~10GB on A100-80GB.
+    if training_recipe == "record_01_adamw":
+        del opt
+    else:
+        del muon_opt, adam_opt
+    if torch.cuda.is_available() and (
+        (hasattr(device, "type") and device.type == "cuda")
+        or (isinstance(device, str) and device.startswith("cuda"))
+    ):
+        torch.cuda.empty_cache()
     val_loss, acc = _eval_val_loss(
-        model, val_data, block=block, batch=batch, vocab_size=vocab_size, device=device
+        model,
+        val_data,
+        block=block,
+        batch=eval_batch,
+        vocab_size=vocab_size,
+        device=device,
+        logit_chunk_tokens=val_logit_chunk_tokens,
     )
     return val_loss, acc, tokens_trained
 
@@ -634,6 +734,7 @@ _TRAINING_COMPONENTS = (
     plan_eos_aligned_windows,
     make_seq_len_schedule,
     _enforce_max_doc_len,
+    _score_hidden_chunked,
     _eval_val_loss,
     _compute_multi_token_loss,
     train_and_eval_student,

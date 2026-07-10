@@ -398,6 +398,8 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     cautious_wd=bool(cfg.get("cautious_wd", False)),
     nor_muon=bool(cfg.get("nor_muon", False)),
     polar_express=bool(cfg.get("polar_express", False)),
+    val_batch_size=cfg.get("val_batch_size"),
+    val_logit_chunk_tokens=cfg.get("val_logit_chunk_tokens"),
 )
 result = {
     "loss": val_loss, "accuracy": acc, "flops": flops,
@@ -504,6 +506,7 @@ def _nanogpt_train_script() -> str:
                     "plan_eos_aligned_windows",
                     "make_seq_len_schedule",
                     "_enforce_max_doc_len",
+                    "_score_hidden_chunked",
                     "_eval_val_loss",
                     "_compute_multi_token_loss",
                     "train_and_eval_student",

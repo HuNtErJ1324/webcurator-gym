@@ -58,6 +58,9 @@ attn_scale = 0.12
 
 block_size = 1024
 batch_size = 16
+# Separate validation microbatch / chunked lm_head scoring for A100-80GB.
+val_batch_size = 1
+val_logit_chunk_tokens = 1024
 steps = 200
 train_token_budget = 400_000_000         # scaled to the 400M corpus target
 learning_rate = 0.0003

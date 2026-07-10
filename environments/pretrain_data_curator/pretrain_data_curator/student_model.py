@@ -539,7 +539,12 @@ class GPT(nn.Module):
             return x * alpha
         return x
 
-    def forward(self, idx: torch.Tensor, *, window_size: int | None = None, output_hidden: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward_hidden(self, idx: torch.Tensor, *, window_size: int | None = None) -> torch.Tensor:
+        """Run the trunk through ``norm_out`` without materializing full-vocab logits.
+
+        Used by held-out validation to score CE in lm_head/softcap chunks so a
+        single A100 80GB pass never allocates oversized ``(B*T, vocab)`` tensors.
+        """
         ws = window_size if window_size is not None else self.sliding_window_size
         x = self.norm_in(self.embed(idx))
         if self.smear is not None:
@@ -620,10 +625,16 @@ class GPT(nn.Module):
                 self.resid_lambdas_mlp[layer_idx] * x
                 + self.post_lambdas[layer_idx, 1] * mlp_out
             )
-        x = self.norm_out(x)
-        hidden = x
+        return self.norm_out(x)
+
+    def apply_lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project hidden states through ``lm_head`` + tanh softcap."""
         logits = self.lm_head(hidden)
-        out = self.softcap * torch.tanh(logits / self.softcap)
+        return self.softcap * torch.tanh(logits / self.softcap)
+
+    def forward(self, idx: torch.Tensor, *, window_size: int | None = None, output_hidden: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.forward_hidden(idx, window_size=window_size)
+        out = self.apply_lm_head(hidden)
         if output_hidden:
             return out, hidden
         return out

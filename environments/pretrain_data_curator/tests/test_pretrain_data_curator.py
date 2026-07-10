@@ -475,6 +475,10 @@ def test_single_smoke_config_exhaustively_matches_source_options():
         "docker_host",
         "modal_gpu",
         "sliding_window_size",
+        # Optional None defaults; TOML 1.0 has no null literal, so omitting them
+        # is the canonical smoke-config spelling.
+        "val_batch_size",
+        "val_logit_chunk_tokens",
         # Portable feature knobs default off; omitted from the smoke TOML.
         "bigram_hash_embed",
         "smear_embed",
@@ -1250,11 +1254,26 @@ def test_curator_config_rejects_invalid(kwargs):
         {"mlp_ratio": 0},
         {"lm_head_softcap": 0.0},
         {"learning_rate": 0.0},
+        {"val_batch_size": 0},
+        {"val_logit_chunk_tokens": 0},
     ],
 )
 def test_proxy_student_config_rejects_invalid(kwargs):
     with pytest.raises(ValidationError):
         ProxyStudentConfig(**kwargs)
+
+
+def test_proxy_student_val_microbatch_defaults_and_payload():
+    cfg = ProxyStudentConfig()
+    assert cfg.val_batch_size is None
+    assert cfg.val_logit_chunk_tokens is None
+    payload = cfg.training_payload()
+    assert payload["val_batch_size"] is None
+    assert payload["val_logit_chunk_tokens"] is None
+    tuned = ProxyStudentConfig(val_batch_size=1, val_logit_chunk_tokens=2048)
+    tuned_payload = tuned.training_payload()
+    assert tuned_payload["val_batch_size"] == 1
+    assert tuned_payload["val_logit_chunk_tokens"] == 2048
 
 
 # --- Tier D2: adjustable token budget -> steps / corpus cap / timeout -------
