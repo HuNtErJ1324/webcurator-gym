@@ -149,8 +149,44 @@ print(key)
 PY
 }
 
+remote_repo_dir() {
+  # root@datacrunch → /root/webcurator-gym; ubuntu@massedcompute → /home/ubuntu/webcurator-gym
+  echo "${REMOTE_ROOT}/webcurator-gym"
+}
+
+set_remote_root_for_user() {
+  local user="$1"
+  if [[ "$user" == "root" ]]; then
+    REMOTE_ROOT="/root"
+  else
+    REMOTE_ROOT="/home/${user}"
+  fi
+}
+
+ensure_remote_repo_dir() {
+  # Do not rely on rsync's implicit mkdir: MassedCompute (ubuntu@) has been
+  # observed to report a successful sync while $REMOTE_ROOT/webcurator-gym is
+  # still missing, so scp of secrets.env fails with "No such file or directory".
+  # Create + verify the configured remote repo dir before any secrets upload.
+  local remote_dir
+  [[ -n "${REMOTE_ROOT:-}" ]] || die "REMOTE_ROOT is unset; cannot ensure remote repo directory"
+  [[ -n "${SSH_USER:-}" && -n "${SSH_HOST:-}" ]] || die "SSH target unset; cannot ensure remote repo directory"
+  remote_dir="$(remote_repo_dir)"
+  log "Ensuring remote repo directory exists and is writable: ${SSH_USER}@${SSH_HOST}:${remote_dir}"
+  if ! remote bash -lc "mkdir -p '$remote_dir' && test -d '$remote_dir' && test -w '$remote_dir'"; then
+    die "Remote repo directory unavailable or not writable: ${SSH_USER}@${SSH_HOST}:${remote_dir}. Refusing to upload secrets."
+  fi
+  # Fail loudly if a subsequent probe still cannot see the directory.
+  if ! remote bash -lc "test -d '$remote_dir'"; then
+    die "Remote repo directory missing after mkdir: ${SSH_USER}@${SSH_HOST}:${remote_dir}"
+  fi
+}
+
 upload_secrets() {
-  local tmp
+  local tmp remote_dir
+  remote_dir="$(remote_repo_dir)"
+  # Defense in depth: never scp into a path we have not verified exists.
+  ensure_remote_repo_dir
   tmp="$(mktemp)"
   cp "$SECRETS_FILE" "$tmp"
   if ! grep -q '^PRIME_API_KEY=' "$tmp"; then
@@ -158,7 +194,8 @@ upload_secrets() {
     printf 'PRIME_API_KEY=%s\n' "$(prime_api_key_from_cli)" >> "$tmp"
   fi
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
-    "$tmp" "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/secrets.env" >/dev/null
+    "$tmp" "${SSH_USER}@${SSH_HOST}:${remote_dir}/secrets.env" >/dev/null \
+    || die "Failed to upload secrets.env to ${SSH_USER}@${SSH_HOST}:${remote_dir}/secrets.env"
   rm -f "$tmp"
 }
 
@@ -406,16 +443,12 @@ PY
         # Some provider images (massedcompute DGX_A100, crusoecloud) log in as a
         # non-root user (ubuntu) whose home is /home/$SSH_USER, not /root. Derive
         # the remote repo root so all remote paths land somewhere the user can write.
-        if [[ "$SSH_USER" == "root" ]]; then
-          REMOTE_ROOT="/root"
-        else
-          REMOTE_ROOT="/home/${SSH_USER}"
-        fi
+        set_remote_root_for_user "$SSH_USER"
         # Cloud IPs get recycled across pods; a stale known_hosts entry from a
         # prior pod at this same IP makes even StrictHostKeyChecking=no refuse
         # to connect (observed 2026-07-08 after a spot-instance reclaim).
         ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$SSH_HOST" >/dev/null 2>&1 || true
-        log "Pod ready: ssh -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@${SSH_HOST}"
+        log "Pod ready: ssh -i $SSH_KEY -p $SSH_PORT ${SSH_USER}@${SSH_HOST} (REMOTE_ROOT=$REMOTE_ROOT)"
         return 0
       fi
     fi
@@ -456,6 +489,10 @@ wait_for_ssh_auth() {
         if [[ "$candidate" != "$SSH_USER" ]]; then
           log "SSH auth confirmed as fallback user '$candidate' (parsed user '$SSH_USER' was rejected)"
           SSH_USER="$candidate"
+          # Keep REMOTE_ROOT in lockstep with the login user so root@datacrunch
+          # (/root/...) and ubuntu@massedcompute (/home/ubuntu/...) both work.
+          set_remote_root_for_user "$SSH_USER"
+          log "Updated REMOTE_ROOT=$REMOTE_ROOT for SSH_USER=$SSH_USER"
         else
           log "SSH auth confirmed (attempt $attempt)"
         fi
@@ -783,6 +820,9 @@ wait_for_ssh_auth
 
 log "Syncing repository to pod"
 remote_rsync
+# Explicit create/verify: do not trust rsync alone to materialize the remote
+# repo directory before secrets scp (MassedCompute ubuntu@ failure mode).
+ensure_remote_repo_dir
 upload_secrets
 
 if [[ "$CURATION_ONLY" -eq 1 ]]; then

@@ -618,6 +618,83 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
     assert "exec uv run eval" not in on_pod
 
 
+def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
+    """MassedCompute ubuntu@ failed when secrets scp assumed rsync created the dir.
+
+    After sync and before secrets upload, the launcher must explicitly mkdir +
+    verify $REMOTE_ROOT/webcurator-gym for both root@datacrunch and ubuntu@.
+    """
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+
+    ensure_body = _extract_bash_function(a100, "ensure_remote_repo_dir")
+    upload_body = _extract_bash_function(a100, "upload_secrets")
+    auth_body = _extract_bash_function(a100, "wait_for_ssh_auth")
+    wait_pod_body = _extract_bash_function(a100, "wait_for_pod")
+
+    assert "mkdir -p" in ensure_body
+    assert "test -d" in ensure_body
+    assert "test -w" in ensure_body
+    assert "Remote repo directory unavailable" in ensure_body
+    assert "remote_repo_dir" in ensure_body or "webcurator-gym" in ensure_body
+
+    # upload_secrets must re-check (or call ensure) before scp — not rely on rsync.
+    assert "ensure_remote_repo_dir" in upload_body
+    assert "secrets.env" in upload_body
+    assert "Failed to upload secrets.env" in upload_body
+
+    # Main flow order: remote_rsync → ensure_remote_repo_dir → upload_secrets.
+    sync_marker = a100.find("Syncing repository to pod")
+    assert sync_marker >= 0
+    main_rsync = a100.find("remote_rsync", sync_marker)
+    main_ensure = a100.find("ensure_remote_repo_dir", sync_marker)
+    main_upload = a100.find("upload_secrets", sync_marker)
+    assert main_rsync >= 0 and main_ensure >= 0 and main_upload >= 0
+    assert main_rsync < main_ensure < main_upload, (
+        "must sync, then ensure remote dir, then upload secrets"
+    )
+
+    # Both login paths must derive REMOTE_ROOT correctly.
+    assert "set_remote_root_for_user" in wait_pod_body
+    assert "set_remote_root_for_user" in auth_body
+    set_root_body = _extract_bash_function(a100, "set_remote_root_for_user")
+    assert 'REMOTE_ROOT="/root"' in set_root_body
+    assert 'REMOTE_ROOT="/home/${user}"' in set_root_body or 'REMOTE_ROOT="/home/' in set_root_body
+
+    repo_dir_body = _extract_bash_function(a100, "remote_repo_dir")
+    assert "webcurator-gym" in repo_dir_body
+    assert "REMOTE_ROOT" in repo_dir_body
+
+
+def test_400m_a100_remote_repo_dir_paths_for_root_and_ubuntu():
+    """remote_repo_dir must resolve datacrunch root and massedcompute ubuntu homes."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            "remote_repo_dir() {",
+            _extract_bash_function(a100, "remote_repo_dir"),
+            "}",
+            "set_remote_root_for_user() {",
+            _extract_bash_function(a100, "set_remote_root_for_user"),
+            "}",
+            "set_remote_root_for_user root",
+            "remote_repo_dir",
+            "set_remote_root_for_user ubuntu",
+            "remote_repo_dir",
+        ]
+    )
+    result = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert lines == ["/root/webcurator-gym", "/home/ubuntu/webcurator-gym"]
+
+
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
 def test_load_environment_uses_one_initial_prompt_for_all_harnesses(
     monkeypatch, harness_id
