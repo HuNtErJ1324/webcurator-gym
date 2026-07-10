@@ -1812,6 +1812,7 @@ def test_400m_a100_massedcompute_nonroot_docker_provision_invariants(tmp_path):
     - rootless never invokes systemctl(1) and never writes /etc/docker/daemon.json
     - rootless configures $HOME/.config/docker/daemon.json and exports DOCKER_HOST
     - rootless installs uidmap/fuse-overlayfs/slirp4netns when missing
+    - rootless installs nvidia-container-toolkit/nvidia-ctk before configure+smoke
     - GPU path includes fail-fast container smoke (nvidia-smi -L)
     - rootful still uses systemctl + default nvidia-ctk ( /etc/docker/daemon.json )
     - generated MC driver embeds the emitter and calls wcg_provision_docker
@@ -1823,6 +1824,7 @@ def test_400m_a100_massedcompute_nonroot_docker_provision_invariants(tmp_path):
     assert "wcg_provision_docker_rootful" in emit_body
     assert "wcg_provision_docker_rootless" in emit_body
     assert "wcg_gpu_container_smoke" in emit_body
+    assert "wcg_ensure_nvidia_ctk" in emit_body
     assert "dockerd-rootless.sh" in emit_body
     assert "DOCKER_HOST" in emit_body
     assert "$HOME/.config/docker/daemon.json" in emit_body
@@ -1845,6 +1847,7 @@ def test_400m_a100_massedcompute_nonroot_docker_provision_invariants(tmp_path):
     )
     rootless = _extract_bash_function(snip, "wcg_provision_docker_rootless")
     rootful = _extract_bash_function(snip, "wcg_provision_docker_rootful")
+    ensure_ctk = _extract_bash_function(snip, "wcg_ensure_nvidia_ctk")
     configure = _extract_bash_function(snip, "wcg_configure_nvidia_rootless")
     smoke = _extract_bash_function(snip, "wcg_gpu_container_smoke")
 
@@ -1865,17 +1868,46 @@ def test_400m_a100_massedcompute_nonroot_docker_provision_invariants(tmp_path):
     assert "$HOME/.config/docker/daemon.json" in configure
     assert "export DOCKER_HOST" in rootless
     assert "wcg_ensure_rootless_deps" in rootless
+    assert "wcg_ensure_nvidia_ctk" in rootless
     assert "wcg_gpu_container_smoke" in rootless
     assert "docker pull" in smoke
     assert "--gpus all" in smoke
     assert ">&2" in smoke  # MassedCompute stdout = result tar
+    assert "smoke context:" in smoke
+    assert "DOCKER_HOST=" in smoke
 
-    # Rootful arm preserved for root-capable providers.
+    # Toolkit ensure: install nvidia-container-toolkit via root or sudo -n; fail hard otherwise.
+    assert "nvidia-container-toolkit" in ensure_ctk
+    assert "sudo -n" in ensure_ctk
+    assert "cannot install nvidia-container-toolkit" in ensure_ctk
+    assert "nvidia-ctk still missing" in ensure_ctk
+    # Ensure must not touch system docker daemon.json.
+    assert "/etc/docker/daemon.json" not in ensure_ctk
+    assert not any(
+        ln.lstrip().startswith("systemctl ") for ln in ensure_ctk.splitlines()
+    )
+
+    # Order in rootless GPU path: ensure toolkit → configure → restart → smoke.
+    ensure_call = rootless.find("wcg_ensure_nvidia_ctk")
+    configure_call = rootless.find("wcg_configure_nvidia_rootless")
+    restart_call = rootless.find("wcg_restart_rootless_dockerd")
+    smoke_call = rootless.find("wcg_gpu_container_smoke")
+    assert ensure_call >= 0, "rootless must call wcg_ensure_nvidia_ctk"
+    assert configure_call > ensure_call, "ensure nvidia-ctk before configure"
+    assert restart_call > configure_call, "configure before rootless dockerd restart"
+    assert smoke_call > restart_call, "restart before GPU smoke"
+
+    # Rootful arm preserved for root-capable providers (inline toolkit install + systemctl).
     assert any(ln.lstrip().startswith("systemctl ") for ln in rootful.splitlines())
     assert "nvidia-ctk runtime configure --runtime=docker" in rootful
+    assert "nvidia-container-toolkit" in rootful
     # Default nvidia-ctk (no --config) writes /etc/docker/daemon.json on rootful.
     assert "--config=" not in rootful.split("nvidia-ctk runtime configure --runtime=docker", 1)[1].splitlines()[0]
     assert "wcg_gpu_container_smoke" in rootful
+    # Rootful must NOT call the rootless ensure/configure helpers.
+    assert "wcg_ensure_nvidia_ctk" not in rootful
+    assert "wcg_configure_nvidia_rootless" not in rootful
+    assert "dockerd-rootless.sh" not in rootful
 
     # Dispatcher branches on uid.
     dispatcher = _extract_bash_function(snip, "wcg_provision_docker")
@@ -1920,6 +1952,7 @@ def test_400m_a100_massedcompute_nonroot_docker_provision_invariants(tmp_path):
     )
     assert syntax.returncode == 0, syntax.stderr
     assert "wcg_provision_docker_rootless" in driver
+    assert "wcg_ensure_nvidia_ctk" in driver
     assert "wcg_provision_docker 1 >&2" in driver
     assert "dockerd-rootless.sh" in driver
     assert "$HOME/.config/docker/daemon.json" in driver

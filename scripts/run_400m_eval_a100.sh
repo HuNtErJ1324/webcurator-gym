@@ -869,12 +869,47 @@ wcg_restart_rootless_dockerd() {
   wcg_start_rootless_dockerd
 }
 
+wcg_ensure_nvidia_ctk() {
+  # Install nvidia-container-toolkit when nvidia-ctk is absent. Package install
+  # needs root or passwordless sudo (MassedCompute ubuntu@ permitted path).
+  # Does not touch the system docker config; rootless configure uses user config.
+  if command -v nvidia-ctk >/dev/null 2>&1; then
+    return 0
+  fi
+  wcg_log "nvidia-ctk missing; installing nvidia-container-toolkit"
+  local keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+  local list="/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | gpg --dearmor -o "$keyring"
+    curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      > "$list"
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | sudo -n gpg --dearmor -o "$keyring"
+    curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      | sudo -n tee "$list" >/dev/null
+    sudo -n apt-get update -qq
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit
+  else
+    wcg_die "nvidia-ctk missing and cannot install nvidia-container-toolkit without root/passwordless sudo (required for rootless GPU runtime)"
+  fi
+  hash -r 2>/dev/null || true
+  command -v nvidia-ctk >/dev/null 2>&1 \
+    || wcg_die "nvidia-ctk still missing after nvidia-container-toolkit install; refuse GPU provision without toolkit"
+  wcg_log "nvidia-ctk ready: $(command -v nvidia-ctk)"
+}
+
 wcg_configure_nvidia_rootless() {
   # User-owned daemon.json ONLY (never the system docker config path).
   local cfg="$HOME/.config/docker/daemon.json"
   mkdir -p "$(dirname "$cfg")"
   command -v nvidia-ctk >/dev/null 2>&1 \
-    || wcg_die "nvidia-ctk missing; cannot configure rootless GPU runtime"
+    || wcg_die "nvidia-ctk missing after ensure; cannot configure rootless GPU runtime"
   wcg_log "nvidia-ctk runtime configure → $cfg"
   nvidia-ctk runtime configure --runtime=docker --config="$cfg"
   # Rootless GPU needs no-cgroups. Prefer in-place system config when writable /
@@ -903,10 +938,24 @@ wcg_gpu_container_smoke() {
   # Fail-fast: container must see the GPU before image build / eval.
   # stdout must stay clean for MassedCompute result-tar protocol → everything on stderr.
   local img="pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
+  local out rc cfg
+  cfg="$HOME/.config/docker/daemon.json"
   wcg_log "=== GPU docker smoke (fail-fast) ==="
+  wcg_log "smoke context: uid=$(id -u) DOCKER_HOST=${DOCKER_HOST:-unset} nvidia-ctk=$(command -v nvidia-ctk 2>/dev/null || echo missing) daemon_json=$cfg"
+  if [[ -f "$cfg" ]]; then
+    wcg_log "daemon.json contents: $(tr '\n' ' ' <"$cfg")"
+  else
+    wcg_log "daemon.json missing at $cfg (rootless GPU runtime may be unconfigured)"
+  fi
   docker pull "$img" >&2
-  docker run --rm --gpus all "$img" nvidia-smi -L >&2 \
-    || wcg_die "GPU container smoke failed (docker run --gpus all nvidia-smi -L)"
+  set +e
+  out="$(docker run --rm --gpus all "$img" nvidia-smi -L 2>&1)"
+  rc=$?
+  set -e
+  printf '%s\n' "$out" >&2
+  if [[ "$rc" -ne 0 ]]; then
+    wcg_die "GPU container smoke failed (rc=$rc). DOCKER_HOST=${DOCKER_HOST:-unset}; nvidia-ctk=$(command -v nvidia-ctk 2>/dev/null || echo missing); daemon_json=$cfg. Fix rootless NVIDIA runtime (nvidia-ctk + user daemon.json + dockerd restart) before eval. docker output above."
+  fi
 }
 
 wcg_provision_docker_rootful() {
@@ -940,6 +989,8 @@ wcg_provision_docker_rootless() {
   wcg_start_rootless_dockerd
   if [[ "$need_gpu" -eq 1 ]]; then
     wcg_log "=== NVIDIA container toolkit (rootless) ==="
+    # Install toolkit first (sudo -n when non-root), then user daemon.json, then smoke.
+    wcg_ensure_nvidia_ctk
     wcg_configure_nvidia_rootless
     wcg_restart_rootless_dockerd
     wcg_gpu_container_smoke
