@@ -193,7 +193,9 @@ class ProxyStudentConfig(BaseModel):
     muon_momentum_max: float = Field(default=0.95, gt=0.0, lt=1.0)
     muon_warmup_steps: int | None = Field(default=None, ge=0)
     muon_cooldown_steps: int | None = Field(default=None, ge=0)
-    # AdamW groups (embed / head / value embeds / scalars)
+    # AdamW groups (embed / head / value embeds / scalars). ``adam_eps`` is the
+    # canonical Speedrun epsilon; the legacy record_01 optimizer has its own
+    # explicitly named epsilon below so this value cannot be shadowed.
     adam_lr: float = Field(default=0.008, gt=0.0, le=1.0)
     adam_eps: float = Field(default=1e-10, gt=0.0, le=1e-1)
     adam_weight_decay: float = Field(default=0.005, ge=0.0, le=1.0)
@@ -231,7 +233,7 @@ class ProxyStudentConfig(BaseModel):
     # first speedrun record inherits): betas (0.9, 0.95), eps 1e-8.
     adam_beta1: float = Field(default=0.9, gt=0.0, lt=1.0)
     adam_beta2: float = Field(default=0.95, gt=0.0, lt=1.0)
-    adam_eps: float = Field(default=1e-8, gt=0.0, le=1e-1)
+    record_adam_eps: float = Field(default=1e-8, gt=0.0, le=1e-1)
     # Global-norm gradient clip applied before every ``opt.step()`` (record_01: 1.0).
     grad_clip: float = Field(default=1.0, ge=0.0)
     # LR warmup length (steps). ``None`` (default) derives a sensible fraction of the
@@ -265,10 +267,13 @@ class ProxyStudentConfig(BaseModel):
     exp_residual_decay: float | None = Field(default=None, gt=0.0, le=1.0)
     # Multi-token prediction (number of extra future-token heads)
     multi_token_pred: int = Field(default=0, ge=0, le=8)
-    # EoS-aligned training batch starts (list of positions or None)
-    eos_positions: list[int] | None = None
-    # Max document length for splitting over-long docs (None = block_size)
-    max_doc_len: int | None = Field(default=None, ge=8)
+    # Encode each source document with GPT-2 EOT/BOS and plan windows strictly
+    # inside the resulting document ranges. Disable only for legacy flat-stream
+    # compatibility.
+    eos_aligned_batches: bool = True
+    # Canonical per-document token cap, including the leading EOT/BOS token.
+    # Historical spellings remain accepted by the compatibility validator below.
+    max_document_tokens: int | None = Field(default=None, ge=8)
     # True 2-step gradient accumulation for embed+lm_head before update
     grad_accum_embed_head_steps: int = Field(default=1, ge=1, le=8)
     # True max sequence length schedule (warm up block size)
@@ -380,6 +385,7 @@ class ProxyStudentConfig(BaseModel):
             "weight_decay": self.weight_decay,
             "adam_beta1": self.adam_beta1,
             "adam_beta2": self.adam_beta2,
+            "record_adam_eps": self.record_adam_eps,
             "grad_clip": self.grad_clip,
             "warmup_steps": self.effective_warmup_steps,
             "lr_min_ratio": self.lr_min_ratio,
@@ -394,8 +400,8 @@ class ProxyStudentConfig(BaseModel):
             "single_act_last_k": self.single_act_last_k,
             "exp_residual_decay": self.exp_residual_decay,
             "multi_token_pred": self.multi_token_pred,
-            "eos_positions": self.eos_positions,
-            "max_doc_len": self.max_doc_len,
+            "eos_aligned_batches": self.eos_aligned_batches,
+            "max_document_tokens": self.max_document_tokens,
             "grad_accum_embed_head_steps": self.grad_accum_embed_head_steps,
             "seq_len_schedule": self.seq_len_schedule,
             "untie_at_frac": self.untie_at_frac,
@@ -453,6 +459,41 @@ class ProxyStudentConfig(BaseModel):
         """Framework deadline for the full harness-runtime scoring phase."""
         margin = max(300.0, self.upload_timeout_seconds * 4 + 60.0)
         return self.effective_timeout_minutes * 60 + margin
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_training_names(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        if "eos_positions" in values:
+            raise ValueError(
+                "eos_positions is no longer accepted: document boundaries are "
+                "derived from the preserved source-document list"
+            )
+        aliases = [name for name in ("max_doc_len", "max_doc_length") if name in values]
+        if aliases and "max_document_tokens" in values:
+            if any(values[name] != values["max_document_tokens"] for name in aliases):
+                raise ValueError("conflicting max-document token settings")
+        elif aliases:
+            values["max_document_tokens"] = values[aliases[0]]
+        for name in aliases:
+            values.pop(name, None)
+        # Before the duplicate-field fix, legacy record_01 configs used
+        # ``adam_eps`` for their optimizer. Preserve that input meaning while
+        # keeping ``adam_eps`` canonical for Speedrun configs.
+        if (
+            values.get("training_recipe") == "record_01_adamw"
+            and "adam_eps" in values
+            and "record_adam_eps" not in values
+        ):
+            values["record_adam_eps"] = values["adam_eps"]
+        return values
+
+    @property
+    def max_doc_len(self) -> int | None:
+        """Deprecated attribute alias for ``max_document_tokens``."""
+        return self.max_document_tokens
 
     @model_validator(mode="after")
     def _check_student_dims(self) -> "ProxyStudentConfig":

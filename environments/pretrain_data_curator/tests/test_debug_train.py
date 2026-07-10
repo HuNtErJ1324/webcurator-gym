@@ -92,6 +92,7 @@ def test_load_manifest_rejects_bad_schema(tmp_path):
         load_manifest(bad)
 
 
+@pytest.mark.asyncio
 async def test_cache_hit_does_not_recurate(base_dir, manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     recorder = _Recorder(base_dir)
@@ -111,6 +112,7 @@ async def test_cache_hit_does_not_recurate(base_dir, manifest, tmp_path):
     assert prov1["manifest_digest"] == prov2["manifest_digest"]
 
 
+@pytest.mark.asyncio
 async def test_mismatch_rejected_before_training(base_dir, manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     recorder = _Recorder(base_dir)
@@ -135,6 +137,7 @@ async def test_mismatch_rejected_before_training(base_dir, manifest, tmp_path):
         await asyncio.to_thread(resolve_corpus, other, bundle_dir, materialize_fn=_Recorder(base_dir))
 
 
+@pytest.mark.asyncio
 async def test_expected_token_budget_mismatch_rejected(manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     with pytest.raises(ManifestMismatchError):
@@ -143,6 +146,7 @@ async def test_expected_token_budget_mismatch_rejected(manifest, tmp_path):
         )
 
 
+@pytest.mark.asyncio
 async def test_explicit_refresh_recurates(base_dir, manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     recorder = _Recorder(base_dir)
@@ -166,6 +170,7 @@ async def test_explicit_refresh_recurates(base_dir, manifest, tmp_path):
     assert prov2["manifest_digest"] != prov["manifest_digest"]
 
 
+@pytest.mark.asyncio
 async def test_corpus_handoff_to_trainer_is_exact(base_dir, manifest, tmp_path):
     bundle_dir = tmp_path / "bundle"
     output_dir = tmp_path / "out"
@@ -179,6 +184,7 @@ async def test_corpus_handoff_to_trainer_is_exact(base_dir, manifest, tmp_path):
     def fake_train(build_model, train_data, val_data, **kwargs):
         recorded["train"] = train_data
         recorded["val"] = val_data
+        recorded["document_ranges"] = kwargs["document_ranges"]
         return (3.0, 0.5, 0.0, int(len(train_data)), 1_000_000)
 
     config = build_debug_config(steps=10, block_size=64, batch_size=4)
@@ -187,14 +193,18 @@ async def test_corpus_handoff_to_trainer_is_exact(base_dir, manifest, tmp_path):
     )
 
     # The trainer received exactly the tokens of the bundle's corpus.txt.
-    expected_train, expected_val = prepare_training_data(cp, val_fraction=config.val_fraction)
+    expected_train, expected_val, expected_ranges = prepare_training_data(
+        cp, val_fraction=config.val_fraction
+    )
     assert torch.equal(recorded["train"], expected_train)
     assert torch.equal(recorded["val"], expected_val)
+    assert recorded["document_ranges"] == expected_ranges
     assert result["tokens_trained"] == int(len(expected_train))
     assert (output_dir / "result.json").is_file()
 
 
 @pytest.mark.slow
+@pytest.mark.asyncio
 async def test_real_recipe_runs_end_to_end(base_dir, manifest, tmp_path):
     """Exercise the actual speedrun recipe (CPU) on the curated bundle.
 

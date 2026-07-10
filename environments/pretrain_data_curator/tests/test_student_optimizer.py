@@ -189,6 +189,74 @@ def test_step_speedrun_optimizers_reports_whether_adam_stepped():
     assert run_step(0, adam_on_odd_steps=False) is True
 
 
+def test_optimizer_specific_clip_cadence_preserves_raw_adam_sum(monkeypatch):
+    model = GPT(vocab_size=64, num_layers=2, model_dim=32, num_heads=2)
+    muon_opt, adam_opt = build_speedrun_optimizers(model)
+    muon_param = muon_opt.param_groups[0]["params"][0]
+    adam_param = adam_opt.param_groups[0]["params"][0]
+    clips: list[tuple[set[int], torch.Tensor | None]] = []
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def spy_clip(params, max_norm, *args, **kwargs):
+        params = list(params)
+        clips.append(
+            (
+                {id(param) for param in params},
+                adam_param.grad.detach().clone()
+                if any(param is adam_param for param in params)
+                else None,
+            )
+        )
+        return real_clip(params, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy_clip)
+    muon_param.grad = torch.full_like(muon_param, 10.0)
+    adam_param.grad = torch.full_like(adam_param, 2.0)
+    assert not step_speedrun_optimizers(
+        muon_opt, adam_opt, step=0, muon_momentum=0.95, grad_clip=1.0
+    )
+    assert len(clips) == 1 and id(adam_param) not in clips[0][0]
+    assert torch.equal(adam_param.grad, torch.full_like(adam_param, 2.0))
+    assert adam_param not in adam_opt.state
+
+    muon_param.grad = torch.full_like(muon_param, 10.0)
+    adam_param.grad.add_(3.0)
+    assert step_speedrun_optimizers(
+        muon_opt, adam_opt, step=1, muon_momentum=0.95, grad_clip=1.0
+    )
+    assert len(clips) == 3  # Muon on both steps, Adam only on the odd update.
+    assert torch.equal(clips[-1][1], torch.full_like(adam_param, 5.0))
+    assert adam_param in adam_opt.state
+
+
+def test_adam_on_every_step_clips_and_updates_on_even_step(monkeypatch):
+    model = GPT(vocab_size=64, num_layers=2, model_dim=32, num_heads=2)
+    muon_opt, adam_opt = build_speedrun_optimizers(model)
+    for optimizer in (muon_opt, adam_opt):
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                param.grad = torch.ones_like(param)
+    calls = 0
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def spy_clip(params, max_norm, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_clip(params, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy_clip)
+    assert step_speedrun_optimizers(
+        muon_opt,
+        adam_opt,
+        step=0,
+        muon_momentum=0.95,
+        adam_on_odd_steps=False,
+        grad_clip=1.0,
+    )
+    assert calls == 2
+    assert adam_opt.state
+
+
 def test_sandbox_script_embeds_optimizer_recipe_verbatim():
     # Regression test: trainer.py's ``_module_definitions_source`` used
     # ``ast.get_source_segment(source, node)`` on the bare ClassDef/FunctionDef

@@ -12,6 +12,7 @@ scratch directory this module creates is removed by the time each test ends.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import tempfile
 import tracemalloc
@@ -235,18 +236,18 @@ def test_document_filter_apply_iter_dedup_exact_preserves_order_and_uniqueness()
     assert f.apply(docs, [FilterSpec(kind="dedup_exact", params={})]) == kept
 
 
-def test_joined_text_matches_eager_join_and_slice_at_every_boundary():
-    docs = ["alpha", "a longer beta document with more text", "gamma"]
+def test_joined_text_preserves_document_list_at_every_cap():
+    docs = ["alpha", "", "a longer beta\n\ndocument", "gamma"]
     corpus = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, docs)])
-    full = "\n\n".join(docs)
-    for cap in [0, 1, 3, 5, 6, 7, len(full) - 1, len(full), len(full) + 50]:
-        assert corpus.joined_text(cap) == full[:cap]
+    for cap in [0, 1, 3, 5, 6, 7, sum(map(len, docs)) - 1, sum(map(len, docs)), 100]:
+        payload = json.loads(corpus.joined_text(cap))
+        assert payload["format"] == "document-list-v1"
+        assert "".join(payload["documents"]) == "".join(docs)[:cap]
+        assert all(isinstance(document, str) for document in payload["documents"])
 
 
 def test_joined_text_stops_reading_once_cap_is_reached():
-    """`joined_text` must not read documents past the cap (the streaming-
-    truncation point of the refactor, replacing the old eager
-    ``"\\n\\n".join(all_docs)[:cap]``)."""
+    """Document serialization must stop pulling input once the source-char cap is met."""
     read_docs: list[str] = []
 
     def _tracking_docs():
@@ -256,10 +257,10 @@ def test_joined_text_stops_reading_once_cap_is_reached():
 
     corpus = CuratedCorpus(sources=[])
     corpus.iter_documents = _tracking_docs  # type: ignore[method-assign]
-    text = corpus.joined_text(250)
-    assert len(text) == 250
+    payload = json.loads(corpus.joined_text(250))
+    assert sum(len(document) for document in payload["documents"]) == 250
     # Only enough documents to cover the cap were pulled from the generator.
-    assert len(read_docs) <= 4
+    assert len(read_docs) <= 3
 
 
 @pytest.mark.asyncio

@@ -205,24 +205,23 @@ def apply_filters(docs, filters):
 
 
 def joined_corpus(docs, cap):
-    """Streaming-truncated ``\\n\\n`` join, matching corpus materialization."""
-    if cap is None:
-        return "\n\n".join(doc for doc in docs if doc)
-    parts = []
-    total = 0
-    sep = "\n\n"
+    """Serialize a capped document-list-v1 payload for proxy training."""
+    documents = []
+    remaining = None if cap is None else max(0, int(cap))
     for doc in docs:
-        if not doc:
-            continue
-        piece = doc if not parts else sep + doc
-        if total + len(piece) > cap:
-            remaining = cap - total
-            if remaining > 0:
-                parts.append(piece[:remaining])
+        if remaining == 0:
             break
-        parts.append(piece)
-        total += len(piece)
-    return "".join(parts)
+        piece = doc if remaining is None else doc[:remaining]
+        documents.append(piece)
+        if remaining is not None:
+            remaining -= len(piece)
+            if len(piece) < len(doc):
+                break
+    return json.dumps(
+        {"format": "document-list-v1", "documents": documents},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def scaled_perf(loss):
@@ -638,8 +637,6 @@ def render_self_score_script(
     decon_threshold: float = 0.2,
 ) -> bytes:
     """Return a configured self-score script without exposing held-out data."""
-    import os as _os
-
     from .leakage import resolve_decon_binary, resolve_decon_evals_dir
 
     replacements: dict[str, object] = {

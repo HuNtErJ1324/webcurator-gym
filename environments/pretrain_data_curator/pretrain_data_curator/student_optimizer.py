@@ -370,6 +370,20 @@ def capture_initial_lrs(
     return muon_lr, adam_lrs
 
 
+def clip_optimizer_grads(optimizer: torch.optim.Optimizer, max_norm: float) -> None:
+    """Clip only gradients owned by one optimizer at its update boundary."""
+    if not max_norm or max_norm <= 0:
+        return
+    params = [
+        param
+        for group in optimizer.param_groups
+        for param in group["params"]
+        if param.grad is not None
+    ]
+    if params:
+        torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
 def step_speedrun_optimizers(
     muon_opt: Muon,
     adam_opt: torch.optim.AdamW,
@@ -380,6 +394,7 @@ def step_speedrun_optimizers(
     cautious_wd: bool = False,
     lr_scale: float = 1.0,
     force_adam: bool = False,
+    grad_clip: float = 0.0,
 ) -> bool:
     """Muon every step; AdamW only on odd steps (heterogeneous batching record).
 
@@ -395,9 +410,13 @@ def step_speedrun_optimizers(
     actually applies it -- on a skipped step the grad is left alone so the
     next ``backward()`` accumulates on top of it).
     """
+    clip_optimizer_grads(muon_opt, grad_clip)
     muon_opt.step(momentum=muon_momentum, cautious_wd=cautious_wd, lr_scale=lr_scale)
     did_adam_step = force_adam or not adam_on_odd_steps or step % 2 == 1
     if did_adam_step:
+        # The retained even-step Adam gradients remain raw until this update;
+        # clipping happens once, after the odd contribution has been summed.
+        clip_optimizer_grads(adam_opt, grad_clip)
         adam_opt.step()
     return did_adam_step
 
@@ -418,6 +437,7 @@ _OPTIMIZER_COMPONENTS = (
     init_speedrun_weights,
     set_optimizer_lrs,
     capture_initial_lrs,
+    clip_optimizer_grads,
     step_speedrun_optimizers,
 )
 
