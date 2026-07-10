@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,6 +56,7 @@ from pretrain_data_curator.self_score import (
 )
 from pretrain_data_curator.tasks import TASK_PROMPT, build_tasks
 from pretrain_data_curator.taskset import (
+    HF_CLI_SKILL_FILENAME,
     CuratorTaskset,
     CuratorTasksetConfig,
     extract_json_object,
@@ -3478,6 +3480,10 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
         in task.prompt
     )
     assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
+    assert (
+        "read `/workspace/hf_cli_skill.md` for local CLI discovery and safety guidance"
+        in task.prompt
+    )
     assert "final response must contain" not in task.prompt
 
 
@@ -3534,10 +3540,30 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
     await taskset.setup(taskset.load_tasks()[0], runtime)
 
     assert SELF_SCORE_FILENAME in runtime.files
+    assert runtime.files[HF_CLI_SKILL_FILENAME] == (
+        resources.files("pretrain_data_curator")
+        .joinpath(HF_CLI_SKILL_FILENAME)
+        .read_bytes()
+    )
+    assert b"hf --version" in runtime.files[HF_CLI_SKILL_FILENAME]
+    assert b"hf --help" in runtime.files[HF_CLI_SKILL_FILENAME]
+    assert b"Never print, echo, log, commit" in runtime.files[HF_CLI_SKILL_FILENAME]
     assert taskset.curator.validation_set.dataset_id.encode() not in runtime.files[
         SELF_SCORE_FILENAME
     ]
     assert SELF_SCORE_TRAIN_FILENAME not in runtime.files
+
+
+def test_hf_cli_skill_is_packaged():
+    skill = resources.files("pretrain_data_curator").joinpath(HF_CLI_SKILL_FILENAME)
+    build_config = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert skill.is_file()
+    assert "pretrain_data_curator/**/*.md" in build_config["tool"]["hatch"]["build"][
+        "include"
+    ]
 
 
 def test_self_score_train_script_renders_and_compiles():

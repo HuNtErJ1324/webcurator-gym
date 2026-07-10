@@ -26,7 +26,11 @@ allow-direct-references = true
 packages = ["pretrain_data_curator"]
 
 [tool.hatch.build]
-include = ["pretrain_data_curator/**/*.py", "pyproject.toml"]
+include = [
+    "pretrain_data_curator/**/*.py",
+    "pretrain_data_curator/**/*.md",
+    "pyproject.toml",
+]
 
 [tool.verifiers.eval]
 num_examples = 1
