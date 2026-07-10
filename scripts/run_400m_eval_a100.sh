@@ -195,6 +195,55 @@ test_remote_file_cmd() {
   printf 'test -f %q\n' "$remote_path"
 }
 
+# Fail-fast affinity probe: create a marker via one multiplexed remote() call,
+# then read it back on a subsequent call. MassedCompute (pod 8b009f19) showed
+# mkdir+test succeeding on one SSH session while the next session lacked the
+# parent dir — ControlMaster + this probe catch that before provision/eval.
+affinity_preflight_write_cmd() {
+  local marker_path="$1"
+  local token="$2"
+  local host_note="$3"
+  # Single remote string: mkdir parent, write token+newline, print hostname + note.
+  # Use echo (not nested printf %%s\\n) so %q escaping stays simple and correct.
+  printf 'umask 077 && mkdir -p "$(dirname %q)" && echo %q > %q && chmod 600 %q && hostname && echo %q\n' \
+    "$marker_path" "$token" "$marker_path" "$marker_path" "$host_note"
+}
+
+affinity_preflight_read_cmd() {
+  local marker_path="$1"
+  # Fail loudly if the marker is missing (affinity break); then cat + hostname.
+  printf 'test -f %q || { echo "affinity-preflight: missing marker at %q" >&2; exit 1; }; cat %q && hostname\n' \
+    "$marker_path" "$marker_path" "$marker_path"
+}
+
+verify_ssh_connection_affinity() {
+  # Prove a file created through the shared ControlMaster session persists and
+  # is readable on a subsequent multiplexed remote() call. Fail before any
+  # expensive provision/eval if affinity is broken.
+  local marker_dir marker_path token host_note write_out read_out write_cmd read_cmd
+  [[ -n "${SSH_CONTROL_PATH:-}" ]] || die "SSH ControlMaster not configured; cannot verify connection affinity"
+  [[ -n "${REMOTE_ROOT:-}" ]] || die "REMOTE_ROOT unset; cannot verify connection affinity"
+  marker_dir="${REMOTE_ROOT}/.wcg-ssh-affinity"
+  marker_path="${marker_dir}/marker.$$.$RANDOM"
+  token="wcg-affinity-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  host_note="control_path=${SSH_CONTROL_DIR:-unset}"
+  write_cmd="$(affinity_preflight_write_cmd "$marker_path" "$token" "$host_note")"
+  read_cmd="$(affinity_preflight_read_cmd "$marker_path")"
+  log "SSH affinity preflight: write marker via ControlMaster, then re-read (${SSH_USER}@${SSH_HOST})"
+  if ! write_out="$(remote "$write_cmd")"; then
+    die "SSH affinity preflight WRITE failed on ${SSH_USER}@${SSH_HOST} (${host_note}). Multiplexed session cannot create durable paths; refusing provision/eval."
+  fi
+  if ! read_out="$(remote "$read_cmd")"; then
+    die "SSH affinity preflight READ failed on ${SSH_USER}@${SSH_HOST} after successful write (${host_note}). Marker ${marker_path} missing on subsequent multiplexed call; hostname/write evidence: ${write_out}"
+  fi
+  if [[ "$read_out" != *"$token"* ]]; then
+    die "SSH affinity preflight token mismatch on ${SSH_USER}@${SSH_HOST}. write=[${write_out}] read=[${read_out}] (${host_note})"
+  fi
+  log "SSH affinity preflight OK (hostname/session evidence): $(printf '%s' "$write_out" | tr '\n' ' ' | head -c 200)"
+  # Best-effort cleanup of the probe marker (ignore failures).
+  remote "$(printf 'rm -f %q\n' "$marker_path")" >/dev/null 2>&1 || true
+}
+
 ensure_remote_repo_dir() {
   # Do not rely on rsync's implicit mkdir: MassedCompute (ubuntu@) has been
   # observed to report a successful sync while $REMOTE_ROOT/webcurator-gym is
@@ -273,9 +322,60 @@ POD_ID=""
 SSH_USER="root"
 SSH_HOST=""
 SSH_PORT="22"
+# Per-launch SSH ControlMaster socket dir (set after auth). Collision-safe via mktemp.
+SSH_CONTROL_DIR=""
+SSH_CONTROL_PATH=""
+
+ssh_common_opts() {
+  # Echo space-separated shared SSH options for remote()/rsync. When
+  # ControlPath is set, ControlMaster=auto reuses one TCP session so
+  # MassedCompute mkdir/write affinity holds across remote() calls (8b009f19).
+  local opts="-o StrictHostKeyChecking=no -o BatchMode=yes"
+  if [[ -n "${SSH_CONTROL_PATH:-}" ]]; then
+    opts+=" -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=${SSH_CONTROL_PATH}"
+  fi
+  printf '%s' "$opts"
+}
+
+ssh_rsync_transport() {
+  # Single -e string for rsync; must include the same ControlPath as remote().
+  printf 'ssh -T -i %q -p %q %s' "$SSH_KEY" "$SSH_PORT" "$(ssh_common_opts)"
+}
+
+setup_ssh_control_master() {
+  # Collision-safe local socket directory for this launch only.
+  [[ -n "${SSH_USER:-}" && -n "${SSH_HOST:-}" ]] || die "SSH target unset; cannot start ControlMaster"
+  if [[ -z "${SSH_CONTROL_DIR:-}" ]]; then
+    SSH_CONTROL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/wcg-ssh-cm.XXXXXX")"
+    # %C hashes local/remote identity — unique per target, safe for paths.
+    SSH_CONTROL_PATH="${SSH_CONTROL_DIR}/cm-%C"
+  fi
+  log "Starting SSH ControlMaster (${SSH_USER}@${SSH_HOST}:${SSH_PORT}, socket_dir=${SSH_CONTROL_DIR})"
+  # First connection with ControlMaster=auto creates the master socket.
+  # shellcheck disable=SC2086
+  ssh -T -i "$SSH_KEY" -p "$SSH_PORT" $(ssh_common_opts) \
+    -o ConnectTimeout=15 \
+    "${SSH_USER}@${SSH_HOST}" true \
+    || die "Failed to establish SSH ControlMaster to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
+}
+
+cleanup_ssh_control_master() {
+  if [[ -n "${SSH_CONTROL_PATH:-}" && -n "${SSH_USER:-}" && -n "${SSH_HOST:-}" ]]; then
+    # shellcheck disable=SC2086
+    ssh -T -i "$SSH_KEY" -p "$SSH_PORT" $(ssh_common_opts) \
+      -O exit \
+      "${SSH_USER}@${SSH_HOST}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SSH_CONTROL_DIR:-}" && -d "${SSH_CONTROL_DIR}" ]]; then
+    rm -rf "${SSH_CONTROL_DIR}"
+  fi
+  SSH_CONTROL_DIR=""
+  SSH_CONTROL_PATH=""
+}
 
 cleanup() {
   local code=$?
+  cleanup_ssh_control_master
   if [[ -n "$POD_ID" && "$KEEP_POD" -eq 0 ]]; then
     log "Terminating pod $POD_ID"
     prime pods terminate "$POD_ID" -y --plain >/dev/null 2>&1 || true
@@ -506,7 +606,8 @@ PY
 }
 
 remote() {
-  ssh -T -i "$SSH_KEY" -o StrictHostKeyChecking=no -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "$@"
+  # shellcheck disable=SC2086
+  ssh -T -i "$SSH_KEY" -p "$SSH_PORT" $(ssh_common_opts) "${SSH_USER}@${SSH_HOST}" "$@"
 }
 
 wait_for_ssh_auth() {
@@ -556,7 +657,8 @@ wait_for_ssh_auth() {
 
 remote_rsync() {
   local attempt
-  local ssh_cmd="ssh -T -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT"
+  local ssh_cmd
+  ssh_cmd="$(ssh_rsync_transport)"
   for attempt in 1 2 3 4 5; do
     if rsync -az --delete \
       --exclude '.git/' \
@@ -772,7 +874,7 @@ download_results() {
   log "Downloading results from outputs/$rel_dir"
   mkdir -p "$LOCAL_OUT_DIR"
   rsync -az \
-    -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT" \
+    -e "$(ssh_rsync_transport)" \
     "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator/outputs/${rel_dir}/" \
     "$LOCAL_OUT_DIR/"
   [[ -s "$LOCAL_OUT_DIR/results.jsonl" ]] || die "Downloaded results.jsonl is empty"
@@ -883,11 +985,13 @@ rm -f "$CREATE_LOG"
 log "Created pod $POD_ID ($POD_NAME)"
 wait_for_pod "$POD_ID"
 wait_for_ssh_auth
+setup_ssh_control_master
+verify_ssh_connection_affinity
 
 log "Syncing repository to pod"
 remote_rsync
 # Explicit create/verify: do not trust rsync alone to materialize the remote
-# repo directory before secrets scp (MassedCompute ubuntu@ failure mode).
+# repo directory before secrets upload (MassedCompute ubuntu@ failure mode).
 ensure_remote_repo_dir
 upload_secrets
 

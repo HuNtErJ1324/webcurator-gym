@@ -531,11 +531,21 @@ def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
 
 
 def _extract_bash_function(script: str, name: str) -> str:
-    """Return the body of ``name() { ... }`` (outermost braces), or raise."""
-    header = f"{name}()"
-    start = script.find(header)
-    assert start != -1, f"missing function {name}()"
-    brace = script.find("{", start)
+    """Return the body of ``name() { ... }`` (outermost braces), or raise.
+
+    Requires a real definition (``name() {`` / ``name()\\n{``), not a comment
+    mention like ``remote() call``.
+    """
+    import re
+
+    match = re.search(rf"(?m)^[ \t]*{re.escape(name)}\s*\(\)\s*\{{", script)
+    if not match:
+        # Also allow the brace on the next line: name()\n{
+        match = re.search(
+            rf"(?m)^[ \t]*{re.escape(name)}\s*\(\)\s*\n\s*\{{", script
+        )
+    assert match, f"missing function {name}()"
+    brace = script.find("{", match.start())
     assert brace != -1, f"missing opening brace for {name}()"
     depth = 0
     for idx in range(brace, len(script)):
@@ -954,6 +964,192 @@ def test_400m_a100_download_remote_log_via_exec_not_scp(tmp_path):
         text=True,
     )
     assert out.stdout == "eval stream line\n"
+
+
+def test_400m_a100_ssh_controlmaster_opts_propagate_to_remote_and_rsync():
+    """ControlMaster options must be shared by remote() and rsync transport."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+
+    remote_body = _extract_bash_function(a100, "remote")
+    rsync_body = _extract_bash_function(a100, "remote_rsync")
+    download_body = _extract_bash_function(a100, "download_results")
+    opts_body = _extract_bash_function(a100, "ssh_common_opts")
+    transport_body = _extract_bash_function(a100, "ssh_rsync_transport")
+    setup_body = _extract_bash_function(a100, "setup_ssh_control_master")
+    cleanup_cm_body = _extract_bash_function(a100, "cleanup_ssh_control_master")
+    cleanup_body = _extract_bash_function(a100, "cleanup")
+
+    assert "ssh_common_opts" in remote_body
+    assert "ssh_rsync_transport" in rsync_body
+    assert "ssh_rsync_transport" in download_body
+    assert "ControlMaster=auto" in opts_body
+    assert "ControlPersist=600" in opts_body
+    assert "ControlPath=" in opts_body
+    assert "mktemp -d" in setup_body
+    assert "cm-%C" in setup_body
+    assert "rm -rf" in cleanup_cm_body
+    assert "-O exit" in cleanup_cm_body
+    assert "cleanup_ssh_control_master" in cleanup_body
+
+    # Main flow: auth → ControlMaster → affinity preflight → sync (before provision).
+    auth_marker = a100.find("wait_for_ssh_auth")
+    assert auth_marker >= 0
+    # Prefer the call site after "Created pod".
+    created = a100.find('log "Created pod')
+    assert created >= 0
+    setup_idx = a100.find("setup_ssh_control_master", created)
+    affinity_idx = a100.find("verify_ssh_connection_affinity", created)
+    sync_idx = a100.find("Syncing repository to pod", created)
+    provision_idx = a100.find("remote_provision_gpu", created)
+    assert setup_idx < affinity_idx < sync_idx < provision_idx
+
+    # Deterministic opts construction with/without ControlPath.
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            "ssh_common_opts() {",
+            opts_body,
+            "}",
+            "ssh_rsync_transport() {",
+            "SSH_KEY=/tmp/id_test",
+            "SSH_PORT=22",
+            transport_body,
+            "}",
+            'SSH_CONTROL_PATH=""',
+            "ssh_common_opts; printf '\\n'",
+            'SSH_CONTROL_PATH="/tmp/wcg-ssh-cm.TEST/cm-%C"',
+            "ssh_common_opts; printf '\\n'",
+            "ssh_rsync_transport; printf '\\n'",
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 3
+    assert "ControlMaster" not in lines[0]
+    assert "ControlMaster=auto" in lines[1]
+    assert "ControlPath=/tmp/wcg-ssh-cm.TEST/cm-%C" in lines[1]
+    assert "ControlMaster=auto" in lines[2]
+    assert "ControlPath=/tmp/wcg-ssh-cm.TEST/cm-%C" in lines[2]
+    assert lines[2].startswith("ssh -T -i ")
+
+
+def test_400m_a100_ssh_controlmaster_cleanup_removes_socket_dir(tmp_path):
+    """cleanup_ssh_control_master must remove the per-launch socket directory."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    cleanup_cm_body = _extract_bash_function(a100, "cleanup_ssh_control_master")
+    sock_dir = tmp_path / "wcg-ssh-cm.fake"
+    sock_dir.mkdir()
+    (sock_dir / "cm-fake").write_text("socket-placeholder\n", encoding="utf-8")
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            "SSH_CONTROL_DIR=" + str(sock_dir),
+            'SSH_CONTROL_PATH="' + str(sock_dir) + '/cm-%C"',
+            'SSH_USER=""',  # skip -O exit remote call
+            'SSH_HOST=""',
+            "cleanup_ssh_control_master() {",
+            cleanup_cm_body,
+            "}",
+            "cleanup_ssh_control_master",
+            '[[ -z "${SSH_CONTROL_DIR}" ]]',
+            '[[ -z "${SSH_CONTROL_PATH}" ]]',
+            f'test ! -d "{sock_dir}"',
+            'echo cleaned',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "cleaned" in built.stdout
+    assert not sock_dir.exists()
+
+
+def test_400m_a100_affinity_preflight_cmds_preserve_paths_and_fail_loudly(tmp_path):
+    """Affinity write/read cmds keep absolute paths; local pass/fail mirrors remote."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    verify_body = _extract_bash_function(a100, "verify_ssh_connection_affinity")
+    assert "affinity_preflight_write_cmd" in verify_body
+    assert "affinity_preflight_read_cmd" in verify_body
+    assert "SSH affinity preflight" in verify_body
+    assert "hostname" in verify_body or "hostname" in _extract_bash_function(
+        a100, "affinity_preflight_write_cmd"
+    )
+    verify_code = "\n".join(
+        ln for ln in verify_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "bash -lc" not in verify_code
+    assert "massedcompute" not in verify_code.lower()  # no hard provider exclude
+
+    builder = "\n".join(
+        [
+            "set -euo pipefail",
+            "affinity_preflight_write_cmd() {",
+            _extract_bash_function(a100, "affinity_preflight_write_cmd"),
+            "}",
+            "affinity_preflight_read_cmd() {",
+            _extract_bash_function(a100, "affinity_preflight_read_cmd"),
+            "}",
+            'affinity_preflight_write_cmd "/home/ubuntu/.wcg-ssh-affinity/marker" "tok-ubuntu" "note-u"',
+            'affinity_preflight_write_cmd "/root/.wcg-ssh-affinity/marker" "tok-root" "note-r"',
+            'affinity_preflight_read_cmd "/home/ubuntu/.wcg-ssh-affinity/marker"',
+            'affinity_preflight_read_cmd "/root/.wcg-ssh-affinity/marker"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", builder],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 4
+    write_u, write_r, read_u, read_r = lines
+    assert "/home/ubuntu/.wcg-ssh-affinity/marker" in write_u
+    assert "/root/.wcg-ssh-affinity/marker" in write_r
+    assert "tok-ubuntu" in write_u and "note-u" in write_u
+    assert "tok-root" in write_r and "note-r" in write_r
+    assert write_u.startswith("umask 077 && mkdir -p")
+    assert "hostname" in write_u and "hostname" in read_u
+    assert read_u.startswith("test -f ")
+
+    # Local PASS: write then read on the same filesystem recovers the token.
+    local_marker = tmp_path / "home/ubuntu/.wcg-ssh-affinity/marker"
+    local_write = write_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(local_marker))
+    # hostname may not exist in minimal envs — strip trailing hostname/note prints
+    # by executing only the mkdir/write/chmod prefix for the pass check.
+    pass_prefix = local_write.split(" && hostname")[0]
+    subprocess.run(["bash", "-c", pass_prefix], check=True)
+    assert local_marker.is_file()
+    assert local_marker.read_text(encoding="utf-8").strip() == "tok-ubuntu"
+    assert (local_marker.stat().st_mode & 0o777) == 0o600
+
+    local_read = read_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(local_marker))
+    read_prefix = local_read.split(" && hostname")[0]
+    read_out = subprocess.run(
+        ["bash", "-c", read_prefix],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "tok-ubuntu" in read_out.stdout
+
+    # Local FAIL: read cmd against a missing marker exits non-zero.
+    missing = tmp_path / "missing" / "marker"
+    fail_read = read_u.replace("/home/ubuntu/.wcg-ssh-affinity/marker", str(missing))
+    fail_prefix = fail_read.split(" && hostname")[0]
+    fail_run = subprocess.run(["bash", "-c", fail_prefix], capture_output=True, text=True)
+    assert fail_run.returncode != 0
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
