@@ -40,6 +40,7 @@ class FakeRuntime:
             stderr="",
             exit_code=0,
         )
+        self.files: dict[str, bytes] = {}
         self.stop_calls = 0
 
     @property
@@ -47,16 +48,40 @@ class FakeRuntime:
         return self.config.type
 
     async def write(self, path: str, data: bytes) -> None:
-        pass
+        self.files[path] = data
 
     async def read(self, path: str) -> bytes:
-        raise FileNotFoundError(path)
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return self.files[path]
 
     async def run(self, argv: list[str], env: dict[str, str]):
         return self.result
 
     async def stop(self) -> None:
         self.stop_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_training_crash_surfaces_redirected_stderr_file():
+    """Trainer redirects sys.stderr to /workspace/stderr.txt; Modal harness must read it."""
+    result = SimpleNamespace(stdout="step 0", stderr="", exit_code=1)
+    runtime = FakeRuntime(result)
+    runtime.files["/workspace/stderr.txt"] = (
+        b"CUDA out of memory. Tried to allocate 9.20 GiB\n"
+        b"RuntimeError: CUDA error: out of memory\n"
+    )
+
+    with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
+        await ModalProxyTrainer().train_and_eval(
+            _corpus(),
+            ProxyStudentConfig(runtime_backend="modal"),
+            runtime=runtime,
+        )
+
+    assert "CUDA out of memory" in excinfo.value.stderr_tail
+    assert "out of memory" in runtime.files["/workspace/train_stderr.log"].decode()
+    assert b"CUDA out of memory" in runtime.files["/workspace/train_stderr_redirect.log"]
 
 
 @pytest.mark.asyncio
