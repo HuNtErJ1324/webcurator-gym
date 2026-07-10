@@ -46,7 +46,9 @@ EVAL_CONFIG=""
 EVAL_CONFIG_PATH=""
 RUN_NAME=""
 
-log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+# Progress/status always on stderr so command substitutions (e.g.
+# stage="$(stage_massedcompute_workspace)") capture only intended path/data.
+log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 usage() {
@@ -929,7 +931,8 @@ EOF
 
 stage_massedcompute_workspace() {
   # Build a temp dir: excluded repo tree + secrets.env (0600) + single-shell driver.
-  # Prints the stage directory path on stdout (not secret contents).
+  # stdout: ONLY the stage directory path (no log lines — a863bcc: prepare_secrets
+  # log-to-stdout polluted stage="$(...)"). Progress goes through log() → stderr.
   local stage
   stage="$(mktemp -d "${TMPDIR:-/tmp}/wcg-mc-stage.XXXXXX")"
   # shellcheck disable=SC2046

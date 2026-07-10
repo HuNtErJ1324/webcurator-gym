@@ -1320,6 +1320,8 @@ def test_400m_a100_massedcompute_staged_archive_excludes_and_secrets_mode(tmp_pa
     assert "repo_tar_exclude_args" in a100
     assert "run_massedcompute_single_shell_eval" in a100
     assert 'POD_PROVIDER:-}" == "massedcompute"' in a100 or '== "massedcompute"' in a100
+    # Global log() must write stderr so stage="$(...)" is not polluted (a863bcc).
+    assert '>&2' in a100.split("log() {", 1)[1].split("}", 1)[0]
 
     # Tiny fake repo + secrets for staging.
     fake_root = tmp_path / "repo"
@@ -1349,8 +1351,9 @@ def test_400m_a100_massedcompute_staged_archive_excludes_and_secrets_mode(tmp_pa
             'MODEL="deepseek/deepseek-v4-pro"',
             'EVAL_CONFIG="configs/eval/400M-300turn-codex.toml"',
             'RUN_NAME="test-run"',
-            "log() { printf '%s\\n' \"$*\" >&2; }",
-            "die() { printf 'FATAL: %s\\n' \"$*\" >&2; exit 1; }",
+            # Use the real log() contract (stderr), not a silent stub.
+            "log() { printf '[%s] %s\\n' \"$(date -u +%H:%M:%S)\" \"$*\" >&2; }",
+            "die() { log \"FATAL: $*\"; exit 1; }",
             "prime_api_key_from_cli() { echo 'should-not-be-called'; exit 1; }",
             "repo_tar_exclude_args() {",
             _extract_bash_function(a100, "repo_tar_exclude_args"),
@@ -1375,7 +1378,10 @@ def test_400m_a100_massedcompute_staged_archive_excludes_and_secrets_mode(tmp_pa
         capture_output=True,
         text=True,
     )
-    stage = Path(built.stdout.strip().splitlines()[-1])
+    # stdout must be exactly one path line (no log contamination).
+    out_lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert len(out_lines) == 1, built.stdout
+    stage = Path(out_lines[0])
     assert stage.is_dir()
     assert (stage / "keep.txt").read_text(encoding="utf-8") == "keep\n"
     assert not (stage / ".git").exists()
@@ -1412,6 +1418,97 @@ def test_400m_a100_massedcompute_staged_archive_excludes_and_secrets_mode(tmp_pa
     assert "HF_TOKEN=" not in boot.stdout
     assert "PRIME_API_KEY=" not in boot.stdout
     assert "hf-test-secret-value" not in boot.stdout
+
+
+def test_400m_a100_massedcompute_stage_cmdsub_no_log_contamination(tmp_path):
+    """Real staging + PRIME injection: stage="$(...)" is a real path, tar succeeds.
+
+    Regression for a863bcc: prepare_secrets_env_file logged Injecting PRIME_API_KEY
+    to stdout, so stage="$(stage_massedcompute_workspace)" was not a usable path.
+    """
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    assert '>&2' in a100.split("log() {", 1)[1].split("}", 1)[0]
+    prepare_body = _extract_bash_function(a100, "prepare_secrets_env_file")
+    assert "Injecting PRIME_API_KEY" in prepare_body
+    assert "prime_api_key_from_cli" in prepare_body
+
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    (fake_root / "keep.txt").write_text("keep\n", encoding="utf-8")
+    (fake_root / "environments" / "pretrain_data_curator").mkdir(parents=True)
+    # No PRIME_API_KEY → forces injection path (the log that polluted stdout).
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("HF_TOKEN=hf-inject-test-value\n", encoding="utf-8")
+
+    snippet = "\n".join(
+        [
+            "set -euo pipefail",
+            f"ROOT={fake_root}",
+            f"SECRETS_FILE={secrets}",
+            "CURATION_ONLY=0",
+            'MODEL="deepseek/deepseek-v4-pro"',
+            'EVAL_CONFIG="configs/eval/400M-300turn-codex.toml"',
+            'RUN_NAME="test-run"',
+            # Real log() from launcher (stderr).
+            "log() { printf '[%s] %s\\n' \"$(date -u +%H:%M:%S)\" \"$*\" >&2; }",
+            "die() { log \"FATAL: $*\"; exit 1; }",
+            "prime_api_key_from_cli() { printf '%s\\n' 'prime-injected-from-cli'; }",
+            "repo_tar_exclude_args() {",
+            _extract_bash_function(a100, "repo_tar_exclude_args"),
+            "}",
+            "prepare_secrets_env_file() {",
+            prepare_body,
+            "}",
+            "write_massedcompute_single_shell_driver() {",
+            _extract_bash_function(a100, "write_massedcompute_single_shell_driver"),
+            "}",
+            "stage_massedcompute_workspace() {",
+            _extract_bash_function(a100, "stage_massedcompute_workspace"),
+            "}",
+            # Exact production capture pattern.
+            'stage="$(stage_massedcompute_workspace)"',
+            '[[ -d "$stage" ]] || { echo "not a dir: [$stage]" >&2; exit 2; }',
+            '[[ -f "$stage/secrets.env" ]] || exit 3',
+            '[[ -f "$stage/wcg_single_shell_driver.sh" ]] || exit 4',
+            # Tar staging must succeed from the captured path (as the runner does).
+            f'archive="{tmp_path / "staged.tar.gz"}"',
+            'tar -czf "$archive" -C "$stage" .',
+            '[[ -s "$archive" ]] || exit 5',
+            'printf "STAGE_OK=%s\\n" "$stage"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", snippet],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # Injection progress must be on stderr, not mixed into the stage path.
+    assert "Injecting PRIME_API_KEY" in built.stderr
+    assert "Injecting PRIME_API_KEY" not in built.stdout
+    assert "prime-injected-from-cli" not in built.stdout
+    assert "prime-injected-from-cli" not in built.stderr
+    assert "hf-inject-test-value" not in built.stdout
+    assert "hf-inject-test-value" not in built.stderr
+
+    ok_lines = [ln for ln in built.stdout.splitlines() if ln.startswith("STAGE_OK=")]
+    assert len(ok_lines) == 1, built.stdout
+    stage = Path(ok_lines[0].removeprefix("STAGE_OK="))
+    assert stage.is_dir()
+    sec_text = (stage / "secrets.env").read_text(encoding="utf-8")
+    assert "HF_TOKEN=hf-inject-test-value" in sec_text
+    assert "PRIME_API_KEY=prime-injected-from-cli" in sec_text
+    assert ((stage / "secrets.env").stat().st_mode & 0o777) == 0o600
+    # Real driver was written and is syntactically valid.
+    driver = stage / "wcg_single_shell_driver.sh"
+    assert driver.is_file()
+    syntax = subprocess.run(
+        ["bash", "-n", str(driver)], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    archive = tmp_path / "staged.tar.gz"
+    assert archive.is_file() and archive.stat().st_size > 0
 
 
 def test_400m_a100_massedcompute_stdout_artifact_vs_stderr_log_protocol(tmp_path):
