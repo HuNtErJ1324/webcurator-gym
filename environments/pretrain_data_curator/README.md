@@ -240,6 +240,7 @@ See [`docs/README.md`](docs/README.md) for the eval visualization site and build
 | Page | Use it for |
 | --- | --- |
 | [Bench site builder](docs/README.md) | Generate a PostTrainBench-style leaderboard from full 400M runs in `outputs/evals-400m/` |
+| [Manifest-backed training debug workflow](docs/debug_manifest_training.md) | Materialize a curated corpus from an explicit local manifest once, then repeatedly debug the NanoGPT/proxy training path against the same bundle without re-curating. |
 
 ## Install And Eval
 
