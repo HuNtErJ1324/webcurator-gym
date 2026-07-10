@@ -163,21 +163,43 @@ set_remote_root_for_user() {
   fi
 }
 
+# Build the remote shell snippet that creates + verifies a repo directory.
+# Kept as a pure string builder so unit tests can assert absolute paths survive
+# OpenSSH's argv-flattening (see ensure_remote_repo_dir).
+ensure_remote_repo_dir_cmd() {
+  local remote_dir="$1"
+  # %q shell-escapes so spaces/metacharacters in the path stay one word remotely.
+  printf 'mkdir -p %q && test -d %q && test -w %q\n' \
+    "$remote_dir" "$remote_dir" "$remote_dir"
+}
+
+probe_remote_repo_dir_cmd() {
+  local remote_dir="$1"
+  printf 'test -d %q\n' "$remote_dir"
+}
+
 ensure_remote_repo_dir() {
   # Do not rely on rsync's implicit mkdir: MassedCompute (ubuntu@) has been
   # observed to report a successful sync while $REMOTE_ROOT/webcurator-gym is
   # still missing, so scp of secrets.env fails with "No such file or directory".
   # Create + verify the configured remote repo dir before any secrets upload.
-  local remote_dir
+  #
+  # Critical: pass ONE remote command string to `remote` / ssh. Do NOT use
+  # `remote bash -lc "mkdir -p '$dir' && ..."`. OpenSSH joins remote argv with
+  # spaces before the login shell runs them, so bash -c's script becomes only
+  # "mkdir" and the path is lost → "mkdir: missing operand" (pod b89b046e).
+  local remote_dir remote_cmd
   [[ -n "${REMOTE_ROOT:-}" ]] || die "REMOTE_ROOT is unset; cannot ensure remote repo directory"
   [[ -n "${SSH_USER:-}" && -n "${SSH_HOST:-}" ]] || die "SSH target unset; cannot ensure remote repo directory"
   remote_dir="$(remote_repo_dir)"
   log "Ensuring remote repo directory exists and is writable: ${SSH_USER}@${SSH_HOST}:${remote_dir}"
-  if ! remote bash -lc "mkdir -p '$remote_dir' && test -d '$remote_dir' && test -w '$remote_dir'"; then
+  remote_cmd="$(ensure_remote_repo_dir_cmd "$remote_dir")"
+  if ! remote "$remote_cmd"; then
     die "Remote repo directory unavailable or not writable: ${SSH_USER}@${SSH_HOST}:${remote_dir}. Refusing to upload secrets."
   fi
   # Fail loudly if a subsequent probe still cannot see the directory.
-  if ! remote bash -lc "test -d '$remote_dir'"; then
+  remote_cmd="$(probe_remote_repo_dir_cmd "$remote_dir")"
+  if ! remote "$remote_cmd"; then
     die "Remote repo directory missing after mkdir: ${SSH_USER}@${SSH_HOST}:${remote_dir}"
   fi
 }

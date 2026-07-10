@@ -628,15 +628,26 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
     a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
 
     ensure_body = _extract_bash_function(a100, "ensure_remote_repo_dir")
+    ensure_cmd_body = _extract_bash_function(a100, "ensure_remote_repo_dir_cmd")
+    probe_cmd_body = _extract_bash_function(a100, "probe_remote_repo_dir_cmd")
     upload_body = _extract_bash_function(a100, "upload_secrets")
     auth_body = _extract_bash_function(a100, "wait_for_ssh_auth")
     wait_pod_body = _extract_bash_function(a100, "wait_for_pod")
 
-    assert "mkdir -p" in ensure_body
-    assert "test -d" in ensure_body
-    assert "test -w" in ensure_body
+    assert "mkdir -p" in ensure_cmd_body
+    assert "test -d" in ensure_cmd_body
+    assert "test -w" in ensure_cmd_body
+    assert "test -d" in probe_cmd_body
     assert "Remote repo directory unavailable" in ensure_body
     assert "remote_repo_dir" in ensure_body or "webcurator-gym" in ensure_body
+    # Must NOT invoke `remote bash -lc ...` — OpenSSH flattens argv so bash -c
+    # only sees "mkdir" (pod b89b046e: "mkdir: missing operand"). Ignore comments.
+    ensure_code = "\n".join(
+        ln for ln in ensure_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "remote bash -lc" not in ensure_code
+    assert "ensure_remote_repo_dir_cmd" in ensure_body
+    assert 'remote "$remote_cmd"' in ensure_body
 
     # upload_secrets must re-check (or call ensure) before scp — not rely on rsync.
     assert "ensure_remote_repo_dir" in upload_body
@@ -693,6 +704,93 @@ def test_400m_a100_remote_repo_dir_paths_for_root_and_ubuntu():
     )
     lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
     assert lines == ["/root/webcurator-gym", "/home/ubuntu/webcurator-gym"]
+
+
+def test_400m_a100_ensure_remote_repo_dir_cmd_preserves_absolute_paths(tmp_path):
+    """Constructed remote cmds must keep absolute paths intact under SSH flattening.
+
+    OpenSSH joins remote argv with spaces. The broken form
+    ``bash -lc "mkdir -p '/home/ubuntu/webcurator-gym' && ..."`` becomes
+    ``bash -lc mkdir -p ...`` so bash -c's script is only ``mkdir`` → missing
+    operand. The fixed builder emits ONE shell string with %q-escaped paths;
+    after the same join it still contains the absolute directory.
+    """
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    builder = "\n".join(
+        [
+            "set -euo pipefail",
+            "ensure_remote_repo_dir_cmd() {",
+            _extract_bash_function(a100, "ensure_remote_repo_dir_cmd"),
+            "}",
+            "probe_remote_repo_dir_cmd() {",
+            _extract_bash_function(a100, "probe_remote_repo_dir_cmd"),
+            "}",
+            'ensure_remote_repo_dir_cmd "/home/ubuntu/webcurator-gym"',
+            'ensure_remote_repo_dir_cmd "/root/webcurator-gym"',
+            'probe_remote_repo_dir_cmd "/home/ubuntu/webcurator-gym"',
+            'probe_remote_repo_dir_cmd "/root/webcurator-gym"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", builder],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 4
+    ensure_ubuntu, ensure_root, probe_ubuntu, probe_root = lines
+
+    for path, ensure_cmd, probe_cmd in (
+        ("/home/ubuntu/webcurator-gym", ensure_ubuntu, probe_ubuntu),
+        ("/root/webcurator-gym", ensure_root, probe_root),
+    ):
+        assert path in ensure_cmd, ensure_cmd
+        assert path in probe_cmd, probe_cmd
+        assert ensure_cmd.startswith("mkdir -p "), ensure_cmd
+        assert "test -d" in ensure_cmd and "test -w" in ensure_cmd
+        assert probe_cmd.startswith("test -d "), probe_cmd
+
+        # Simulate OpenSSH argv flattening of the FIXED form: a single remote
+        # argv survives join as the full command string.
+        flat_fixed = " ".join([ensure_cmd])
+        assert path in flat_fixed
+        assert "mkdir: missing operand" not in flat_fixed
+
+        # Simulate the BROKEN form from pod b89b046e and prove path loss.
+        broken_argv = [
+            "bash",
+            "-lc",
+            f"mkdir -p '{path}' && test -d '{path}' && test -w '{path}'",
+        ]
+        flat_broken = " ".join(broken_argv)
+        # After join, bash -c's next word (the script) is only "mkdir".
+        broken_words = flat_broken.split()
+        assert broken_words[0:2] == ["bash", "-lc"]
+        assert broken_words[2] == "mkdir", broken_words
+        # Execute that flattened broken command the way a remote shell would:
+        # bash -lc mkdir -p /path ... → script=mkdir, missing operand.
+        broken_run = subprocess.run(
+            broken_words,
+            capture_output=True,
+            text=True,
+        )
+        assert broken_run.returncode != 0
+        assert "missing operand" in (broken_run.stderr + broken_run.stdout)
+
+        # Execute the FIXED single-string command locally against tmp_path
+        # (rewrite absolute path → tmp) to prove mkdir/test receive the path.
+        local_dir = tmp_path / path.lstrip("/")
+        local_cmd = ensure_cmd.replace(path, str(local_dir))
+        fixed_run = subprocess.run(
+            ["bash", "-c", local_cmd],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert local_dir.is_dir()
+        assert fixed_run.returncode == 0
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
