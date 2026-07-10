@@ -175,6 +175,13 @@ class ProxyStudentConfig(BaseModel):
     sliding_window_size: int | None = Field(default=None, ge=2)
     block_size: int = Field(default=1024, ge=8, le=8192)
     batch_size: int = Field(default=16, ge=1, le=4096)
+    # Cap peak training activation memory without changing scheduled effective-batch
+    # token accounting. When set (e.g. 16 on A100-80GB), each optimizer step still
+    # consumes ``effective_batch = batch_size * stage_mul`` windows, but forward /
+    # backward run in loss-scaled microbatches so full-vocab logits never materialize
+    # for the 2×/3× schedule stages at once. ``None`` (default) = one full effective
+    # batch per step (legacy behavior).
+    train_microbatch_size: int | None = Field(default=None, ge=1, le=4096)
     # Held-out validation microbatch. Separate from training ``batch_size`` so the
     # final CE pass can stay under the A100-80GB ceiling after Muon/Adam state is
     # still resident. ``None`` (default) reuses ``batch_size`` for backwards
@@ -354,6 +361,7 @@ class ProxyStudentConfig(BaseModel):
             "sliding_window_size": self.sliding_window_size,
             "block_size": self.block_size,
             "batch_size": self.batch_size,
+            "train_microbatch_size": self.train_microbatch_size,
             "val_batch_size": self.val_batch_size,
             "val_logit_chunk_tokens": self.val_logit_chunk_tokens,
             "steps": self.effective_steps,

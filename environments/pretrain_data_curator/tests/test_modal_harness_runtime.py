@@ -49,6 +49,9 @@ class FakeRuntime:
     async def write(self, path: str, data: bytes) -> None:
         pass
 
+    async def read(self, path: str) -> bytes:
+        raise FileNotFoundError(path)
+
     async def run(self, argv: list[str], env: dict[str, str]):
         return self.result
 

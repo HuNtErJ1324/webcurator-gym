@@ -219,8 +219,16 @@ class RuntimeSelectedTrainer:
 
 
 _NANOGPT_TRAIN_SCRIPT_TEMPLATE = r'''
+import atexit
 import sys
-sys.stderr = open('/workspace/stderr.txt', 'w')
+
+# Redirect stderr to a durable workspace file. Use line buffering so traceback /
+# CUDA OOM lines are visible to the harness before process death, and flush on
+# exit so a final partial line is not lost when the interpreter aborts.
+_stderr_path = "/workspace/stderr.txt"
+_stderr_fh = open(_stderr_path, "w", buffering=1)
+sys.stderr = _stderr_fh
+atexit.register(_stderr_fh.flush)
 
 import json, math, os, subprocess, time
 from dataclasses import dataclass
@@ -398,6 +406,7 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     cautious_wd=bool(cfg.get("cautious_wd", False)),
     nor_muon=bool(cfg.get("nor_muon", False)),
     polar_express=bool(cfg.get("polar_express", False)),
+    train_microbatch_size=cfg.get("train_microbatch_size"),
     val_batch_size=cfg.get("val_batch_size"),
     val_logit_chunk_tokens=cfg.get("val_logit_chunk_tokens"),
 )
@@ -506,6 +515,8 @@ def _nanogpt_train_script() -> str:
                     "plan_eos_aligned_windows",
                     "make_seq_len_schedule",
                     "_enforce_max_doc_len",
+                    "_microbatch_ranges",
+                    "_scaled_microbatch_loss",
                     "_score_hidden_chunked",
                     "_eval_val_loss",
                     "_compute_multi_token_loss",

@@ -479,6 +479,7 @@ def test_single_smoke_config_exhaustively_matches_source_options():
         # is the canonical smoke-config spelling.
         "val_batch_size",
         "val_logit_chunk_tokens",
+        "train_microbatch_size",
         # Portable feature knobs default off; omitted from the smoke TOML.
         "bigram_hash_embed",
         "smear_embed",
@@ -523,6 +524,10 @@ def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
     assert proxy["runtime_backend"] == "docker"
     assert proxy["docker_image"] == "webcurator-runtime:latest"
     assert "pytorch/pytorch" not in proxy["docker_image"]
+    # A100-80GB reliability knobs: train microbatch + held-out val chunking.
+    assert proxy["train_microbatch_size"] == 16
+    assert proxy["val_batch_size"] == 1
+    assert proxy["val_logit_chunk_tokens"] == 1024
 
 
 def _extract_bash_function(script: str, name: str) -> str:
@@ -1256,6 +1261,7 @@ def test_curator_config_rejects_invalid(kwargs):
         {"learning_rate": 0.0},
         {"val_batch_size": 0},
         {"val_logit_chunk_tokens": 0},
+        {"train_microbatch_size": 0},
     ],
 )
 def test_proxy_student_config_rejects_invalid(kwargs):
@@ -1267,13 +1273,20 @@ def test_proxy_student_val_microbatch_defaults_and_payload():
     cfg = ProxyStudentConfig()
     assert cfg.val_batch_size is None
     assert cfg.val_logit_chunk_tokens is None
+    assert cfg.train_microbatch_size is None
     payload = cfg.training_payload()
     assert payload["val_batch_size"] is None
     assert payload["val_logit_chunk_tokens"] is None
-    tuned = ProxyStudentConfig(val_batch_size=1, val_logit_chunk_tokens=2048)
+    assert payload["train_microbatch_size"] is None
+    tuned = ProxyStudentConfig(
+        val_batch_size=1,
+        val_logit_chunk_tokens=2048,
+        train_microbatch_size=16,
+    )
     tuned_payload = tuned.training_payload()
     assert tuned_payload["val_batch_size"] == 1
     assert tuned_payload["val_logit_chunk_tokens"] == 2048
+    assert tuned_payload["train_microbatch_size"] == 16
 
 
 # --- Tier D2: adjustable token budget -> steps / corpus cap / timeout -------
@@ -3563,7 +3576,44 @@ def test_self_score_train_script_renders_and_compiles():
     script = render_self_score_train_script()
     assert b"WORKDIR" in script
     assert b"/workspace" not in script
+    assert b"buffering=1" in script
+    assert b"atexit.register(_stderr_fh.flush)" in script
     compile(script.decode("utf-8"), SELF_SCORE_TRAIN_FILENAME, "exec")
+
+
+def test_self_score_script_preserves_trainer_stderr_tail_before_cleanup():
+    """Rendered self_score must read WORKDIR/stderr.txt before rmtree on failure."""
+    from pretrain_data_curator import self_score as _self_score
+
+    script = _self_score._SCRIPT
+    assert "def _read_trainer_stderr_tail(" in script
+    assert "_read_trainer_stderr_tail(tmp)" in script
+    assert 'os.path.join(workdir, "stderr.txt")' in script
+    # Failure path must surface the file tail, not only captured subprocess stderr.
+    assert "file_stderr = _read_trainer_stderr_tail(tmp)" in script
+    assert "detail = file_stderr or result.stderr or result.stdout" in script
+
+
+def test_self_score_read_trainer_stderr_tail_helper(tmp_path):
+    """Unit-test the helper extracted from the rendered script template."""
+    import re
+    from pretrain_data_curator import self_score as _self_score
+
+    match = re.search(
+        r"def _read_trainer_stderr_tail\(.*?(?=\ndef )",
+        _self_score._SCRIPT,
+        flags=re.S,
+    )
+    assert match
+    ns: dict[str, object] = {"os": __import__("os")}
+    exec(compile(match.group(0), "<stderr_helper>", "exec"), ns)
+    helper = ns["_read_trainer_stderr_tail"]
+    assert helper(str(tmp_path)) == ""
+    (tmp_path / "stderr.txt").write_text("line1\nCUDA OOM boom\n", encoding="utf-8")
+    assert "CUDA OOM boom" in helper(str(tmp_path))
+    big = "x" * 10_000
+    (tmp_path / "stderr.txt").write_text(big, encoding="utf-8")
+    assert len(helper(str(tmp_path), max_chars=100)) == 100
 
 
 @pytest.mark.asyncio

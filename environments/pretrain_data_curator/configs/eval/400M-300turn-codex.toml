@@ -63,6 +63,9 @@ batch_size = 16
 # Separate from training batch_size: after Muon/Adam state is resident on a
 # single A100 80GB, full-vocab softcap logits at train batch (and especially
 # the 3x schedule stage) OOMs. Cap validation microbatch + lm_head chunking.
+# Cap peak train logits on A100-80GB while keeping scheduled effective batch
+# (16→32→48) token/update semantics via loss-scaled microbatch accumulation.
+train_microbatch_size = 16
 val_batch_size = 1
 val_logit_chunk_tokens = 1024
 steps = 200

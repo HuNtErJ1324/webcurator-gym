@@ -268,6 +268,35 @@ def _compute_multi_token_loss(logits, hidden, y, multi_heads, y_future, vocab_si
     return main_loss
 
 
+def _microbatch_ranges(batch_size, microbatch_size):
+    """Yield ``(start, end)`` slices that cover ``batch_size`` without exceeding ``microbatch_size``.
+
+    ``microbatch_size is None`` (or >= batch) yields a single full-batch slice — legacy
+    behavior. Used so scheduled effective batches (16→32→48) can honor the intended
+    token/update semantics while never materializing full-vocab logits for the whole
+    effective batch at once.
+    """
+    n = int(batch_size)
+    if n < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    if microbatch_size is None:
+        yield 0, n
+        return
+    micro = int(microbatch_size)
+    if micro < 1:
+        raise ValueError(f"train_microbatch_size must be >= 1, got {microbatch_size}")
+    if micro >= n:
+        yield 0, n
+        return
+    for start in range(0, n, micro):
+        yield start, min(start + micro, n)
+
+
+def _scaled_microbatch_loss(loss, micro_n, total_n):
+    """Scale mean-reduced microbatch loss so summed grads match full-batch mean CE."""
+    return loss * (float(micro_n) / float(total_n))
+
+
 def train_and_eval_student(
     model,
     train_data,
@@ -323,6 +352,7 @@ def train_and_eval_student(
     cautious_wd=False,
     nor_muon=False,
     polar_express=False,
+    train_microbatch_size=None,
     val_batch_size=None,
     val_logit_chunk_tokens=None,
 ):
@@ -333,6 +363,10 @@ def train_and_eval_student(
     eval_batch = int(batch_size if val_batch_size is None else val_batch_size)
     if eval_batch < 1:
         raise ValueError(f"val_batch_size must be >= 1, got {val_batch_size}")
+    if train_microbatch_size is not None and int(train_microbatch_size) < 1:
+        raise ValueError(
+            f"train_microbatch_size must be >= 1, got {train_microbatch_size}"
+        )
 
     train_src = train_data
     if len(train_src) <= block + 1:
@@ -394,16 +428,23 @@ def train_and_eval_student(
                 group["lr"] = lr
             current_block = block_fn(step) if block_fn else block
             x, y, _ = next_batch(batch, current_block)
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            loss_weighted = None
+            for start, end in _microbatch_ranges(batch, train_microbatch_size):
+                xb = x[start:end]
+                yb = y[start:end]
+                logits = model(xb)
+                loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                _scaled_microbatch_loss(loss, end - start, batch).backward()
+                with torch.no_grad():
+                    piece = loss.detach() * float(end - start)
+                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             tokens_trained += batch * current_block
             with torch.no_grad():
-                loss_detached = loss.detach()
+                loss_detached = loss_weighted / float(batch)
                 ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
                     ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
                 )
@@ -522,14 +563,27 @@ def train_and_eval_student(
                             future_targets.append(seg)
                     y_future.append(torch.stack(future_targets).to(device))
 
-            logits = model(x, output_hidden=use_mt)
-
-            # --- Portable: multi-token prediction loss ---
-            if use_mt:
-                hidden = logits[1]
-                loss = _compute_multi_token_loss(logits[0], hidden, y, model.multi_heads, y_future, vocab_size)
-            else:
-                loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+            # Loss-scaled microbatch accumulation: honor scheduled effective_batch
+            # tokens/update while capping peak full-vocab logit memory.
+            if grad_accum_embed_head_steps <= 1:
+                muon_opt.zero_grad(set_to_none=True)
+            loss_weighted = None
+            for start, end in _microbatch_ranges(effective_batch, train_microbatch_size):
+                xb = x[start:end]
+                yb = y[start:end]
+                logits = model(xb, output_hidden=use_mt)
+                if use_mt:
+                    hidden = logits[1]
+                    y_future_mb = [yf[start:end] for yf in y_future]
+                    loss = _compute_multi_token_loss(
+                        logits[0], hidden, yb, model.multi_heads, y_future_mb, vocab_size
+                    )
+                else:
+                    loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                _scaled_microbatch_loss(loss, end - start, effective_batch).backward()
+                with torch.no_grad():
+                    piece = loss.detach() * float(end - start)
+                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
 
             # --- Portable: true N-step gradient accumulation for embed + lm_head ---
             if grad_accum_embed_head_steps > 1:
@@ -537,8 +591,6 @@ def train_and_eval_student(
                 for name, p in model.named_parameters():
                     if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
                         embed_head_params.append(p)
-
-                loss.backward()
 
                 # Accumulate embed/head/multi-head grads into a buffer, then
                 # zero p.grad so the next backward starts fresh (no double-count).
@@ -601,8 +653,6 @@ def train_and_eval_student(
                 # top of it (PyTorch's default add-into-.grad), matching the
                 # original's "don't clear Adam grads on even steps" behavior
                 # instead of silently discarding the even step's gradient.
-                muon_opt.zero_grad(set_to_none=True)
-                loss.backward()
                 if grad_clip and grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 adam_stepped = step_speedrun_optimizers(
@@ -632,7 +682,7 @@ def train_and_eval_student(
 
             tokens_trained += effective_batch * current_block
             with torch.no_grad():
-                loss_detached = loss.detach()
+                loss_detached = loss_weighted / float(effective_batch)
                 ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
                     ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
                 )
@@ -734,6 +784,8 @@ _TRAINING_COMPONENTS = (
     plan_eos_aligned_windows,
     make_seq_len_schedule,
     _enforce_max_doc_len,
+    _microbatch_ranges,
+    _scaled_microbatch_loss,
     _score_hidden_chunked,
     _eval_val_loss,
     _compute_multi_token_loss,
