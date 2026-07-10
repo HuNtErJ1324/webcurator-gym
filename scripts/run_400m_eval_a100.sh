@@ -133,7 +133,6 @@ fi
 command -v prime >/dev/null || die "prime CLI not found"
 command -v rsync >/dev/null || die "rsync not found"
 command -v ssh >/dev/null || die "ssh not found"
-command -v scp >/dev/null || die "scp not found"
 [[ -f "$SECRETS_FILE" ]] || die "Missing $SECRETS_FILE (need at least HF_TOKEN)"
 
 prime_api_key_from_cli() {
@@ -178,6 +177,24 @@ probe_remote_repo_dir_cmd() {
   printf 'test -d %q\n' "$remote_dir"
 }
 
+# Write a remote file from SSH stdin (exec channel). Avoids scp/SFTP, which on
+# MassedCompute can fail to open paths that SSH-exec mkdir/test just verified
+# (pod 60ee57c4). Payload stays on stdin — never in argv or launcher logs.
+write_remote_file_from_stdin_cmd() {
+  local remote_path="$1"
+  printf 'umask 077 && cat > %q && chmod 600 %q\n' "$remote_path" "$remote_path"
+}
+
+cat_remote_file_cmd() {
+  local remote_path="$1"
+  printf 'cat %q\n' "$remote_path"
+}
+
+test_remote_file_cmd() {
+  local remote_path="$1"
+  printf 'test -f %q\n' "$remote_path"
+}
+
 ensure_remote_repo_dir() {
   # Do not rely on rsync's implicit mkdir: MassedCompute (ubuntu@) has been
   # observed to report a successful sync while $REMOTE_ROOT/webcurator-gym is
@@ -205,9 +222,13 @@ ensure_remote_repo_dir() {
 }
 
 upload_secrets() {
-  local tmp remote_dir
+  # MassedCompute: scp/SFTP can fail with "No such file or directory" even after
+  # SSH-exec mkdir+test succeeds (pod 60ee57c4). Upload via the same SSH exec
+  # channel as `remote()`: stdin → `cat > secrets.env` with umask 077 / chmod 600.
+  # Secret contents never appear in argv or log lines.
+  local tmp remote_dir secrets_path remote_cmd
   remote_dir="$(remote_repo_dir)"
-  # Defense in depth: never scp into a path we have not verified exists.
+  secrets_path="${remote_dir}/secrets.env"
   ensure_remote_repo_dir
   tmp="$(mktemp)"
   cp "$SECRETS_FILE" "$tmp"
@@ -215,10 +236,16 @@ upload_secrets() {
     log "Injecting PRIME_API_KEY from local prime CLI config into remote secrets.env"
     printf 'PRIME_API_KEY=%s\n' "$(prime_api_key_from_cli)" >> "$tmp"
   fi
-  scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
-    "$tmp" "${SSH_USER}@${SSH_HOST}:${remote_dir}/secrets.env" >/dev/null \
-    || die "Failed to upload secrets.env to ${SSH_USER}@${SSH_HOST}:${remote_dir}/secrets.env"
+  remote_cmd="$(write_remote_file_from_stdin_cmd "$secrets_path")"
+  log "Uploading secrets.env via SSH exec (not scp/sftp) to ${SSH_USER}@${SSH_HOST}:${secrets_path}"
+  if ! remote "$remote_cmd" < "$tmp"; then
+    rm -f "$tmp"
+    die "Failed to upload secrets.env via SSH exec to ${SSH_USER}@${SSH_HOST}:${secrets_path}"
+  fi
   rm -f "$tmp"
+  if ! remote "$(test_remote_file_cmd "$secrets_path")"; then
+    die "Remote secrets.env missing after SSH-exec upload: ${SSH_USER}@${SSH_HOST}:${secrets_path}"
+  fi
 }
 
 SSH_KEY="$(python3 - <<'PY'
@@ -751,8 +778,9 @@ download_results() {
   [[ -s "$LOCAL_OUT_DIR/results.jsonl" ]] || die "Downloaded results.jsonl is empty"
   write_resolved_config "$LOCAL_OUT_DIR/config.toml"
   local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
-  scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
-    "${SSH_USER}@${SSH_HOST}:${remote_log}" "$LOCAL_OUT_DIR/eval-stream.log" >/dev/null 2>&1 || true
+  # MassedCompute: do not use scp/SFTP for the eval stream log — same provider
+  # path-namespace mismatch that broke secrets scp. Pull via SSH exec `cat`.
+  download_remote_log_via_exec "$remote_log" "$LOCAL_OUT_DIR/eval-stream.log"
   if [[ "$CURATION_ONLY" -eq 1 ]]; then
     cat > "$LOCAL_OUT_DIR/README.txt" <<EOF
 ${MODEL} 400M curation-only eval ($(date -u +%Y-%m-%d))
@@ -762,6 +790,22 @@ Full conversation trace is in results.jsonl. Perf metrics are not meaningful.
 
 Config: ${EVAL_CONFIG}
 EOF
+  fi
+}
+
+download_remote_log_via_exec() {
+  local remote_path="$1"
+  local local_path="$2"
+  local remote_cmd
+  if remote "$(test_remote_file_cmd "$remote_path")"; then
+    remote_cmd="$(cat_remote_file_cmd "$remote_path")"
+    log "Downloading eval log via SSH exec (not scp/sftp): ${SSH_USER}@${SSH_HOST}:${remote_path}"
+    if ! remote "$remote_cmd" > "$local_path"; then
+      die "Failed to download eval log via SSH exec from ${SSH_USER}@${SSH_HOST}:${remote_path}"
+    fi
+    [[ -s "$local_path" ]] || die "Downloaded eval log is empty: $local_path"
+  else
+    log "WARNING: remote eval log missing at ${SSH_USER}@${SSH_HOST}:${remote_path}; results.jsonl was still downloaded"
   fi
 }
 

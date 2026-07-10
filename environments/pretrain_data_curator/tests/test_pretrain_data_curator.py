@@ -649,10 +649,38 @@ def test_400m_a100_launcher_ensures_remote_repo_dir_before_secrets():
     assert "ensure_remote_repo_dir_cmd" in ensure_body
     assert 'remote "$remote_cmd"' in ensure_body
 
-    # upload_secrets must re-check (or call ensure) before scp — not rely on rsync.
+    # upload_secrets must use SSH-exec stdin write (not scp/sftp) after ensure.
+    upload_code = "\n".join(
+        ln for ln in upload_body.splitlines() if not ln.lstrip().startswith("#")
+    )
     assert "ensure_remote_repo_dir" in upload_body
+    assert "write_remote_file_from_stdin_cmd" in upload_body
     assert "secrets.env" in upload_body
     assert "Failed to upload secrets.env" in upload_body
+    # Forbid scp/sftp invocations (log text may still say "not scp/sftp").
+    assert not any(
+        ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
+        for ln in upload_code.splitlines()
+    )
+    assert "bash -lc" not in upload_code
+    assert 'remote "$remote_cmd" <' in upload_body
+    assert "umask" in _extract_bash_function(a100, "write_remote_file_from_stdin_cmd")
+    assert "chmod 600" in _extract_bash_function(a100, "write_remote_file_from_stdin_cmd")
+
+    # Eval-stream log download must also avoid scp/SFTP on MassedCompute.
+    download_body = _extract_bash_function(a100, "download_results")
+    download_log_body = _extract_bash_function(a100, "download_remote_log_via_exec")
+    download_code = "\n".join(
+        ln for ln in download_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "download_remote_log_via_exec" in download_body
+    assert not any(
+        ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
+        for ln in download_code.splitlines()
+    )
+    assert "cat_remote_file_cmd" in download_log_body
+    assert "test_remote_file_cmd" in download_log_body
+    assert "eval-stream.log" in download_body
 
     # Main flow order: remote_rsync → ensure_remote_repo_dir → upload_secrets.
     sync_marker = a100.find("Syncing repository to pod")
@@ -791,6 +819,141 @@ def test_400m_a100_ensure_remote_repo_dir_cmd_preserves_absolute_paths(tmp_path)
         )
         assert local_dir.is_dir()
         assert fixed_run.returncode == 0
+
+
+def test_400m_a100_upload_secrets_uses_exec_channel_not_scp(tmp_path):
+    """upload_secrets must write via SSH-exec stdin with %q-escaped paths + chmod.
+
+    MassedCompute pod 60ee57c4: ensure_remote_repo_dir succeeded over SSH exec,
+    but scp still failed with dest open No such file. Payload must ride stdin
+    (never argv/logs); remote cmd must keep absolute root/ubuntu paths intact.
+    """
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    upload_body = _extract_bash_function(a100, "upload_secrets")
+    write_cmd_body = _extract_bash_function(a100, "write_remote_file_from_stdin_cmd")
+    upload_code = "\n".join(
+        ln for ln in upload_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+
+    assert "write_remote_file_from_stdin_cmd" in upload_body
+    assert 'remote "$remote_cmd" <' in upload_body
+    assert "umask 077" in write_cmd_body
+    assert "chmod 600" in write_cmd_body
+    assert "cat >" in write_cmd_body
+    assert not any(
+        ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
+        for ln in upload_code.splitlines()
+    )
+    assert "bash -lc" not in upload_code
+
+    builder = "\n".join(
+        [
+            "set -euo pipefail",
+            "write_remote_file_from_stdin_cmd() {",
+            write_cmd_body,
+            "}",
+            'write_remote_file_from_stdin_cmd "/home/ubuntu/webcurator-gym/secrets.env"',
+            'write_remote_file_from_stdin_cmd "/root/webcurator-gym/secrets.env"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", builder],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert lines == [
+        "umask 077 && cat > /home/ubuntu/webcurator-gym/secrets.env && chmod 600 /home/ubuntu/webcurator-gym/secrets.env",
+        "umask 077 && cat > /root/webcurator-gym/secrets.env && chmod 600 /root/webcurator-gym/secrets.env",
+    ]
+    for path, cmd in (
+        ("/home/ubuntu/webcurator-gym/secrets.env", lines[0]),
+        ("/root/webcurator-gym/secrets.env", lines[1]),
+    ):
+        assert path in cmd
+        # Secret values must not appear in the constructed remote argv/cmd.
+        assert "HF_TOKEN=" not in cmd
+        assert "PRIME_API_KEY=" not in cmd
+        assert "sk-" not in cmd
+
+        # Execute locally: stdin payload lands in the path with mode 0600.
+        local_path = tmp_path / path.lstrip("/")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_cmd = cmd.replace(path, str(local_path))
+        payload = "HF_TOKEN=test-secret-value\nPRIME_API_KEY=prime-test\n"
+        run = subprocess.run(
+            ["bash", "-c", local_cmd],
+            input=payload,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert run.returncode == 0
+        assert local_path.read_text(encoding="utf-8") == payload
+        assert (local_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_400m_a100_download_remote_log_via_exec_not_scp(tmp_path):
+    """Eval-stream log pull must use SSH-exec cat, not scp/SFTP."""
+    scripts_dir = Path(__file__).resolve().parents[3] / "scripts"
+    a100 = (scripts_dir / "run_400m_eval_a100.sh").read_text(encoding="utf-8")
+    download_body = _extract_bash_function(a100, "download_results")
+    log_body = _extract_bash_function(a100, "download_remote_log_via_exec")
+    cat_cmd_body = _extract_bash_function(a100, "cat_remote_file_cmd")
+    download_code = "\n".join(
+        ln for ln in download_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+    log_code = "\n".join(
+        ln for ln in log_body.splitlines() if not ln.lstrip().startswith("#")
+    )
+
+    assert "download_remote_log_via_exec" in download_body
+    assert not any(
+        ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
+        for ln in download_code.splitlines()
+    )
+    assert not any(
+        ln.lstrip().startswith("scp ") or " scp " in ln or ln.lstrip().startswith("sftp ")
+        for ln in log_code.splitlines()
+    )
+    assert "bash -lc" not in log_code
+    assert "cat_remote_file_cmd" in log_body
+    assert "results.jsonl" in download_body  # rsync results path preserved
+
+    builder = "\n".join(
+        [
+            "set -euo pipefail",
+            "cat_remote_file_cmd() {",
+            cat_cmd_body,
+            "}",
+            'cat_remote_file_cmd "/home/ubuntu/wcg-eval-run.log"',
+            'cat_remote_file_cmd "/root/wcg-eval-run.log"',
+        ]
+    )
+    built = subprocess.run(
+        ["bash", "-c", builder],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in built.stdout.splitlines() if ln.strip()]
+    assert lines == [
+        "cat /home/ubuntu/wcg-eval-run.log",
+        "cat /root/wcg-eval-run.log",
+    ]
+    # Local execute: cat cmd streams file contents to stdout (download sink).
+    src = tmp_path / "remote.log"
+    src.write_text("eval stream line\n", encoding="utf-8")
+    local_cmd = lines[0].replace("/home/ubuntu/wcg-eval-run.log", str(src))
+    out = subprocess.run(
+        ["bash", "-c", local_cmd],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert out.stdout == "eval stream line\n"
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
