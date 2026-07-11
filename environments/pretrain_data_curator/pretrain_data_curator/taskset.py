@@ -445,6 +445,8 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     decon_evals_dir: str | None = None
     decon_threshold: float = 0.2
     screen_val_set: bool = True
+    # Cap on tool / bash output captured from runtimes; <=0 disables truncation.
+    max_tool_output_chars: int = 20_000
 
     @field_validator("manifest_filename")
     @classmethod
@@ -517,6 +519,7 @@ class CuratorTaskset(_TasksetBase):
             use_real_trainer=config.use_real_trainer,
             proxy_student=ProxyStudentConfig(**(config.proxy_student or {})),
             validation_set=ValidationSetConfig(**(config.validation_set or {})),
+            max_tool_output_chars=config.max_tool_output_chars,
         )
 
     # -- collaborators ---------------------------------------------------------

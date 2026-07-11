@@ -9,6 +9,8 @@ import verifiers.v1 as vf
 from datasets import Dataset
 from verifiers.v1.clients.config import EvalClientConfig, TrainClientConfig
 
+from .truncating_client import wrap_client
+
 
 def _branch_prompt_len(branch: Any) -> int:
     """Final-turn prompt length without relying on Branch convenience properties."""
@@ -29,6 +31,8 @@ class Environment(vf.Environment, legacy_vf.Environment):
 
     def __init__(self, config: vf.EnvConfig, env_args: dict[str, Any]) -> None:
         vf.Environment.__init__(self, config)
+        self.env_args = env_args
+        self.max_tool_output_chars = int(env_args.get("max_tool_output_chars", 20_000))
         self._compat_tasks = self.taskset.load_tasks()
         self._compat_clients: dict[str, vf.Client] = {}
         rows = [
@@ -52,6 +56,20 @@ class Environment(vf.Environment, legacy_vf.Environment):
             env_args=env_args,
             score_rollouts=False,
         )
+
+    def _capping_client(self, client: vf.Client) -> vf.Client:
+        """Cap Codex/chat tool results at the interception→provider wire boundary."""
+        return wrap_client(client, self.max_tool_output_chars)
+
+    def episode(self, task: vf.Task, ctx: vf.RolloutContext, n: int = 1) -> vf.Episode:
+        # prime eval / env-server inject the raw client here; wrap so Codex
+        # function_call_output items are capped before EvalClient forwards them.
+        capped_ctx = vf.RolloutContext(
+            model=ctx.model,
+            client=self._capping_client(ctx.client),
+            sampling=ctx.sampling,
+        )
+        return vf.Environment.episode(self, task, capped_ctx, n)
 
     @staticmethod
     def _message(message: Any) -> dict[str, Any]:
@@ -86,7 +104,9 @@ class Environment(vf.Environment, legacy_vf.Environment):
             v1_config = EvalClientConfig(**common)
         key = v1_config.model_dump_json()
         if key not in self._compat_clients:
-            self._compat_clients[key] = vf.resolve_client(v1_config)
+            self._compat_clients[key] = self._capping_client(
+                vf.resolve_client(v1_config)
+            )
         return self._compat_clients[key]
 
     @staticmethod
@@ -107,9 +127,7 @@ class Environment(vf.Environment, legacy_vf.Environment):
         timing.setup.end = trace.timing.setup.end
         timing.generation.start = trace.timing.generation.start
         timing.generation.end = trace.timing.generation.end
-        timing.scoring.start = (
-            trace.timing.finalize.start or trace.timing.scoring.start
-        )
+        timing.scoring.start = trace.timing.finalize.start or trace.timing.scoring.start
         timing.scoring.end = trace.timing.scoring.end
         return timing
 
@@ -150,9 +168,7 @@ class Environment(vf.Environment, legacy_vf.Environment):
         return steps
 
     @classmethod
-    def _state(
-        cls, input: legacy_vf.RolloutInput, trace: vf.Trace
-    ) -> legacy_vf.State:
+    def _state(cls, input: legacy_vf.RolloutInput, trace: vf.Trace) -> legacy_vf.State:
         error = trace.error
         branches = trace.branches
         final_branch = branches[-1] if branches else None
@@ -196,9 +212,7 @@ class Environment(vf.Environment, legacy_vf.Environment):
                     else sum(_branch_completion_len(branch) for branch in branches)
                 ),
                 "final_input_tokens": (
-                    _branch_prompt_len(final_branch)
-                    if final_branch is not None
-                    else 0
+                    _branch_prompt_len(final_branch) if final_branch is not None else 0
                 ),
                 "final_output_tokens": (
                     _branch_completion_len(final_branch)

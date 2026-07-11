@@ -301,6 +301,9 @@ def ledger_from_messages(messages: Iterable[Any]) -> CostLedger:
     tool-call's ``arguments`` JSON; its result's byte size is the paired
     ``ToolMessage`` content) and text-action harnesses (the command is fenced in
     the assistant ``content``; no paired output, so 0 bytes).
+
+    When the bash harness caps tool results, those already-truncated contents are
+    what get metered here — no second accounting-only pass is applied.
     """
     messages = list(messages)
     # tool_call_id -> result byte size, for byte attribution on tool-call harnesses.

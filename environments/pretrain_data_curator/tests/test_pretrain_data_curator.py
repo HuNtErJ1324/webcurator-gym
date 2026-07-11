@@ -443,7 +443,10 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.taskset.config.candidate_limit == 3
     assert env.taskset.config.manifest_filename == MANIFEST_FILENAME
     assert env.harness.config.id == "bash"
-    assert env.harness.config.env == {"HF_TOKEN": "test-token"}
+    assert env.harness.config.env == {
+        "MAX_TOOL_OUTPUT_CHARS": "20000",
+        "HF_TOKEN": "test-token",
+    }
     assert env.env_args["harness_id"] == "bash"
     assert env.taskset.load_tasks()
 
@@ -653,7 +656,10 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
         use_real_trainer=True,
         proxy_student={"runtime_backend": "docker", "gpu_count": 1},
     )
-    assert docker_env.harness.config.env == {"UV_REINSTALL_PACKAGE": "pydantic-core"}
+    assert docker_env.harness.config.env == {
+        "MAX_TOOL_OUTPUT_CHARS": "20000",
+        "UV_REINSTALL_PACKAGE": "pydantic-core",
+    }
     runtime = docker_env.harness.config.runtime
     assert isinstance(runtime, vf.DockerConfig)
     assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
@@ -676,7 +682,10 @@ def test_load_environment_injects_hf_token_into_harness_env(monkeypatch):
     assert docker_env.harness.config.env["UV_REINSTALL_PACKAGE"] == "pydantic-core"
 
     subprocess_env = load_environment(harness_id="codex")
-    assert subprocess_env.harness.config.env == {"HF_TOKEN": "hf_test_token"}
+    assert subprocess_env.harness.config.env == {
+        "MAX_TOOL_OUTPUT_CHARS": "20000",
+        "HF_TOKEN": "hf_test_token",
+    }
 
 
 def test_load_environment_omits_hf_token_from_harness_env_when_unset(monkeypatch):
