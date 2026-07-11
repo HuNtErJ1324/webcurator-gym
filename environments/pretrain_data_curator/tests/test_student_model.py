@@ -18,6 +18,9 @@ import torch.nn as nn
 
 from pretrain_data_curator.student_model import (
     _MODEL_COMPONENTS,
+    _causal_attn_mask,
+    _combine_attn_masks,
+    _sliding_window_mask,
     GPT,
     GPT2_SMALL,
     GPT2_SMALL_PARAM_COUNT,
@@ -36,6 +39,7 @@ from pretrain_data_curator.student_model import (
     MultiTokenHeads,
     model_source,
 )
+from pretrain_data_curator.student_train import build_document_attn_mask
 from pretrain_data_curator.trainer import NANOGPT_TRAIN_SCRIPT
 
 
@@ -298,6 +302,91 @@ def test_sliding_window_changes_output_vs_full_context():
         full = model(idx)
         windowed = model(idx, window_size=3)
     assert not torch.allclose(full, windowed, atol=1e-6)
+
+
+def test_sdpa_boolean_mask_true_means_keep():
+    """PyTorch SDPA boolean convention: True participates, False is masked."""
+    keep = _causal_attn_mask(4, torch.device("cpu"))
+    assert bool(keep[2, 0].item()) is True
+    assert bool(keep[2, 3].item()) is False
+    sliding = _sliding_window_mask(6, 3, torch.device("cpu"))
+    # query 5 may see keys 3,4,5 only
+    assert sliding[5].tolist() == [False, False, False, True, True, True]
+
+
+def test_causal_mask_future_tokens_do_not_affect_prior_outputs():
+    model = GPT(64, num_layers=2, model_dim=32, num_heads=2).eval()
+    _randomize(model)
+    base = torch.randint(0, 64, (1, 8))
+    flipped = base.clone()
+    flipped[0, 5:] = (flipped[0, 5:] + 17) % 64
+    with torch.no_grad():
+        out_base = model(base)
+        out_flip = model(flipped)
+    assert torch.allclose(out_base[:, :5], out_flip[:, :5], atol=1e-5)
+    assert not torch.allclose(out_base[:, 5:], out_flip[:, 5:], atol=1e-5)
+
+
+def test_document_mask_blocks_cross_document_influence_on_outputs():
+    model = GPT(64, num_layers=2, model_dim=32, num_heads=2).eval()
+    _randomize(model)
+    base = torch.randint(0, 64, (1, 8))
+    # Two documents: [0,4) and [4,8)
+    doc_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    attn_mask = build_document_attn_mask(doc_ids)
+    other_doc = base.clone()
+    other_doc[0, :4] = (other_doc[0, :4] + 23) % 64
+    with torch.no_grad():
+        out_base = model(base, attn_mask=attn_mask)
+        out_other = model(other_doc, attn_mask=attn_mask)
+    # Queries in doc1 must be invariant to doc0 token edits.
+    assert torch.allclose(out_base[:, 4:], out_other[:, 4:], atol=1e-5)
+    assert not torch.allclose(out_base[:, :4], out_other[:, :4], atol=1e-5)
+
+
+def test_document_mask_same_document_past_tokens_affect_outputs():
+    model = GPT(64, num_layers=2, model_dim=32, num_heads=2).eval()
+    _randomize(model)
+    base = torch.randint(0, 64, (1, 8))
+    doc_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    attn_mask = build_document_attn_mask(doc_ids)
+    same_doc = base.clone()
+    same_doc[0, 4] = (same_doc[0, 4] + 29) % 64
+    with torch.no_grad():
+        out_base = model(base, attn_mask=attn_mask)
+        out_same = model(same_doc, attn_mask=attn_mask)
+    # Editing an earlier same-document token must change later same-doc outputs.
+    assert not torch.allclose(out_base[:, 5:], out_same[:, 5:], atol=1e-5)
+    # Positions before the edited token stay unchanged.
+    assert torch.allclose(out_base[:, :4], out_same[:, :4], atol=1e-5)
+
+
+def test_combined_sliding_window_and_document_mask_on_outputs():
+    model = GPT(64, num_layers=2, model_dim=32, num_heads=2).eval()
+    _randomize(model)
+    base = torch.randint(0, 64, (1, 10))
+    doc_ids = torch.zeros(1, 10, dtype=torch.long)  # one document
+    attn_mask = build_document_attn_mask(doc_ids)
+    # Far past token inside the document but outside window_size=3.
+    far = base.clone()
+    far[0, 0] = (far[0, 0] + 31) % 64
+    near = base.clone()
+    near[0, 8] = (near[0, 8] + 31) % 64
+    with torch.no_grad():
+        out_base = model(base, window_size=3, attn_mask=attn_mask)
+        out_far = model(far, window_size=3, attn_mask=attn_mask)
+        out_near = model(near, window_size=3, attn_mask=attn_mask)
+    # Token 0 is outside the window of query 9, so it must not affect that output.
+    assert torch.allclose(out_base[:, 9], out_far[:, 9], atol=1e-5)
+    # Token 8 is inside the window of query 9, so it must affect that output.
+    assert not torch.allclose(out_base[:, 9], out_near[:, 9], atol=1e-5)
+    # Combine helper keeps True=participate semantics under AND.
+    combined = _combine_attn_masks(
+        10, torch.device("cpu"), window_size=3, attn_mask=attn_mask
+    )
+    assert combined is not None
+    assert bool(combined[0, 0, 9, 0].item()) is False
+    assert bool(combined[0, 0, 9, 8].item()) is True
 
 
 def test_attn_gate_scales_attention_output():

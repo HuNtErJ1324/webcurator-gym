@@ -254,9 +254,9 @@ class ProxyStudentConfig(BaseModel):
     exp_residual_decay: float | None = Field(default=None, gt=0.0, le=1.0)
     # Multi-token prediction (number of extra future-token heads)
     multi_token_pred: int = Field(default=0, ge=0, le=8)
-    # Encode each source document with GPT-2 EOT/BOS and plan windows strictly
-    # inside the resulting document ranges. Disable only for legacy flat-stream
-    # compatibility.
+    # Encode each source document with GPT-2 EOT/BOS and plan packed windows:
+    # long docs keep intra-document starts; short docs pack into fixed blocks.
+    # Disable only for legacy flat-stream compatibility.
     eos_aligned_batches: bool = True
     # Canonical per-document token cap, including the leading EOT/BOS token.
     # Historical spellings remain accepted by the compatibility validator below.

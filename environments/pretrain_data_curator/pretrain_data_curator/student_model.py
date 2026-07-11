@@ -111,12 +111,56 @@ class RotaryWithOffset(nn.Module):
 def _sliding_window_mask(
     seq_len: int, window_size: int, device: torch.device
 ) -> torch.Tensor:
-    """Causal band mask for SDPA: query i attends to keys in [i-window+1, i]."""
+    """Causal band mask for SDPA: ``True`` means the key may participate.
+
+    Query ``i`` may attend to keys ``j`` in ``[i - window_size + 1, i]``.
+    """
     idx = torch.arange(seq_len, device=device)
-    mask = (idx[None, :] > idx[:, None]) | (
-        idx[None, :] < idx[:, None] - window_size + 1
+    return (idx[None, :] <= idx[:, None]) & (
+        idx[None, :] >= idx[:, None] - window_size + 1
     )
-    return mask
+
+
+def _causal_attn_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    """Boolean causal mask ``(T, T)``; ``True`` means the key may participate."""
+    idx = torch.arange(seq_len, device=device)
+    return idx[None, :] <= idx[:, None]
+
+
+def _combine_attn_masks(
+    seq_len: int,
+    device: torch.device,
+    *,
+    window_size: int | None = None,
+    attn_mask: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """AND keep-masks into one SDPA boolean mask (``True`` = participate).
+
+    Returns ``None`` when pure ``is_causal=True`` SDPA is sufficient.
+    ``attn_mask`` may be ``(T, T)``, ``(B, T, T)``, or ``(B, 1, T, T)``.
+    Document masks are expected to already encode causality; this helper does
+    not re-apply a redundant causal term on top of them.
+    """
+    combined: torch.Tensor | None = None
+    if window_size is not None and window_size < seq_len:
+        combined = _sliding_window_mask(seq_len, window_size, device)
+    if attn_mask is not None:
+        mask = attn_mask
+        if mask.dim() == 2:
+            pass
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        elif mask.dim() == 4:
+            if mask.size(1) != 1:
+                raise ValueError(
+                    f"attn_mask batch head dim must be 1, got shape {tuple(mask.shape)}"
+                )
+        else:
+            raise ValueError(
+                f"attn_mask must be 2/3/4-D, got shape {tuple(mask.shape)}"
+            )
+        combined = mask if combined is None else (combined & mask)
+    return combined
 
 
 class CausalSelfAttention(nn.Module):
@@ -147,6 +191,7 @@ class CausalSelfAttention(nn.Module):
         *,
         window_size: int | None = None,
         partial_key_offset: float | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T = x.size(0), x.size(1)
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
@@ -166,18 +211,20 @@ class CausalSelfAttention(nn.Module):
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
-        if window_size is not None and window_size < T:
-            attn_mask = _sliding_window_mask(T, window_size, x.device)
+        combined = _combine_attn_masks(
+            T, x.device, window_size=window_size, attn_mask=attn_mask
+        )
+        if combined is None:
+            y = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True, scale=self.attn_scale
+            ).transpose(1, 2)
+        else:
             y = F.scaled_dot_product_attention(
                 q_t,
                 k_t,
                 v_t,
-                attn_mask=attn_mask,
+                attn_mask=combined,
                 scale=self.attn_scale,
-            ).transpose(1, 2)
-        else:
-            y = F.scaled_dot_product_attention(
-                q_t, k_t, v_t, is_causal=True, scale=self.attn_scale
             ).transpose(1, 2)
         gate = torch.sigmoid(self.attn_gate(x[..., :12])).view(B, T, self.num_heads, 1)
         y = (y * gate).contiguous().view(B, T, self.num_heads * self.head_dim)
@@ -221,6 +268,7 @@ class PairedHeadAttention(nn.Module):
         *,
         window_size: int | None = None,
         partial_key_offset: float | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T = x.size(0), x.size(1)
         q = self.q(x).view(B, T, self.num_pairs, self.head_dim)
@@ -244,18 +292,20 @@ class PairedHeadAttention(nn.Module):
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v_pair.transpose(1, 2)
-        if window_size is not None and window_size < T:
-            attn_mask = _sliding_window_mask(T, window_size, x.device)
+        combined = _combine_attn_masks(
+            T, x.device, window_size=window_size, attn_mask=attn_mask
+        )
+        if combined is None:
+            y = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True, scale=self.attn_scale
+            ).transpose(1, 2)
+        else:
             y = F.scaled_dot_product_attention(
                 q_t,
                 k_t,
                 v_t,
-                attn_mask=attn_mask,
+                attn_mask=combined,
                 scale=self.attn_scale,
-            ).transpose(1, 2)
-        else:
-            y = F.scaled_dot_product_attention(
-                q_t, k_t, v_t, is_causal=True, scale=self.attn_scale
             ).transpose(1, 2)
         # y shape: (B, T, num_pairs, 2*head_dim) -> reshape to (B, T, num_heads, head_dim)
         y = y.reshape(B, T, self.num_heads, self.head_dim)
@@ -306,12 +356,14 @@ class Block(nn.Module):
         *,
         window_size: int | None = None,
         partial_key_offset: float | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         attn_out = self.attn(
             self.norm1(x),
             value_embed,
             window_size=window_size,
             partial_key_offset=partial_key_offset,
+            attn_mask=attn_mask,
         )
         mlp_out = self.mlp(self.norm2(x))
         return attn_out, mlp_out
@@ -599,7 +651,11 @@ class GPT(nn.Module):
         return x
 
     def forward_hidden(
-        self, idx: torch.Tensor, *, window_size: int | None = None
+        self,
+        idx: torch.Tensor,
+        *,
+        window_size: int | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the trunk through ``norm_out`` without materializing full-vocab logits.
 
@@ -617,7 +673,11 @@ class GPT(nn.Module):
         encoder_outputs: list[torch.Tensor] = []
         for i in range(self.num_encoder_layers):
             attn_out, mlp_out = self.blocks[i](
-                x, ve_enc[i], window_size=ws, partial_key_offset=self.partial_key_offset
+                x,
+                ve_enc[i],
+                window_size=ws,
+                partial_key_offset=self.partial_key_offset,
+                attn_mask=attn_mask,
             )
             x = (
                 self._apply_exp_residual_decay(i, x)
@@ -683,6 +743,7 @@ class GPT(nn.Module):
                 ve_i,
                 window_size=ws,
                 partial_key_offset=self.partial_key_offset,
+                attn_mask=attn_mask,
             )
 
             # MUDD residual contribution
@@ -719,9 +780,12 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         *,
         window_size: int | None = None,
+        attn_mask: torch.Tensor | None = None,
         output_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.forward_hidden(idx, window_size=window_size)
+        hidden = self.forward_hidden(
+            idx, window_size=window_size, attn_mask=attn_mask
+        )
         out = self.apply_lm_head(hidden)
         if output_hidden:
             return out, hidden
@@ -836,6 +900,8 @@ _MODEL_COMPONENTS = (
     Rotary,
     RotaryWithOffset,
     _sliding_window_mask,
+    _causal_attn_mask,
+    _combine_attn_masks,
     CausalSelfAttention,
     PairedHeadAttention,
     MLP,

@@ -25,6 +25,8 @@ from pretrain_data_curator.student_model import StudentModelConfig
 from pretrain_data_curator.student_train import (
     _TRAINING_COMPONENTS,
     averaged_train_and_eval,
+    batch_document_attn_mask,
+    build_document_attn_mask,
     encode_document_tokens,
     lr_at_step,
     plan_train_windows,
@@ -33,6 +35,7 @@ from pretrain_data_curator.student_train import (
     shuffled_window_starts,
     make_seq_len_schedule,
     train_and_eval_student,
+    window_document_ids,
 )
 from pretrain_data_curator.trainer import NANOGPT_TRAIN_SCRIPT
 
@@ -622,12 +625,123 @@ def test_eos_aligned_windows_reserve_multi_token_lookahead():
     ranges = [(0, 12), (12, 24)]
     assert plan_eos_aligned_windows(24, 8, ranges, lookahead=1) == [0, 12]
     assert plan_eos_aligned_windows(24, 8, ranges, lookahead=4) == [0, 12]
-    assert plan_eos_aligned_windows(22, 8, [(0, 10), (10, 22)], lookahead=4) == [10]
+    # First doc is short for lookahead=4 (need=12); one sequential pack covers it.
+    # The following doc has no residual uncovered span long enough for another window.
+    assert plan_eos_aligned_windows(22, 8, [(0, 10), (10, 22)], lookahead=4) == [0]
 
 
 def test_eos_aligned_windows_have_no_flat_fallback():
     assert plan_eos_aligned_windows(100, 16, []) == []
-    assert plan_eos_aligned_windows(10, 8, [(0, 8), (8, 10)]) == []
+    # Even with packing, the stream is shorter than block+lookahead.
+    assert plan_eos_aligned_windows(8, 8, [(0, 5), (5, 8)]) == []
+
+
+def test_eos_aligned_windows_reject_gaps():
+    with pytest.raises(ValueError, match="contiguous"):
+        plan_eos_aligned_windows(20, 8, [(0, 5), (7, 20)])
+
+
+def test_packed_windows_include_short_documents_without_overlap():
+    ranges = [(0, 5), (5, 10), (10, 28)]
+    starts = plan_eos_aligned_windows(28, 8, ranges)
+    # One sequential pack from the first short doc, then long-doc strides.
+    assert starts == [0, 10, 18]
+    assert 5 not in starts  # no overlapping second short-doc start
+
+
+def test_packed_window_targets_follow_flat_shift_across_eot():
+    """Speedrun contract: targets are the flat next-token shift (may be next EOT)."""
+    enc = tiktoken.get_encoding("gpt2")
+    documents = ["aa", "bb", "long enough document text here"]
+    token_ids, ranges = encode_document_tokens(documents, enc)
+    data = torch.tensor(token_ids, dtype=torch.long)
+    starts = plan_eos_aligned_windows(len(data), 8, ranges)
+    assert 0 in starts
+    x = data[0:8]
+    y = data[1:9]
+    # First document is shorter than the window, so some target is past its end.
+    first_end = ranges[0][1]
+    assert first_end < 9
+    assert int(y[first_end - 1].item()) == 50256  # leading EOT of the next doc
+    assert int(x[0].item()) == 50256
+
+
+def test_packed_attention_mask_keeps_same_document_causal_keys():
+    ranges = [(0, 5), (5, 20)]
+    mask = batch_document_attn_mask([0], 8, ranges, device="cpu")
+    assert mask is not None
+    assert mask.shape == (1, 8, 8)
+    # True = may participate: cross-document key is masked out.
+    assert bool(mask[0, 5, 0].item()) is False
+    # Same-document past key may participate.
+    assert bool(mask[0, 4, 0].item()) is True
+    # Future keys are masked out.
+    assert bool(mask[0, 0, 1].item()) is False
+    # Single-document windows skip the mask path entirely.
+    assert batch_document_attn_mask([5], 8, ranges, device="cpu") is None
+
+
+def test_document_gap_ids_do_not_attend_each_other():
+    doc_ids = torch.tensor([[0, 0, -1, -1, 1]])
+    mask = build_document_attn_mask(doc_ids)
+    # Gap positions cannot attend to each other.
+    assert bool(mask[0, 2, 3].item()) is False
+    assert bool(mask[0, 3, 2].item()) is False
+    # Self-attention remains available for gaps.
+    assert bool(mask[0, 2, 2].item()) is True
+    assert bool(mask[0, 3, 3].item()) is True
+
+
+def test_packed_planning_is_fixed_seed_deterministic():
+    ranges = [(0, 4), (4, 8), (8, 40), (40, 80)]
+    starts = plan_eos_aligned_windows(80, 8, ranges)
+    assert starts == [0, 9, 17, 25, 40, 48, 56, 64]
+    first = shuffled_window_starts(starts, torch.Generator().manual_seed(123))
+    second = shuffled_window_starts(starts, torch.Generator().manual_seed(123))
+    different = shuffled_window_starts(starts, torch.Generator().manual_seed(124))
+    assert first == second
+    assert first != different
+
+
+def test_packed_short_documents_contribute_trained_tokens():
+    V = 16
+    model = _tiny_cfg(V).build()
+    # Three short docs that only become usable via packing.
+    data = torch.arange(24) % V
+    ranges = [(0, 6), (6, 12), (12, 24)]
+    starts = plan_eos_aligned_windows(24, 8, ranges)
+    assert starts == [0, 12]  # one pack, then residual long-enough third doc
+    gen = torch.Generator().manual_seed(0)
+    loss, acc, tokens = train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
+        document_ranges=ranges,
+        batch_schedule_enabled=False,
+    )
+    assert math.isfinite(loss)
+    assert tokens == 3 * 2 * 8
+
+
+def test_legacy_flat_windows_ignore_document_ranges_when_disabled():
+    assert plan_train_windows(20, 8) == [0, 8]
+    # plan_eos with empty ranges still refuses a flat fallback.
+    assert plan_eos_aligned_windows(20, 8, []) == []
 
 
 def test_eos_aligned_window_selection_is_fixed_seed_deterministic():
@@ -637,6 +751,13 @@ def test_eos_aligned_window_selection_is_fixed_seed_deterministic():
     different = shuffled_window_starts(starts, torch.Generator().manual_seed(124))
     assert first == second
     assert first != different
+
+
+def test_window_document_ids_cover_packed_span():
+    ids = window_document_ids(0, 8, [(0, 5), (5, 20)])
+    assert ids.tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    mask = build_document_attn_mask(ids.unsqueeze(0))
+    assert mask.shape == (1, 8, 8)
 
 
 def test_seq_len_schedule_warmup():

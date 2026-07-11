@@ -21,7 +21,8 @@ Legacy recipe (**``record_01_adamw``**) remains for fast CPU tests:
 
 Portable features (all opt-in):
 
-* **EoS-aligned batch starts** — align training windows to end-of-sequence markers.
+* **EoS-aligned packed batch starts** — EOT-prefixed documents; long docs keep
+  intra-document windows, short docs pack into fixed blocks (Speedrun-style).
 * **Max document length handling** — reject over-long documents explicitly.
 * **True 2-step gradient accumulation** — accumulate embed+lm_head grads before update.
 * **True max seq length schedule** — warm up sequence length from small to max.
@@ -136,23 +137,134 @@ def encode_document_tokens(documents, encoder, max_document_tokens=None):
 
 
 def plan_eos_aligned_windows(n_tokens, block, document_ranges, lookahead=1):
-    """Plan non-overlapping windows wholly contained in source documents.
+    """Plan training-window starts over an EOT-prefixed document stream.
 
-    An empty/too-short document set returns no windows. There is deliberately no
-    flat-stream fallback because that would cross an EOT/BOS boundary silently.
+    Long documents (length >= ``block + lookahead``) keep non-overlapping
+    intra-document starts with stride ``block``.
+
+    Short documents are packed with deterministic sequential, non-overlapping
+    windows (portable adaptation of modded-nanogpt ``Shard.next_batch``): each
+    pack starts at the next unused short document's leading EOT/BOS, covers
+    ``block + lookahead`` tokens of the concatenated stream, and advances past
+    every document that overlaps that span so short docs are not oversampled.
+    If a pack truncates into a long document, residual intra-document stride
+    windows begin at the first uncovered position of that long document.
+
+    Boundary contract (Speedrun-aligned as far as this SDPA port allows):
+
+    * **Targets** use the flat next-token shift over the window, so a target may
+      be the next document's leading EOT (Speedrun ``buf[:-1]`` / ``buf[1:]``).
+    * **Attention** must not cross document boundaries: callers use
+      :func:`batch_document_attn_mask` for packed multi-document windows
+      (Speedrun uses flash-attn varlen ``cum_lengths`` for the same guarantee).
+    * Document ranges must be sorted, disjoint, and contiguous (no gaps).
+    * There is no flat-stream fallback that ignores ``document_ranges``.
     """
     block = int(block)
     n_tokens = int(n_tokens)
     lookahead = max(1, int(lookahead))
-    starts = []
+    need = block + lookahead
+    ranges = []
     previous_end = 0
     for raw_start, raw_end in document_ranges or ():
         start, end = int(raw_start), int(raw_end)
         if start < previous_end or end < start or end > n_tokens:
             raise ValueError("document ranges must be sorted, disjoint, and in bounds")
+        if ranges and start != previous_end:
+            raise ValueError(
+                "document ranges must be contiguous with no gaps; "
+                f"found gap between {previous_end} and {start}"
+            )
         previous_end = end
-        starts.extend(range(start, end - block - lookahead + 1, block))
+        ranges.append((start, end))
+
+    starts = []
+    cursor = 0
+    while cursor < len(ranges):
+        doc_start, doc_end = ranges[cursor]
+        length = doc_end - doc_start
+        if length >= need:
+            starts.extend(range(doc_start, doc_end - need + 1, block))
+            cursor += 1
+            continue
+
+        if doc_start + need > n_tokens:
+            cursor += 1
+            continue
+
+        pack_start = doc_start
+        pack_end = pack_start + need
+        starts.append(pack_start)
+        while cursor < len(ranges) and ranges[cursor][0] < pack_end:
+            d_start, d_end = ranges[cursor]
+            d_len = d_end - d_start
+            if d_len >= need:
+                residual_from = max(pack_end, d_start)
+                if residual_from + need <= d_end:
+                    starts.extend(range(residual_from, d_end - need + 1, block))
+                cursor += 1
+                break
+            cursor += 1
     return starts
+
+
+def window_document_ids(start, length, document_ranges, device=None):
+    """Per-position document ids for ``train_src[start:start+length]``."""
+    start = int(start)
+    length = int(length)
+    ids = torch.full((length,), -1, dtype=torch.long, device=device)
+    end = start + length
+    for doc_id, (raw_start, raw_end) in enumerate(document_ranges or ()):
+        doc_start, doc_end = int(raw_start), int(raw_end)
+        lo = max(doc_start, start)
+        hi = min(doc_end, end)
+        if lo < hi:
+            ids[lo - start : hi - start] = doc_id
+    return ids
+
+
+def build_document_attn_mask(doc_ids):
+    """Boolean SDPA mask ``(B, T, T)``; ``True`` means the key may participate.
+
+    Keeps causal same-document positions. Gap ids (``< 0``) never attend to each
+    other; they are restricted to self-attention so softmax stays well-defined.
+    """
+    if doc_ids.dim() != 2:
+        raise ValueError(f"doc_ids must be (batch, seq), got shape {tuple(doc_ids.shape)}")
+    _batch, seq_len = doc_ids.shape
+    idx = torch.arange(seq_len, device=doc_ids.device)
+    causal = idx[None, :] <= idx[:, None]
+    valid = doc_ids >= 0
+    same_document = (
+        (doc_ids[:, :, None] == doc_ids[:, None, :])
+        & valid[:, :, None]
+        & valid[:, None, :]
+    )
+    keep = causal.unsqueeze(0) & same_document
+    eye = torch.eye(seq_len, dtype=torch.bool, device=doc_ids.device)
+    return keep | eye.unsqueeze(0)
+
+
+def batch_document_attn_mask(starts, block, document_ranges, device):
+    """Build a batched document keep-mask, or ``None`` when every window is single-doc."""
+    if not starts:
+        return None
+    rows = []
+    any_cross = False
+    any_gap = False
+    block = int(block)
+    for start in starts:
+        doc_ids = window_document_ids(
+            start, block, document_ranges, device=device
+        )
+        if doc_ids.numel() > 0 and bool((doc_ids < 0).any().item()):
+            any_gap = True
+        if doc_ids.numel() > 0 and bool((doc_ids != doc_ids[0]).any().item()):
+            any_cross = True
+        rows.append(doc_ids)
+    if not any_cross and not any_gap:
+        return None
+    return build_document_attn_mask(torch.stack(rows, dim=0))
 
 
 def shuffled_window_starts(starts, generator):
@@ -418,8 +530,10 @@ def train_and_eval_student(
     if document_ranges is None and len(train_src) <= block + 1:
         train_src = train_src.repeat(math.ceil((block + 2) / max(len(train_src), 1)))
 
-    # Document-aware training never tiles or falls back to flat windows: every
-    # selected input/target pair must remain inside one real source document.
+    # Document-aware training never falls back to flat windows that ignore
+    # document_ranges. Short documents are packed into fixed blocks; long
+    # documents keep intra-document starts. Packed multi-document windows use
+    # an SDPA document mask so attention does not cross EOT boundaries.
     if document_ranges is not None:
         starts = plan_eos_aligned_windows(
             len(train_src),
@@ -429,8 +543,8 @@ def train_and_eval_student(
         )
         if not starts:
             raise ValueError(
-                "no document is long enough for block_size + 1 tokens; "
-                "lower block_size or provide longer documents"
+                "no packed document window fits block_size + lookahead tokens; "
+                "lower block_size or provide more/longer documents"
             )
     else:
         starts = plan_train_windows(len(train_src), block)
@@ -455,7 +569,17 @@ def train_and_eval_student(
             batch_starts.append(i)
             xs.append(train_src[i : i + current_block])
             ys.append(train_src[i + 1 : i + current_block + 1])
-        return torch.stack(xs).to(device), torch.stack(ys).to(device), batch_starts
+        attn_mask = None
+        if document_ranges is not None:
+            attn_mask = batch_document_attn_mask(
+                batch_starts, current_block, document_ranges, device
+            )
+        return (
+            torch.stack(xs).to(device),
+            torch.stack(ys).to(device),
+            batch_starts,
+            attn_mask,
+        )
 
     log_every = max(50, max(1, steps // 50))
     ema_loss_tensor = None
@@ -481,7 +605,7 @@ def train_and_eval_student(
             for group in opt.param_groups:
                 group["lr"] = lr
             current_block = block_fn(step) if block_fn else block
-            x, y, _ = next_batch(batch, current_block)
+            x, y, _batch_starts, attn_mask = next_batch(batch, current_block)
             opt.zero_grad(set_to_none=True)
             # Loss-scaled microbatch accumulation: summed microbatch grads equal a
             # single full-batch mean-CE backward while capping peak logit memory.
@@ -489,7 +613,8 @@ def train_and_eval_student(
             for start, end in _microbatch_ranges(batch, train_microbatch_size):
                 xb = x[start:end]
                 yb = y[start:end]
-                logits = model(xb)
+                mb_mask = None if attn_mask is None else attn_mask[start:end]
+                logits = model(xb, attn_mask=mb_mask)
                 loss = F.cross_entropy(logits.float().view(-1, vocab_size), yb.view(-1))
                 _scaled_microbatch_loss(loss, end - start, batch).backward()
                 with torch.no_grad():
@@ -615,7 +740,7 @@ def train_and_eval_student(
             )
 
             current_block = block_fn(step) if block_fn else block
-            x, y, batch_starts = next_batch(effective_batch, current_block)
+            x, y, batch_starts, attn_mask = next_batch(effective_batch, current_block)
 
             # --- Portable: multi-token prediction targets ---
             use_mt = (
@@ -663,7 +788,8 @@ def train_and_eval_student(
             ):
                 xb = x[start:end]
                 yb = y[start:end]
-                logits = model(xb, output_hidden=use_mt)
+                mb_mask = None if attn_mask is None else attn_mask[start:end]
+                logits = model(xb, attn_mask=mb_mask, output_hidden=use_mt)
                 if use_mt:
                     hidden = logits[1]
                     y_future_mb = [yf[start:end] for yf in y_future]
@@ -933,6 +1059,9 @@ _TRAINING_COMPONENTS = (
     plan_train_windows,
     encode_document_tokens,
     plan_eos_aligned_windows,
+    window_document_ids,
+    build_document_attn_mask,
+    batch_document_attn_mask,
     shuffled_window_starts,
     make_seq_len_schedule,
     _is_cuda_device,
