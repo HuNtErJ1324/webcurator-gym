@@ -3,13 +3,12 @@
 Under verifiers v1 the per-rollout shared state is a typed, mutable ``vf.State``
 attached to the ``Trace`` (and synced to the tool server via the interception
 channel). ``CuratorState`` declares the curation fields; ``RolloutStore`` is the
-single place that (de)serializes the manifest and cost ledger, owns the
-per-rollout document cache, scratch directory, and external-error telemetry.
+single place that (de)serializes the manifest, owns the per-rollout document
+cache, scratch directory, and external-error telemetry.
 
-The manifest and cost ledger are stored as plain JSON-able dicts (model dumps)
-so the state round-trips cleanly over the v1 state channel; ``RolloutStore``
-hands callers validated ``Manifest`` / ``CostLedger`` instances and writes them
-back as dumps, exactly as the v0 ``RolloutStore`` did against the dict-state.
+The manifest is stored as a plain JSON-able dict (model dump) so the state
+round-trips cleanly over the v1 state channel; ``RolloutStore`` hands callers a
+validated ``Manifest`` and writes it back as a dump.
 """
 
 from __future__ import annotations
@@ -25,11 +24,11 @@ from typing import Any
 import verifiers.v1 as vf
 from pydantic import Field
 
-from .models import CostLedger, Manifest
+from .models import Manifest
 
 
 class CuratorState(vf.State):
-    """The rollout's shared curation state (manifest, ledger, caches, telemetry).
+    """The rollout's shared curation state (manifest, caches, telemetry).
 
     Typed and strict (unknown fields rejected), transient (never persisted to
     disk), and shared between the tool server (``self.state``) and scoring
@@ -39,9 +38,6 @@ class CuratorState(vf.State):
 
     cutoff_date: str | None = None
     manifest: dict[str, Any] = Field(default_factory=lambda: Manifest().model_dump())
-    cost_ledger: dict[str, Any] = Field(
-        default_factory=lambda: CostLedger().model_dump()
-    )
     # Cache key -> filename (relative to `scratch_dir`) of that key's raw fetched
     # documents, JSONL-encoded on disk. NOT the documents themselves -- see
     # `RolloutStore.scratch_dir`/`store_docs`/`cached_docs` for why.
@@ -73,14 +69,6 @@ class RolloutStore:
     @classmethod
     def set_manifest(cls, state: CuratorState, manifest: Manifest) -> None:
         state.manifest = manifest.model_dump()
-
-    @classmethod
-    def ledger(cls, state: CuratorState) -> CostLedger:
-        return CostLedger.model_validate(state.cost_ledger or {})
-
-    @classmethod
-    def set_ledger(cls, state: CuratorState, ledger: CostLedger) -> None:
-        state.cost_ledger = ledger.model_dump()
 
     @classmethod
     def set_materialization_stats(

@@ -8,19 +8,15 @@ override ``Taskset.tools``), it satisfies the non-MCP harness gate at
 ``verifiers/v1/env.py:239-247`` and runs under codex / kimi_code as well as the
 default / bash harnesses.
 
-After generation, ``finalize`` (run before scoring, while the runtime is live):
-  1. reads and parses the manifest JSON from the runtime workspace,
-  2. meters the live ``hf`` discovery cost into the cost ledger (see
-     :mod:`hf_meter`), preferring the PATH-shim's runtime log and falling back to
-     reconstructing hf calls from the trace.
+After generation, ``finalize`` (run before scoring, while the runtime is live)
+reads and parses the manifest JSON from the runtime workspace.
 
 Scoring is unchanged from v1: the finalized manifest's datasets are materialized
 and used to train the fixed proxy student, and the composite reward is:
 
     R(M, H) = alpha_perf*Perf_scaled_to_target - lambda_leakage*Leakage
 
-Cost is recorded as a telemetry-only metric (``cost_total``) with zero weight on
-the reward. Leakage is a token-weighted scalar from the decon Rust n-gram
+Leakage is a token-weighted scalar from the decon Rust n-gram
 detector run against PUBLIC BENCHMARK eval sets (bundled under
 ``decon/bundled-evals/``) AND, optionally, the held-out validation set (when
 ``screen_val_set`` is enabled — the default).  The val eval file is detokenised
@@ -51,7 +47,7 @@ from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .leakage import DeconLeakageDetector
 from .docker_network import DockerHostReachability
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
-from .hf_meter import _content_text, extract_hf_commands, install_shim, meter_ledger
+from .hf_cli_parse import content_text, extract_hf_commands
 from .leakage import DEFAULT_DECON_BINARY, DEFAULT_EVAL_SETS_DIR
 from .models import (
     CuratorConfig,
@@ -192,7 +188,7 @@ def _ids_from_trace(trace: vf.Trace) -> list[str]:
         return list(inspected)
     observed: dict[str, None] = {}
     for msg in getattr(trace, "tool_messages", []):
-        text = _content_text(getattr(msg, "content", ""))
+        text = content_text(getattr(msg, "content", ""))
         for m in _HF_ID_RE.finditer(text):
             did = m.group(1)
             if _looks_like_hf_id(did):
@@ -486,7 +482,6 @@ class CuratorTaskset(_TasksetBase):
     def __init__(self, config: CuratorTasksetConfig) -> None:
         super().__init__(config)
         self.curator = self._build_curator_config(config)
-        install_shim()
         self._client: HuggingFaceDatasetClient | None = None
         self._corpus_builder: CorpusBuilder | None = None
         self._trainer: ProxyStudentTrainer | None = None
@@ -795,7 +790,7 @@ class CuratorTaskset(_TasksetBase):
         return None
 
     async def finalize(self, task: CuratorTask, trace: vf.Trace, runtime: Any) -> None:
-        """Read the agent's manifest and meter live `hf` discovery cost.
+        """Read the agent's manifest from the runtime workspace.
 
         Positional signature as invoked at ``verifiers/v1/rollout.py:241``; runs
         after generation and before ``score``. The workspace file is the primary
@@ -803,8 +798,7 @@ class CuratorTaskset(_TasksetBase):
         shell-write/finalize race. Assistant-message parsing and trace-ID synthesis
         remain compatibility fallbacks. Tolerant of a missing/garbled rollout (no
         usable manifest anywhere -> "not finalized" -> the scorer returns the zero
-        sentinel). The discovery cost ledger is computed here and persisted; the
-        scorer still adds ``train_flops`` and materialization cost on top.
+        sentinel).
         """
         state = trace.state
         manifest = await self._manifest_from_workspace_file(task, runtime)
@@ -835,15 +829,10 @@ class CuratorTaskset(_TasksetBase):
             RolloutStore.set_finalized(state, True)
         else:
             RolloutStore.set_finalized(state, False)
-        try:
-            ledger = await meter_ledger(trace, runtime)
-        except Exception:
-            ledger = RolloutStore.ledger(state)
-        RolloutStore.set_ledger(state, ledger)
         validation_id = self.curator.validation_set.dataset_id
         accessed_validation_set = False
         for message in trace.assistant_messages:
-            if validation_id in _content_text(getattr(message, "content", "")):
+            if validation_id in content_text(getattr(message, "content", "")):
                 accessed_validation_set = True
                 break
             for tool_call in message.tool_calls or []:
@@ -997,12 +986,6 @@ class CuratorTaskset(_TasksetBase):
                 "num_contaminated_matches"
             ]
         )
-
-    @vf.metric
-    async def cost_total(
-        self, trace: vf.Trace, runtime: vf.Runtime | None = None
-    ) -> float:
-        return (await self._prepared(trace, runtime))["cost"]
 
     @vf.metric
     async def finalized(self, trace: vf.Trace) -> float:

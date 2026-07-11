@@ -119,8 +119,7 @@ class FetchKey:
     """Deterministic cache identity for a sampled document slice.
 
     Two fetches with the same `(dataset_id, config, split, text_field, n)` MUST
-    observe identical documents (so a preview and final scoring agree, and cost
-    is charged once).
+    observe identical documents (so a preview and final scoring agree).
     """
 
     dataset_id: str

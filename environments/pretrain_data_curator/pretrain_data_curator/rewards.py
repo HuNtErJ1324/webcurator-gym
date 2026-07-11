@@ -17,7 +17,7 @@ the held-out validation set (detokenised from GPT-2-BPE token IDs back to
 text via tiktoken at scoring time only; the val set is NEVER exposed to the
 agent).
 
-Performance, cost (telemetry-only), and leakage derive from one prepared scoring pass over the
+Performance and leakage derive from one prepared scoring pass over the
 finalized manifest. The expensive corpus build and proxy-student training run
 happen exactly once per rollout: the taskset wraps this scorer in a per-rollout
 lock and cache so concurrent reward/metric evaluation shares the result.
@@ -76,10 +76,6 @@ class CuratorScorer:
         )
         train_result = await self._train(corpus, state, runtime)
 
-        ledger = RolloutStore.ledger(state)
-        ledger.train_flops += train_result.flops
-        RolloutStore.set_ledger(state, ledger)
-
         # Decon runs off the event loop via subprocess.
         decon_error = False
         val_screen_skipped = False
@@ -111,7 +107,6 @@ class CuratorScorer:
 
         return {
             "perf": self._perf(train_result),
-            "cost": ledger.total(self.config.prices),
             "leakage": leakage.as_dict(),
             "decon_error": float(decon_error),
             "val_screen_skipped": float(val_screen_skipped),
@@ -157,10 +152,8 @@ class CuratorScorer:
             )
 
     def _empty_scoring(self, state: CuratorState) -> dict[str, Any]:
-        ledger = RolloutStore.ledger(state)
         return {
             "perf": 0.0,
-            "cost": ledger.total(self.config.prices),
             "leakage": {"leakage_score": 0.0, "num_contaminated_matches": 0},
             "decon_error": 0.0,
             "val_screen_skipped": 0.0,

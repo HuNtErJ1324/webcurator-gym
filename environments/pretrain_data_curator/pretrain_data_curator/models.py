@@ -1,7 +1,7 @@
 """Pydantic contracts for the pretraining-data curation environment.
 
 Everything the agent produces and everything the reward consumes is expressed
-here so the manifest, cost ledger, and configuration have one strict home.
+here so the manifest and configuration have one strict home.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ _RESERVED_WORKSPACE_FILES = frozenset(
         "config.json",
         "train.py",
         "val.bin",
-        ".vf_hf_cost.jsonl",
     }
 )
 
@@ -118,35 +117,6 @@ class Manifest(BaseModel):
     # `Sampling.max_docs`/`max_tokens` truncation on `Source`). Omit for no cap;
     # fetches are then sized from each source's weight-proportional token target.
     sample_docs_per_source: int | None = Field(default=None, ge=1)
-
-
-class CostPrices(BaseModel):
-    """Per-unit prices charged on the single cost ledger."""
-
-    web_query: float = 0.0
-    hub_call: float = 0.01
-    code_call: float = 0.02
-    per_1k_tokens: float = 0.001
-    per_gflop: float = 1e-6
-
-
-class CostLedger(BaseModel):
-    """Running tally of resources spent during a rollout."""
-
-    web_queries: int = 0
-    hub_calls: int = 0
-    code_calls: int = 0
-    tokens: int = 0
-    train_flops: float = 0.0
-
-    def total(self, prices: CostPrices) -> float:
-        return (
-            self.web_queries * prices.web_query
-            + self.hub_calls * prices.hub_call
-            + self.code_calls * prices.code_call
-            + (self.tokens / 1000.0) * prices.per_1k_tokens
-            + (self.train_flops / 1e9) * prices.per_gflop
-        )
 
 
 class ProxyStudentConfig(BaseModel):
@@ -609,7 +579,6 @@ class CuratorConfig(BaseModel):
     fetch_timeout_per_doc_seconds: float = Field(default=0.25, ge=0.0)
     fetch_max_attempts: int = Field(default=3, ge=1, le=20)
 
-    prices: CostPrices = Field(default_factory=CostPrices)
     proxy_student: ProxyStudentConfig = Field(default_factory=ProxyStudentConfig)
     # Held-out validation set for the downstream cross-entropy (Perf) signal.
     # Defaults to the NanoGPT speedrun set (FineWeb sample-10BT GPT-2-BPE val

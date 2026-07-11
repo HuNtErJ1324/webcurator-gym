@@ -119,7 +119,6 @@ def test_local_source_rejects_absolute_and_parent_paths(path: str):
         "nested/config.json",
         "train.py",
         "outputs/val.bin",
-        ".vf_hf_cost.jsonl",
         MANIFEST_FILENAME,
     ],
 )
@@ -238,9 +237,7 @@ async def test_fetch_local_docs_caches_and_bills_once():
     assert runtime.commands[0][0][2] == "wc -c < data/docs.jsonl"
     assert runtime.commands[1][0][2] == "head -c 1024 -- data/docs.jsonl"
     assert runtime.read_calls == []
-    ledger = RolloutStore.ledger(state)
-    assert ledger.code_calls == 1
-    assert ledger.tokens == sum(estimate_tokens(doc) for doc in docs)
+    assert RolloutStore.local_source_count(state) == 1
     assert RolloutStore.local_source_count(state) == 1
     assert RolloutStore.local_source_bytes(state) == len(content)
     assert not RolloutStore.local_source_truncated(state)
@@ -479,7 +476,7 @@ def test_local_configuration_is_validated_and_plumbed():
     assert env.env_args["max_local_source_bytes"] == 4096
 
 
-def test_initial_prompt_discloses_local_source_safety_and_cost():
+def test_initial_prompt_discloses_local_source_safety_and_token_budget():
     prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
     assert '"kind": "hf"' in prompt
     assert '"kind": "local"' in prompt

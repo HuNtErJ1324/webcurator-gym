@@ -215,7 +215,12 @@ def test_shipped_codex_eval_configs_receive_default_cap(monkeypatch):
 
     for path in configs:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
-        args = data.get("args") or {}
+        eval_rows = data.get("eval") or []
+        if eval_rows:
+            args = eval_rows[0].get("args") or {}
+        else:
+            args = data.get("args") or {}
+        assert args, path.name
         assert args.get("harness_id") == "codex", path.name
         # Configs omit max_tool_output_chars so load_environment's default applies.
         assert "max_tool_output_chars" not in args, path.name

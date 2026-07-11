@@ -36,6 +36,7 @@ from pretrain_data_curator.hf_access import (
     loop_local_semaphore,
     run_blocking_with_retry,
 )
+from pretrain_data_curator.hf_cli_parse import extract_hf_commands
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
@@ -62,7 +63,6 @@ from pretrain_data_curator.taskset import (
     parse_manifest,
 )
 from tests.conftest import NoOpLeakageDetector, bind_fast_scorer
-from pretrain_data_curator import hf_meter
 from verifiers.v1.taskset import Taskset
 from pretrain_data_curator.trainer import (
     HeuristicProxyTrainer,
@@ -742,8 +742,7 @@ async def test_finalize_then_reward_aggregation():
     assert "quality" not in scoring
     assert "diversity" not in scoring
     assert scoring["flops"] > 0.0
-    ledger = RolloutStore.ledger(curator.state)
-    assert ledger.train_flops > 0.0  # FLOPs charged back to the ledger
+    assert "cost" not in scoring
 
 
 @pytest.mark.asyncio
@@ -1410,30 +1409,22 @@ def test_build_tasks_carry_typed_token_budget():
 
 
 @pytest.mark.asyncio
-async def test_fetch_cache_same_key_identity_and_cost_once():
+async def test_fetch_cache_same_key_identity_once():
     client = FakeClient()
     curator = await _make(client=client)
     state = await _finalized(curator, sources=("good/encyclopedia",))
     assert client.sample_calls == []  # nothing fetched until materialize
-    tokens_before = RolloutStore.ledger(state).tokens
-    hub_before = RolloutStore.ledger(state).hub_calls
 
     manifest = RolloutStore.manifest(state)
     corpus_a = await curator.corpus_builder.materialize(manifest, state)
     assert client.sample_calls == ["good/encyclopedia"]  # fetched exactly once
-    tokens_once = RolloutStore.ledger(state).tokens
-    # The fetch charged one hub call and a positive token cost, exactly once.
-    assert tokens_once > tokens_before
-    assert RolloutStore.ledger(state).hub_calls == hub_before + 1
 
     corpus_b = await curator.corpus_builder.materialize(manifest, state)
     # No re-streaming on repeated same-key fetches.
     assert client.sample_calls == ["good/encyclopedia"]
     # Identical docs across fetches (preview == score).
     assert corpus_a.documents == corpus_b.documents
-    # Token/corpus cost counted exactly once (no re-billing from cached builds).
-    assert RolloutStore.ledger(state).tokens == tokens_once
-    assert RolloutStore.ledger(state).hub_calls == hub_before + 1
+
 
 
 @pytest.mark.asyncio
@@ -1504,7 +1495,6 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     # score materializes the parsed manifest's sources (once each) and trains.
     await taskset.score(trace, None)
     assert client.sample_calls == ["good/encyclopedia", "good/science"]
-    assert RolloutStore.ledger(state).hub_calls == 2  # one Hub fetch per source
     assert trace.reward != 0.0  # scoring actually ran over the shared state
 
 
@@ -1524,9 +1514,9 @@ class _SlowCountingClient(FakeClient):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_same_key_fetch_coalesces_to_one_fetch_and_one_bill():
-    # N concurrent same-key fetches must share ONE underlying Hub fetch and ONE
-    # billing event; later callers read the cached result (single-flight).
+async def test_concurrent_same_key_fetch_coalesces_to_one_fetch():
+    # N concurrent same-key fetches must share ONE underlying Hub fetch;
+    # later callers read the cached result (single-flight).
     client = _SlowCountingClient()
     builder = CorpusBuilder(client=client)
     state = CuratorState()
@@ -1536,21 +1526,13 @@ async def test_concurrent_same_key_fetch_coalesces_to_one_fetch_and_one_bill():
         *[builder.fetch_source_docs(state, key) for _ in range(12)]
     )
 
-    # (a) the underlying HF fetch ran exactly once despite 12 racing callers.
     assert client.sample_calls == ["good/encyclopedia"]
-    # (b) cost/billing was applied exactly once.
-    ledger = RolloutStore.ledger(state)
-    assert ledger.hub_calls == 1
-    assert ledger.tokens > 0
-    # (c) every caller received the same (non-empty, error-free) docs.
     docs0, err0 = results[0]
     assert err0 is None and docs0
     for docs, err in results:
         assert err is None
         assert docs == docs0
 
-
-# --- Tier A: corpus build + training run exactly once per rollout ----------
 
 
 class _CountingBuilder(CorpusBuilder):
@@ -1588,7 +1570,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 22  # 2 rewards + 20 diagnostic metrics
+    assert len(funcs) == 21  # 2 rewards + 19 diagnostic metrics (cost_total removed)
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -1950,7 +1932,8 @@ async def test_reward_unaffected_by_recorded_errors():
     assert trace.reward == pytest.approx(baseline)
     assert trace.metrics["tool_error_count"] == 1.0
     assert trace.metrics["external_failure"] == 1.0
-    assert trace.metrics["cost_total"] >= 0.0
+    assert "cost_total" not in trace.metrics
+    assert "train_flops" in trace.metrics
     assert trace.metrics["budget_fill_ratio"] == pytest.approx(
         curator.state.budget_fill_ratio
     )
@@ -1966,35 +1949,23 @@ def test_reward_surface_has_only_perf_and_leakage():
 
 
 @pytest.mark.asyncio
-async def test_reward_is_invariant_to_cost_total():
-    """The reward must not depend on cost (cost is telemetry-only).
-
-    We start with a baseline reward, then add extra cost to the ledger and
-    recompute scoring. The reward must not change even though cost_total
-    increases.
-    """
+async def test_reward_has_no_cost_total_metric():
+    """Cost metering is removed; reward remains perf - leakage only."""
     curator = await _make()
     await _finalized(curator)
     trace = await curator.score()
+    assert "cost_total" not in trace.metrics
     baseline_reward = trace.reward
-    baseline_cost = trace.metrics.get("cost_total", 0.0)
+    assert "train_flops" in trace.metrics
+    assert "corpus_tokens" in trace.metrics
+    assert "budget_fill_ratio" in trace.metrics
 
-    # Add extra cost to the ledger (simulate more hub calls / tokens).
-    ledger = RolloutStore.ledger(curator.state)
-    ledger.hub_calls += 100
-    ledger.tokens += 500_000
-    RolloutStore.set_ledger(curator.state, ledger)
-
-    # Re-score with the inflated cost.
+    await curator.reset()
+    await _finalized(curator)
     trace2 = await curator.score()
-    inflated_cost = trace2.metrics.get("cost_total", 0.0)
-
-    # Cost increased.
-    assert inflated_cost > baseline_cost
-    # But reward must not change — cost is telemetry-only.
+    assert "cost_total" not in trace2.metrics
     assert trace2.reward == pytest.approx(baseline_reward)
-    assert "cost_total" in trace2.metrics
-    assert isinstance(trace2.metrics["cost_total"], float)
+
 
 
 # --- Tier M: single PTB-style prompt + leakage-safe self-score --------------
@@ -2875,135 +2846,28 @@ def test_extract_json_object_handles_braces_in_strings():
     assert obj["sources"][0]["id"] == "x/y"
 
 
-# --- hf_meter: classify + JSONL cost log -> ledger -------------------------
-
-
-@pytest.mark.parametrize(
-    "argv,kind",
-    [
-        (["datasets", "ls", "--search", "code"], "search"),
-        (["datasets", "ls", "--sort", "downloads", "--limit", "10"], "search"),
-        (["models", "ls", "--search", "bert"], "search"),
-        (["datasets", "info", "HuggingFaceFW/fineweb"], "info"),
-        (["download", "foo/bar", "--repo-type", "dataset"], "download"),
-        (["version"], "local"),
-        (["env"], "local"),
-        (["auth", "whoami"], "local"),
-        (["repo", "create", "x"], "other"),
-    ],
-)
-def test_classify_hf_argv(argv, kind):
-    assert hf_meter.classify_hf_argv(argv) == kind
-
-
-def test_parse_cost_log_maps_records_to_ledger():
-    log = "\n".join(
-        [
-            json.dumps(
-                {
-                    "argv": ["datasets", "ls", "--search", "code"],
-                    "exit": 0,
-                    "bytes": 400,
-                }
-            ),
-            json.dumps({"argv": ["datasets", "info", "a/b"], "exit": 0, "bytes": 80}),
-            json.dumps(
-                {
-                    "argv": ["download", "a/b", "--repo-type", "dataset"],
-                    "exit": 0,
-                    "bytes": 4000,
-                }
-            ),
-            json.dumps({"argv": ["version"], "exit": 0, "bytes": 12}),  # local -> free
-            "   ",  # blank line tolerated
-            "{not valid json",  # corrupt line tolerated
-        ]
-    )
-    led = hf_meter.parse_cost_log(log)
-    # search -> web_queries + hub_calls; info + download -> hub_calls; version free.
-    assert led.web_queries == 1
-    assert led.hub_calls == 3
-    # downloaded bytes -> tokens (bytes // 4), summed over the network calls only.
-    assert led.tokens == 400 // 4 + 80 // 4 + 4000 // 4
-    assert led.train_flops == 0.0  # never set by metering
-
-
-def test_parse_cost_log_charges_failed_calls_too():
-    # A failed hf call still cost a round-trip; it is charged like the old tool
-    # accounting (which incremented before the call), regardless of exit code.
-    log = json.dumps(
-        {"argv": ["datasets", "ls", "--search", "x"], "exit": 1, "bytes": 0}
-    )
-    led = hf_meter.parse_cost_log(log)
-    assert led.web_queries == 1 and led.hub_calls == 1
-
-
-# --- hf_meter: trace-reconstruction fallback -------------------------------
-
-
-def test_ledger_from_messages_reconstructs_tool_call_and_text_action_calls():
-    messages = [
-        SimpleNamespace(role="system", content="sys"),
-        SimpleNamespace(role="user", content="go"),
-        # tool-call harness (bash): command in the tool-call arguments; the paired
-        # ToolMessage's content is its output size.
-        SimpleNamespace(
-            role="assistant",
-            content=None,
-            tool_calls=[
-                SimpleNamespace(
-                    id="c1",
-                    arguments=json.dumps(
-                        {"command": "hf datasets ls --search code --limit 5"}
-                    ),
-                )
-            ],
-        ),
-        SimpleNamespace(role="tool", tool_call_id="c1", content="x" * 400),
-        # text-action harness (mini_swe_agent): command fenced in assistant text.
-        SimpleNamespace(
-            role="assistant",
-            content="Now inspect:\n```bash\nhf datasets info good/encyclopedia\n```",
-            tool_calls=None,
-        ),
-        # the final JSON manifest carries no hf call.
-        SimpleNamespace(
-            role="assistant",
-            content='```json\n{"sources": [{"id": "good/encyclopedia", "weight": 1}]}\n```',
-            tool_calls=None,
-        ),
-    ]
-    led = hf_meter.ledger_from_messages(messages)
-    assert led.web_queries == 1  # the `ls --search`
-    assert led.hub_calls == 2  # ls + info
-    assert led.tokens == 400 // 4  # only the ls had paired output bytes
-
-
 def test_extract_hf_commands_splits_on_shell_separators():
-    cmds = hf_meter.extract_hf_commands(
+    cmds = extract_hf_commands(
         "hf datasets ls --search a && hf datasets info b/c"
     )
     assert cmds == [["datasets", "ls", "--search", "a"], ["datasets", "info", "b/c"]]
 
 
-# --- finalize: populates state.manifest + cost ledger ----------------------
+# --- finalize: populates state.manifest ------------------------------------
 
 
 class _FakeRuntime:
-    """Minimal runtime exposing agent-written files and an optional cost log."""
+    """Minimal runtime exposing agent-written files."""
 
     def __init__(self, log_bytes=None, *, files=None):
-        self._log = log_bytes
         self._files = files or {}
 
     async def read(self, path):
         if path in self._files:
             return self._files[path]
-        if path != hf_meter.COST_LOG_NAME:
-            raise FileNotFoundError(path)
-        if self._log is None:
-            raise FileNotFoundError(path)
-        return self._log
+        raise FileNotFoundError(path)
+
+
 
 
 def _trace_with_final(task, state, final_text):
@@ -3037,9 +2901,8 @@ async def test_finalize_warns_when_fetch_cap_cannot_reach_token_budget(caplog):
 
     assert "TOKEN BUDGET IS NOT REACHABLE" in caplog.text
 
-
 @pytest.mark.asyncio
-async def test_finalize_populates_manifest_and_meters_runtime_log():
+async def test_finalize_populates_manifest_without_cost_ledger():
     curator = await _make()
     final = (
         "```json\n"
@@ -3048,29 +2911,14 @@ async def test_finalize_populates_manifest_and_meters_runtime_log():
         "```"
     )
     trace = _trace_with_final(curator.task, curator.state, final)
-    log = (
-        json.dumps(
-            {"argv": ["datasets", "ls", "--search", "x"], "exit": 0, "bytes": 400}
-        )
-        + "\n"
-        + json.dumps(
-            {"argv": ["datasets", "info", "good/encyclopedia"], "exit": 0, "bytes": 40}
-        )
-        + "\n"
-    )
-    await curator.taskset.finalize(curator.task, trace, _FakeRuntime(log.encode()))
-
-    state = curator.state
-    assert RolloutStore.is_finalized(state)
-    manifest = RolloutStore.manifest(state)
-    assert {s.dataset_id for s in manifest.sources} == {
+    await curator.taskset.finalize(curator.task, trace, None)
+    assert RolloutStore.is_finalized(curator.state)
+    manifest = RolloutStore.manifest(curator.state)
+    assert [s.dataset_id for s in manifest.sources] == [
         "good/encyclopedia",
         "good/science",
-    }
-    led = RolloutStore.ledger(state)
-    assert led.web_queries == 1 and led.hub_calls == 2
-    assert led.tokens == 400 // 4 + 40 // 4
-    assert led.train_flops == 0.0  # the scorer adds FLOPs later, not finalize
+    ]
+    assert "cost_ledger" not in type(curator.state).model_fields
 
 
 @pytest.mark.asyncio
@@ -3161,24 +3009,6 @@ async def test_finalize_malformed_workspace_manifest_warns_and_falls_back(
     assert [
         source.dataset_id for source in RolloutStore.manifest(curator.state).sources
     ] == ["message/fallback"]
-
-
-@pytest.mark.asyncio
-async def test_finalize_meters_via_trace_when_no_runtime_log():
-    curator = await _make()
-    final = (
-        "Searching:\n```bash\nhf datasets ls --search code\n```\n\n"
-        "Final:\n```json\n"
-        '{"sources": [{"id": "good/encyclopedia", "weight": 1.0}]}\n'
-        "```"
-    )
-    trace = _trace_with_final(curator.task, curator.state, final)
-    # runtime.read raises -> fall back to reconstructing hf calls from the trace.
-    await curator.taskset.finalize(curator.task, trace, _FakeRuntime(None))
-
-    assert RolloutStore.is_finalized(curator.state)
-    led = RolloutStore.ledger(curator.state)
-    assert led.web_queries == 1 and led.hub_calls == 1  # the `ls --search`
 
 
 @pytest.mark.asyncio
@@ -3706,28 +3536,6 @@ async def test_runtime_read_reads_file_created_by_agent_shell():
     finally:
         runtime.cleanup()
 
-
-# --- the PATH-shadow shim --------------------------------------------------
-
-
-def test_install_shim_is_idempotent_and_resolves_real_hf():
-    real = hf_meter._resolve_real_hf()
-    if real is None:
-        pytest.skip("no real `hf` CLI on PATH to shim")
-    p1 = hf_meter.install_shim()
-    p2 = hf_meter.install_shim()
-    assert p1 == p2 == hf_meter.SHIM_HF
-    assert os.path.isfile(hf_meter.SHIM_HF) and os.access(hf_meter.SHIM_HF, os.X_OK)
-    # The shim dir shadows the real hf by sitting first on PATH...
-    assert os.environ["PATH"].split(os.pathsep)[0] == hf_meter.SHIM_BIN_DIR
-    # ...and the wrapper execs the real hf by absolute path.
-    body = Path(hf_meter.SHIM_HF).read_text()
-    assert real in body
-
-
-# --- Tier R (cont.): last-sources-wins manifest parsing --------------------
-
-
 def test_parse_manifest_prefers_last_sources_block_across_multiple_fences():
     # Multiple fenced blocks: a leading note (no sources), then a DRAFT manifest,
     # then the FINAL manifest. The parser must pick the LAST sources-bearing block
@@ -3802,102 +3610,6 @@ class _CorruptRuntime:
     ],
     ids=["no_runtime", "missing_log", "corrupt_log"],
 )
-@pytest.mark.asyncio
-async def test_finalize_trace_fallback_reconstructs_ledger(runtime):
-    # When the shim's runtime cost log can't be read (no runtime / missing /
-    # unreadable), the finalize metering reconstructs a non-empty discovery ledger
-    # from the hf calls recorded in the trace itself.
-    curator = await _make()
-    final = (
-        "Search:\n```bash\nhf datasets ls --search code --limit 5\n```\n"
-        "Inspect:\n```bash\nhf datasets info good/encyclopedia\n```\n"
-        "Final:\n```json\n"
-        '{"sources": [{"id": "good/encyclopedia", "weight": 1.0}]}\n'
-        "```"
-    )
-    trace = _trace_with_final(curator.task, curator.state, final)
-    await curator.taskset.finalize(curator.task, trace, runtime)
-
-    assert RolloutStore.is_finalized(curator.state)
-    led = RolloutStore.ledger(curator.state)
-    # Reconstructed from the trace: the `ls --search` (web query + hub call) plus
-    # the `info` (hub call) — a non-empty ledger despite the unusable runtime log.
-    assert led.web_queries == 1
-    assert led.hub_calls == 2
-
-
-# --- Tier R (cont.): the PATH-shadow shim actually records a cost line -------
-
-
-def test_shim_writes_jsonl_cost_record_when_hf_invoked(tmp_path, monkeypatch):
-    # Strong shim test: actually invoke `hf` THROUGH the shimmed PATH (with a stub
-    # `hf` standing in for the real binary) and assert a JSONL cost record is
-    # written. If the shim genuinely can't be exercised here, drive the record
-    # shape -> ledger codepath directly and assert the JSONL line shape.
-    import shutil
-
-    # A stub `hf` the shim will exec as the "real" binary (prints to stdout, ok).
-    real_bin = tmp_path / "realbin"
-    real_bin.mkdir()
-    stub_hf = real_bin / "hf"
-    stub_hf.write_text("#!/bin/sh\nprintf 'DATASET a/b\\n'\nexit 0\n")
-    stub_hf.chmod(0o755)
-
-    work = tmp_path / "work"
-    work.mkdir()
-    monkeypatch.chdir(work)
-    # Stub first on PATH so the shim resolves IT as the real hf; force a fresh
-    # install so the shim re-renders against this PATH (and clean up after).
-    monkeypatch.setenv("PATH", f"{real_bin}{os.pathsep}{os.environ.get('PATH', '')}")
-    hf_meter._installed = False
-    try:
-        shim = hf_meter.install_shim()
-        can_run = bool(shim) and shutil.which("bash") is not None
-        if can_run:
-            proc = subprocess.run(
-                ["hf", "datasets", "ls", "--search", "code"],
-                cwd=str(work),
-                env=os.environ.copy(),
-                capture_output=True,
-                text=True,
-            )
-            assert proc.returncode == 0
-            assert "DATASET a/b" in proc.stdout  # real hf stdout passed through
-            log_path = work / hf_meter.COST_LOG_NAME
-            assert log_path.is_file()
-            lines = [ln for ln in log_path.read_text().splitlines() if ln.strip()]
-            assert len(lines) == 1  # exactly one cost record for the one hf call
-            rec = json.loads(lines[0])
-            # The JSONL line shape `parse_cost_log` consumes.
-            assert set(rec) >= {"argv", "exit", "bytes", "duration", "ts"}
-            assert rec["argv"] == ["datasets", "ls", "--search", "code"]
-            assert rec["exit"] == 0
-            assert isinstance(rec["bytes"], int) and rec["bytes"] >= 0
-            if rec["bytes"]:
-                assert rec["bytes"] == len(proc.stdout.encode())
-            # ...and it folds into a non-empty ledger (search -> web query + hub call).
-            led = hf_meter.parse_cost_log(log_path.read_text())
-            assert led.web_queries == 1 and led.hub_calls == 1
-        else:
-            # Fallback: exercise the record-shape -> ledger codepath directly and
-            # assert the JSONL line maps exactly as the live shim's record would.
-            rec = {
-                "argv": ["datasets", "ls", "--search", "code"],
-                "exit": 0,
-                "bytes": 400,
-                "duration": 0.01,
-                "ts": 123.0,
-            }
-            led = hf_meter.parse_cost_log(json.dumps(rec))
-            assert led.web_queries == 1 and led.hub_calls == 1
-            assert led.tokens == 400 // 4
-    finally:
-        hf_meter._installed = False
-        shutil.rmtree(hf_meter.SHIM_DIR, ignore_errors=True)
-
-
-# --- Tier M: selectable real-training backends ----------------------------
-
 
 def _real_trainer_taskset(**proxy_student):
     use_real = proxy_student.pop("use_real_trainer", True)

@@ -430,8 +430,8 @@ class CorpusBuilder:
 
     The async `materialize` path is the one used by the environment and reward:
     it fetches each source's documents through a per-rollout deterministic cache
-    (so a preview and final scoring observe identical docs and cost is charged
-    exactly once), offloads the blocking fetch off the event loop, bounds
+    (so a preview and final scoring observe identical docs), offloads the
+    blocking fetch off the event loop, bounds
     concurrency, and degrades a failed source to an empty slice (recording the
     error in state) rather than raising. The synchronous `build` is retained for
     direct, cache-free use (e.g. unit tests of filtering/sampling).
@@ -453,8 +453,8 @@ class CorpusBuilder:
         self._allow_local_sources = allow_local_sources
         self._max_local_source_bytes = max_local_source_bytes
         # Loop-local single-flight guard: concurrent fetches sharing one
-        # (rollout, source key) coalesce onto a single Hub fetch + a single
-        # billing event. Locks bind to their running loop, and the rollout
+        # (rollout, source key) coalesce onto a single Hub fetch. Locks bind to
+        # their running loop, and the rollout
         # state must stay JSON-serializable, so they live here keyed by loop
         # then by "<rollout token>\x00<cache key>", never in state (mirrors the
         # loop-local registries in hf_access).
@@ -487,18 +487,17 @@ class CorpusBuilder:
     ) -> tuple[list[str], dict[str, Any] | None]:
         """Return `(docs, error)` for `key`, using/populating the rollout cache.
 
-        On a cache hit the stored docs are returned with no re-streaming and no
-        re-billing. On a miss the fetch is attempted (bounded + timed + retried);
-        success stores the docs and charges the ledger once (one hub call plus
-        the sampled tokens); failure records typed telemetry and returns an empty
+        On a cache hit the stored docs are returned with no re-streaming. On a
+        miss the fetch is attempted (bounded + timed + retried); success stores
+        the docs once; failure records typed telemetry and returns an empty
         slice with the structured error (and is *not* cached, so a later attempt
         may still succeed).
 
         Concurrent same-key callers (e.g. a preview racing the scoring fetch)
         are coalesced by a per-(rollout, key) single-flight lock with the same
         double-checked locking as ``CuratorRubric._prepared``: the cache is
-        re-checked inside the lock so the underlying fetch and its billing fire
-        exactly once, and the losers read the cached result.
+        re-checked inside the lock so the underlying fetch fires exactly once,
+        and the losers read the cached result.
         """
         cache_key = key.as_str()
         cached = RolloutStore.cached_docs(state, cache_key)
@@ -514,7 +513,7 @@ class CorpusBuilder:
         try:
             async with lock:
                 # Re-check under the lock: a racing caller may have already
-                # fetched, stored, and billed this key while we waited.
+                # fetched and stored this key while we waited.
                 cached = RolloutStore.cached_docs(state, cache_key)
                 if cached is not None:
                     return cached, None
@@ -530,10 +529,6 @@ class CorpusBuilder:
                     RolloutStore.set_external_failure(state, True)
                     return [], exc.as_dict()
                 RolloutStore.store_docs(state, cache_key, docs)
-                ledger = RolloutStore.ledger(state)
-                ledger.hub_calls += 1
-                ledger.tokens += sum(estimate_tokens(d) for d in docs)
-                RolloutStore.set_ledger(state, ledger)
                 return docs, None
         finally:
             self._discard_fetch_lock(lock_key)
@@ -646,10 +641,6 @@ class CorpusBuilder:
                     bytes_pulled=min(size, cap),
                     truncated=truncated,
                 )
-                ledger = RolloutStore.ledger(state)
-                ledger.code_calls += 1
-                ledger.tokens += sum(estimate_tokens(doc) for doc in docs)
-                RolloutStore.set_ledger(state, ledger)
                 return docs, None
         finally:
             self._discard_fetch_lock(lock_key)

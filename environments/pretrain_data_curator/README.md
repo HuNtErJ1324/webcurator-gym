@@ -3,7 +3,7 @@
 An environment where an agent curates an **LLM pretraining dataset** from the
 pre-cutoff Hugging Face universe. The curated mixture is scored by training a
 **fixed GPT-2-scale proxy-student where everything but the data is held
-constant**, combined with cross-entropy performance, cost, and leakage terms.
+constant**, combined with cross-entropy performance and leakage terms.
 
 ## Quickstart
 
@@ -40,8 +40,6 @@ R(M, H) = alpha_perf * Perf(M)
         - lambda_leakage * Leakage(M, H)
 ```
 
-Cost is tracked as a telemetry-only metric (``cost_total``) with zero weight on
-the reward.
 
 By default, `Perf(M)` uses a convex power-law scaling (`perf_scaling_exponent`,
 default `2.0`) from the neutral loss baseline to the nanoGPT speedrun target:
@@ -64,7 +62,7 @@ linear formula.
 Each term is also emitted as a metric (`perf_loss`, `perf_accuracy`,
 `perf_vs_baseline`, `train_flops`, `corpus_tokens`, `num_sources`,
 `leakage_score`, `num_contaminated_matches`, `decon_error`,
-`cost_total`, `finalized`). Local-source provenance is exposed as
+`finalized`). Local-source provenance is exposed as
 `local_source_count`, `local_source_bytes`, `local_source_truncated`, and
 `val_set_access`. Two further zero-weight **diagnostics**,
 `tool_error_count` and `external_failure`, separate bad curation from
@@ -92,7 +90,7 @@ external/infrastructure failure (a flaky Hub or sandbox). See
   Only the training corpus varies between rollouts. Its lifecycle is hardened
   (per-step timeouts, exit-code checks, stderr-tail preservation).
 
-Measured/estimated training FLOPs are charged back onto the cost ledger.
+Training FLOPs are reported as the zero-weight ``train_flops`` metric.
 
 #### Real-trainer backends: Docker and Modal
 
@@ -115,7 +113,7 @@ runtime you actually configure must agree.
   Docker daemon or GPU; it uses outbound HTTPS and the Modal SDK. Requires
   `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`. Set `modal_gpu` (default `"L4"`)
   to choose the GPU type. Because the GPU sandbox now hosts the full rollout,
-  Modal billing covers discovery through scoring, not only the training phase.
+  Modal covers discovery through scoring, not only the training phase.
 
 Docker maps `gpu_count` → `--gpus <count>`; there is no VM-mode or named-GPU-type
 config to satisfy for either real-trainer backend, and Docker has no 24h timeout
@@ -194,13 +192,13 @@ development. This signal does not load the final validation shard; the configure
 validation repository is blocked by a hash so its identity is not disclosed by
 the script.
 
-| `hf` command | Purpose | Cost |
-| --- | --- | --- |
-| `hf datasets ls --search "<query>" --sort downloads --limit 5 \| head -c 6000` | Search and rank dataset repositories without flooding model context. | `web_queries += 1`, `hub_calls += 1`, plus stdout bytes. |
-| `hf datasets ls --search "<q>" --format json --expand downloads,likes,lastModified --limit 5 \| head -c 6000` | JSON-formatted search; deliberately omit high-volume `tags`. | same as above |
-| `hf datasets info <dataset_id> --expand downloads,likes,tags \| head -c 6000` | Inspect one shortlisted repository. | `hub_calls += 1`, plus stdout bytes. |
-| `hf version`, `hf env`, `hf auth`, `hf cache` | Local setup/status — no network. | none |
-| `/workspace/manifest.json` | The agent's curation decision; read by `finalize()`. | none |
+| `hf` command | Purpose |
+|---|---|
+| `hf datasets ls --search "<query>" --sort downloads --limit 5 \| head -c 6000` | Search and rank dataset repositories without flooding model context. |
+| `hf datasets ls --search "<q>" --format json --expand downloads,likes,lastModified --limit 5 \| head -c 6000` | JSON-formatted search; deliberately omit high-volume `tags`. |
+| `hf datasets info <dataset_id> --expand downloads,likes,tags \| head -c 6000` | Inspect one shortlisted repository. |
+| `hf version`, `hf env`, `hf auth`, `hf cache` | Local setup/status — no network. |
+| `/workspace/manifest.json` | The agent's curation decision; read by `finalize()`. |
 
 The agent must write a non-empty manifest JSON object to
 `/workspace/manifest.json`. File existence is the completion signal; no sentinel
@@ -280,7 +278,7 @@ but every rollout does.
 | `max_turns` | int | `64` | Generous harness safety cap; absent from the prompt, reward, and metrics. |
 | `harness_id` | str | `"bash"` | Bundled Verifiers harness (`bash`, `codex`, `mini_swe_agent`, etc.). |
 | `alpha_perf` | float | `1.0` | Cross-entropy performance weight. |
-| `lambda_leakage` | float | `1.0` | Leakage penalty weight. Cost is telemetry-only (no reward term). |
+| `lambda_leakage` | float | `1.0` | Leakage penalty weight. |
 | `perf_baseline_loss` | float | `log(50304)` | Neutral CE reference for relative performance. |
 | `perf_target_loss` | float | `3.28` | Target CE that maps to `Perf=1.0` under baseline-relative scoring. |
 | `perf_scaling_exponent` | float | `2.0` | Power-law exponent for near-target amplification; `1.0` recovers linear. |
@@ -305,17 +303,17 @@ unavailable because the pinned Verifiers package requires `datasets>=3`.
 
 When streaming is unavailable, a local source can bridge a genuine downloaded
 dataset into scoring without executing repository code. Local paths are
-validated, transferred through the live runtime with `head -c`, billed like
-fetched tokens plus one code call, and audited with provenance metrics.
+validated, transferred through the live runtime with `head -c`, and audited
+with provenance metrics.
 
 ## Module Layout
 
 - `__init__.py` — `_bootstrap_verifiers_v1()`: patches `verifiers.__path__` at import time so the real v1 is importable inside Prime's Hosted Training orchestrator (which pre-loads a `verifiers==0.0.0` stub).
 - `pretrain_data_curator.py` — `load_environment` entry point; builds `CuratorTasksetConfig` and returns a `hosted_compat.Environment`.
 - `hosted_compat.py` — `Environment`: multiple-inheritance v0/v1 bridge. Derives from both `vf.Environment` and `legacy_vf.Environment`; delegates rollout work to the v1 episode engine and translates `vf.Trace` to the v0 `State` / `RolloutTiming` / trajectory format consumed by `prime eval` and Hosted Training.
-- `models.py` — Pydantic contracts (`Manifest`, `Source`, `FilterSpec`, `CostLedger`, `CuratorConfig`, `ProxyStudentConfig`, ...).
+- `models.py` — Pydantic contracts (`Manifest`, `Source`, `FilterSpec`, `CuratorConfig`, `ProxyStudentConfig`, ...).
 - `hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers. Setup checks credentials before rollout; the client checks again at first Hub use.
-- `hf_meter.py` — PATH-shadow `hf` shim, per-rollout JSONL cost log, and trace-reconstruction fallback.
+- `hf_cli_parse.py` — parse `hf` CLI argv from shell/command text for manifest recovery and val-set access detection.
 - `corpus.py` — `CorpusBuilder` + `DocumentFilter` (materialize manifest into documents).
 - `leakage.py` — `DeconLeakageDetector` (decon n-gram contamination vs bundled benchmarks + optional ephemeral held-out val screen), `LeakageScores`, `DeconError`, and the token-weighted `_reduce_report`.
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
@@ -339,10 +337,9 @@ fetched tokens plus one code call, and audited with provenance metrics.
   `screen_val_set=true`, an ephemeral detokenised val reference), reduced to a
   token-weighted scalar. A detector failure raises `DeconError` and is surfaced
   as `decon_error`/`external_failure` rather than a silent `0.0`.
-- Token/corpus cost is billed **once per real fetch**: documents are fetched
-  through a per-rollout cache keyed by `(dataset_id, config, split, text_field, n)`
-  with per-key single-flight, so previews and final scoring observe identical docs
-  and there is no double/triple billing.
+- Documents are fetched **once per real fetch**: a per-rollout cache keyed by
+  `(dataset_id, config, split, text_field, n)` with per-key single-flight so
+  previews and final scoring observe identical docs.
 - External (HF/sandbox) calls are wrapped with timeout + retry and a typed
   `DatasetAccessError`; on failure tools/scoring **degrade** to a defined sentinel
   (empty slice / infinite-loss `TrainResult`) and record diagnostics rather than

@@ -13,8 +13,8 @@ Treat the installed CLI as current truth:
 3. Before using a command, run its subgroup help (for example,
    `hf <group> --help`, then `hf <group> <command> --help`).
 
-Do not assume flags or commands from memory. The workspace `hf` command is metered
-and delegates to the real CLI, so keep using it rather than seeking another binary.
+Do not assume flags or commands from memory. Keep using the workspace `hf`
+command rather than seeking another binary.
 
 ## Safety
 

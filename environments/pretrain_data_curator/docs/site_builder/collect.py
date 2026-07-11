@@ -77,7 +77,6 @@ def _metrics_from_row(row: dict[str, Any]) -> dict[str, float | int | bool | Non
     metrics = dict(row.get("metrics") or {})
     for key in (
         "corpus_tokens",
-        "cost_total",
         "external_failure",
         "finalized",
         "leakage_score",

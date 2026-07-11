@@ -53,7 +53,6 @@ def build_site(
             {"key": "budget_fill_ratio", "label": "Budget Fill", "higher_is_better": True},
             {"key": "corpus_tokens", "label": "Corpus Tokens", "higher_is_better": True},
             {"key": "num_sources", "label": "Sources", "higher_is_better": True},
-            {"key": "cost_total", "label": "Cost", "higher_is_better": False},
         ],
     }
     (data_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
