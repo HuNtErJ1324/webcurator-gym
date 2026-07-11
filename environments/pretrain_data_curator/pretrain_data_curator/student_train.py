@@ -156,27 +156,105 @@ def make_seq_len_schedule(total_steps, max_block, warmup_frac=0.25):
     return block_at_step
 
 
-def _eval_val_loss(model, val_data, *, block, batch, vocab_size, device):
+def _score_hidden_chunked(model, hidden, targets, *, vocab_size, logit_chunk_tokens):
+    """Sum CE + correct counts over ``hidden`` without a full (N, vocab) allocation.
+
+    When ``logit_chunk_tokens`` is set, projects ``lm_head``/softcap in row chunks so
+    peak activation memory stays O(chunk * vocab) instead of O(N * vocab). Mean CE
+    and accuracy over the full set are identical to a single full-vocab pass.
+    """
+    flat_h = hidden.reshape(-1, hidden.size(-1))
+    flat_y = targets.reshape(-1)
+    n = int(flat_h.size(0))
+    chunk = int(logit_chunk_tokens) if logit_chunk_tokens is not None else n
+    if chunk < 1:
+        raise ValueError(f"logit_chunk_tokens must be >= 1, got {logit_chunk_tokens}")
+    loss_sum = 0.0
+    correct = 0
+    apply_head = getattr(model, "apply_lm_head", None)
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        h = flat_h[start:end]
+        y = flat_y[start:end]
+        if apply_head is not None:
+            logits = apply_head(h)
+        else:
+            logits = model.softcap * torch.tanh(model.lm_head(h) / model.softcap)
+        loss_sum += F.cross_entropy(logits, y, reduction="sum").item()
+        correct += (logits.argmax(-1) == y).sum().item()
+        del logits
+    return loss_sum, correct
+
+
+def _eval_val_loss(
+    model,
+    val_data,
+    *,
+    block,
+    batch,
+    vocab_size,
+    device,
+    logit_chunk_tokens=None,
+):
+    """Mean held-out CE / accuracy over every predictable val target.
+
+    ``batch`` is the validation microbatch (independent of training batch size).
+    When the model exposes ``forward_hidden``, the trunk runs once per microbatch
+    and ``lm_head``/softcap are applied in ``logit_chunk_tokens``-sized chunks so
+    oversized full-vocab logit tensors are never materialized.
+    """
     model.eval()
     val_windows = plan_val_windows(len(val_data), block)
     total = sum(length for _, length in val_windows)
     loss_sum = 0.0
     correct = 0
+    val_batch = max(1, int(batch))
+    forward_hidden = getattr(model, "forward_hidden", None)
     with torch.no_grad():
         wi = 0
         while wi < len(val_windows):
             length = val_windows[wi][1]
             starts = []
-            while wi < len(val_windows) and val_windows[wi][1] == length and len(starts) < batch:
+            while (
+                wi < len(val_windows)
+                and val_windows[wi][1] == length
+                and len(starts) < val_batch
+            ):
                 starts.append(val_windows[wi][0])
                 wi += 1
             xb = torch.stack([val_data[s : s + length] for s in starts]).to(device)
             yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(device)
-            logits = model(xb)
-            loss_sum += F.cross_entropy(
-                logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
-            ).item()
-            correct += (logits.argmax(-1) == yb).sum().item()
+            if forward_hidden is not None:
+                hidden = forward_hidden(xb)
+                chunk_loss, chunk_correct = _score_hidden_chunked(
+                    model,
+                    hidden,
+                    yb,
+                    vocab_size=vocab_size,
+                    logit_chunk_tokens=logit_chunk_tokens,
+                )
+                loss_sum += chunk_loss
+                correct += chunk_correct
+                del hidden
+            else:
+                logits = model(xb)
+                if logit_chunk_tokens is None:
+                    loss_sum += F.cross_entropy(
+                        logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
+                    ).item()
+                    correct += (logits.argmax(-1) == yb).sum().item()
+                else:
+                    flat_logits = logits.reshape(-1, vocab_size)
+                    flat_y = yb.reshape(-1)
+                    chunk = int(logit_chunk_tokens)
+                    for start in range(0, flat_logits.size(0), chunk):
+                        end = min(start + chunk, flat_logits.size(0))
+                        sl = flat_logits[start:end]
+                        sy = flat_y[start:end]
+                        loss_sum += F.cross_entropy(sl, sy, reduction="sum").item()
+                        correct += (sl.argmax(-1) == sy).sum().item()
+                del logits
+            del xb, yb
     return loss_sum / total, correct / total
 
 
@@ -200,6 +278,35 @@ def _compute_multi_token_loss(logits, hidden, y, multi_heads, y_future, vocab_si
     if mt_loss > 0.0:
         return main_loss + mt_weight * mt_loss
     return main_loss
+
+
+def _microbatch_ranges(batch_size, microbatch_size):
+    """Yield ``(start, end)`` slices that cover ``batch_size`` without exceeding ``microbatch_size``.
+
+    ``microbatch_size is None`` (or >= batch) yields a single full-batch slice — legacy
+    behavior. Used so scheduled effective batches (16→32→48) can honor the intended
+    token/update semantics while never materializing full-vocab logits for the whole
+    effective batch at once.
+    """
+    n = int(batch_size)
+    if n < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    if microbatch_size is None:
+        yield 0, n
+        return
+    micro = int(microbatch_size)
+    if micro < 1:
+        raise ValueError(f"train_microbatch_size must be >= 1, got {microbatch_size}")
+    if micro >= n:
+        yield 0, n
+        return
+    for start in range(0, n, micro):
+        yield start, min(start + micro, n)
+
+
+def _scaled_microbatch_loss(loss, micro_n, total_n):
+    """Scale mean-reduced microbatch loss so summed grads match full-batch mean CE."""
+    return loss * (float(micro_n) / float(total_n))
 
 
 def train_and_eval_student(
@@ -256,11 +363,21 @@ def train_and_eval_student(
     cautious_wd=False,
     nor_muon=False,
     polar_express=False,
+    train_microbatch_size=None,
+    val_batch_size=None,
+    val_logit_chunk_tokens=None,
 ):
     """Train ``model`` and score held-out CE; returns ``(val_loss, accuracy, tokens_trained)``."""
     block = int(block_size)
     batch = int(batch_size)
     steps = int(steps)
+    eval_batch = int(batch_size if val_batch_size is None else val_batch_size)
+    if eval_batch < 1:
+        raise ValueError(f"val_batch_size must be >= 1, got {val_batch_size}")
+    if train_microbatch_size is not None and int(train_microbatch_size) < 1:
+        raise ValueError(
+            f"train_microbatch_size must be >= 1, got {train_microbatch_size}"
+        )
 
     train_src = train_data
     if document_ranges is None and len(train_src) <= block + 1:
@@ -328,16 +445,25 @@ def train_and_eval_student(
                 group["lr"] = lr
             current_block = block_fn(step) if block_fn else block
             x, y, _ = next_batch(batch, current_block)
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            # Loss-scaled microbatch accumulation: summed microbatch grads equal a
+            # single full-batch mean-CE backward while capping peak logit memory.
+            loss_weighted = None
+            for start, end in _microbatch_ranges(batch, train_microbatch_size):
+                xb = x[start:end]
+                yb = y[start:end]
+                logits = model(xb)
+                loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                _scaled_microbatch_loss(loss, end - start, batch).backward()
+                with torch.no_grad():
+                    piece = loss.detach() * float(end - start)
+                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             tokens_trained += batch * current_block
             with torch.no_grad():
-                loss_detached = loss.detach()
+                loss_detached = loss_weighted / float(batch)
                 ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
                     ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
                 )
@@ -456,14 +582,29 @@ def train_and_eval_student(
                             future_targets.append(seg)
                     y_future.append(torch.stack(future_targets).to(device))
 
-            logits = model(x, output_hidden=use_mt)
-
-            # --- Portable: multi-token prediction loss ---
-            if use_mt:
-                hidden = logits[1]
-                loss = _compute_multi_token_loss(logits[0], hidden, y, model.multi_heads, y_future, vocab_size)
-            else:
-                loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+            # Loss-scaled microbatch accumulation: honor scheduled effective_batch
+            # tokens/update while capping peak full-vocab logit memory. Grads sum
+            # across microbatches so the net .grad equals a single full-effective
+            # -batch mean-CE backward before any optimizer/accumulation bookkeeping.
+            if grad_accum_embed_head_steps <= 1:
+                muon_opt.zero_grad(set_to_none=True)
+            loss_weighted = None
+            for start, end in _microbatch_ranges(effective_batch, train_microbatch_size):
+                xb = x[start:end]
+                yb = y[start:end]
+                logits = model(xb, output_hidden=use_mt)
+                if use_mt:
+                    hidden = logits[1]
+                    y_future_mb = [yf[start:end] for yf in y_future]
+                    loss = _compute_multi_token_loss(
+                        logits[0], hidden, yb, model.multi_heads, y_future_mb, vocab_size
+                    )
+                else:
+                    loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                _scaled_microbatch_loss(loss, end - start, effective_batch).backward()
+                with torch.no_grad():
+                    piece = loss.detach() * float(end - start)
+                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
 
             # --- Portable: true N-step gradient accumulation for embed + lm_head ---
             if grad_accum_embed_head_steps > 1:
@@ -472,8 +613,8 @@ def train_and_eval_student(
                     if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
                         embed_head_params.append(p)
 
-                loss.backward()
-
+                # backward() already ran per-microbatch above; grads for embed/head
+                # /multi-head params are fully summed for this effective batch.
                 # Accumulate embed/head/multi-head grads into a buffer, then
                 # zero p.grad so the next backward starts fresh (no double-count).
                 if accum_buffer_embed_head is None:
@@ -535,8 +676,8 @@ def train_and_eval_student(
                 # top of it (PyTorch's default add-into-.grad), matching the
                 # original's "don't clear Adam grads on even steps" behavior
                 # instead of silently discarding the even step's gradient.
-                muon_opt.zero_grad(set_to_none=True)
-                loss.backward()
+                # (muon grads were zeroed before the microbatch backward loop; the
+                # loss-scaled backward already ran per microbatch above.)
                 adam_stepped = step_speedrun_optimizers(
                     muon_opt,
                     adam_opt,
@@ -565,7 +706,7 @@ def train_and_eval_student(
 
             tokens_trained += effective_batch * current_block
             with torch.no_grad():
-                loss_detached = loss.detach()
+                loss_detached = loss_weighted / float(effective_batch)
                 ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
                     ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
                 )
@@ -603,8 +744,25 @@ def train_and_eval_student(
         accum_count = 0
 
     pbar.close()
+    # Drop optimizer state before the held-out pass so validation activations are
+    # not competing with Muon/Adam buffers for the last ~10GB on A100-80GB.
+    if training_recipe == "record_01_adamw":
+        del opt
+    else:
+        del muon_opt, adam_opt
+    if torch.cuda.is_available() and (
+        (hasattr(device, "type") and device.type == "cuda")
+        or (isinstance(device, str) and device.startswith("cuda"))
+    ):
+        torch.cuda.empty_cache()
     val_loss, acc = _eval_val_loss(
-        model, val_data, block=block, batch=batch, vocab_size=vocab_size, device=device
+        model,
+        val_data,
+        block=block,
+        batch=eval_batch,
+        vocab_size=vocab_size,
+        device=device,
+        logit_chunk_tokens=val_logit_chunk_tokens,
     )
     return val_loss, acc, tokens_trained
 
@@ -650,6 +808,9 @@ _TRAINING_COMPONENTS = (
     plan_eos_aligned_windows,
     shuffled_window_starts,
     make_seq_len_schedule,
+    _microbatch_ranges,
+    _scaled_microbatch_loss,
+    _score_hidden_chunked,
     _eval_val_loss,
     _compute_multi_token_loss,
     train_and_eval_student,

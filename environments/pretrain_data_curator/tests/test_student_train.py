@@ -1843,3 +1843,424 @@ def test_non_accum_path_adam_grad_accumulates_across_even_odd_pair(monkeypatch):
         "AdamW.step() must not consume only the odd step's own gradient -- "
         "that would mean the even step's gradient was silently dropped"
     )
+
+
+# --- Held-out validation microbatch / chunked lm_head scoring (A100 OOM fix) -
+
+
+def test_eval_val_loss_respects_microbatch_cap(monkeypatch):
+    """Validation must never forward more than ``batch`` windows at once."""
+    from pretrain_data_curator.student_train import _eval_val_loss
+
+    V, block, n_tokens = 64, 8, 65  # 64 targets -> 8 full-length windows
+    model = _tiny_cfg(V).build().eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    val = torch.randint(0, V, (n_tokens,), dtype=torch.long)
+    seen = []
+    real_forward_hidden = model.forward_hidden
+
+    def capped_forward_hidden(xb, **kwargs):
+        seen.append(int(xb.size(0)))
+        assert xb.size(0) <= 2, f"validation microbatch exceeded cap: {xb.size(0)}"
+        return real_forward_hidden(xb, **kwargs)
+
+    monkeypatch.setattr(model, "forward_hidden", capped_forward_hidden)
+    loss, acc = _eval_val_loss(
+        model, val, block=block, batch=2, vocab_size=V, device="cpu", logit_chunk_tokens=16
+    )
+    assert math.isfinite(loss)
+    assert 0.0 <= acc <= 1.0
+    assert seen, "expected at least one validation forward"
+    assert all(b <= 2 for b in seen)
+    assert sum(seen) == 8  # every full-length window scored
+
+
+def test_eval_val_loss_chunked_matches_full_vocab_semantics():
+    """Chunked lm_head scoring must match a single full-vocab pass exactly."""
+    from pretrain_data_curator.student_train import _eval_val_loss
+
+    V, block, n_tokens = 64, 8, 41
+    torch.manual_seed(0)
+    model = _tiny_cfg(V).build().eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    val = torch.randint(0, V, (n_tokens,), dtype=torch.long)
+
+    full_loss, full_acc = _eval_val_loss(
+        model, val, block=block, batch=4, vocab_size=V, device="cpu", logit_chunk_tokens=None
+    )
+    chunked_loss, chunked_acc = _eval_val_loss(
+        model, val, block=block, batch=1, vocab_size=V, device="cpu", logit_chunk_tokens=7
+    )
+    assert chunked_loss == pytest.approx(full_loss, rel=0, abs=1e-6)
+    assert chunked_acc == pytest.approx(full_acc, rel=0, abs=1e-12)
+
+
+def test_eval_val_loss_processes_all_validation_targets_under_cap():
+    """Every predictable target is scored even when microbatch + chunk caps are tiny."""
+    from pretrain_data_curator.student_train import _eval_val_loss
+    from pretrain_data_curator.val_set import plan_val_windows
+
+    V, block, n_tokens = 48, 5, 23
+    model = _tiny_cfg(V).build().eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    val = torch.arange(n_tokens, dtype=torch.long) % V
+    windows = plan_val_windows(n_tokens, block)
+    expected_targets = sum(length for _, length in windows)
+    assert expected_targets == n_tokens - 1
+
+    loss, acc = _eval_val_loss(
+        model,
+        val,
+        block=block,
+        batch=1,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=3,
+    )
+    assert math.isfinite(loss)
+    assert 0.0 <= acc <= 1.0
+    # Sanity: scoring the same stream twice is stable (all targets visited).
+    loss2, acc2 = _eval_val_loss(
+        model,
+        val,
+        block=block,
+        batch=1,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=3,
+    )
+    assert loss2 == pytest.approx(loss, rel=0, abs=0.0)
+    assert acc2 == pytest.approx(acc, rel=0, abs=0.0)
+
+
+def test_train_and_eval_honors_separate_val_batch_size(monkeypatch):
+    """``val_batch_size`` must drive validation, not training ``batch_size``."""
+    from pretrain_data_curator import student_train as st
+
+    V = 64
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (128,), dtype=torch.long)
+    gen = torch.Generator().manual_seed(0)
+    captured = {}
+
+    def fake_eval(model, val_data, *, block, batch, vocab_size, device, logit_chunk_tokens=None):
+        captured["batch"] = batch
+        captured["logit_chunk_tokens"] = logit_chunk_tokens
+        return 1.23, 0.45
+
+    monkeypatch.setattr(st, "_eval_val_loss", fake_eval)
+    loss, acc, tokens = train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=4,
+        steps=2,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
+        val_batch_size=1,
+        val_logit_chunk_tokens=32,
+    )
+    assert captured["batch"] == 1
+    assert captured["logit_chunk_tokens"] == 32
+    assert loss == pytest.approx(1.23)
+    assert acc == pytest.approx(0.45)
+    assert tokens > 0
+
+
+def test_proxy_payload_and_sandbox_script_carry_val_microbatch_knobs():
+    from pretrain_data_curator.models import ProxyStudentConfig
+
+    payload = ProxyStudentConfig(
+        val_batch_size=1, val_logit_chunk_tokens=1024, train_microbatch_size=16
+    ).training_payload()
+    assert payload["val_batch_size"] == 1
+    assert payload["val_logit_chunk_tokens"] == 1024
+    assert payload["train_microbatch_size"] == 16
+    assert "val_batch_size=cfg.get(\"val_batch_size\")" in NANOGPT_TRAIN_SCRIPT
+    assert "val_logit_chunk_tokens=cfg.get(\"val_logit_chunk_tokens\")" in NANOGPT_TRAIN_SCRIPT
+    assert "train_microbatch_size=cfg.get(\"train_microbatch_size\")" in NANOGPT_TRAIN_SCRIPT
+    assert "def _score_hidden_chunked(" in NANOGPT_TRAIN_SCRIPT
+    assert "def _microbatch_ranges(" in NANOGPT_TRAIN_SCRIPT
+    assert "def _scaled_microbatch_loss(" in NANOGPT_TRAIN_SCRIPT
+    assert "def forward_hidden(" in NANOGPT_TRAIN_SCRIPT
+    assert "def apply_lm_head(" in NANOGPT_TRAIN_SCRIPT
+    assert "buffering=1" in NANOGPT_TRAIN_SCRIPT
+    assert 'atexit.register(_stderr_fh.flush)' in NANOGPT_TRAIN_SCRIPT
+
+
+# --- Loss-scaled train microbatch accumulation (A100 OOM fix) ----------------
+
+
+def test_microbatch_ranges_covers_effective_batch():
+    from pretrain_data_curator.student_train import _microbatch_ranges
+
+    assert list(_microbatch_ranges(16, None)) == [(0, 16)]
+    assert list(_microbatch_ranges(16, 16)) == [(0, 16)]
+    assert list(_microbatch_ranges(16, 32)) == [(0, 16)]
+    assert list(_microbatch_ranges(32, 16)) == [(0, 16), (16, 32)]
+    assert list(_microbatch_ranges(48, 16)) == [(0, 16), (16, 32), (32, 48)]
+    assert list(_microbatch_ranges(33, 16)) == [(0, 16), (16, 32), (32, 33)]
+
+
+def test_train_microbatch_accum_matches_full_batch_adamw_grads():
+    """Loss-scaled microbatch grads match a single full-batch backward (AdamW path).
+
+    Documented tolerance: exact equality on CPU fp32 for this tiny model; any
+    future softcap/bf16 path may need a small abs tolerance.
+    """
+    from pretrain_data_curator.student_train import (
+        _microbatch_ranges,
+        _scaled_microbatch_loss,
+    )
+
+    torch.manual_seed(0)
+    V = 64
+    model = _tiny_cfg(V).build()
+    x = torch.randint(0, V, (4, 8), dtype=torch.long)
+    y = torch.randint(0, V, (4, 8), dtype=torch.long)
+
+    model.zero_grad(set_to_none=True)
+    logits = model(x)
+    full_loss = torch.nn.functional.cross_entropy(logits.view(-1, V), y.view(-1))
+    full_loss.backward()
+    full_grads = {
+        n: p.grad.detach().clone()
+        for n, p in model.named_parameters()
+        if p.grad is not None
+    }
+
+    model.zero_grad(set_to_none=True)
+    for start, end in _microbatch_ranges(4, 2):
+        logits = model(x[start:end])
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, V), y[start:end].view(-1)
+        )
+        _scaled_microbatch_loss(loss, end - start, 4).backward()
+    micro_grads = {
+        n: p.grad.detach().clone()
+        for n, p in model.named_parameters()
+        if p.grad is not None
+    }
+
+    assert set(full_grads) == set(micro_grads)
+    for name in full_grads:
+        assert torch.allclose(full_grads[name], micro_grads[name], rtol=0, atol=1e-6), name
+
+
+def test_train_microbatch_preserves_tokens_and_schedule_ramp(monkeypatch):
+    """Scheduled effective batch still drives token accounting under microbatching."""
+    from pretrain_data_curator import student_train as st
+
+    V = 64
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (256,), dtype=torch.long)
+    gen = torch.Generator().manual_seed(0)
+    seen_batches: list[int] = []
+    real_ranges = st._microbatch_ranges
+
+    def tracking_ranges(batch_size, microbatch_size):
+        seen_batches.append(int(batch_size))
+        return real_ranges(batch_size, microbatch_size)
+
+    monkeypatch.setattr(st, "_microbatch_ranges", tracking_ranges)
+    monkeypatch.setattr(st, "_eval_val_loss", lambda *a, **k: (1.0, 0.5))
+
+    _, _, tokens = train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
+        batch_schedule_enabled=True,
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_stage_muls=(1, 2, 3),
+        lr_stage_muls=(1.0, 1.0, 1.0),
+        lr_cooldown_frac=0.0,
+        train_microbatch_size=2,
+        adam_on_odd_steps=False,
+    )
+    # 6 steps -> 2 per stage at muls 1,2,3 -> effective batches 2,4,6
+    assert seen_batches == [2, 2, 4, 4, 6, 6]
+    # tokens = sum(effective_batch * block) over steps
+    assert tokens == (2 + 2 + 4 + 4 + 6 + 6) * 8
+
+
+def test_train_microbatch_adamw_end_to_end_matches_full_batch_weights():
+    """End-to-end AdamW: microbatch=2 vs full batch=4 yields near-identical weights.
+
+    Tolerance documents fp32 accumulation order differences across micro-forwards.
+    """
+    V = 64
+    data = torch.randint(0, V, (128,), dtype=torch.long)
+    common = dict(
+        block_size=8,
+        batch_size=4,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.0,
+        grad_clip=0.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=1.0,
+        vocab_size=V,
+        device="cpu",
+        training_recipe="record_01_adamw",
+    )
+
+    torch.manual_seed(0)
+    model_full = _tiny_cfg(V).build()
+    gen_full = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model_full, data, data, generator=gen_full, train_microbatch_size=None, **common
+    )
+
+    torch.manual_seed(0)
+    model_micro = _tiny_cfg(V).build()
+    gen_micro = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model_micro, data, data, generator=gen_micro, train_microbatch_size=2, **common
+    )
+
+    for (n1, p1), (n2, p2) in zip(
+        model_full.named_parameters(), model_micro.named_parameters()
+    ):
+        assert n1 == n2
+        assert torch.allclose(p1, p2, rtol=1e-5, atol=1e-5), n1
+
+
+# --- Microbatch x grad_accum_embed_head_steps regression (values 1 and >1) ---
+
+
+@pytest.mark.parametrize("grad_accum", [1, 2])
+@pytest.mark.parametrize("microbatch", [None, 1])
+def test_grad_accum_microbatch_clip_cadence_unchanged(monkeypatch, grad_accum, microbatch):
+    """Clipping fires once per optimizer update for grad_accum in {1, >1}, and
+    loss-scaled microbatching must not add or skip a clip (no double/skipped clip).
+
+    With batch schedule off, batch=2, steps=6, adam_on_odd_steps=True there are
+    always 6 Muon updates + 3 AdamW updates = 9 clips, independent of how many
+    microbatches each backward is split into.
+    """
+    clip_calls: list[float] = []
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def spy_clip(params, max_norm, *a, **k):
+        clip_calls.append(float(max_norm))
+        return real_clip(params, max_norm, *a, **k)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy_clip)
+
+    V = 32
+    model = _tiny_cfg(V).build()
+    data = torch.randint(0, V, (300,), dtype=torch.long)
+    gen = torch.Generator().manual_seed(0)
+    train_and_eval_student(
+        model, data, data, block_size=8, batch_size=2, steps=6,
+        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
+        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
+        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        batch_schedule_enabled=False,
+        adam_on_odd_steps=True,
+        grad_accum_embed_head_steps=grad_accum,
+        train_microbatch_size=microbatch,
+    )
+    assert len(clip_calls) == 9, (
+        f"grad_accum={grad_accum} microbatch={microbatch}: expected 9 clips, "
+        f"got {len(clip_calls)}: {clip_calls}"
+    )
+    assert all(c == 1.0 for c in clip_calls)
+
+
+@pytest.mark.parametrize("grad_accum", [1, 2])
+def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(monkeypatch, grad_accum):
+    """For grad_accum in {1, >1}, loss-scaled microbatching must hand the speedrun
+    optimizers the same embed/lm_head gradients as a single full-effective-batch
+    backward at the optimizer-update boundary.
+
+    Comparing *at the optimizer boundary* (not final weights) isolates the property
+    this change guarantees: Muon's Newton-Schulz orthogonalization and the 75x
+    value-embed LR would otherwise amplify pure fp32 summation-order noise into
+    visible weight drift. ``grad_clip=0`` so nothing perturbs the raw accumulation.
+    """
+    from pretrain_data_curator import student_train as st
+
+    V = 48
+    data = torch.randint(0, V, (256,), dtype=torch.long)
+    common = dict(
+        block_size=8,
+        batch_size=2,
+        steps=grad_accum,  # exactly one full accumulation cycle
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=0.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        training_recipe="speedrun_muon",
+        batch_schedule_enabled=False,
+        grad_accum_embed_head_steps=grad_accum,
+    )
+    monkeypatch.setattr(st, "_eval_val_loss", lambda *a, **k: (1.0, 0.5))
+
+    def run(microbatch):
+        torch.manual_seed(0)
+        model = _tiny_cfg(V).build()
+        gen = torch.Generator().manual_seed(0)
+        real_step = st.step_speedrun_optimizers
+        captured: dict[str, torch.Tensor] = {}
+
+        def spy(muon_opt, adam_opt, **kwargs):
+            # First optimizer update carries this cycle's summed embed/head grads
+            # (grad_accum=1: the step's own grads; grad_accum>1: the restored buffer).
+            if not captured:
+                for name, p in model.named_parameters():
+                    if name.startswith("embed.") or name.startswith("lm_head."):
+                        if p.grad is not None:
+                            captured[name] = p.grad.detach().clone()
+            return real_step(muon_opt, adam_opt, **kwargs)
+
+        monkeypatch.setattr(st, "step_speedrun_optimizers", spy)
+        train_and_eval_student(
+            model, data, data, generator=gen, train_microbatch_size=microbatch, **common
+        )
+        assert captured, "expected an optimizer update to capture embed/head grads"
+        return captured
+
+    full = run(None)
+    micro = run(1)
+    assert set(full) == set(micro)
+    for name in full:
+        assert torch.allclose(full[name], micro[name], rtol=1e-4, atol=1e-6), name

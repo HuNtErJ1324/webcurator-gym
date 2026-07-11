@@ -280,6 +280,25 @@ def _reduce_report(report_lines, total_tokens):
     return leakage, len(best_per_doc)
 
 
+def _read_trainer_stderr_tail(workdir, *, max_chars=8000):
+    """Read trainer-redirected stderr before the temp workdir is deleted.
+
+    ``self_score_train.py`` redirects ``sys.stderr`` into ``WORKDIR/stderr.txt``
+    (line-buffered). Captured subprocess stderr is therefore often empty on
+    crash; surface the file tail so CUDA OOM / traceback lines survive cleanup.
+    """
+    path = os.path.join(workdir, "stderr.txt")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    text = text.strip()
+    if not text:
+        return ""
+    return text[-max_chars:]
+
+
 def decon_score(docs):
     """Run decon on sampled documents, return (leakage_score, num_matches) or (None, None)."""
     # ``DECON_BINARY``/``DECON_EVALS_DIR`` are baked as host absolute paths at
@@ -405,9 +424,13 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             timeout=train_timeout,
         )
         if result.returncode != 0:
+            # Trainer redirects its own stderr into WORKDIR/stderr.txt (line-buffered).
+            # Read that tail BEFORE cleanup — captured process stderr is often empty.
+            file_stderr = _read_trainer_stderr_tail(tmp)
+            detail = file_stderr or result.stderr or result.stdout or ""
             print(
                 "[self-score] WARNING: proxy training exited %d: %s"
-                % (result.returncode, (result.stderr or result.stdout)[:300]),
+                % (result.returncode, detail[:2000]),
                 file=sys.stderr,
             )
             return None, None, None
@@ -419,7 +442,13 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
         if line is None:
             result_path = os.path.join(tmp, "result.json")
             if not os.path.isfile(result_path):
-                print("[self-score] WARNING: training produced no result JSON", file=sys.stderr)
+                file_stderr = _read_trainer_stderr_tail(tmp)
+                detail = file_stderr or result.stderr or result.stdout or ""
+                print(
+                    "[self-score] WARNING: training produced no result JSON: %s"
+                    % detail[:2000],
+                    file=sys.stderr,
+                )
                 return None, None, None
             parsed = json.loads(Path(result_path).read_text(encoding="utf-8"))
         else:
@@ -427,15 +456,22 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
         loss = float(parsed.get("loss", float("inf")))
         backend = str(parsed.get("val_source") or "sample_ce")
         return loss, scaled_perf(loss), backend
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        file_stderr = _read_trainer_stderr_tail(tmp)
+        detail = file_stderr or getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
         print(
-            "[self-score] WARNING: proxy training timed out after %ds"
-            % train_timeout,
+            "[self-score] WARNING: proxy training timed out after %ds: %s"
+            % (train_timeout, (detail or "")[:2000]),
             file=sys.stderr,
         )
         return None, None, None
     except Exception as exc:
-        print("[self-score] WARNING: proxy training failed: %s" % exc, file=sys.stderr)
+        file_stderr = _read_trainer_stderr_tail(tmp)
+        detail = file_stderr or str(exc)
+        print(
+            "[self-score] WARNING: proxy training failed: %s" % detail[:2000],
+            file=sys.stderr,
+        )
         return None, None, None
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -604,8 +640,8 @@ def render_self_score_train_script() -> bytes:
     """Return the workspace-local proxy-student trainer used by ``self_score.py``."""
     body = _nanogpt_train_script()
     replacements = {
-        "open('/workspace/stderr.txt', 'w')": (
-            "open(os.path.join(WORKDIR, 'stderr.txt'), 'w')"
+        '_stderr_path = "/workspace/stderr.txt"': (
+            '_stderr_path = os.path.join(WORKDIR, "stderr.txt")'
         ),
         'open("/workspace/config.json")': 'open(os.path.join(WORKDIR, "config.json"))',
         'open("/workspace/corpus.txt", encoding="utf-8")': (

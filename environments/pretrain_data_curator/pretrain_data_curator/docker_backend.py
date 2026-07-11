@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import verifiers.v1 as vf
@@ -166,13 +167,50 @@ class HarnessRuntimeProxyTrainer:
             raise TrainerError(
                 f"proxy-student training timed out after {timeout}s"
             ) from exc
-        await self._persist_training_logs(runtime, result, config)
+        file_stderr = await self._read_redirected_stderr(runtime, config)
+        merged_stderr = self._merge_stderr(getattr(result, "stderr", None), file_stderr)
+        await self._persist_training_logs(
+            runtime, result, config, file_stderr=file_stderr, merged_stderr=merged_stderr
+        )
         if result.exit_code not in (0, None):
             raise TrainerError(
                 f"proxy-student training exited with code {result.exit_code}",
-                stderr_tail=self._training_diagnostic(result.stdout, result.stderr),
+                stderr_tail=self._training_diagnostic(result.stdout, merged_stderr),
             )
-        return result
+        return SimpleNamespace(
+            stdout=getattr(result, "stdout", "") or "",
+            stderr=merged_stderr,
+            exit_code=getattr(result, "exit_code", None),
+        )
+
+    async def _read_redirected_stderr(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> str:
+        """Read ``/workspace/stderr.txt`` written by the trainer's line-buffered redirect."""
+        try:
+            data = await asyncio.wait_for(
+                runtime.read("/workspace/stderr.txt"),
+                timeout=config.upload_timeout_seconds,
+            )
+        except Exception:
+            return ""
+        if data is None:
+            return ""
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return str(data)
+
+    @staticmethod
+    def _merge_stderr(captured: str | None, file_stderr: str | None) -> str:
+        captured = (captured or "").strip()
+        file_stderr = (file_stderr or "").strip()
+        if file_stderr and captured:
+            if file_stderr in captured:
+                return captured
+            if captured in file_stderr:
+                return file_stderr
+            return f"{captured}\n--- redirected stderr.txt ---\n{file_stderr}"
+        return file_stderr or captured
 
     def _parse_result(self, stdout: str, stderr: str) -> TrainResult:
         marker = next(
@@ -204,11 +242,19 @@ class HarnessRuntimeProxyTrainer:
             ) from exc
 
     async def _persist_training_logs(
-        self, runtime: vf.Runtime, result: Any, config: ProxyStudentConfig
+        self,
+        runtime: vf.Runtime,
+        result: Any,
+        config: ProxyStudentConfig,
+        *,
+        file_stderr: str = "",
+        merged_stderr: str = "",
     ) -> None:
         logs = {
             "/workspace/train_stdout.log": (getattr(result, "stdout", "") or ""),
-            "/workspace/train_stderr.log": (getattr(result, "stderr", "") or ""),
+            "/workspace/train_stderr.log": merged_stderr
+            or (getattr(result, "stderr", "") or ""),
+            "/workspace/train_stderr_redirect.log": file_stderr,
         }
         try:
             for path, text in logs.items():
