@@ -204,7 +204,7 @@ def _score_hidden_chunked(model, hidden, targets, *, vocab_size, logit_chunk_tok
             logits = apply_head(h)
         else:
             logits = model.softcap * torch.tanh(
-                model.lm_head(h).float() / model.softcap
+                model.lm_head(h.float()).float() / model.softcap
             )
         loss_sum += F.cross_entropy(logits.float(), y, reduction="sum").item()
         correct += (logits.float().argmax(-1) == y).sum().item()
@@ -804,6 +804,7 @@ def train_and_eval_student(
                             "params": [model.lm_head.weight],
                             "lr": lr_val,
                             "weight_decay": wd_val,
+                            "betas": (0.5, 0.95),
                         }
                     )
 

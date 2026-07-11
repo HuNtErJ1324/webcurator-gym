@@ -3066,3 +3066,157 @@ def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(
     assert set(full) == set(micro)
     for name in full:
         assert torch.allclose(full[name], micro[name], rtol=1e-4, atol=1e-6), name
+
+
+# --- (N) Chunked scoring: bf16 hidden + fp32 lm_head ----------------------
+
+
+def test_score_hidden_chunked_bf16_hidden_fp32_head_cpu():
+    """``_score_hidden_chunked`` must accept bf16 hidden states and route them
+    through the model's centralized fp32 lm-head/softcap logic, and chunked
+    scoring must agree (modulo fp summation order) with the unchunked pass and
+    with a single full-vocab reference CE. Mirrors the bf16-on-CUDA trunk feeding
+    an fp32 ``lm_head``; the CPU bf16 injection keeps the test deterministic.
+    """
+    import torch.nn.functional as F
+
+    import pretrain_data_curator.student_train as st
+    from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
+    V, dim = 50, 32
+    model = SMC(
+        model_dim=dim, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1
+    ).build()  # exposes apply_lm_head (centralized fp32 path)
+
+    gen = torch.Generator().manual_seed(0)
+    n = 64
+    hidden_fp32 = torch.randn(n, dim, generator=gen)
+    hidden_bf16 = hidden_fp32.bfloat16()  # simulate bf16 CUDA trunk output
+    targets = torch.randint(0, V, (n,), generator=gen)
+
+    # Chunked vs unchunked via the centralized fp32 lm-head path.
+    full_loss, full_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=n
+    )
+    chunk_loss, chunk_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=8
+    )
+    assert chunk_correct == full_correct
+    assert chunk_loss == pytest.approx(full_loss, rel=1e-5)
+
+    # Reference: single full-vocab pass through apply_lm_head.
+    with torch.no_grad():
+        ref_logits = model.apply_lm_head(hidden_bf16.float())
+    ref_loss = F.cross_entropy(ref_logits.float(), targets).item()
+    ref_correct = (ref_logits.float().argmax(-1) == targets).sum().item()
+    assert chunk_correct == ref_correct
+    assert (chunk_loss / n) == pytest.approx(ref_loss, rel=1e-5)
+
+
+def _make_fp32_head_stub(dim: int, vocab: int, softcap: float):
+    """A head-only model WITHOUT ``apply_lm_head`` to exercise the generic
+    ``lm_head``/softcap fallback branch in ``_score_hidden_chunked``."""
+    import torch.nn as nn
+
+    class _Fp32HeadStub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(dim, vocab, bias=False)
+            self.softcap = float(softcap)
+
+    return _Fp32HeadStub()
+
+
+def test_score_hidden_chunked_else_branch_bf16_hidden_fp32_head_cpu():
+    """The generic ``lm_head``/softcap fallback branch must also accept bf16
+    hidden states and cast to fp32 before the fp32 linear layer, so bf16 hidden
+    + fp32 head works and chunked scoring agrees with the unchunked pass.
+    """
+    import torch.nn.functional as F
+
+    import pretrain_data_curator.student_train as st
+
+    V, dim, softcap = 50, 32, 30.0
+    model = _make_fp32_head_stub(dim, V, softcap)  # fp32 weights, no apply_lm_head
+    assert next(model.parameters()).dtype is torch.float32
+
+    gen = torch.Generator().manual_seed(1)
+    n = 64
+    hidden_fp32 = torch.randn(n, dim, generator=gen)
+    hidden_bf16 = hidden_fp32.bfloat16()
+    targets = torch.randint(0, V, (n,), generator=gen)
+
+    full_loss, full_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=n
+    )
+    chunk_loss, chunk_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=8
+    )
+    assert chunk_correct == full_correct
+    assert chunk_loss == pytest.approx(full_loss, rel=1e-5)
+
+    with torch.no_grad():
+        ref_logits = model.softcap * torch.tanh(
+            model.lm_head(hidden_bf16.float()).float() / model.softcap
+        )
+    ref_loss = F.cross_entropy(ref_logits.float(), targets).item()
+    ref_correct = (ref_logits.float().argmax(-1) == targets).sum().item()
+    assert chunk_correct == ref_correct
+    assert (chunk_loss / n) == pytest.approx(ref_loss, rel=1e-5)
+
+
+def test_untie_lm_head_adam_group_retains_betas(monkeypatch):
+    """When embed/lm_head are untied mid-training, the new ``lm_head`` Adam param
+    group must retain the speedrun recipe betas ``(0.5, 0.95)`` rather than
+    inheriting Adam defaults ``(0.9, 0.999)``.
+    """
+    import pretrain_data_curator.student_train as st
+    from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
+    V = 32
+    cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
+    model = cfg.build()
+    data = torch.randint(0, V, (200,))
+    gen = torch.Generator().manual_seed(0)
+
+    captured = {}
+    real_build = st.build_speedrun_optimizers
+
+    def spy_build(m, **kw):
+        muon_opt, adam_opt = real_build(m, **kw)
+        captured["adam_opt"] = adam_opt
+        return muon_opt, adam_opt
+
+    monkeypatch.setattr(st, "build_speedrun_optimizers", spy_build)
+
+    train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
+        untie_at_frac=0.5,
+    )
+
+    adam_opt = captured["adam_opt"]
+    lm_head_groups = [
+        g
+        for g in adam_opt.param_groups
+        if any(p is model.lm_head.weight for p in g["params"])
+    ]
+    assert lm_head_groups, "expected an lm_head adam param group after untie"
+    for g in lm_head_groups:
+        assert g["betas"] == (0.5, 0.95), g["betas"]
