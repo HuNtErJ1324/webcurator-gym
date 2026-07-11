@@ -42,6 +42,11 @@ traces/run.html?id=<run-id>#tab=trace
 
 Tabs: **Trace**, **Metrics**, **Artifacts**, **Log** (PostTrainBench-style).
 
+A static **Codebase** page (`codebase.html`, linked from the header) explains the
+environment: rollout lifecycle, repository layout, module map, and how this site
+is generated. It is a plain asset in `site_builder/assets/`; edit it there and
+rebuild.
+
 Debug curation snapshots under `outputs/debug/<run-name>/` are included automatically.
 Rebuild with `python docs/build_site.py` (omit them with `--no-debug`).
 

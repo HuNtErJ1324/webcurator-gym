@@ -99,7 +99,7 @@ def build_site(
 
 
 def _copy_assets(site_dir: Path) -> None:
-    for name in ("index.html", "styles.css", "app.js", "utils.js", "renderer.js"):
+    for name in ("index.html", "codebase.html", "styles.css", "app.js", "utils.js", "renderer.js"):
         shutil.copy2(ASSETS_DIR / name, site_dir / name)
     traces_out = site_dir / "traces"
     traces_out.mkdir(parents=True, exist_ok=True)

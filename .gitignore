@@ -68,3 +68,6 @@ Thumbs.db
 # Manifest-backed training-debug workflow artifacts (stable local bundle/output)
 /pdc-debug-bundle/
 /pdc-debug-out/
+
+# Codex scratch / sandbox temp
+.codex-tmp/

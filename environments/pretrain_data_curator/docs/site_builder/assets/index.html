@@ -14,6 +14,11 @@
         <p class="eyebrow">Benchmark</p>
         <h1>Pretrain Data Curator Bench</h1>
         <p class="lede">Full 400M-token curation runs with real GPU proxy-student scoring.</p>
+        <nav class="site-nav">
+          <a href="index.html" class="active">Leaderboard</a>
+          <a href="codebase.html">Codebase</a>
+          <a href="https://github.com/HuNtErJ1324/webcurator-gym">GitHub</a>
+        </nav>
       </div>
       <div class="meta-box">
         <div><span>Runs</span><strong id="run-count">—</strong></div>
@@ -93,7 +98,8 @@
         trainer on GPU. The reward combines proxy-student performance and leakage penalties. Traces live at
         <code>traces/run.html?id=&lt;run-id&gt;</code>. This site is generated from
         <code>outputs/evals-400m/**/results.jsonl</code> and optional <code>outputs/debug/**</code> snapshots via
-        <code>docs/build_site.py</code>.
+        <code>docs/build_site.py</code>. For how the environment, scoring pipeline, and this site fit together,
+        see the <a href="codebase.html">codebase explanation</a>.
       </p>
     </section>
   </main>

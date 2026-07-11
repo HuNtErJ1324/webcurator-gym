@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codebase — Pretrain Data Curator Bench</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="container header-inner trace-header">
+      <div>
+        <nav class="breadcrumb">
+          <a href="index.html">Pretrain Data Curator Bench</a>
+          <span>/</span>
+          <span>codebase</span>
+        </nav>
+        <h1>Codebase</h1>
+        <p class="lede">How the environment, scoring pipeline, and this site fit together.</p>
+        <nav class="site-nav">
+          <a href="index.html">Leaderboard</a>
+          <a href="codebase.html" class="active">Codebase</a>
+          <a href="https://github.com/HuNtErJ1324/webcurator-gym">GitHub</a>
+        </nav>
+      </div>
+      <div class="trace-actions">
+        <a class="button ghost" href="index.html">← Back to all runs</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container doc">
+    <section class="panel">
+      <div class="section-head">
+        <h2>What this is</h2>
+      </div>
+      <p>
+        <strong>webcurator-gym</strong> is a Prime Lab / <a href="https://github.com/PrimeIntellect-ai/verifiers">Verifiers</a>
+        workspace whose centerpiece is the <code>pretrain-data-curator</code> environment
+        (<code>environments/pretrain_data_curator/</code>). An LLM agent is asked to curate an
+        <em>LLM pretraining dataset</em> from the pre-cutoff Hugging Face universe under a fixed token
+        budget. The curated mixture is then scored by training a <strong>fixed GPT-2-scale proxy student</strong>
+        on it — everything except the data is held constant — and measuring cross-entropy on a held-out
+        validation stream, minus a contamination penalty:
+      </p>
+      <pre class="tree">reward R(M, H) = alpha_perf · Perf(M)  −  lambda_leakage · Leakage(M, H)
+
+Perf     proxy-student cross-entropy vs. a neutral baseline, power-law scaled so the
+         NanoGPT-speedrun target loss (3.28 nats/token) maps to exactly 1.0
+Leakage  token-weighted n-gram contamination (decon) against public benchmarks
+         and the held-out validation set</pre>
+      <p>
+        The agent gets <strong>no bespoke tools</strong> — just one prompt and its harness's own shell
+        (bash, Codex, mini-SWE-agent, …) with the <code>hf</code> CLI available. It searches and inspects
+        datasets, optionally self-scores drafts, and finishes by writing a manifest JSON describing the
+        mixture. Every run on the leaderboard is one such rollout with a 400M-token budget and real GPU
+        proxy-student scoring.
+      </p>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Anatomy of a rollout</h2>
+        <p>What happens between "run eval" and a reward landing on the leaderboard.</p>
+      </div>
+      <ol class="flow">
+        <li>
+          <strong>Setup.</strong> <code>CuratorTaskset.setup()</code> validates <code>HF_TOKEN</code>, renders the
+          single curation task (<code>tasks.py</code>) as the initial user prompt, and copies a leakage-safe
+          <code>self_score.py</code> helper into the agent's workspace.
+        </li>
+        <li>
+          <strong>Agent loop.</strong> The agent explores the Hub from its shell
+          (<code>hf datasets ls --search …</code>, <code>hf datasets info …</code>), applies its own judgment about
+          quality and mixing, and may run <code>python self_score.py draft.json</code> to estimate proxy CE and
+          token fill for a draft manifest (screened against public benchmarks only — never the hidden val set).
+        </li>
+        <li>
+          <strong>Finalize.</strong> Writing <code>/workspace/manifest.json</code> is the completion signal: a token
+          budget plus weighted sources (<code>id</code>, <code>weight</code>, optional <code>config</code>/<code>split</code>/
+          <code>text_field</code>/<code>filters</code>/caps, or <code>kind: "local"</code> files prepared in the workspace).
+          <code>finalize()</code> parses it, with trace-based recovery if the file is malformed.
+        </li>
+        <li>
+          <strong>Materialize.</strong> <code>CorpusBuilder</code> streams each source from the Hub (or capped local
+          files) straight to disk, applying structured filters, per-source caps, weights, and the global token
+          budget. Fetches are cached per rollout so previews and scoring see identical documents.
+        </li>
+        <li>
+          <strong>Score.</strong> <code>CuratorScorer</code> computes the two reward terms: a proxy-student trainer
+          produces <code>Perf</code>, and the vendored <a href="https://github.com/allenai/decon">decon</a> binary
+          screens the corpus for benchmark/val-set contamination to produce <code>Leakage</code>. Both, plus
+          diagnostics (<code>budget_fill_ratio</code>, <code>corpus_tokens</code>, <code>tool_error_count</code>,
+          <code>external_failure</code>, …), are emitted as run metrics.
+        </li>
+        <li>
+          <strong>Proxy-student training.</strong> With <code>use_real_trainer=true</code> (all leaderboard runs), a
+          fixed modded-nanogpt-style student is trained on the corpus <em>inside the same rollout-owned Docker
+          container or Modal sandbox the agent used</em>, then evaluated on the NanoGPT-speedrun validation
+          stream (FineWeb <code>sample-10BT</code> GPT-2 val tokens, first 10,485,760). A deterministic CPU
+          heuristic stands in during GPU-less development.
+        </li>
+      </ol>
+      <pre class="tree">manifest.json ──▶ CorpusBuilder ──▶ curated corpus ──┬──▶ proxy-student training ──▶ Perf ─┐
+                                                     │                                      ├──▶ reward
+                                                     └──▶ decon screening ──────▶ Leakage ──┘</pre>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Repository layout</h2>
+      </div>
+      <pre class="tree">webcurator-gym/
+├── environments/pretrain_data_curator/   the benchmark environment (details below)
+├── configs/                              workspace-level eval / GEPA / RL run configs
+├── scripts/                              A100 / pod runners for smoke and full 400M evals
+├── outputs/                              workspace-level eval artifacts
+└── examples/                             misc examples
+
+environments/pretrain_data_curator/
+├── pretrain_data_curator/                the Python package (module map below)
+├── configs/eval/                         checked-in eval configs (e.g. the Modal smoke run)
+├── decon/                                vendored decon binary + bundled benchmark eval sets
+├── docs/                                 this site: build_site.py + site_builder/ + generated site/
+├── outputs/evals-400m/                   full 400M eval artifacts (config.toml + results.jsonl)
+├── outputs/debug/                        curation debug snapshots (also rendered as runs)
+├── tests/                                pytest suite (corpus, trainers, harness runtimes, …)
+└── Dockerfile.runtime                    combined discovery + CUDA-training runtime image</pre>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Module map</h2>
+        <p>Everything lives in <code>environments/pretrain_data_curator/pretrain_data_curator/</code>.</p>
+      </div>
+
+      <h3>Entry points &amp; platform bridge</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Module</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>pretrain_data_curator.py</code></td><td>The <code>load_environment()</code> entry point: builds <code>CuratorTasksetConfig</code> and returns the environment.</td></tr>
+            <tr><td><code>__init__.py</code></td><td>Bootstraps the real Verifiers v1 package at import time so the environment also loads inside Prime Hosted Training (which pre-loads a stub).</td></tr>
+            <tr><td><code>hosted_compat.py</code></td><td>v0/v1 bridge <code>Environment</code>: runs rollouts on the v1 episode engine and translates traces to the v0 state format consumed by <code>prime eval</code> and Hosted Training.</td></tr>
+            <tr><td><code>runtime_config.py</code></td><td>Single source of truth deriving Docker/Modal runtime resources and timeouts from <code>ProxyStudentConfig</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Agent interface</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Module</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>taskset.py</code></td><td><code>CuratorTaskset</code>: rollout setup, manifest parsing and recovery, <code>finalize()</code>, reward/metric declarations, and the turn-cap stop condition. Exposes no MCP tools.</td></tr>
+            <tr><td><code>tasks.py</code></td><td>The one typed v1 curation task, rendered as the initial user prompt.</td></tr>
+            <tr><td><code>bash_harness.py</code></td><td>Patched bash harness that truncates tool output so giant Hub dumps can't overflow the model context.</td></tr>
+            <tr><td><code>truncating_client.py</code></td><td>Applies the same output cap at the API-interception boundary for compiled CLI agents (e.g. Codex) whose tool output never passes through a Python harness.</td></tr>
+            <tr><td><code>self_score.py</code></td><td>Renders the standalone self-scoring script copied into each workspace; screens drafts against bundled benchmarks only, with the val-set repo blocked by hash.</td></tr>
+            <tr><td><code>rollout_state.py</code></td><td>Typed <code>CuratorState</code> plus <code>RolloutStore</code> accessors for per-rollout bookkeeping.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Data contracts &amp; corpus pipeline</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Module</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>models.py</code></td><td>Pydantic contracts: <code>Manifest</code>, <code>Source</code>, <code>FilterSpec</code>, <code>CuratorConfig</code>, <code>ProxyStudentConfig</code>, …</td></tr>
+            <tr><td><code>hf_access.py</code></td><td><code>DatasetSearchClient</code> protocol and the live Hugging Face client; cutoff-date and query helpers; credential checks with timeout/retry and typed errors.</td></tr>
+            <tr><td><code>hf_cli_parse.py</code></td><td>Parses <code>hf</code> CLI invocations out of shell traces, for manifest recovery and val-set-access detection.</td></tr>
+            <tr><td><code>corpus.py</code></td><td><code>CorpusBuilder</code> + <code>DocumentFilter</code>: streams manifest sources to disk, applies filters/weights/budget, and audits capped local sources.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Scoring &amp; reward</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Module</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>rewards.py</code></td><td><code>CuratorScorer</code>: the framework-agnostic heavy scoring pass combining Perf and Leakage into the final reward.</td></tr>
+            <tr><td><code>leakage.py</code></td><td><code>DeconLeakageDetector</code>: runs the decon binary against bundled benchmarks (plus an ephemeral detokenised val screen) and reduces the report to a token-weighted scalar; failures surface as <code>DeconError</code>, never a silent 0.</td></tr>
+            <tr><td><code>val_set.py</code></td><td>Held-out validation token stream (<code>ValidationSetConfig</code>, <code>ValTokenLoader</code>, <code>.bin</code> parser); NanoGPT-speedrun FineWeb tokens by default.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Proxy-student training</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Module</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td><code>trainer.py</code></td><td><code>ProxyStudentTrainer</code> interface, the CPU <code>HeuristicProxyTrainer</code> surrogate, and <code>RuntimeSelectedTrainer</code>, which dispatches to the backend matching the live harness runtime.</td></tr>
+            <tr><td><code>docker_backend.py</code></td><td>Runs the training script in the rollout-owned Docker container: deadlines, concurrency limits, cancellation teardown, structured <code>RESULT_JSON</code> parsing.</td></tr>
+            <tr><td><code>modal_backend.py</code></td><td>Same contract on a rollout-owned Modal GPU sandbox (GPU-type mapping, token auth, identical result validation).</td></tr>
+            <tr><td><code>docker_network.py</code></td><td>WSL2 shim: advertises the interception server on an address Docker Desktop containers can actually reach.</td></tr>
+            <tr><td><code>student_model.py</code></td><td>The fixed modded-nanogpt-style student architecture, embedded into the sandbox training script.</td></tr>
+            <tr><td><code>student_train.py</code></td><td>The training loop embedded alongside it: LR schedule, contiguous batching, EOT-packed windows, multi-run averaging.</td></tr>
+            <tr><td><code>student_optimizer.py</code></td><td>Single-device port of the speedrun optimizer recipe (Muon / Polar Express / NorMuon on block weights, AdamW elsewhere).</td></tr>
+            <tr><td><code>debug_train.py</code></td><td>Manifest-backed debug workflow: materialize a corpus bundle once locally, then re-run the real training path against it repeatedly.</td></tr>
+            <tr><td><code>utils.py</code></td><td>Small import-safe helpers (tool-output truncation).</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>How this site is built</h2>
+      </div>
+      <p>
+        The leaderboard is a static site generated by <code>docs/build_site.py</code> using the
+        <code>docs/site_builder/</code> package. <code>collect.py</code> discovers runs in
+        <code>outputs/evals-400m/**</code> (each a <code>config.toml</code> + <code>results.jsonl</code>),
+        <code>filters.py</code> keeps only full 400M real-trainer evals, <code>traces.py</code> extracts the
+        rollout conversation, and <code>debug_runs.py</code> folds in curation snapshots from
+        <code>outputs/debug/</code>. <code>render.py</code> writes <code>data/manifest.json</code> plus one JSON
+        payload per trace and copies the static assets (this page included). The leaderboard and the
+        per-run trace viewer (<code>traces/run.html</code>) are plain HTML/JS reading those JSON files —
+        no server-side code.
+      </p>
+      <pre class="tree">outputs/evals-400m/&lt;run&gt;/{config.toml, results.jsonl} ─┐
+outputs/debug/&lt;run&gt;/                                   ├─▶ python docs/build_site.py ─▶ docs/site/
+site_builder/assets/ (HTML/CSS/JS)  ───────────────────┘      ├── index.html + data/manifest.json
+                                                              ├── codebase.html   (this page)
+                                                              └── traces/run.html + data/traces/*.json</pre>
+      <p class="muted">
+        Rebuild any time with <code>python docs/build_site.py</code> from
+        <code>environments/pretrain_data_curator/</code>. See the repository
+        <a href="https://github.com/HuNtErJ1324/webcurator-gym">README</a> for eval configuration,
+        environment args, and backend prerequisites.
+      </p>
+    </section>
+  </main>
+</body>
+</html>
