@@ -25,7 +25,7 @@ from .trainer import (
     _nanogpt_train_script,
     training_semaphore,
 )
-from .val_set import NANOGPT_VAL_TOKENIZER, HeldOutValSet, ValTokenLoader
+from .val_set import HeldOutValSet, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 

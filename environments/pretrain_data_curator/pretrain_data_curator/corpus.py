@@ -120,6 +120,19 @@ def _iter_local_documents(
             yield text
 
 
+def _materialize_local_docs(
+    raw_path: Path, raw_text: str, fmt: str, text_field: str | None
+) -> list[str]:
+    """Write a runtime-pulled file and parse it off the event loop.
+
+    The blocking write + parse of a runtime-local source is run through
+    `asyncio.to_thread` by ``fetch_local_docs`` so the async fetch path never
+    blocks on disk I/O; results are identical to an inline parse.
+    """
+    raw_path.write_text(raw_text, encoding="utf-8")
+    return list(_iter_local_documents(raw_path, fmt, text_field))
+
+
 @dataclass
 class SourceCorpus:
     dataset_id: str
@@ -144,6 +157,25 @@ class SourceCorpus:
         size.
         """
         return list(self.iter_documents())
+
+    @classmethod
+    def from_docs(
+        cls,
+        dataset_id: str,
+        config: str | None,
+        weight: float,
+        docs: Iterable[str],
+        *,
+        dest_dir: Path | None = None,
+    ) -> "SourceCorpus":
+        """Stream `docs` to a scratch file (see `from_iter`).
+
+        Kept as a named entry point so the materialization of an in-memory
+        document iterable is explicit; the async fetch/materialize paths call
+        this through `asyncio.to_thread` to keep the blocking disk write off the
+        event loop.
+        """
+        return cls.from_iter(dataset_id, config, weight, docs, dest_dir=dest_dir)
 
     @classmethod
     def from_iter(
@@ -623,11 +655,12 @@ class CorpusBuilder:
                     / f"local_raw_{uuid.uuid4().hex}"
                 )
                 try:
-                    raw_path.write_text(pulled.stdout, encoding="utf-8")
-                    docs = list(
-                        _iter_local_documents(
-                            raw_path, source.local_format, source.text_field
-                        )
+                    docs = await asyncio.to_thread(
+                        _materialize_local_docs,
+                        raw_path,
+                        pulled.stdout,
+                        source.local_format,
+                        source.text_field,
                     )
                 except Exception as exc:  # noqa: BLE001 - typed soft failure
                     return failure("local_parse_failed", str(exc))
@@ -719,7 +752,8 @@ class CorpusBuilder:
 
             filtered = tracked_filtered()
             sampled = _iter_sampling(filtered, source, weight_target)
-            corpus = SourceCorpus.from_iter(
+            corpus = await asyncio.to_thread(
+                SourceCorpus.from_docs,
                 source.dataset_id,
                 source.config,
                 source.weight,

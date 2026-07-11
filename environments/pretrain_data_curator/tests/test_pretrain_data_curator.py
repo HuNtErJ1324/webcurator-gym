@@ -3592,7 +3592,7 @@ def test_build_tasks_renders_single_structured_task_prompt():
 
 
 class _CorruptRuntime:
-    """Runtime whose cost-log read fails (a corrupt / unreadable shim log)."""
+    """Runtime whose read fails (a corrupt / unreadable shim log)."""
 
     def __init__(self, exc):
         self._exc = exc

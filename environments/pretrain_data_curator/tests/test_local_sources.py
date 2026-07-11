@@ -14,7 +14,6 @@ from pretrain_data_curator.corpus import (
     CorpusBuilder,
     _iter_local_documents,
 )
-from pretrain_data_curator.hf_access import estimate_tokens
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,

@@ -10,12 +10,11 @@ from typing import Any
 import verifiers as legacy_vf
 import verifiers.v1 as vf
 import verifiers.v1.harnesses as vf_harnesses
-from verifiers.v1.runtimes.modal import ModalConfig
 
 from .hosted_compat import Environment
 from .leakage import DEFAULT_DECON_BINARY
-from .modal_backend import _modal_gpu_for
 from .models import MANIFEST_FILENAME, ProxyStudentConfig
+from .runtime_config import derive_env_harness_runtime
 from .taskset import CuratorTasksetConfig
 from .tasks import TASK_PROMPT
 
@@ -139,8 +138,6 @@ def load_environment(
     harness_env: dict[str, str] = {
         "MAX_TOOL_OUTPUT_CHARS": str(max_tool_output_chars),
     }
-    harness_runtime: vf.RuntimeConfig = vf.SubprocessConfig()
-    timeout = vf.TimeoutConfig()
     ps = ProxyStudentConfig(**config.proxy_student)
     if use_real_trainer and ps.runtime_backend is None:
         raise ValueError(
@@ -159,18 +156,6 @@ def load_environment(
         # extension and fail before reward training starts. Reinstall only that
         # package on this path; hosted/Prime/default paths keep the normal cache.
         harness_env["UV_REINSTALL_PACKAGE"] = "pydantic-core"
-        harness_runtime = vf.DockerConfig(
-            image=ps.docker_image,
-            workdir="/workspace",
-            gpu=str(ps.gpu_count) if ps.gpu_count > 0 else None,
-            cpu=float(ps.cpu_cores),
-            memory=float(ps.memory_gb),
-            disk=float(ps.disk_size_gb),
-        )
-        # Scoring includes corpus materialization, input writes, training, and
-        # leakage computation. Keep the framework deadline above the trainer's
-        # own multi-hour command deadline so the trainer can report/clean up.
-        timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
     elif use_real_trainer and ps.runtime_backend == "modal":
         legacy_vf.ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
         # Intentionally do not set UV_REINSTALL_PACKAGE here. That workaround
@@ -179,15 +164,9 @@ def load_environment(
         # a fresh sandbox per rollout from the registry image and mounts no
         # persistent Volume or snapshot, so its uv script environment cannot carry
         # a stale pydantic-core extension across rollouts.
-        harness_runtime = ModalConfig(
-            image=ps.docker_image,
-            workdir="/workspace",
-            gpu=_modal_gpu_for(ps.modal_gpu),
-            cpu=float(ps.cpu_cores),
-            memory=float(ps.memory_gb),
-            disk=float(ps.disk_size_gb),
-        )
-        timeout = vf.TimeoutConfig(scoring=ps.effective_scoring_timeout_seconds)
+    harness_runtime, timeout = derive_env_harness_runtime(
+        ps, use_real_trainer=use_real_trainer
+    )
 
     hf_token = os.environ.get(hf_token_env)
     if hf_token:
