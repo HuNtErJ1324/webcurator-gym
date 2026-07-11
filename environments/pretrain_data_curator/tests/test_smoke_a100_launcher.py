@@ -402,3 +402,227 @@ def test_remote_eval_quotes_eval_config_path():
     # Whitespace / glob-sensitive paths must stay inside quotes.
     assert '"${EVAL_CONFIG}"' in text
     assert 'tee "${remote_log}"' in text
+
+
+def _extract_heredoc_python(script: str, func_name: str) -> str:
+    body = _extract_bash_function(script, func_name)
+    marker = "<<'PY'"
+    start = body.find(marker)
+    assert start != -1, f"missing python heredoc in {func_name}"
+    py_start = body.find("\n", start) + 1
+    end = body.find("\nPY", py_start)
+    assert end != -1, f"missing PY terminator in {func_name}"
+    return body[py_start:end]
+
+
+def _select_cloud_id(func_name: str, resources: list, excluded: str = "") -> str:
+    import io
+
+    import sys as _sys
+
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    code = _extract_heredoc_python(script, func_name)
+    buf = io.StringIO()
+    ns = {"__name__": "__main__", "sys": _sys}
+    _sys.argv = [func_name, json.dumps({"gpu_resources": resources}), excluded]
+    old = _sys.stdout
+    _sys.stdout = buf
+    try:
+        exec(compile(code, func_name, "exec"), ns)
+    except SystemExit as exc:
+        _sys.stdout = old
+        if exc.code:
+            raise AssertionError(
+                f"{func_name} exited {exc.code}: {buf.getvalue().strip()}"
+            )
+        return buf.getvalue().strip()
+    _sys.stdout = old
+    return buf.getvalue().strip()
+
+
+def _gpu_resource(cloud_id, provider, price="1.00", spot=False):
+    return {
+        "cloud_id": cloud_id,
+        "provider": provider,
+        "stock_status": "available",
+        "price_per_hour": price,
+        "is_spot": spot,
+    }
+
+
+def _cpu_resource(cloud_id, provider, mem="64", vcpus="16", price="1.00"):
+    return {
+        "cloud_id": cloud_id,
+        "provider": provider,
+        "stock_status": "available",
+        "memory_gb": mem,
+        "vcpus": vcpus,
+        "price_per_hour": price,
+    }
+
+
+def test_gpu_filter_excludes_massedcompute_and_crusoe_case_insensitive():
+    # MassedCompute (any case) and crusoecloud must be skipped; the cheapest
+    # root-capable provider must be selected instead.
+    resources = [
+        _gpu_resource("mc-cheap", "MassedCompute", price="0.40"),
+        _gpu_resource("mc-low", "massedcompute", price="0.41"),
+        _gpu_resource("cr-cheap", "crusoecloud", price="0.50"),
+        _gpu_resource("rp-root", "runpod", price="0.99"),
+    ]
+    selected = _select_cloud_id("pick_cloud_id", resources)
+    assert selected == "rp-root"
+    # When only MassedCompute is available the filter must yield nothing.
+    with pytest.raises(AssertionError):
+        _select_cloud_id("pick_cloud_id", [_gpu_resource("mc-only", "massedcompute")])
+
+
+def test_cpu_filter_excludes_massedcompute_case_insensitive():
+    resources = [
+        _cpu_resource("mc-cpu", "MassedCompute", price="0.40"),
+        _cpu_resource("cr-cpu", "crusoecloud", price="0.50"),
+        _cpu_resource("rp-cpu", "runpod", price="0.90"),
+    ]
+    selected = _select_cloud_id("pick_cpu_cloud_id", resources)
+    assert selected == "rp-cpu"
+    with pytest.raises(AssertionError):
+        _select_cloud_id(
+            "pick_cpu_cloud_id", [_cpu_resource("mc-only", "massedcompute")]
+        )
+
+
+def test_root_capable_provider_selected_over_unsupported():
+    # A root-capable provider must win even when a cheaper MassedCompute offer
+    # exists; this is the "root-capable provider selection" guarantee.
+    resources = [
+        _gpu_resource("mc-cheapest", "massedcompute", price="0.10"),
+        _gpu_resource("rp-root", "runpod", price="1.20"),
+    ]
+    assert _select_cloud_id("pick_cloud_id", resources) == "rp-root"
+
+
+def test_non_root_ssh_user_fail_fast_terminates_pod(tmp_path: Path):
+    text = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    # The root check must sit between SSH auth and the rsync/sync step.
+    auth_at = text.find('wait_for_ssh_auth\n')
+    root_check_at = text.find(
+        'if [[ "$SSH_USER" != "root" ]]; then'
+    )
+    rsync_at = text.find("\nremote_rsync\n")
+    assert 0 <= auth_at < root_check_at < rsync_at, "root check misplaced"
+    assert "FATAL: pod authenticated as non-root user" in text
+    assert "Unsupported provider image" in text
+    # The fail-fast must run under the EXIT trap so the pod is terminated.
+    assert "trap cleanup EXIT" in text
+    cleanup = _extract_bash_function(text, "cleanup")
+    assert "prime pods terminate" in cleanup
+
+    # Drive the exact guarded block in a controlled subshell: a non-root user
+    # must die (non-zero) and never reach the sync step.
+    probe = tmp_path / "non_root_probe.sh"
+    probe.write_text(
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+SSH_USER="ubuntu"
+POD_ID="pod-xyz"
+KEEP_POD=0
+terminated=""
+die() { echo "FATAL: $*" >&2; exit 3; }
+log() { :; }
+cleanup() {
+  local code=$?
+  if [[ -n "$POD_ID" && "$KEEP_POD" -eq 0 ]]; then
+    terminated="$POD_ID"
+  fi
+  exit "$code"
+}
+trap cleanup EXIT
+# --- guarded block copied from launcher ---
+if [[ "$SSH_USER" != "root" ]]; then
+  die "FATAL: pod authenticated as non-root user '$SSH_USER'; this launcher requires root SSH access (rootful Docker / root home). Unsupported provider image -- terminating pod."
+fi
+echo "SHOULD NOT REACH SYNC"
+""",
+        encoding="utf-8",
+    )
+    probe.chmod(0o755)
+    proc = subprocess.run(
+        ["bash", str(probe)], check=False, capture_output=True, text=True
+    )
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "SHOULD NOT REACH SYNC" not in proc.stdout
+    assert "FATAL: pod authenticated as non-root user 'ubuntu'" in (
+        proc.stdout + proc.stderr
+    )
+
+
+def test_rsync_permanent_failure_fails_fast_no_retry():
+    import re as _re
+
+    text = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    rsync_fn = _extract_bash_function(text, "remote_rsync")
+    m = _re.search(r"PERMANENT_RE='([^']+)'", rsync_fn)
+    assert m, "could not find PERMANENT_RE pattern in remote_rsync"
+    pattern = _re.compile(m.group(1), _re.IGNORECASE)
+
+    permanent = [
+        'rsync: failed to set times on "/root/webcurator-gym": Permission denied (13)',
+        'rsync: link_stat "/root/webcurator-gym" failed: No such file or directory (2)',
+        'rsync: mkdir "/root/webcurator-gym/sub" failed: Permission denied (13)',
+        'rsync: write failed on "/root/webcurator-gym/x": Read-only file system (30)',
+        "rsync: cannot stat destination /root/webcurator-gym: Permission denied",
+        "rsync: read-only filesystem while writing",
+    ]
+    for line in permanent:
+        assert pattern.search(line), f"permanent pattern should match: {line}"
+
+    transient = [
+        "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]",
+        "rsync error: timeout in data send/receive (code 30)",
+        "rsync: failed to connect to host: Connection timed out (110)",
+        "rsync: recv_generator: failed to stat due to Input/output error",
+        "ssh: connect to host 1.2.3.4 port 22: Connection refused",
+    ]
+    for line in transient:
+        assert not pattern.search(line), f"transient must NOT match: {line}"
+
+    # Permanent path must die before the retry sleep; retries must still exist.
+    perm_die_at = rsync_fn.find('die "rsync permanent failure')
+    sleep_at = rsync_fn.find("sleep 20")
+    assert 0 <= perm_die_at < sleep_at, "permanent failure must die before retry"
+    assert rsync_fn.count("sleep 20") >= 1, "transient retry/backoff preserved"
+
+
+def test_rsync_transient_retry_preserved():
+    text = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    rsync_fn = _extract_bash_function(text, "remote_rsync")
+    # Retry loop over multiple attempts with backoff sleep must remain.
+    assert re.search(r"for attempt in 1 2 3 4 5", rsync_fn)
+    assert 'log "rsync attempt $attempt failed; retrying in 20s"' in rsync_fn
+    assert 'die "rsync failed after 5 attempts"' in rsync_fn
+
+
+def test_upload_secrets_enforces_chmod_600(tmp_path: Path):
+    text = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    fn = _extract_bash_function(text, "upload_secrets")
+    # Must set restrictive perms on the remote secrets file.
+    assert "chmod 600 /root/webcurator-gym/secrets.env" in fn
+    # Must fail the run if chmod fails (never leave secrets world-readable).
+    assert "Failed to chmod 600 the remote secrets file" in fn
+    assert re.search(r"if ! remote chmod 600", fn)
+    # Secret contents must never be logged: scp output is suppressed and the
+    # function must not echo the temp file or its contents.
+    assert "scp -i" in fn
+    assert ">/dev/null" in fn
+    assert "echo \"$tmp\"" not in fn
+    assert "cat \"$tmp\"" not in fn
+
+
+def test_cleanup_trap_preserved_and_terminates_pod():
+    text = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    assert "trap cleanup EXIT" in text
+    cleanup = _extract_bash_function(text, "cleanup")
+    assert "prime pods terminate" in cleanup
+    assert "KEEP_POD" in cleanup
+    # Unconditional termination: a non-zero run still hits cleanup (EXIT trap).
+    assert "exit \"$code\"" in cleanup
