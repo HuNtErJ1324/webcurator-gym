@@ -1,0 +1,133 @@
+# A100 smoke-test: 10M-token / 60-turn / codex-harness real-trainer eval.
+# Small enough to finish quickly end-to-end while still exercising the real
+# GPU trainer (speedrun_muon recipe, current student_optimizer / student_train
+# pipeline) rather than the heuristic fallback. Swap only the inference model
+# at run time:
+#   uv run eval -m <provider/model> @ configs/eval/10M-60turn-codex-smoke.toml
+#
+# Or use the pod orchestrator:
+#   ./scripts/run_25m_smoke_a100.sh --model deepseek/deepseek-v4-pro --profile 10M --gpu-type A100_80GB
+#   ./scripts/run_25m_smoke_a100.sh --model z-ai/glm-5.2 --config configs/eval/10M-60turn-codex-smoke.toml
+#
+# Artifacts land in outputs/evals/<run-name>/ (smaller-budget runs stay out of
+# the curated outputs/evals-400m/ bench site; see docs/README.md).
+
+id = "pretrain-data-curator"
+model = "z-ai/glm-5.2"  # overridden by -m / --model when set
+num_tasks = 1
+num_rollouts = 1
+max_concurrent = 1
+max_turns = 60
+multiplex = 1
+verbose = true
+rich = true
+
+[sampling]
+temperature = 0.6
+top_p = 0.9
+top_k = 0.9
+
+[args]
+cutoff_date = "2024-12-31"
+token_budget = 10_000_000
+hf_token_env = "HF_TOKEN"
+manifest_filename = "manifest.json"
+candidate_limit = 64
+allow_local_sources = true
+max_local_source_bytes = 134_217_728
+max_turns = 60
+harness_id = "codex"
+
+alpha_perf = 1.0
+lambda_leakage = 1.0
+perf_baseline_loss = 10.825839875788878
+perf_target_loss = 3.28
+baseline_relative_perf = true
+
+max_concurrent_fetches = 8
+max_concurrent_training = 1
+fetch_timeout_seconds = 120.0
+fetch_timeout_per_doc_seconds = 0.02
+fetch_max_attempts = 5
+
+use_real_trainer = true
+decon_binary = "decon"
+decon_evals_dir = ""
+decon_threshold = 0.2
+screen_val_set = true
+
+[args.proxy_student]
+n_layer = 12
+n_head = 6
+n_embd = 768
+mlp_ratio = 4
+lm_head_softcap = 30.0
+num_value_embeds = 3
+attn_scale = 0.12
+
+block_size = 1024
+# 8 (not the 400M bench's 16): with batch_schedule [1,2,3] the peak micro-batch
+# is 8*3=24 instead of 16*3=48, roughly halving the full-vocab logits/softcap
+# peak so this smoke clears the 80GB A100 with comfortable headroom (and trains
+# faster). The end-to-end pipeline is still exercised; smoke perf is not a bench.
+batch_size = 8
+steps = 200
+train_token_budget = 10_000_000
+learning_rate = 0.0003
+seed = 0
+val_fraction = 0.1
+weight_decay = 0.1
+adam_beta1 = 0.9
+adam_beta2 = 0.95
+adam_eps = 0.0000000001
+grad_clip = 1.0
+warmup_steps = 256
+lr_min_ratio = 0.1
+n_train_runs = 1
+
+training_recipe = "speedrun_muon"
+muon_lr = 0.023
+muon_weight_decay = 0.05
+muon_momentum_min = 0.85
+muon_momentum_max = 0.95
+muon_warmup_steps = 300
+muon_cooldown_steps = 50
+adam_lr = 0.008
+adam_weight_decay = 0.005
+embed_lr_mul = 1.0
+lm_head_lr_mul = 1.0
+value_embed_lr_mul = 75.0
+scalar_lr_mul = 5.0
+embed_wd_mul = 150.0
+lm_head_wd_mul = 150.0
+value_embed_wd_mul = 5.0
+scalar_wd_mul = 0.0
+adam_on_odd_steps = true
+batch_schedule_enabled = true
+batch_stage_fracs = [0.3333333333, 0.3333333333, 0.3333333334]
+batch_stage_muls = [1, 2, 3]
+lr_stage_muls = [1.0, 1.52, 1.73]
+lr_cooldown_frac = 0.60
+lr_cooldown_floor = 0.15
+
+runtime_backend = "docker"
+# Custom image built from environments/pretrain_data_curator/Dockerfile.runtime
+# (bare pytorch + huggingface-hub/tiktoken/tqdm/uv + baked decon binary & evals).
+# The codex AGENT runs INSIDE this harness-runtime container, so using the bare
+# pytorch image left its self_score.py with no decon (leakage check skipped) and
+# no hf. Provisioning builds this tag; see scripts/run_25m_smoke_a100.sh.
+docker_image = "webcurator-runtime:latest"
+gpu_count = 1
+cpu_cores = 8
+memory_gb = 32
+disk_size_gb = 40
+max_corpus_chars = 100_000_000
+timeout_minutes = 90
+upload_timeout_seconds = 600.0
+
+[args.validation_set]
+dataset_id = "kjj0/fineweb10B-gpt2"
+filename = "fineweb_val_000000.bin"
+repo_type = "dataset"
+tokenizer = "gpt2"
+val_tokens = 10_485_760
