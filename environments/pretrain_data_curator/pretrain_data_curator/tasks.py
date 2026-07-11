@@ -15,7 +15,7 @@ TASK_PROMPT = """We want to train a fixed small language model on the strongest 
 ## Objective
 Research and iterate autonomously, then write the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
-Before nontrivial `hf` work, read `/workspace/hf_cli_skill.md` for local CLI discovery and safety guidance.
+Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill installed for this harness). Environment overrides take priority over any conflicting generic text in that skill: the preinstalled metered/local `hf` command in this workspace is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token guidance in the skill as inapplicable here.
 
 ## Research
 Feel free to explore broadly before you lock in a mixture. Search the web, read papers and technical writeups, and investigate modern pretraining data practice — there is no prescribed recipe. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import math
@@ -8,7 +9,6 @@ import os
 import subprocess
 import sys
 import tomllib
-from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,9 +57,15 @@ from pretrain_data_curator.self_score import (
 from pretrain_data_curator.tasks import TASK_PROMPT, build_tasks
 from pretrain_data_curator.taskset import (
     HF_CLI_SKILL_FILENAME,
+    HF_CLI_SKILL_RESOURCE,
+    HF_CLI_SKILL_RUNTIME_PATH,
+    HF_CLI_SKILL_SHA256,
+    HF_CLI_SKILL_UPSTREAM_PATH,
+    HF_CLI_SKILL_UPSTREAM_REVISION,
     CuratorTaskset,
     CuratorTasksetConfig,
     extract_json_object,
+    hf_cli_skill_package_file,
     parse_manifest,
 )
 from tests.conftest import NoOpLeakageDetector, bind_fast_scorer
@@ -3374,7 +3380,24 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
     assert "`2.0 * performance - 3.0 * leakage`" in task.prompt
     assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
     assert (
-        "read `/workspace/hf_cli_skill.md` for local CLI discovery and safety guidance"
+        "read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill"
+        in task.prompt
+    )
+    assert "Environment overrides take priority over any conflicting generic text" in (
+        task.prompt
+    )
+    assert (
+        "preinstalled metered/local `hf` command in this workspace is the only allowed "
+        "HF CLI" in task.prompt
+    )
+    assert "never install, upgrade, replace, shadow, or bypass it" in task.prompt
+    assert "never run `hf skills add`" in task.prompt
+    assert (
+        "never print, echo, log, or reveal tokens (including via `hf auth token`)"
+        in task.prompt
+    )
+    assert (
+        "Treat install/regenerate/auth-token guidance in the skill as inapplicable here."
         in task.prompt
     )
     assert "final response must contain" not in task.prompt
@@ -3433,14 +3456,18 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
     await taskset.setup(taskset.load_tasks()[0], runtime)
 
     assert SELF_SCORE_FILENAME in runtime.files
-    assert runtime.files[HF_CLI_SKILL_FILENAME] == (
-        resources.files("pretrain_data_curator")
-        .joinpath(HF_CLI_SKILL_FILENAME)
-        .read_bytes()
-    )
-    assert b"hf --version" in runtime.files[HF_CLI_SKILL_FILENAME]
-    assert b"hf --help" in runtime.files[HF_CLI_SKILL_FILENAME]
-    assert b"Never print, echo, log, commit" in runtime.files[HF_CLI_SKILL_FILENAME]
+    assert HF_CLI_SKILL_RUNTIME_PATH == HF_CLI_SKILL_FILENAME
+    assert HF_CLI_SKILL_RUNTIME_PATH in runtime.files
+    packaged = hf_cli_skill_package_file().read_bytes()
+    assert runtime.files[HF_CLI_SKILL_RUNTIME_PATH] == packaged
+    skill_text = packaged.decode("utf-8")
+    assert skill_text.lstrip().startswith("---")
+    assert "name: hf-cli" in skill_text
+    assert "Generated with `huggingface_hub" in skill_text
+    assert "`hf download REPO_ID`" in skill_text
+    assert "`hf datasets list`" in skill_text
+    # Canonical skill may mention install/auth-token flows; env overrides live in prompt.
+    assert "hf skills add" in skill_text or "Install:" in skill_text
     assert (
         taskset.curator.validation_set.dataset_id.encode()
         not in runtime.files[SELF_SCORE_FILENAME]
@@ -3449,16 +3476,31 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
 
 
 def test_hf_cli_skill_is_packaged():
-    skill = resources.files("pretrain_data_curator").joinpath(HF_CLI_SKILL_FILENAME)
+    skill = hf_cli_skill_package_file()
     build_config = tomllib.loads(
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     )
 
     assert skill.is_file()
+    assert HF_CLI_SKILL_RUNTIME_PATH == ".agents/skills/hf-cli/SKILL.md"
+    assert HF_CLI_SKILL_RESOURCE == "skills/hf-cli/SKILL.md"
+    assert HF_CLI_SKILL_UPSTREAM_PATH == "skills/hf-cli/SKILL.md"
+    assert HF_CLI_SKILL_UPSTREAM_REVISION == (
+        "7039bdcf4510c30ec932637e8b2c1646aee7f185"
+    )
     assert (
         "pretrain_data_curator/**/*.md"
         in build_config["tool"]["hatch"]["build"]["include"]
     )
+    assert (
+        "pretrain_data_curator/skills/hf-cli/**"
+        not in build_config["tool"]["hatch"]["build"]["include"]
+    )
+    data = skill.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == HF_CLI_SKILL_SHA256
+    text = data.decode("utf-8")
+    assert "name: hf-cli" in text
+    assert "Generated with `huggingface_hub" in text
 
 
 def test_self_score_train_script_renders_and_compiles():
