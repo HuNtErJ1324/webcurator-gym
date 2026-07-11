@@ -80,9 +80,13 @@ def muon_update(
 
     When ``polar_express=True``, uses ONI-based polar decomposition instead of
     Newton–Schulz iteration.
+
+    Momentum and orthogonalization run in float32 for stability even when the
+    parameter/grad tensors are bfloat16 on CUDA.
     """
-    momentum.lerp_(grad, 1.0 - mu)
-    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    grad_fp32 = grad.float()
+    momentum.lerp_(grad_fp32, 1.0 - mu)
+    update = grad_fp32.lerp(momentum, mu) if nesterov else momentum
     if polar_express:
         update = zeropower_via_polar_express(update)
     else:
@@ -105,7 +109,9 @@ def muon_update_normalized(
     First computes the standard Muon update, then RMS-normalizes it so that the
     update magnitude is decoupled from the matrix scale.
     """
-    update = muon_update(grad, momentum, mu=mu, nesterov=nesterov, polar_express=polar_express)
+    update = muon_update(
+        grad, momentum, mu=mu, nesterov=nesterov, polar_express=polar_express
+    )
     rms = update.norm() / (update.numel() ** 0.5)
     return update / (rms + 1e-8)
 
@@ -113,15 +119,36 @@ def muon_update_normalized(
 class Muon(torch.optim.Optimizer):
     """Single-device Muon optimizer (no distributed all_gather)."""
 
-    def __init__(self, params, *, lr: float = 0.02, weight_decay: float = 0.0, momentum: float = 0.95, nor_muon: bool = False, polar_express: bool = False):
+    def __init__(
+        self,
+        params,
+        *,
+        lr: float = 0.02,
+        weight_decay: float = 0.0,
+        momentum: float = 0.95,
+        nor_muon: bool = False,
+        polar_express: bool = False,
+    ):
         params = [p for p in params if p.requires_grad]
         if not params:
             raise ValueError("Muon requires at least one trainable parameter")
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nor_muon=nor_muon, polar_express=polar_express)
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nor_muon=nor_muon,
+            polar_express=polar_express,
+        )
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, *, momentum: float | None = None, cautious_wd: bool = False, lr_scale: float = 1.0):
+    def step(
+        self,
+        *,
+        momentum: float | None = None,
+        cautious_wd: bool = False,
+        lr_scale: float = 1.0,
+    ):
         for group in self.param_groups:
             mu = group["momentum"] if momentum is None else momentum
             lr = group["lr"]
@@ -133,17 +160,30 @@ class Muon(torch.optim.Optimizer):
                     continue
                 state = self.state[param]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(param)
+                    # Keep Muon momentum in float32 even when params are bf16.
+                    state["momentum_buffer"] = torch.zeros(
+                        param.shape, dtype=torch.float32, device=param.device
+                    )
                 if nor_muon:
-                    update = muon_update_normalized(param.grad, state["momentum_buffer"], mu=mu, polar_express=polar_express)
+                    update = muon_update_normalized(
+                        param.grad,
+                        state["momentum_buffer"],
+                        mu=mu,
+                        polar_express=polar_express,
+                    )
                 else:
-                    update = muon_update(param.grad, state["momentum_buffer"], mu=mu, polar_express=polar_express)
+                    update = muon_update(
+                        param.grad,
+                        state["momentum_buffer"],
+                        mu=mu,
+                        polar_express=polar_express,
+                    )
                 effective_wd = wd
                 if cautious_wd:
                     effective_wd = wd * lr_scale
                 if effective_wd:
                     param.mul_(1.0 - lr * effective_wd)
-                param.add_(update, alpha=-lr)
+                param.add_(update.to(dtype=param.dtype), alpha=-lr)
 
 
 @dataclass(frozen=True)
@@ -235,7 +275,9 @@ def get_muon_momentum(
     return momentum_max
 
 
-def classify_speedrun_params(model) -> tuple[list[torch.nn.Parameter], dict[str, list[torch.nn.Parameter]]]:
+def classify_speedrun_params(
+    model,
+) -> tuple[list[torch.nn.Parameter], dict[str, list[torch.nn.Parameter]]]:
     """Split ``student_model.GPT`` params into Muon matrices vs AdamW groups."""
     muon_params: list[torch.nn.Parameter] = []
     adam: dict[str, list[torch.nn.Parameter]] = {
@@ -268,7 +310,7 @@ def build_speedrun_optimizers(
     model,
     *,
     muon_lr: float = 0.023,
-    muon_weight_decay: float = 0.05,
+    muon_weight_decay: float = 1.2,
     adam_lr: float = 0.008,
     adam_eps: float = 1e-10,
     adam_weight_decay: float = 0.005,
@@ -281,16 +323,26 @@ def build_speedrun_optimizers(
     value_embed_wd_mul: float = 5.0,
     scalar_wd_mul: float = 0.0,
     # --- portable optimizer features ---
-    nor_muon: bool = False,
+    nor_muon: bool = True,
     polar_express: bool = False,
 ):
     """Build Muon + multi-group AdamW optimizers for ``student_model.GPT``.
 
     When ``nor_muon=True``, Muon uses normalized (RMS-normalized) updates.
     When ``polar_express=True``, Muon uses ONI-based polar decomposition.
+
+    Adam betas are set per group to match the modern speedrun recipe:
+    embed/lm_head ``(0.5, 0.95)``, value embeddings ``(0.75, 0.95)``,
+    scalars ``(0.9, 0.99)``.
     """
     muon_params, adam = classify_speedrun_params(model)
-    muon_opt = Muon(muon_params, lr=muon_lr, weight_decay=muon_weight_decay, nor_muon=nor_muon, polar_express=polar_express)
+    muon_opt = Muon(
+        muon_params,
+        lr=muon_lr,
+        weight_decay=muon_weight_decay,
+        nor_muon=nor_muon,
+        polar_express=polar_express,
+    )
     adam_groups = []
     if adam["embed"]:
         adam_groups.append(
@@ -298,6 +350,7 @@ def build_speedrun_optimizers(
                 "params": adam["embed"],
                 "lr": adam_lr * embed_lr_mul,
                 "weight_decay": adam_weight_decay * embed_wd_mul,
+                "betas": (0.5, 0.95),
             }
         )
     if adam["lm_head"]:
@@ -306,6 +359,7 @@ def build_speedrun_optimizers(
                 "params": adam["lm_head"],
                 "lr": adam_lr * lm_head_lr_mul,
                 "weight_decay": adam_weight_decay * lm_head_wd_mul,
+                "betas": (0.5, 0.95),
             }
         )
     if adam["value_embeds"]:
@@ -314,6 +368,7 @@ def build_speedrun_optimizers(
                 "params": adam["value_embeds"],
                 "lr": adam_lr * value_embed_lr_mul,
                 "weight_decay": adam_weight_decay * value_embed_wd_mul,
+                "betas": (0.75, 0.95),
             }
         )
     if adam["scalars"]:
@@ -322,25 +377,33 @@ def build_speedrun_optimizers(
                 "params": adam["scalars"],
                 "lr": adam_lr * scalar_lr_mul,
                 "weight_decay": adam_weight_decay * scalar_wd_mul,
+                "betas": (0.9, 0.99),
             }
         )
     adam_opt = torch.optim.AdamW(
         adam_groups,
-        betas=(0.9, 0.99),
         eps=adam_eps,
     )
     return muon_opt, adam_opt
 
 
 def init_speedrun_weights(model) -> None:
-    """Weight init aligned with modded-nanogpt block matrices (``train_gpt_simple``)."""
+    """Weight init aligned with modded-nanogpt block matrices (``train_gpt_simple``).
+
+    Projection matrices stay zero-init; ``lm_head`` uses ``N(0, 0.005)``; value
+    embeddings use ``N(0, 0.01)``; token embeddings use ``N(0, 0.02)``.
+    """
     for name, param in model.named_parameters():
         data = param.data
         if not name.endswith("weight"):
             continue
-        if "proj" in name or "lm_head" in name:
+        if "proj" in name:
             data.zero_()
-        elif "embed" in name and "value_embeds" not in name:
+        elif "lm_head" in name:
+            data.normal_(std=0.005)
+        elif "value_embeds" in name:
+            data.normal_(std=0.01)
+        elif "embed" in name:
             if data.numel() > 0:
                 data.normal_(std=0.02)
         elif data.ndim >= 2:

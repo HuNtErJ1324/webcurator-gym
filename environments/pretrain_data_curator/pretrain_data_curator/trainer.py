@@ -36,9 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Loop-local bound on concurrent sandbox-training jobs, so a rollout group with
 # the real trainer never spawns more GPU sandboxes than configured at once.
-_TRAIN_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
-    weakref.WeakKeyDictionary()
-)
+_TRAIN_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
 
 
 def training_semaphore(limit: int) -> asyncio.Semaphore:
@@ -196,7 +194,9 @@ class RuntimeSelectedTrainer:
     supported -- only Docker and Modal harness runtimes have a real trainer.
     """
 
-    def __init__(self, trainers_by_runtime_type: dict[str, "ProxyStudentTrainer"]) -> None:
+    def __init__(
+        self, trainers_by_runtime_type: dict[str, "ProxyStudentTrainer"]
+    ) -> None:
         self._trainers_by_runtime_type = trainers_by_runtime_type
 
     async def train_and_eval(
@@ -218,7 +218,7 @@ class RuntimeSelectedTrainer:
         return await trainer.train_and_eval(corpus, config, runtime=runtime)
 
 
-_NANOGPT_TRAIN_SCRIPT_TEMPLATE = r'''
+_NANOGPT_TRAIN_SCRIPT_TEMPLATE = r"""
 import atexit
 import sys
 
@@ -392,13 +392,13 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     base_lr=float(cfg.get("learning_rate", 3e-4)),
     warmup_steps=int(cfg.get("warmup_steps", 0)),
     weight_decay=float(cfg.get("weight_decay", 0.1)),
-    grad_clip=float(cfg.get("grad_clip", 1.0)),
+    grad_clip=float(cfg.get("grad_clip", 0.0)),
     beta1=float(cfg.get("adam_beta1", 0.9)),
     beta2=float(cfg.get("adam_beta2", 0.95)),
     eps=float(cfg.get("record_adam_eps", cfg.get("adam_eps", 1e-8))),
     lr_min_ratio=float(cfg.get("lr_min_ratio", 0.1)),
     muon_lr=float(cfg.get("muon_lr", 0.023)),
-    muon_weight_decay=float(cfg.get("muon_weight_decay", 0.05)),
+    muon_weight_decay=float(cfg.get("muon_weight_decay", 1.2)),
     adam_lr=float(cfg.get("adam_lr", 0.008)),
     adam_eps=float(cfg.get("adam_eps", 1e-10)),
     adam_weight_decay=float(cfg.get("adam_weight_decay", 0.005)),
@@ -428,7 +428,7 @@ val_loss, acc, flops, tokens_trained, n_params = averaged_train_and_eval(
     multi_token_pred=int(cfg.get("multi_token_pred", 0)),
     untie_at_frac=float(cfg.get("untie_at_frac", 0.0)),
     cautious_wd=bool(cfg.get("cautious_wd", False)),
-    nor_muon=bool(cfg.get("nor_muon", False)),
+    nor_muon=bool(cfg.get("nor_muon", True)),
     polar_express=bool(cfg.get("polar_express", False)),
     train_microbatch_size=cfg.get("train_microbatch_size"),
     val_batch_size=cfg.get("val_batch_size"),
@@ -443,7 +443,7 @@ result = {
 print("RESULT_JSON " + json.dumps(result), flush=True)
 import pathlib
 pathlib.Path("/workspace/result.json").write_text(json.dumps(result))
-'''
+"""
 
 
 # Embed the exact, CPU-tested ``plan_val_windows`` source, the verbatim
@@ -497,6 +497,8 @@ def _nanogpt_train_script() -> str:
                     "Rotary",
                     "RotaryWithOffset",
                     "_sliding_window_mask",
+                    "_causal_attn_mask",
+                    "_combine_attn_masks",
                     "CausalSelfAttention",
                     "PairedHeadAttention",
                     "MLP",
@@ -544,8 +546,13 @@ def _nanogpt_train_script() -> str:
                     "lr_at_step",
                     "plan_train_windows",
                     "plan_eos_aligned_windows",
+                    "window_document_ids",
+                    "build_document_attn_mask",
+                    "batch_document_attn_mask",
                     "shuffled_window_starts",
                     "make_seq_len_schedule",
+                    "_is_cuda_device",
+                    "prepare_student_model_dtype",
                     "_microbatch_ranges",
                     "_scaled_microbatch_loss",
                     "_score_hidden_chunked",

@@ -21,7 +21,8 @@ Legacy recipe (**``record_01_adamw``**) remains for fast CPU tests:
 
 Portable features (all opt-in):
 
-* **EoS-aligned batch starts** — align training windows to end-of-sequence markers.
+* **EoS-aligned packed batch starts** — EOT-prefixed documents; long docs keep
+  intra-document windows, short docs pack into fixed blocks (Speedrun-style).
 * **Max document length handling** — reject over-long documents explicitly.
 * **True 2-step gradient accumulation** — accumulate embed+lm_head grads before update.
 * **True max seq length schedule** — warm up sequence length from small to max.
@@ -45,6 +46,7 @@ from .student_optimizer import (
     build_batch_schedule,
     build_speedrun_optimizers,
     capture_initial_lrs,
+    classify_speedrun_params,
     clip_optimizer_grads,
     get_muon_momentum,
     init_speedrun_weights,
@@ -54,6 +56,29 @@ from .student_optimizer import (
     step_speedrun_optimizers,
 )
 from .val_set import plan_val_windows
+
+
+def _is_cuda_device(device) -> bool:
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    return isinstance(device, str) and device.startswith("cuda")
+
+
+def prepare_student_model_dtype(model, device):
+    """CUDA-only bfloat16 for Muon matrices; Adam groups stay float32.
+
+    CPU behavior is unchanged (all float32). On CUDA, cast the full module to
+    bfloat16 then restore Adam-managed parameters to float32 so optimizer state
+    and lm_head/softcap/CE remain numerically stable.
+    """
+    if not _is_cuda_device(device):
+        return model
+    model.to(dtype=torch.bfloat16)
+    _, adam = classify_speedrun_params(model)
+    for params in adam.values():
+        for param in params:
+            param.data = param.data.to(dtype=torch.float32)
+    return model
 
 
 def lr_at_step(step, total_steps, warmup_steps, base_lr, min_ratio):
@@ -112,23 +137,134 @@ def encode_document_tokens(documents, encoder, max_document_tokens=None):
 
 
 def plan_eos_aligned_windows(n_tokens, block, document_ranges, lookahead=1):
-    """Plan non-overlapping windows wholly contained in source documents.
+    """Plan training-window starts over an EOT-prefixed document stream.
 
-    An empty/too-short document set returns no windows. There is deliberately no
-    flat-stream fallback because that would cross an EOT/BOS boundary silently.
+    Long documents (length >= ``block + lookahead``) keep non-overlapping
+    intra-document starts with stride ``block``.
+
+    Short documents are packed with deterministic sequential, non-overlapping
+    windows (portable adaptation of modded-nanogpt ``Shard.next_batch``): each
+    pack starts at the next unused short document's leading EOT/BOS, covers
+    ``block + lookahead`` tokens of the concatenated stream, and advances past
+    every document that overlaps that span so short docs are not oversampled.
+    If a pack truncates into a long document, residual intra-document stride
+    windows begin at the first uncovered position of that long document.
+
+    Boundary contract (Speedrun-aligned as far as this SDPA port allows):
+
+    * **Targets** use the flat next-token shift over the window, so a target may
+      be the next document's leading EOT (Speedrun ``buf[:-1]`` / ``buf[1:]``).
+    * **Attention** must not cross document boundaries: callers use
+      :func:`batch_document_attn_mask` for packed multi-document windows
+      (Speedrun uses flash-attn varlen ``cum_lengths`` for the same guarantee).
+    * Document ranges must be sorted, disjoint, and contiguous (no gaps).
+    * There is no flat-stream fallback that ignores ``document_ranges``.
     """
     block = int(block)
     n_tokens = int(n_tokens)
     lookahead = max(1, int(lookahead))
-    starts = []
+    need = block + lookahead
+    ranges = []
     previous_end = 0
     for raw_start, raw_end in document_ranges or ():
         start, end = int(raw_start), int(raw_end)
         if start < previous_end or end < start or end > n_tokens:
             raise ValueError("document ranges must be sorted, disjoint, and in bounds")
+        if ranges and start != previous_end:
+            raise ValueError(
+                "document ranges must be contiguous with no gaps; "
+                f"found gap between {previous_end} and {start}"
+            )
         previous_end = end
-        starts.extend(range(start, end - block - lookahead + 1, block))
+        ranges.append((start, end))
+
+    starts = []
+    cursor = 0
+    while cursor < len(ranges):
+        doc_start, doc_end = ranges[cursor]
+        length = doc_end - doc_start
+        if length >= need:
+            starts.extend(range(doc_start, doc_end - need + 1, block))
+            cursor += 1
+            continue
+
+        if doc_start + need > n_tokens:
+            cursor += 1
+            continue
+
+        pack_start = doc_start
+        pack_end = pack_start + need
+        starts.append(pack_start)
+        while cursor < len(ranges) and ranges[cursor][0] < pack_end:
+            d_start, d_end = ranges[cursor]
+            d_len = d_end - d_start
+            if d_len >= need:
+                residual_from = max(pack_end, d_start)
+                if residual_from + need <= d_end:
+                    starts.extend(range(residual_from, d_end - need + 1, block))
+                cursor += 1
+                break
+            cursor += 1
     return starts
+
+
+def window_document_ids(start, length, document_ranges, device=None):
+    """Per-position document ids for ``train_src[start:start+length]``."""
+    start = int(start)
+    length = int(length)
+    ids = torch.full((length,), -1, dtype=torch.long, device=device)
+    end = start + length
+    for doc_id, (raw_start, raw_end) in enumerate(document_ranges or ()):
+        doc_start, doc_end = int(raw_start), int(raw_end)
+        lo = max(doc_start, start)
+        hi = min(doc_end, end)
+        if lo < hi:
+            ids[lo - start : hi - start] = doc_id
+    return ids
+
+
+def build_document_attn_mask(doc_ids):
+    """Boolean SDPA mask ``(B, T, T)``; ``True`` means the key may participate.
+
+    Keeps causal same-document positions. Gap ids (``< 0``) never attend to each
+    other; they are restricted to self-attention so softmax stays well-defined.
+    """
+    if doc_ids.dim() != 2:
+        raise ValueError(f"doc_ids must be (batch, seq), got shape {tuple(doc_ids.shape)}")
+    _batch, seq_len = doc_ids.shape
+    idx = torch.arange(seq_len, device=doc_ids.device)
+    causal = idx[None, :] <= idx[:, None]
+    valid = doc_ids >= 0
+    same_document = (
+        (doc_ids[:, :, None] == doc_ids[:, None, :])
+        & valid[:, :, None]
+        & valid[:, None, :]
+    )
+    keep = causal.unsqueeze(0) & same_document
+    eye = torch.eye(seq_len, dtype=torch.bool, device=doc_ids.device)
+    return keep | eye.unsqueeze(0)
+
+
+def batch_document_attn_mask(starts, block, document_ranges, device):
+    """Build a batched document keep-mask, or ``None`` when every window is single-doc."""
+    if not starts:
+        return None
+    rows = []
+    any_cross = False
+    any_gap = False
+    block = int(block)
+    for start in starts:
+        doc_ids = window_document_ids(
+            start, block, document_ranges, device=device
+        )
+        if doc_ids.numel() > 0 and bool((doc_ids < 0).any().item()):
+            any_gap = True
+        if doc_ids.numel() > 0 and bool((doc_ids != doc_ids[0]).any().item()):
+            any_cross = True
+        rows.append(doc_ids)
+    if not any_cross and not any_gap:
+        return None
+    return build_document_attn_mask(torch.stack(rows, dim=0))
 
 
 def shuffled_window_starts(starts, generator):
@@ -179,9 +315,11 @@ def _score_hidden_chunked(model, hidden, targets, *, vocab_size, logit_chunk_tok
         if apply_head is not None:
             logits = apply_head(h)
         else:
-            logits = model.softcap * torch.tanh(model.lm_head(h) / model.softcap)
-        loss_sum += F.cross_entropy(logits, y, reduction="sum").item()
-        correct += (logits.argmax(-1) == y).sum().item()
+            logits = model.softcap * torch.tanh(
+                model.lm_head(h.float()).float() / model.softcap
+            )
+        loss_sum += F.cross_entropy(logits.float(), y, reduction="sum").item()
+        correct += (logits.float().argmax(-1) == y).sum().item()
         del logits
     return loss_sum, correct
 
@@ -223,7 +361,9 @@ def _eval_val_loss(
                 starts.append(val_windows[wi][0])
                 wi += 1
             xb = torch.stack([val_data[s : s + length] for s in starts]).to(device)
-            yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(device)
+            yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(
+                device
+            )
             if forward_hidden is not None:
                 hidden = forward_hidden(xb)
                 chunk_loss, chunk_correct = _score_hidden_chunked(
@@ -240,11 +380,13 @@ def _eval_val_loss(
                 logits = model(xb)
                 if logit_chunk_tokens is None:
                     loss_sum += F.cross_entropy(
-                        logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
+                        logits.float().reshape(-1, vocab_size),
+                        yb.reshape(-1),
+                        reduction="sum",
                     ).item()
-                    correct += (logits.argmax(-1) == yb).sum().item()
+                    correct += (logits.float().argmax(-1) == yb).sum().item()
                 else:
-                    flat_logits = logits.reshape(-1, vocab_size)
+                    flat_logits = logits.float().reshape(-1, vocab_size)
                     flat_y = yb.reshape(-1)
                     chunk = int(logit_chunk_tokens)
                     for start in range(0, flat_logits.size(0), chunk):
@@ -264,14 +406,18 @@ def _compute_multi_token_loss(logits, hidden, y, multi_heads, y_future, vocab_si
     Multi-token heads are applied to the final hidden states (pre-lm_head),
     not to logits, since the heads are ``nn.Linear(model_dim, vocab_size)``.
     """
-    main_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-    if multi_heads is None or not hasattr(multi_heads, 'heads') or not multi_heads.heads:
+    main_loss = F.cross_entropy(logits.float().view(-1, vocab_size), y.view(-1))
+    if (
+        multi_heads is None
+        or not hasattr(multi_heads, "heads")
+        or not multi_heads.heads
+    ):
         return main_loss
     mt_loss = 0.0
     mt_weight = 0.3
     for k, head in enumerate(multi_heads.heads):
         if k < len(y_future) and y_future[k] is not None:
-            head_logits = head(hidden)
+            head_logits = head(hidden).float()
             mt_loss = mt_loss + F.cross_entropy(
                 head_logits.view(-1, vocab_size), y_future[k].view(-1)
             )
@@ -331,7 +477,7 @@ def train_and_eval_student(
     run_label="",
     training_recipe="speedrun_muon",
     muon_lr=0.023,
-    muon_weight_decay=0.05,
+    muon_weight_decay=1.2,
     adam_lr=0.008,
     adam_eps=1e-10,
     adam_weight_decay=0.005,
@@ -361,13 +507,14 @@ def train_and_eval_student(
     multi_token_pred=0,
     untie_at_frac=0.0,
     cautious_wd=False,
-    nor_muon=False,
+    nor_muon=True,
     polar_express=False,
     train_microbatch_size=None,
     val_batch_size=None,
     val_logit_chunk_tokens=None,
 ):
     """Train ``model`` and score held-out CE; returns ``(val_loss, accuracy, tokens_trained)``."""
+    prepare_student_model_dtype(model, device)
     block = int(block_size)
     batch = int(batch_size)
     steps = int(steps)
@@ -383,8 +530,10 @@ def train_and_eval_student(
     if document_ranges is None and len(train_src) <= block + 1:
         train_src = train_src.repeat(math.ceil((block + 2) / max(len(train_src), 1)))
 
-    # Document-aware training never tiles or falls back to flat windows: every
-    # selected input/target pair must remain inside one real source document.
+    # Document-aware training never falls back to flat windows that ignore
+    # document_ranges. Short documents are packed into fixed blocks; long
+    # documents keep intra-document starts. Packed multi-document windows use
+    # an SDPA document mask so attention does not cross EOT boundaries.
     if document_ranges is not None:
         starts = plan_eos_aligned_windows(
             len(train_src),
@@ -394,8 +543,8 @@ def train_and_eval_student(
         )
         if not starts:
             raise ValueError(
-                "no document is long enough for block_size + 1 tokens; "
-                "lower block_size or provide longer documents"
+                "no packed document window fits block_size + lookahead tokens; "
+                "lower block_size or provide more/longer documents"
             )
     else:
         starts = plan_train_windows(len(train_src), block)
@@ -420,14 +569,26 @@ def train_and_eval_student(
             batch_starts.append(i)
             xs.append(train_src[i : i + current_block])
             ys.append(train_src[i + 1 : i + current_block + 1])
-        return torch.stack(xs).to(device), torch.stack(ys).to(device), batch_starts
+        attn_mask = None
+        if document_ranges is not None:
+            attn_mask = batch_document_attn_mask(
+                batch_starts, current_block, document_ranges, device
+            )
+        return (
+            torch.stack(xs).to(device),
+            torch.stack(ys).to(device),
+            batch_starts,
+            attn_mask,
+        )
 
     log_every = max(50, max(1, steps // 50))
     ema_loss_tensor = None
     ema_decay = 0.9
     start_time = time.time()
     desc = f"{run_label}train" if run_label else "train"
-    pbar = tqdm(range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout)
+    pbar = tqdm(
+        range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout
+    )
 
     if training_recipe == "record_01_adamw":
         opt = torch.optim.AdamW(
@@ -444,7 +605,7 @@ def train_and_eval_student(
             for group in opt.param_groups:
                 group["lr"] = lr
             current_block = block_fn(step) if block_fn else block
-            x, y, _ = next_batch(batch, current_block)
+            x, y, _batch_starts, attn_mask = next_batch(batch, current_block)
             opt.zero_grad(set_to_none=True)
             # Loss-scaled microbatch accumulation: summed microbatch grads equal a
             # single full-batch mean-CE backward while capping peak logit memory.
@@ -452,27 +613,38 @@ def train_and_eval_student(
             for start, end in _microbatch_ranges(batch, train_microbatch_size):
                 xb = x[start:end]
                 yb = y[start:end]
-                logits = model(xb)
-                loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                mb_mask = None if attn_mask is None else attn_mask[start:end]
+                logits = model(xb, attn_mask=mb_mask)
+                loss = F.cross_entropy(logits.float().view(-1, vocab_size), yb.view(-1))
                 _scaled_microbatch_loss(loss, end - start, batch).backward()
                 with torch.no_grad():
                     piece = loss.detach() * float(end - start)
-                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
+                    loss_weighted = (
+                        piece if loss_weighted is None else loss_weighted + piece
+                    )
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             tokens_trained += batch * current_block
             with torch.no_grad():
                 loss_detached = loss_weighted / float(batch)
-                ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
-                    ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                ema_loss_tensor = (
+                    loss_detached
+                    if ema_loss_tensor is None
+                    else (
+                        ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                    )
                 )
             completed = step + 1
             if step == 0 or completed == steps or completed % log_every == 0:
                 ema_loss = ema_loss_tensor.item()
                 elapsed = time.time() - start_time
                 tokens_per_sec = tokens_trained / elapsed if elapsed > 0 else 0.0
-                eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+                eta_seconds = (
+                    (elapsed / completed) * (steps - completed)
+                    if completed > 0
+                    else 0.0
+                )
                 pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
                 pbar.write(
                     f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
@@ -522,8 +694,16 @@ def train_and_eval_student(
             boundaries = [(0, steps)]
             stages = [BatchScheduleStage(batch_mul=1, lr_mul=1.0)]
             cd_start, cd_floor = steps, lr_cooldown_floor
-        muon_warm = muon_warmup_steps if muon_warmup_steps is not None else min(300, max(1, steps // 5))
-        muon_cd = muon_cooldown_steps if muon_cooldown_steps is not None else min(50, max(1, steps // 20))
+        muon_warm = (
+            muon_warmup_steps
+            if muon_warmup_steps is not None
+            else min(300, max(1, steps // 5))
+        )
+        muon_cd = (
+            muon_cooldown_steps
+            if muon_cooldown_steps is not None
+            else min(50, max(1, steps // 20))
+        )
         model.train()
         tokens_trained = 0
         accum_buffer_embed_head = None
@@ -560,10 +740,14 @@ def train_and_eval_student(
             )
 
             current_block = block_fn(step) if block_fn else block
-            x, y, batch_starts = next_batch(effective_batch, current_block)
+            x, y, batch_starts, attn_mask = next_batch(effective_batch, current_block)
 
             # --- Portable: multi-token prediction targets ---
-            use_mt = multi_token_pred > 0 and hasattr(model, 'multi_heads') and model.multi_heads is not None
+            use_mt = (
+                multi_token_pred > 0
+                and hasattr(model, "multi_heads")
+                and model.multi_heads is not None
+            )
             y_future = []
             if use_mt:
                 for k in range(multi_token_pred):
@@ -571,12 +755,22 @@ def train_and_eval_student(
                     future_targets = []
                     for sidx in batch_starts:
                         if sidx + shift + current_block <= len(train_src):
-                            future_targets.append(train_src[sidx + shift : sidx + shift + current_block])
+                            future_targets.append(
+                                train_src[sidx + shift : sidx + shift + current_block]
+                            )
                         else:
                             n_avail = max(0, len(train_src) - (sidx + shift))
                             if n_avail > 0:
-                                seg = train_src[sidx + shift:]
-                                seg = torch.cat([seg, torch.zeros(current_block - n_avail, dtype=train_src.dtype)])
+                                seg = train_src[sidx + shift :]
+                                seg = torch.cat(
+                                    [
+                                        seg,
+                                        torch.zeros(
+                                            current_block - n_avail,
+                                            dtype=train_src.dtype,
+                                        ),
+                                    ]
+                                )
                             else:
                                 seg = torch.zeros(current_block, dtype=train_src.dtype)
                             future_targets.append(seg)
@@ -589,28 +783,44 @@ def train_and_eval_student(
             if grad_accum_embed_head_steps <= 1:
                 muon_opt.zero_grad(set_to_none=True)
             loss_weighted = None
-            for start, end in _microbatch_ranges(effective_batch, train_microbatch_size):
+            for start, end in _microbatch_ranges(
+                effective_batch, train_microbatch_size
+            ):
                 xb = x[start:end]
                 yb = y[start:end]
-                logits = model(xb, output_hidden=use_mt)
+                mb_mask = None if attn_mask is None else attn_mask[start:end]
+                logits = model(xb, attn_mask=mb_mask, output_hidden=use_mt)
                 if use_mt:
                     hidden = logits[1]
                     y_future_mb = [yf[start:end] for yf in y_future]
                     loss = _compute_multi_token_loss(
-                        logits[0], hidden, yb, model.multi_heads, y_future_mb, vocab_size
+                        logits[0],
+                        hidden,
+                        yb,
+                        model.multi_heads,
+                        y_future_mb,
+                        vocab_size,
                     )
                 else:
-                    loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                    loss = F.cross_entropy(
+                        logits.float().view(-1, vocab_size), yb.view(-1)
+                    )
                 _scaled_microbatch_loss(loss, end - start, effective_batch).backward()
                 with torch.no_grad():
                     piece = loss.detach() * float(end - start)
-                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
+                    loss_weighted = (
+                        piece if loss_weighted is None else loss_weighted + piece
+                    )
 
             # --- Portable: true N-step gradient accumulation for embed + lm_head ---
             if grad_accum_embed_head_steps > 1:
                 embed_head_params = []
                 for name, p in model.named_parameters():
-                    if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                    if (
+                        name.startswith("embed.")
+                        or name.startswith("lm_head.")
+                        or name.startswith("multi_heads.")
+                    ):
                         embed_head_params.append(p)
 
                 # backward() already ran per-microbatch above; grads for embed/head
@@ -634,9 +844,17 @@ def train_and_eval_student(
                 if accum_count >= grad_accum_embed_head_steps:
                     # Restore accumulated buffer to embed/head/multi-head param grads.
                     for name, p in model.named_parameters():
-                        if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                        if (
+                            name.startswith("embed.")
+                            or name.startswith("lm_head.")
+                            or name.startswith("multi_heads.")
+                        ):
                             if id(p) in accum_buffer_embed_head:
-                                p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
+                                p.grad = (
+                                    accum_buffer_embed_head[id(p)]
+                                    .clone()
+                                    .to(device=p.device)
+                                )
                     # Per-optimizer clipping occurs inside the actual updates below.
                     # force_adam=True: a closing cycle always carries freshly
                     # restored embed/head/multi-head grads that must be applied
@@ -660,7 +878,11 @@ def train_and_eval_student(
                     adam_opt.zero_grad(set_to_none=True)
                 else:
                     clip_optimizer_grads(muon_opt, grad_clip)
-                    muon_opt.step(momentum=muon_momentum, cautious_wd=cautious_wd, lr_scale=lr_scale)
+                    muon_opt.step(
+                        momentum=muon_momentum,
+                        cautious_wd=cautious_wd,
+                        lr_scale=lr_scale,
+                    )
                     # Zero all grads between micro-steps so stale gradients do
                     # not accumulate for any param group.  Embed/head/multi-head
                     # grads are safe in the buffer; everything else must be
@@ -693,29 +915,45 @@ def train_and_eval_student(
 
             # --- Portable: untie embed and lm_head at 2/3 of training ---
             if untie_at_frac > 0.0 and step == int(steps * untie_at_frac):
-                if hasattr(model.embed, "weight") and model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr():
-                    model.lm_head.weight = nn.Parameter(model.lm_head.weight.data.clone())
+                if (
+                    hasattr(model.embed, "weight")
+                    and model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr()
+                ):
+                    model.lm_head.weight = nn.Parameter(
+                        model.lm_head.weight.data.clone()
+                    )
                     model.lm_head.weight.data.zero_()
                     lr_val = adam_lr * lm_head_lr_mul
                     wd_val = adam_weight_decay * lm_head_wd_mul
-                    adam_opt.add_param_group({
-                        "params": [model.lm_head.weight],
-                        "lr": lr_val,
-                        "weight_decay": wd_val,
-                    })
+                    adam_opt.add_param_group(
+                        {
+                            "params": [model.lm_head.weight],
+                            "lr": lr_val,
+                            "weight_decay": wd_val,
+                            "betas": (0.5, 0.95),
+                        }
+                    )
 
             tokens_trained += effective_batch * current_block
             with torch.no_grad():
                 loss_detached = loss_weighted / float(effective_batch)
-                ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
-                    ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                ema_loss_tensor = (
+                    loss_detached
+                    if ema_loss_tensor is None
+                    else (
+                        ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                    )
                 )
             completed = step + 1
             if step == 0 or completed == steps or completed % log_every == 0:
                 ema_loss = ema_loss_tensor.item()
                 elapsed = time.time() - start_time
                 tokens_per_sec = tokens_trained / elapsed if elapsed > 0 else 0.0
-                eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+                eta_seconds = (
+                    (elapsed / completed) * (steps - completed)
+                    if completed > 0
+                    else 0.0
+                )
                 pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
                 pbar.write(
                     f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
@@ -725,13 +963,22 @@ def train_and_eval_student(
 
     # Flush any remaining partial accumulation cycle so embed/head grads
     # from the last incomplete cycle are not silently dropped.
-    if training_recipe != "record_01_adamw" and grad_accum_embed_head_steps > 1 and accum_buffer_embed_head is not None:
+    if (
+        training_recipe != "record_01_adamw"
+        and grad_accum_embed_head_steps > 1
+        and accum_buffer_embed_head is not None
+    ):
         for name, p in model.named_parameters():
-            if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+            if (
+                name.startswith("embed.")
+                or name.startswith("lm_head.")
+                or name.startswith("multi_heads.")
+            ):
                 if id(p) in accum_buffer_embed_head:
                     p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
         step_speedrun_optimizers(
-            muon_opt, adam_opt,
+            muon_opt,
+            adam_opt,
             step=step,
             muon_momentum=muon_momentum,
             adam_on_odd_steps=adam_on_odd_steps,
@@ -798,7 +1045,13 @@ def averaged_train_and_eval(
         accs.append(acc)
         total_flops += 6.0 * n_params * tokens_trained
         total_tokens += tokens_trained
-    return sum(losses) / len(losses), sum(accs) / len(accs), total_flops, total_tokens, n_params
+    return (
+        sum(losses) / len(losses),
+        sum(accs) / len(accs),
+        total_flops,
+        total_tokens,
+        n_params,
+    )
 
 
 _TRAINING_COMPONENTS = (
@@ -806,8 +1059,13 @@ _TRAINING_COMPONENTS = (
     plan_train_windows,
     encode_document_tokens,
     plan_eos_aligned_windows,
+    window_document_ids,
+    build_document_attn_mask,
+    batch_document_attn_mask,
     shuffled_window_starts,
     make_seq_len_schedule,
+    _is_cuda_device,
+    prepare_student_model_dtype,
     _microbatch_ranges,
     _scaled_microbatch_loss,
     _score_hidden_chunked,

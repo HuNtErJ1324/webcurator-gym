@@ -174,7 +174,7 @@ class ProxyStudentConfig(BaseModel):
     training_recipe: Literal["speedrun_muon", "record_01_adamw"] = "speedrun_muon"
     # Classic Muon (2-D block weights)
     muon_lr: float = Field(default=0.023, gt=0.0, le=1.0)
-    muon_weight_decay: float = Field(default=0.05, ge=0.0, le=10.0)
+    muon_weight_decay: float = Field(default=1.2, ge=0.0, le=10.0)
     muon_momentum_min: float = Field(default=0.85, gt=0.0, lt=1.0)
     muon_momentum_max: float = Field(default=0.95, gt=0.0, lt=1.0)
     muon_warmup_steps: int | None = Field(default=None, ge=0)
@@ -220,8 +220,9 @@ class ProxyStudentConfig(BaseModel):
     adam_beta1: float = Field(default=0.9, gt=0.0, lt=1.0)
     adam_beta2: float = Field(default=0.95, gt=0.0, lt=1.0)
     record_adam_eps: float = Field(default=1e-8, gt=0.0, le=1e-1)
-    # Global-norm gradient clip applied before every ``opt.step()`` (record_01: 1.0).
-    grad_clip: float = Field(default=1.0, ge=0.0)
+    # Global-norm gradient clip applied before every optimizer update.
+    # Default 0.0 disables clipping (modern speedrun recipe); set >0 to enable.
+    grad_clip: float = Field(default=0.0, ge=0.0)
     # LR warmup length (steps). ``None`` (default) derives a sensible fraction of the
     # run, ``min(256, max(1, effective_steps // 10))``; an explicit value is clamped
     # to the run length. See ``effective_warmup_steps``.
@@ -253,9 +254,9 @@ class ProxyStudentConfig(BaseModel):
     exp_residual_decay: float | None = Field(default=None, gt=0.0, le=1.0)
     # Multi-token prediction (number of extra future-token heads)
     multi_token_pred: int = Field(default=0, ge=0, le=8)
-    # Encode each source document with GPT-2 EOT/BOS and plan windows strictly
-    # inside the resulting document ranges. Disable only for legacy flat-stream
-    # compatibility.
+    # Encode each source document with GPT-2 EOT/BOS and plan packed windows:
+    # long docs keep intra-document starts; short docs pack into fixed blocks.
+    # Disable only for legacy flat-stream compatibility.
     eos_aligned_batches: bool = True
     # Canonical per-document token cap, including the leading EOT/BOS token.
     # Historical spellings remain accepted by the compatibility validator below.
@@ -268,8 +269,8 @@ class ProxyStudentConfig(BaseModel):
     untie_at_frac: float = Field(default=0.0, ge=0.0, le=1.0)
     # Cautious weight decay tied to LR
     cautious_wd: bool = False
-    # NorMuon (normalized Muon updates)
-    nor_muon: bool = False
+    # NorMuon (normalized Muon updates); on by default to match modern speedrun.
+    nor_muon: bool = True
     # Polar Express (ONI-based orthogonalization in Muon)
     polar_express: bool = False
     # --- real-trainer backend selection (only used when use_real_trainer) -----
@@ -539,9 +540,7 @@ class CuratorConfig(BaseModel):
         ),
     )
     allow_local_sources: bool = True
-    max_local_source_bytes: int = Field(
-        default=33_554_432, ge=1, le=1_073_741_824
-    )
+    max_local_source_bytes: int = Field(default=33_554_432, ge=1, le=1_073_741_824)
 
     # Reward coefficients: R = a1*Perf_scaled_to_target - l1*Leakage
     alpha_perf: float = Field(default=1.0, ge=0.0)
@@ -603,7 +602,6 @@ class CuratorConfig(BaseModel):
         exp = self.perf_scaling_exponent
         if not math.isfinite(exp) or exp <= 0:
             raise ValueError(
-                "perf_scaling_exponent must be finite and > 0 "
-                f"(got {exp})"
+                f"perf_scaling_exponent must be finite and > 0 (got {exp})"
             )
         return self

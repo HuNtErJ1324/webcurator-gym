@@ -16,6 +16,7 @@ from pretrain_data_curator.student_optimizer import (
     build_speedrun_optimizers,
     classify_speedrun_params,
     get_muon_momentum,
+    init_speedrun_weights,
     lookup_batch_stage,
     schedule_lr_multiplier,
     step_speedrun_optimizers,
@@ -53,8 +54,12 @@ def test_batch_schedule_stages_and_cooldown():
 
 
 def test_muon_momentum_warmup_and_cooldown():
-    assert get_muon_momentum(0, 100, warmup_steps=10, cooldown_steps=10) == pytest.approx(0.85)
-    assert get_muon_momentum(50, 100, warmup_steps=10, cooldown_steps=10) == pytest.approx(0.95)
+    assert get_muon_momentum(
+        0, 100, warmup_steps=10, cooldown_steps=10
+    ) == pytest.approx(0.85)
+    assert get_muon_momentum(
+        50, 100, warmup_steps=10, cooldown_steps=10
+    ) == pytest.approx(0.95)
     assert get_muon_momentum(95, 100, warmup_steps=10, cooldown_steps=10) < 0.95
 
 
@@ -64,7 +69,9 @@ def test_classify_and_step_speedrun_optimizers():
     ).build()
     muon_params, adam = classify_speedrun_params(model)
     assert muon_params
-    assert adam["embed"] and adam["lm_head"] and adam["value_embeds"] and adam["scalars"]
+    assert (
+        adam["embed"] and adam["lm_head"] and adam["value_embeds"] and adam["scalars"]
+    )
     muon_opt, adam_opt = build_speedrun_optimizers(model)
     x = torch.randint(0, 64, (2, 8))
     loss = model(x).sum()
@@ -73,8 +80,8 @@ def test_classify_and_step_speedrun_optimizers():
     assert isinstance(muon_opt, Muon)
 
 
-
 # --- portable optimizer features ---
+
 
 def test_polar_express_orthogonalizes_2d():
     g = torch.randn(8, 4)
@@ -134,7 +141,9 @@ def test_polar_express_muon_optimizer_steps():
 
 def test_build_speedrun_optimizers_with_nor_muon():
     model = GPT(vocab_size=64, num_layers=2, model_dim=32, num_heads=2)
-    muon_opt, adam_opt = build_speedrun_optimizers(model, nor_muon=True, polar_express=False)
+    muon_opt, adam_opt = build_speedrun_optimizers(
+        model, nor_muon=True, polar_express=False
+    )
     assert isinstance(muon_opt, Muon)
     for g in muon_opt.param_groups:
         assert g.get("nor_muon", False) is True
@@ -162,7 +171,9 @@ def test_step_speedrun_cautious_wd():
     x = torch.randint(0, 64, (2, 8))
     loss = model(x).sum()
     loss.backward()
-    step_speedrun_optimizers(muon_opt, adam_opt, step=1, muon_momentum=0.95, cautious_wd=True, lr_scale=0.5)
+    step_speedrun_optimizers(
+        muon_opt, adam_opt, step=1, muon_momentum=0.95, cautious_wd=True, lr_scale=0.5
+    )
 
 
 def test_step_speedrun_optimizers_reports_whether_adam_stepped():
@@ -177,7 +188,9 @@ def test_step_speedrun_optimizers_reports_whether_adam_stepped():
         x = torch.randint(0, 64, (2, 8))
         loss = model(x).sum()
         loss.backward()
-        return step_speedrun_optimizers(muon_opt, adam_opt, step=step, muon_momentum=0.95, **kw)
+        return step_speedrun_optimizers(
+            muon_opt, adam_opt, step=step, muon_momentum=0.95, **kw
+        )
 
     # Even step, default adam_on_odd_steps=True: Adam is skipped.
     assert run_step(0) is False
@@ -280,8 +293,58 @@ def test_sandbox_script_embeds_optimizer_recipe_verbatim():
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             try:
                 exec(compile(ast.Module([node], []), "<script>", "exec"), namespace)
-            except Exception:  # optional/heavy imports (torch, tqdm) are irrelevant here
+            except (
+                Exception
+            ):  # optional/heavy imports (torch, tqdm) are irrelevant here
                 pass
         elif isinstance(node, ast.ClassDef) and node.name == "BatchScheduleStage":
             exec(compile(ast.Module([node], []), "<script>", "exec"), namespace)
     assert "BatchScheduleStage" in namespace  # decorator resolved at runtime
+
+
+def test_build_speedrun_optimizers_defaults_and_per_group_betas():
+    model = StudentModelConfig(
+        model_dim=32, num_layers=2, num_heads=2, vocab_size=64, num_value_embeds=1
+    ).build()
+    muon_opt, adam_opt = build_speedrun_optimizers(model)
+    assert muon_opt.param_groups[0]["weight_decay"] == pytest.approx(1.2)
+    assert all(g.get("nor_muon", False) is True for g in muon_opt.param_groups)
+    betas = {tuple(g["betas"]) for g in adam_opt.param_groups}
+    assert (0.5, 0.95) in betas
+    assert (0.75, 0.95) in betas
+    assert (0.9, 0.99) in betas
+    # Group order is embed, lm_head, value_embeds, scalars when all present.
+    assert adam_opt.param_groups[0]["betas"] == (0.5, 0.95)
+    assert adam_opt.param_groups[1]["betas"] == (0.5, 0.95)
+    assert adam_opt.param_groups[2]["betas"] == (0.75, 0.95)
+    assert adam_opt.param_groups[3]["betas"] == (0.9, 0.99)
+
+
+def test_muon_momentum_buffer_is_float32_for_bfloat16_params():
+    param = torch.nn.Parameter(torch.randn(8, 4, dtype=torch.bfloat16))
+    opt = Muon([param], lr=0.02, weight_decay=0.0, nor_muon=True)
+    param.grad = torch.randn_like(param)
+    opt.step(momentum=0.95)
+    state = opt.state[param]
+    assert state["momentum_buffer"].dtype == torch.float32
+    assert param.dtype == torch.bfloat16
+
+
+def test_init_speedrun_weights_lm_head_proj_and_value_embeds():
+    torch.manual_seed(0)
+    model = StudentModelConfig(
+        model_dim=32, num_layers=2, num_heads=2, vocab_size=64, num_value_embeds=1
+    ).build()
+    # Force a known pre-init so post-init asserts are meaningful.
+    with torch.no_grad():
+        model.lm_head.weight.fill_(1.0)
+        model.blocks[0].attn.proj.weight.fill_(1.0)
+        model.value_embeds.embed[0].weight.fill_(1.0)
+    init_speedrun_weights(model)
+    assert model.blocks[0].attn.proj.weight.abs().sum().item() == 0.0
+    assert model.lm_head.weight.abs().sum().item() > 0.0
+    assert model.lm_head.weight.std().item() == pytest.approx(
+        0.005, rel=0.35, abs=0.002
+    )
+    ve_std = model.value_embeds.embed[0].weight.std().item()
+    assert ve_std == pytest.approx(0.01, rel=0.35, abs=0.004)

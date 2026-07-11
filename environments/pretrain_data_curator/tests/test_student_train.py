@@ -25,13 +25,17 @@ from pretrain_data_curator.student_model import StudentModelConfig
 from pretrain_data_curator.student_train import (
     _TRAINING_COMPONENTS,
     averaged_train_and_eval,
+    batch_document_attn_mask,
+    build_document_attn_mask,
     encode_document_tokens,
     lr_at_step,
     plan_train_windows,
     plan_eos_aligned_windows,
+    prepare_student_model_dtype,
     shuffled_window_starts,
     make_seq_len_schedule,
     train_and_eval_student,
+    window_document_ids,
 )
 from pretrain_data_curator.trainer import NANOGPT_TRAIN_SCRIPT
 
@@ -90,7 +94,9 @@ def test_lr_at_step_last_executed_step_hits_floor_exactly(total, warm):
     # point: it FAILS against the pre-fix `max(1, total-warmup)` denominator, which
     # left short runs at e.g. 0.325*base (5,2) or never decaying at all (2,1)/(1,0).
     base, floor = 0.7, 0.1
-    assert lr_at_step(total - 1, total, warm, base, floor) == pytest.approx(base * floor)
+    assert lr_at_step(total - 1, total, warm, base, floor) == pytest.approx(
+        base * floor
+    )
 
 
 @pytest.mark.parametrize("total, warm", [(5, 2), (64, 8)])
@@ -170,10 +176,24 @@ def test_batching_draws_each_contiguous_window_before_repeating(monkeypatch):
     # pass. Training runs entirely BEFORE eval, so the first len(starts) captured
     # examples are the training draws.
     train_and_eval_student(
-        model, data, data, block_size=block, batch_size=batch, steps=len(starts),
-        base_lr=1e-3, warmup_steps=2, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=block,
+        batch_size=batch,
+        steps=len(starts),
+        base_lr=1e-3,
+        warmup_steps=2,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
     # Each training step stacks the inputs (window start s) then the targets
     # (start s+1), so the input-window starts are the even-indexed captures of the
@@ -221,10 +241,24 @@ def test_recipe_applies_adamw_betas_weight_decay_grad_clip_and_schedule(monkeypa
     gen = torch.Generator().manual_seed(0)
     steps = 5
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=4, steps=steps,
-        base_lr=1e-3, warmup_steps=2, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=4,
+        steps=steps,
+        base_lr=1e-3,
+        warmup_steps=2,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
 
     # AdamW built with the record_01 betas/eps + decoupled weight decay (not ignored).
@@ -255,10 +289,24 @@ def test_grad_clip_zero_skips_clipping(monkeypatch):
     data = torch.randint(0, V, (100,))
     gen = torch.Generator().manual_seed(0)
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=3,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=0.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=0.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
     assert clip_calls == []
 
@@ -282,10 +330,24 @@ def test_averaged_train_and_eval_averages_loss_and_sums_flops(monkeypatch):
     monkeypatch.setattr(st, "train_and_eval_student", fake_train)
     data = torch.randint(0, V, (50,))
     loss, acc, flops, tokens, n_params = st.averaged_train_and_eval(
-        cfg.build, data, data, n_runs=3, base_seed=0, device="cpu",
-        block_size=8, batch_size=4, steps=1, base_lr=1e-3, warmup_steps=1,
-        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
-        lr_min_ratio=0.1, vocab_size=V,
+        cfg.build,
+        data,
+        data,
+        n_runs=3,
+        base_seed=0,
+        device="cpu",
+        block_size=8,
+        batch_size=4,
+        steps=1,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
     )
     assert calls["i"] == 3  # ran every requested run
     assert loss == pytest.approx(sum(seq) / 3)  # loss AVERAGED across runs
@@ -311,10 +373,24 @@ def test_averaged_train_and_eval_nonfinite_run_collapses_to_sentinel(monkeypatch
     monkeypatch.setattr(st, "train_and_eval_student", fake_train)
     data = torch.randint(0, V, (50,))
     result = st.averaged_train_and_eval(
-        cfg.build, data, data, n_runs=3, base_seed=0, device="cpu",
-        block_size=8, batch_size=4, steps=1, base_lr=1e-3, warmup_steps=1,
-        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
-        lr_min_ratio=0.1, vocab_size=V,
+        cfg.build,
+        data,
+        data,
+        n_runs=3,
+        base_seed=0,
+        device="cpu",
+        block_size=8,
+        batch_size=4,
+        steps=1,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
     )
     # A single non-finite run collapses the WHOLE result to the infinite-loss
     # sentinel (perf -> 0), and short-circuits before the remaining runs.
@@ -337,10 +413,24 @@ def test_n_train_runs_one_equals_a_single_run(monkeypatch):
     monkeypatch.setattr(st, "train_and_eval_student", fake_train)
     data = torch.randint(0, V, (50,))
     loss, acc, flops, tokens, n_params = st.averaged_train_and_eval(
-        cfg.build, data, data, n_runs=1, base_seed=0, device="cpu",
-        block_size=8, batch_size=4, steps=1, base_lr=1e-3, warmup_steps=1,
-        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
-        lr_min_ratio=0.1, vocab_size=V,
+        cfg.build,
+        data,
+        data,
+        n_runs=1,
+        base_seed=0,
+        device="cpu",
+        block_size=8,
+        batch_size=4,
+        steps=1,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
     )
     assert calls["i"] == 1
     assert (loss, acc, tokens) == (3.0, 0.25, 100)
@@ -372,18 +462,38 @@ def test_clean_corpus_yields_lower_proxy_val_loss_than_dirty():
     val_data = _char_tensor(held_out, stoi)
     cfg = _tiny_cfg(vocab_size)
     hparams = dict(
-        block_size=16, batch_size=8, steps=24, base_lr=3e-3, warmup_steps=4,
-        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
-        lr_min_ratio=0.1, vocab_size=vocab_size, training_recipe="record_01_adamw",
+        block_size=16,
+        batch_size=8,
+        steps=24,
+        base_lr=3e-3,
+        warmup_steps=4,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=vocab_size,
+        training_recipe="record_01_adamw",
     )
 
     clean_loss, *_ = averaged_train_and_eval(
-        cfg.build, _char_tensor(clean, stoi), val_data,
-        n_runs=1, base_seed=0, device="cpu", **hparams,
+        cfg.build,
+        _char_tensor(clean, stoi),
+        val_data,
+        n_runs=1,
+        base_seed=0,
+        device="cpu",
+        **hparams,
     )
     dirty_loss, *_ = averaged_train_and_eval(
-        cfg.build, _char_tensor(dirty, stoi), val_data,
-        n_runs=1, base_seed=0, device="cpu", **hparams,
+        cfg.build,
+        _char_tensor(dirty, stoi),
+        val_data,
+        n_runs=1,
+        base_seed=0,
+        device="cpu",
+        **hparams,
     )
     assert math.isfinite(clean_loss) and math.isfinite(dirty_loss)
     # Clean training generalizes to the held-out clean stream; dirty training does
@@ -428,10 +538,24 @@ def test_discriminative_signal_requires_contiguous_recipe_not_replacement(monkey
     gen = torch.Generator().manual_seed(0)
     steps = epochs * len(starts)
     train_and_eval_student(
-        model, data, data, block_size=block, batch_size=batch, steps=steps,
-        base_lr=1e-3, warmup_steps=2, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=block,
+        batch_size=batch,
+        steps=steps,
+        base_lr=1e-3,
+        warmup_steps=2,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
     # Training (steps draws) runs entirely BEFORE the val pass and stacks inputs then
     # targets each step, so the input-window starts are the even-indexed captures of
@@ -455,10 +579,13 @@ def test_discriminative_signal_requires_contiguous_recipe_not_replacement(monkey
     last_offset = n - block - 1
     replacement_starts = [rng.randint(0, last_offset) for _ in range(steps)]
     assert any(s % block != 0 for s in replacement_starts)  # not block-aligned
-    assert collections.Counter(replacement_starts) != {s: epochs for s in starts}  # not uniform
+    assert collections.Counter(replacement_starts) != {
+        s: epochs for s in starts
+    }  # not uniform
 
 
 # --- (8) document-aware portable training feature tests ---
+
 
 def test_real_document_tokenization_preserves_boundaries():
     enc = tiktoken.get_encoding("gpt2")
@@ -486,7 +613,10 @@ def test_eos_aligned_windows_never_cross_document_boundaries():
     starts = plan_eos_aligned_windows(65, 8, ranges)
     assert starts == [0, 8, 20, 29, 37, 45, 53]
     assert all(
-        any(start >= doc_start and start + 8 + 1 <= doc_end for doc_start, doc_end in ranges)
+        any(
+            start >= doc_start and start + 8 + 1 <= doc_end
+            for doc_start, doc_end in ranges
+        )
         for start in starts
     )
 
@@ -495,12 +625,123 @@ def test_eos_aligned_windows_reserve_multi_token_lookahead():
     ranges = [(0, 12), (12, 24)]
     assert plan_eos_aligned_windows(24, 8, ranges, lookahead=1) == [0, 12]
     assert plan_eos_aligned_windows(24, 8, ranges, lookahead=4) == [0, 12]
-    assert plan_eos_aligned_windows(22, 8, [(0, 10), (10, 22)], lookahead=4) == [10]
+    # First doc is short for lookahead=4 (need=12); one sequential pack covers it.
+    # The following doc has no residual uncovered span long enough for another window.
+    assert plan_eos_aligned_windows(22, 8, [(0, 10), (10, 22)], lookahead=4) == [0]
 
 
 def test_eos_aligned_windows_have_no_flat_fallback():
     assert plan_eos_aligned_windows(100, 16, []) == []
-    assert plan_eos_aligned_windows(10, 8, [(0, 8), (8, 10)]) == []
+    # Even with packing, the stream is shorter than block+lookahead.
+    assert plan_eos_aligned_windows(8, 8, [(0, 5), (5, 8)]) == []
+
+
+def test_eos_aligned_windows_reject_gaps():
+    with pytest.raises(ValueError, match="contiguous"):
+        plan_eos_aligned_windows(20, 8, [(0, 5), (7, 20)])
+
+
+def test_packed_windows_include_short_documents_without_overlap():
+    ranges = [(0, 5), (5, 10), (10, 28)]
+    starts = plan_eos_aligned_windows(28, 8, ranges)
+    # One sequential pack from the first short doc, then long-doc strides.
+    assert starts == [0, 10, 18]
+    assert 5 not in starts  # no overlapping second short-doc start
+
+
+def test_packed_window_targets_follow_flat_shift_across_eot():
+    """Speedrun contract: targets are the flat next-token shift (may be next EOT)."""
+    enc = tiktoken.get_encoding("gpt2")
+    documents = ["aa", "bb", "long enough document text here"]
+    token_ids, ranges = encode_document_tokens(documents, enc)
+    data = torch.tensor(token_ids, dtype=torch.long)
+    starts = plan_eos_aligned_windows(len(data), 8, ranges)
+    assert 0 in starts
+    x = data[0:8]
+    y = data[1:9]
+    # First document is shorter than the window, so some target is past its end.
+    first_end = ranges[0][1]
+    assert first_end < 9
+    assert int(y[first_end - 1].item()) == 50256  # leading EOT of the next doc
+    assert int(x[0].item()) == 50256
+
+
+def test_packed_attention_mask_keeps_same_document_causal_keys():
+    ranges = [(0, 5), (5, 20)]
+    mask = batch_document_attn_mask([0], 8, ranges, device="cpu")
+    assert mask is not None
+    assert mask.shape == (1, 8, 8)
+    # True = may participate: cross-document key is masked out.
+    assert bool(mask[0, 5, 0].item()) is False
+    # Same-document past key may participate.
+    assert bool(mask[0, 4, 0].item()) is True
+    # Future keys are masked out.
+    assert bool(mask[0, 0, 1].item()) is False
+    # Single-document windows skip the mask path entirely.
+    assert batch_document_attn_mask([5], 8, ranges, device="cpu") is None
+
+
+def test_document_gap_ids_do_not_attend_each_other():
+    doc_ids = torch.tensor([[0, 0, -1, -1, 1]])
+    mask = build_document_attn_mask(doc_ids)
+    # Gap positions cannot attend to each other.
+    assert bool(mask[0, 2, 3].item()) is False
+    assert bool(mask[0, 3, 2].item()) is False
+    # Self-attention remains available for gaps.
+    assert bool(mask[0, 2, 2].item()) is True
+    assert bool(mask[0, 3, 3].item()) is True
+
+
+def test_packed_planning_is_fixed_seed_deterministic():
+    ranges = [(0, 4), (4, 8), (8, 40), (40, 80)]
+    starts = plan_eos_aligned_windows(80, 8, ranges)
+    assert starts == [0, 9, 17, 25, 40, 48, 56, 64]
+    first = shuffled_window_starts(starts, torch.Generator().manual_seed(123))
+    second = shuffled_window_starts(starts, torch.Generator().manual_seed(123))
+    different = shuffled_window_starts(starts, torch.Generator().manual_seed(124))
+    assert first == second
+    assert first != different
+
+
+def test_packed_short_documents_contribute_trained_tokens():
+    V = 16
+    model = _tiny_cfg(V).build()
+    # Three short docs that only become usable via packing.
+    data = torch.arange(24) % V
+    ranges = [(0, 6), (6, 12), (12, 24)]
+    starts = plan_eos_aligned_windows(24, 8, ranges)
+    assert starts == [0, 12]  # one pack, then residual long-enough third doc
+    gen = torch.Generator().manual_seed(0)
+    loss, acc, tokens = train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
+        document_ranges=ranges,
+        batch_schedule_enabled=False,
+    )
+    assert math.isfinite(loss)
+    assert tokens == 3 * 2 * 8
+
+
+def test_legacy_flat_windows_ignore_document_ranges_when_disabled():
+    assert plan_train_windows(20, 8) == [0, 8]
+    # plan_eos with empty ranges still refuses a flat fallback.
+    assert plan_eos_aligned_windows(20, 8, []) == []
 
 
 def test_eos_aligned_window_selection_is_fixed_seed_deterministic():
@@ -510,6 +751,13 @@ def test_eos_aligned_window_selection_is_fixed_seed_deterministic():
     different = shuffled_window_starts(starts, torch.Generator().manual_seed(124))
     assert first == second
     assert first != different
+
+
+def test_window_document_ids_cover_packed_span():
+    ids = window_document_ids(0, 8, [(0, 5), (5, 20)])
+    assert ids.tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    mask = build_document_attn_mask(ids.unsqueeze(0))
+    assert mask.shape == (1, 8, 8)
 
 
 def test_seq_len_schedule_warmup():
@@ -538,10 +786,24 @@ def test_training_with_eos_aligned_windows():
     data = torch.randint(0, V, (120,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=3,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
         document_ranges=[(0, 30), (30, 60), (60, 120)],
     )
     assert math.isfinite(loss)
@@ -592,10 +854,24 @@ def test_training_with_seq_len_schedule():
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=16, batch_size=2, steps=5,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=16,
+        batch_size=2,
+        steps=5,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
         seq_len_schedule=True,
     )
     assert math.isfinite(loss)
@@ -611,10 +887,24 @@ def test_training_with_multi_token_pred():
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=5,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=5,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
         multi_token_pred=2,
     )
     assert math.isfinite(loss)
@@ -625,15 +915,30 @@ def test_training_with_multi_token_pred_and_speedrun():
     """Multi-token prediction must also work under the speedrun_muon recipe."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=5,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=5,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         multi_token_pred=2,
     )
     assert math.isfinite(loss)
@@ -643,16 +948,32 @@ def test_training_with_multi_token_pred_and_speedrun():
 def test_full_training_with_speedrun_and_nor_muon():
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (100,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=4,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
-        nor_muon=True, cautious_wd=True,
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=4,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
+        nor_muon=True,
+        cautious_wd=True,
     )
     assert math.isfinite(loss)
     assert tokens > 0
@@ -663,7 +984,9 @@ def test_max_document_tokens_rejects_instead_of_splitting_a_document():
     with pytest.raises(ValueError, match="documents are never truncated"):
         encode_document_tokens(["one " * 100], enc, max_document_tokens=32)
 
-    token_ids, ranges = encode_document_tokens(["", "short"], enc, max_document_tokens=32)
+    token_ids, ranges = encode_document_tokens(
+        ["", "short"], enc, max_document_tokens=32
+    )
     assert token_ids == [50256, 50256, *enc.encode_ordinary("short")]
     assert ranges == [(0, 1), (1, len(token_ids))]
 
@@ -675,7 +998,10 @@ def test_multi_token_pred_targets_shifted_correctly(monkeypatch):
 
     V = 64
     from pretrain_data_curator.student_model import GPT
-    model = GPT(vocab_size=V, num_layers=2, model_dim=32, num_heads=2, multi_token_pred=2)
+
+    model = GPT(
+        vocab_size=V, num_layers=2, model_dim=32, num_heads=2, multi_token_pred=2
+    )
 
     # Create a predictable sequence (values modulo vocab so all tokens are valid)
     data = torch.arange(200, dtype=torch.long) % V
@@ -692,10 +1018,24 @@ def test_multi_token_pred_targets_shifted_correctly(monkeypatch):
     monkeypatch.setattr(st, "_compute_multi_token_loss", spy_mt_loss)
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=3,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         multi_token_pred=2,
     )
 
@@ -712,6 +1052,7 @@ def test_untie_embed_lm_head_at_frac(monkeypatch):
 
     V = 32
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (200,))
@@ -720,16 +1061,28 @@ def test_untie_embed_lm_head_at_frac(monkeypatch):
     def spy_train(model, train_data, val_data, **kw):
         # After init_speedrun_weights and weight tying, before training starts:
         # The real train_and_eval_student does the tying. We'll check after.
-        result = st.train_and_eval_student(
-            model, train_data, val_data, **kw
-        )
+        result = st.train_and_eval_student(model, train_data, val_data, **kw)
         return result
 
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         untie_at_frac=0.5,  # untie at step 4 (8 * 0.5 = 4)
     )
     # After training with untie_at_frac, the weights should be separate
@@ -744,16 +1097,31 @@ def test_untie_does_not_tie_when_frac_zero():
     so embed and lm_head have separate weight tensors."""
     V = 32
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
 
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=4,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=4,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         untie_at_frac=0.0,  # no tying/untieing
     )
     # With untie_at_frac=0.0, weight tying is skipped; weights stay separate.
@@ -765,15 +1133,30 @@ def test_untie_does_not_tie_when_frac_zero():
 def test_full_training_with_polar_express():
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (100,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=4,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=4,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         polar_express=True,
     )
     assert math.isfinite(loss)
@@ -788,16 +1171,37 @@ def test_untie_at_frac_with_bigram_hash_embed_does_not_crash():
     model.embed.weight (BigramHashEmbedding has no .weight attribute)."""
     V = 32
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
-    cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V,
-              num_value_embeds=1, bigram_hash_embed=True)
+
+    cfg = SMC(
+        model_dim=32,
+        num_layers=2,
+        num_heads=2,
+        vocab_size=V,
+        num_value_embeds=1,
+        bigram_hash_embed=True,
+    )
     model = cfg.build()
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         untie_at_frac=0.5,
     )
     # The lm_head must be tracked by the optimizer after untie so loss is finite.
@@ -810,6 +1214,7 @@ def test_untie_at_frac_registers_lm_head_in_optimizer(monkeypatch):
     """After untie the new lm_head.weight must be registered in AdamW."""
     V = 32
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (200,))
@@ -827,10 +1232,24 @@ def test_untie_at_frac_registers_lm_head_in_optimizer(monkeypatch):
 
     monkeypatch.setattr(torch.optim.AdamW, "add_param_group", spy_add_param_group)
     st.train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         untie_at_frac=0.5,
     )
     assert id(model.lm_head.weight) in lm_head_param_ids
@@ -841,16 +1260,31 @@ def test_untied_lm_head_weight_actually_updates():
     training steps (proves it is registered in the optimizer and stepped)."""
     V = 32
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         untie_at_frac=0.5,
     )
     # After the untie (step 4) the lm_head weight is zeroed, but subsequent
@@ -866,15 +1300,30 @@ def test_grad_accum_embed_head_finite_and_produces_loss():
     non-zero tokens (smoke test: no crash, the loop actually runs)."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (300,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
     assert math.isfinite(loss)
@@ -886,6 +1335,7 @@ def test_grad_accum_embed_head_embed_and_lm_head_weights_update():
     initial values (proving accumulated grads are applied)."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (300,))
@@ -895,10 +1345,24 @@ def test_grad_accum_embed_head_embed_and_lm_head_weights_update():
     pre_lm_head = model.lm_head.weight.data.clone()
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
     # embed and lm_head weights must differ from zero-init (they were trained)
@@ -911,15 +1375,30 @@ def test_grad_accum_embed_head_with_untie_at_frac():
     produce finite loss (tests both blockers together)."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (300,))
     gen = torch.Generator().manual_seed(0)
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=10,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=10,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
         untie_at_frac=0.5,
     )
@@ -934,6 +1413,7 @@ def test_grad_accum_embed_head_no_duplicate_first_step_counting(monkeypatch):
     produce a fresh single-batch gradient, not a growing accumulation."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (500,))
@@ -951,10 +1431,24 @@ def test_grad_accum_embed_head_no_duplicate_first_step_counting(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "backward", spy_backward)
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
 
@@ -980,6 +1474,7 @@ def test_grad_accum_embed_head_muon_grads_fresh_per_micro_step(monkeypatch):
 
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (500,))
@@ -1005,10 +1500,24 @@ def test_grad_accum_embed_head_muon_grads_fresh_per_micro_step(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "backward", spy_backward)
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
 
@@ -1037,21 +1546,38 @@ def test_grad_accum_embed_head_clip_called(monkeypatch):
 
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (300,))
     gen = torch.Generator().manual_seed(0)
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
 
     # Muon clips at all six updates; Adam clips only at its three updates.
-    assert len(clip_calls) == 9, f"Expected 9 clip calls, got {len(clip_calls)}: {clip_calls}"
+    assert len(clip_calls) == 9, (
+        f"Expected 9 clip calls, got {len(clip_calls)}: {clip_calls}"
+    )
     assert all(c == 1.0 for c in clip_calls)
 
 
@@ -1062,6 +1588,7 @@ def test_grad_accum_embed_head_non_embed_adam_bounded(monkeypatch):
 
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (500,))
@@ -1076,10 +1603,24 @@ def test_grad_accum_embed_head_non_embed_adam_bounded(monkeypatch):
             pre_weights[name] = p.data.clone()
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
 
@@ -1103,6 +1644,7 @@ def test_grad_accum_embed_head_produces_correct_weight_changes(monkeypatch):
     stepping frequency), but a guard against catastrophic corruption."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
 
     model_with = cfg.build()
@@ -1112,22 +1654,53 @@ def test_grad_accum_embed_head_produces_correct_weight_changes(monkeypatch):
     gen_without = torch.Generator().manual_seed(42)
 
     # Record initial weights (same init for both, same seed)
-    pre_with = {n: p.data.clone() for n, p in model_with.named_parameters()
-                if n.startswith("embed.") or n.startswith("lm_head.")}
+    pre_with = {
+        n: p.data.clone()
+        for n, p in model_with.named_parameters()
+        if n.startswith("embed.") or n.startswith("lm_head.")
+    }
 
     train_and_eval_student(
-        model_with, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=2, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen_with, training_recipe="speedrun_muon",
+        model_with,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=2,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen_with,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
 
     train_and_eval_student(
-        model_without, data, data, block_size=8, batch_size=2, steps=8,
-        base_lr=1e-3, warmup_steps=2, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen_without, training_recipe="speedrun_muon",
+        model_without,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=2,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen_without,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=1,
     )
 
@@ -1136,8 +1709,12 @@ def test_grad_accum_embed_head_produces_correct_weight_changes(monkeypatch):
         p_with = dict(model_with.named_parameters())[name]
         p_without = dict(model_without.named_parameters())[name]
         # Both changed (not zero).
-        assert not torch.equal(p_with.data, pre_with[name]), f"{name} unchanged with accum"
-        assert not torch.equal(p_without.data, pre_with[name]), f"{name} unchanged without accum"
+        assert not torch.equal(p_with.data, pre_with[name]), (
+            f"{name} unchanged with accum"
+        )
+        assert not torch.equal(p_without.data, pre_with[name]), (
+            f"{name} unchanged without accum"
+        )
         # Embed/head weight delta norms should be same order of magnitude
         # (neither is zero while the other is nonzero).
         delta_with = (p_with.data - pre_with[name]).norm().item()
@@ -1147,6 +1724,35 @@ def test_grad_accum_embed_head_produces_correct_weight_changes(monkeypatch):
 
 
 # --- (6) single source of truth: verbatim recipe embedded in the script ------
+
+
+def test_prepare_student_model_dtype_cpu_noop():
+    model = _tiny_cfg(32).build()
+    q_before = model.blocks[0].attn.q.weight.data.clone()
+    prepare_student_model_dtype(model, "cpu")
+    assert model.blocks[0].attn.q.weight.dtype == torch.float32
+    assert model.embed.weight.dtype == torch.float32
+    assert model.lm_head.weight.dtype == torch.float32
+    assert torch.equal(model.blocks[0].attn.q.weight.data, q_before)
+
+
+def test_prepare_student_model_dtype_cuda_casts_muon_keeps_adam_fp32(monkeypatch):
+    """Exercise CUDA dtype policy without requiring a GPU.
+
+    Mock ``_is_cuda_device`` so the cast path runs on CPU-resident tensors.
+    """
+    import pretrain_data_curator.student_train as st
+
+    monkeypatch.setattr(st, "_is_cuda_device", lambda device: True)
+    model = _tiny_cfg(32).build()
+    prepare_student_model_dtype(model, "cuda")
+    assert model.blocks[0].attn.q.weight.dtype == torch.bfloat16
+    assert model.blocks[0].mlp.fc.weight.dtype == torch.bfloat16
+    assert model.embed.weight.dtype == torch.float32
+    assert model.lm_head.weight.dtype == torch.float32
+    assert model.resid_lambdas_attn.dtype == torch.float32
+    for table in model.value_embeds.embed:
+        assert table.weight.dtype == torch.float32
 
 
 def test_sandbox_script_embeds_training_recipe_verbatim():
@@ -1166,11 +1772,20 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     assert "averaged_train_and_eval(" in NANOGPT_TRAIN_SCRIPT
     assert 'text.split("\\n\\n")' not in NANOGPT_TRAIN_SCRIPT
     assert '"\\n\\n".join(documents)' not in NANOGPT_TRAIN_SCRIPT
-    assert "corpus_ids, encoded_document_ranges = encode_document_tokens(" in NANOGPT_TRAIN_SCRIPT
-    assert "flat text cannot recover source document boundaries safely" in NANOGPT_TRAIN_SCRIPT
+    assert (
+        "corpus_ids, encoded_document_ranges = encode_document_tokens("
+        in NANOGPT_TRAIN_SCRIPT
+    )
+    assert (
+        "flat text cannot recover source document boundaries safely"
+        in NANOGPT_TRAIN_SCRIPT
+    )
     # ...and the OLD constant-LR plain-AdamW + random-with-replacement sampler is gone.
     assert "torch.randint(len(src) - block - 1" not in NANOGPT_TRAIN_SCRIPT
-    assert "opt = torch.optim.AdamW(model.parameters(), lr=float(cfg" not in NANOGPT_TRAIN_SCRIPT
+    assert (
+        "opt = torch.optim.AdamW(model.parameters(), lr=float(cfg"
+        not in NANOGPT_TRAIN_SCRIPT
+    )
     # The sandbox script imports tqdm (installed on demand, like tiktoken) so the
     # embedded training loop's progress bar/logging actually runs there too.
     assert "from tqdm import tqdm" in NANOGPT_TRAIN_SCRIPT
@@ -1207,7 +1822,9 @@ def test_sandbox_tqdm_fallback_shim_works_when_import_and_install_both_fail(
     exec(snippet, namespace)
 
     shim_tqdm = namespace["tqdm"]
-    bar = shim_tqdm(range(3), total=3, desc="test", unit="step", leave=False, file=sys.stdout)
+    bar = shim_tqdm(
+        range(3), total=3, desc="test", unit="step", leave=False, file=sys.stdout
+    )
     assert list(bar) == [0, 1, 2]
     bar.set_postfix(loss="1.0000")  # no-op, must not raise
     bar.write("[test] step 3/3")
@@ -1228,10 +1845,24 @@ def test_progress_lines_emitted_for_first_and_last_step(capsys):
     data = torch.randint(0, V, (100,))
     gen = torch.Generator().manual_seed(0)
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=5,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=5,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
     out = capsys.readouterr().out
     lines = [line for line in out.splitlines() if line.startswith("[train]")]
@@ -1239,7 +1870,9 @@ def test_progress_lines_emitted_for_first_and_last_step(capsys):
     assert "step 1/5" in lines[0]
     assert "step 5/5" in lines[1]
     for line in lines:
-        assert "loss" in line and "tok/s" in line and "elapsed" in line and "eta" in line
+        assert (
+            "loss" in line and "tok/s" in line and "elapsed" in line and "eta" in line
+        )
 
 
 def test_progress_line_survives_a_single_step_run():
@@ -1254,10 +1887,24 @@ def test_progress_line_survives_a_single_step_run():
     buf = io.StringIO()
     with redirect_stdout(buf):
         train_and_eval_student(
-            model, data, data, block_size=8, batch_size=2, steps=1,
-            base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-            beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-            device="cpu", generator=gen, training_recipe="record_01_adamw",
+            model,
+            data,
+            data,
+            block_size=8,
+            batch_size=2,
+            steps=1,
+            base_lr=1e-3,
+            warmup_steps=1,
+            weight_decay=0.1,
+            grad_clip=1.0,
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-8,
+            lr_min_ratio=0.1,
+            vocab_size=V,
+            device="cpu",
+            generator=gen,
+            training_recipe="record_01_adamw",
         )
     lines = [line for line in buf.getvalue().splitlines() if line.startswith("[train]")]
     assert len(lines) == 1
@@ -1272,10 +1919,24 @@ def test_progress_lines_throttled_for_a_longer_run(capsys):
     data = torch.randint(0, V, (300,))
     gen = torch.Generator().manual_seed(0)
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=30,
-        base_lr=1e-3, warmup_steps=4, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=30,
+        base_lr=1e-3,
+        warmup_steps=4,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
     out = capsys.readouterr().out
     lines = [line for line in out.splitlines() if line.startswith("[train]")]
@@ -1313,10 +1974,24 @@ def test_ema_loss_updates_every_step_not_just_at_log_points(monkeypatch, capsys)
 
     monkeypatch.setattr(st.F, "cross_entropy", spy_cross_entropy)
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=steps,
-        base_lr=1e-3, warmup_steps=4, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="record_01_adamw",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=steps,
+        base_lr=1e-3,
+        warmup_steps=4,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="record_01_adamw",
     )
     assert len(captured_losses) == steps  # one captured training loss per step
 
@@ -1324,7 +1999,9 @@ def test_ema_loss_updates_every_step_not_just_at_log_points(monkeypatch, capsys)
     ref_ema = None
     for loss_val in (t.item() for t in captured_losses):
         ref_ema = (
-            loss_val if ref_ema is None else ema_decay * ref_ema + (1 - ema_decay) * loss_val
+            loss_val
+            if ref_ema is None
+            else ema_decay * ref_ema + (1 - ema_decay) * loss_val
         )
 
     out = capsys.readouterr().out
@@ -1340,10 +2017,25 @@ def test_run_label_prefixes_progress_lines_when_multiple_runs(capsys):
     cfg = _tiny_cfg(V)
     data = torch.randint(0, V, (100,))
     averaged_train_and_eval(
-        cfg.build, data, data, n_runs=2, base_seed=0, device="cpu",
-        block_size=8, batch_size=2, steps=2, base_lr=1e-3, warmup_steps=1,
-        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
-        lr_min_ratio=0.1, vocab_size=V, training_recipe="record_01_adamw",
+        cfg.build,
+        data,
+        data,
+        n_runs=2,
+        base_seed=0,
+        device="cpu",
+        block_size=8,
+        batch_size=2,
+        steps=2,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        training_recipe="record_01_adamw",
     )
     out = capsys.readouterr().out
     assert "[run 1/2 train] step 1/2" in out
@@ -1359,10 +2051,25 @@ def test_run_label_absent_for_a_single_run(capsys):
     cfg = _tiny_cfg(V)
     data = torch.randint(0, V, (100,))
     averaged_train_and_eval(
-        cfg.build, data, data, n_runs=1, base_seed=0, device="cpu",
-        block_size=8, batch_size=2, steps=2, base_lr=1e-3, warmup_steps=1,
-        weight_decay=0.1, grad_clip=1.0, beta1=0.9, beta2=0.95, eps=1e-8,
-        lr_min_ratio=0.1, vocab_size=V, training_recipe="record_01_adamw",
+        cfg.build,
+        data,
+        data,
+        n_runs=1,
+        base_seed=0,
+        device="cpu",
+        block_size=8,
+        batch_size=2,
+        steps=2,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        training_recipe="record_01_adamw",
     )
     out = capsys.readouterr().out
     assert "[train] step 1/2" in out
@@ -1387,6 +2094,7 @@ def test_grad_accum_non_embed_adam_grads_fresh_per_micro_step(monkeypatch):
     test_grad_accum_embed_head_muon_grads_fresh_per_micro_step."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
 
@@ -1406,10 +2114,24 @@ def test_grad_accum_non_embed_adam_grads_fresh_per_micro_step(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "backward", spy_backward)
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
     )
 
@@ -1431,8 +2153,12 @@ def test_grad_accum_multi_heads_in_buffer_with_accum(monkeypatch):
     double-counted)."""
     V = 16
     from pretrain_data_curator.student_model import GPT
+
     model = GPT(
-        vocab_size=V, num_layers=2, model_dim=32, num_heads=2,
+        vocab_size=V,
+        num_layers=2,
+        model_dim=32,
+        num_heads=2,
         multi_token_pred=2,
     )
 
@@ -1446,10 +2172,24 @@ def test_grad_accum_multi_heads_in_buffer_with_accum(monkeypatch):
     assert pre_weights, "No multi_heads.* params found — model lacks multi-token heads"
 
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
         multi_token_pred=2,
     )
@@ -1468,6 +2208,7 @@ def test_grad_accum_partial_cycle_flushes_remaining_grads():
     partial cycle (7 steps, micro-steps 1-2-3, 4-5-6, 7 being partial)."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (400,))
@@ -1477,10 +2218,24 @@ def test_grad_accum_partial_cycle_flushes_remaining_grads():
     pre_lm_head = model.lm_head.weight.data.clone()
 
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=7,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=7,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=3,
     )
 
@@ -1503,32 +2258,67 @@ def test_grad_accum_partial_cycle_vs_full_cycle_similar_delta():
     data schedule."""
     V = 16
     from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
 
     # Run with 6 steps (divisible by 3) — 2 full cycles
     model_full = cfg.build()
     data = torch.randint(0, V, (500,))
     gen_full = torch.Generator().manual_seed(42)
-    pre_full = {n: p.data.clone() for n, p in model_full.named_parameters()
-                if n.startswith("embed.") or n.startswith("lm_head.")}
+    pre_full = {
+        n: p.data.clone()
+        for n, p in model_full.named_parameters()
+        if n.startswith("embed.") or n.startswith("lm_head.")
+    }
     train_and_eval_student(
-        model_full, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen_full, training_recipe="speedrun_muon",
+        model_full,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen_full,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=3,
     )
 
     # Run with 7 steps (not divisible by 3) — 2 full cycles + 1 partial cycle
     model_partial = cfg.build()
     gen_partial = torch.Generator().manual_seed(42)
-    pre_partial = {n: p.data.clone() for n, p in model_partial.named_parameters()
-                   if n.startswith("embed.") or n.startswith("lm_head.")}
+    pre_partial = {
+        n: p.data.clone()
+        for n, p in model_partial.named_parameters()
+        if n.startswith("embed.") or n.startswith("lm_head.")
+    }
     train_and_eval_student(
-        model_partial, data, data, block_size=8, batch_size=2, steps=7,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen_partial, training_recipe="speedrun_muon",
+        model_partial,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=7,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen_partial,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=3,
     )
 
@@ -1564,8 +2354,12 @@ def test_flush_on_even_step_applies_adam_grads():
     ensures Adam always steps."""
     V = 16
     from pretrain_data_curator.student_model import GPT
+
     model = GPT(
-        vocab_size=V, num_layers=2, model_dim=32, num_heads=2,
+        vocab_size=V,
+        num_layers=2,
+        model_dim=32,
+        num_heads=2,
         multi_token_pred=2,
     )
 
@@ -1574,15 +2368,33 @@ def test_flush_on_even_step_applies_adam_grads():
 
     pre = {}
     for name, p in model.named_parameters():
-        if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+        if (
+            name.startswith("embed.")
+            or name.startswith("lm_head.")
+            or name.startswith("multi_heads.")
+        ):
             pre[name] = p.data.clone()
     assert pre, "No tracked params found"
 
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=1,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=1,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=2,
         multi_token_pred=2,
         adam_on_odd_steps=True,
@@ -1608,8 +2420,12 @@ def test_flush_on_even_step_updates_all_embed_lm_head_multi_heads():
         force_adam, otherwise multi_heads gradient is silently dropped."""
     V = 16
     from pretrain_data_curator.student_model import GPT
+
     model = GPT(
-        vocab_size=V, num_layers=2, model_dim=32, num_heads=2,
+        vocab_size=V,
+        num_layers=2,
+        model_dim=32,
+        num_heads=2,
         multi_token_pred=2,
     )
 
@@ -1618,15 +2434,33 @@ def test_flush_on_even_step_updates_all_embed_lm_head_multi_heads():
 
     pre = {}
     for name, p in model.named_parameters():
-        if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+        if (
+            name.startswith("embed.")
+            or name.startswith("lm_head.")
+            or name.startswith("multi_heads.")
+        ):
             pre[name] = p.data.clone()
     assert pre, "No tracked params found"
 
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=5,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=5,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=4,
         multi_token_pred=2,
         adam_on_odd_steps=True,
@@ -1660,7 +2494,10 @@ def test_in_loop_full_cycle_closes_on_even_step_forces_adam(monkeypatch):
     invoked at all for that cycle."""
     V = 16
     from pretrain_data_curator.student_model import GPT
-    model = GPT(vocab_size=V, num_layers=2, model_dim=32, num_heads=2, multi_token_pred=2)
+
+    model = GPT(
+        vocab_size=V, num_layers=2, model_dim=32, num_heads=2, multi_token_pred=2
+    )
     data = torch.randint(0, V, (300,))
     gen = torch.Generator().manual_seed(0)
 
@@ -1685,10 +2522,24 @@ def test_in_loop_full_cycle_closes_on_even_step_forces_adam(monkeypatch):
     monkeypatch.setattr(torch.optim.AdamW, "step", spy_adam_step)
 
     loss, acc, tokens = train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=3,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=3,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         grad_accum_embed_head_steps=3,
         multi_token_pred=2,
         adam_on_odd_steps=True,
@@ -1745,10 +2596,24 @@ def test_non_accum_path_adam_zero_grad_only_follows_adam_step(monkeypatch):
 
     steps = 6
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=steps,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=steps,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         adam_on_odd_steps=True,
     )
 
@@ -1780,11 +2645,9 @@ def test_non_accum_path_adam_grad_accumulates_across_even_odd_pair(monkeypatch):
 
     # Capture each backward()'s raw contribution to lm_head.weight.grad,
     # BEFORE it is accumulated into (or discarded from) .grad. lm_head is
-    # used here (rather than embed) because ``init_speedrun_weights`` zero-
-    # inits it, which zeros the upstream gradient to embed/blocks until
-    # lm_head's first Adam update -- lm_head itself gets a nonzero direct
-    # gradient (hidden^T @ error) on every step regardless, so it exercises
-    # the accumulate-vs-discard distinction on every step of this test.
+    # used here (rather than embed) because it receives a nonzero direct
+    # gradient (hidden^T @ error) on every step regardless of init scale,
+    # so it exercises the accumulate-vs-discard distinction on every step.
     raw_grad_per_step: list[torch.Tensor] = []
 
     def _hook(grad):
@@ -1809,13 +2672,26 @@ def test_non_accum_path_adam_grad_accumulates_across_even_odd_pair(monkeypatch):
     try:
         steps = 4
         train_and_eval_student(
-            model, data, data, block_size=8, batch_size=2, steps=steps,
-            base_lr=1e-3, warmup_steps=1, weight_decay=0.1,
+            model,
+            data,
+            data,
+            block_size=8,
+            batch_size=2,
+            steps=steps,
+            base_lr=1e-3,
+            warmup_steps=1,
+            weight_decay=0.1,
             # grad_clip disabled: clipping would rescale .grad in place and
             # break the exact-sum comparison below.
             grad_clip=0.0,
-            beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-            device="cpu", generator=gen, training_recipe="speedrun_muon",
+            beta1=0.9,
+            beta2=0.95,
+            eps=1e-8,
+            lr_min_ratio=0.1,
+            vocab_size=V,
+            device="cpu",
+            generator=gen,
+            training_recipe="speedrun_muon",
             adam_on_odd_steps=True,
         )
     finally:
@@ -1867,7 +2743,13 @@ def test_eval_val_loss_respects_microbatch_cap(monkeypatch):
 
     monkeypatch.setattr(model, "forward_hidden", capped_forward_hidden)
     loss, acc = _eval_val_loss(
-        model, val, block=block, batch=2, vocab_size=V, device="cpu", logit_chunk_tokens=16
+        model,
+        val,
+        block=block,
+        batch=2,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=16,
     )
     assert math.isfinite(loss)
     assert 0.0 <= acc <= 1.0
@@ -1888,10 +2770,22 @@ def test_eval_val_loss_chunked_matches_full_vocab_semantics():
     val = torch.randint(0, V, (n_tokens,), dtype=torch.long)
 
     full_loss, full_acc = _eval_val_loss(
-        model, val, block=block, batch=4, vocab_size=V, device="cpu", logit_chunk_tokens=None
+        model,
+        val,
+        block=block,
+        batch=4,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=None,
     )
     chunked_loss, chunked_acc = _eval_val_loss(
-        model, val, block=block, batch=1, vocab_size=V, device="cpu", logit_chunk_tokens=7
+        model,
+        val,
+        block=block,
+        batch=1,
+        vocab_size=V,
+        device="cpu",
+        logit_chunk_tokens=7,
     )
     assert chunked_loss == pytest.approx(full_loss, rel=0, abs=1e-6)
     assert chunked_acc == pytest.approx(full_acc, rel=0, abs=1e-12)
@@ -1946,7 +2840,9 @@ def test_train_and_eval_honors_separate_val_batch_size(monkeypatch):
     gen = torch.Generator().manual_seed(0)
     captured = {}
 
-    def fake_eval(model, val_data, *, block, batch, vocab_size, device, logit_chunk_tokens=None):
+    def fake_eval(
+        model, val_data, *, block, batch, vocab_size, device, logit_chunk_tokens=None
+    ):
         captured["batch"] = batch
         captured["logit_chunk_tokens"] = logit_chunk_tokens
         return 1.23, 0.45
@@ -1990,16 +2886,21 @@ def test_proxy_payload_and_sandbox_script_carry_val_microbatch_knobs():
     assert payload["val_batch_size"] == 1
     assert payload["val_logit_chunk_tokens"] == 1024
     assert payload["train_microbatch_size"] == 16
-    assert "val_batch_size=cfg.get(\"val_batch_size\")" in NANOGPT_TRAIN_SCRIPT
-    assert "val_logit_chunk_tokens=cfg.get(\"val_logit_chunk_tokens\")" in NANOGPT_TRAIN_SCRIPT
-    assert "train_microbatch_size=cfg.get(\"train_microbatch_size\")" in NANOGPT_TRAIN_SCRIPT
+    assert 'val_batch_size=cfg.get("val_batch_size")' in NANOGPT_TRAIN_SCRIPT
+    assert (
+        'val_logit_chunk_tokens=cfg.get("val_logit_chunk_tokens")'
+        in NANOGPT_TRAIN_SCRIPT
+    )
+    assert (
+        'train_microbatch_size=cfg.get("train_microbatch_size")' in NANOGPT_TRAIN_SCRIPT
+    )
     assert "def _score_hidden_chunked(" in NANOGPT_TRAIN_SCRIPT
     assert "def _microbatch_ranges(" in NANOGPT_TRAIN_SCRIPT
     assert "def _scaled_microbatch_loss(" in NANOGPT_TRAIN_SCRIPT
     assert "def forward_hidden(" in NANOGPT_TRAIN_SCRIPT
     assert "def apply_lm_head(" in NANOGPT_TRAIN_SCRIPT
     assert "buffering=1" in NANOGPT_TRAIN_SCRIPT
-    assert 'atexit.register(_stderr_fh.flush)' in NANOGPT_TRAIN_SCRIPT
+    assert "atexit.register(_stderr_fh.flush)" in NANOGPT_TRAIN_SCRIPT
 
 
 # --- Loss-scaled train microbatch accumulation (A100 OOM fix) ----------------
@@ -2058,7 +2959,9 @@ def test_train_microbatch_accum_matches_full_batch_adamw_grads():
 
     assert set(full_grads) == set(micro_grads)
     for name in full_grads:
-        assert torch.allclose(full_grads[name], micro_grads[name], rtol=0, atol=1e-6), name
+        assert torch.allclose(full_grads[name], micro_grads[name], rtol=0, atol=1e-6), (
+            name
+        )
 
 
 def test_train_microbatch_preserves_tokens_and_schedule_ramp(monkeypatch):
@@ -2154,7 +3057,9 @@ def test_train_microbatch_adamw_end_to_end_matches_full_batch_weights():
         model_full.named_parameters(), model_micro.named_parameters()
     ):
         assert n1 == n2
-        assert torch.allclose(p1, p2, rtol=1e-5, atol=1e-5), n1
+        # Slightly looser than 1e-5: residual-lambda init at sqrt(1.1) makes
+        # fp32 microbatch vs full-batch accumulation order noise visible at 1e-5.
+        assert torch.allclose(p1, p2, rtol=1e-4, atol=1e-4), n1
 
 
 # --- Microbatch x grad_accum_embed_head_steps regression (values 1 and >1) ---
@@ -2162,7 +3067,9 @@ def test_train_microbatch_adamw_end_to_end_matches_full_batch_weights():
 
 @pytest.mark.parametrize("grad_accum", [1, 2])
 @pytest.mark.parametrize("microbatch", [None, 1])
-def test_grad_accum_microbatch_clip_cadence_unchanged(monkeypatch, grad_accum, microbatch):
+def test_grad_accum_microbatch_clip_cadence_unchanged(
+    monkeypatch, grad_accum, microbatch
+):
     """Clipping fires once per optimizer update for grad_accum in {1, >1}, and
     loss-scaled microbatching must not add or skip a clip (no double/skipped clip).
 
@@ -2184,10 +3091,24 @@ def test_grad_accum_microbatch_clip_cadence_unchanged(monkeypatch, grad_accum, m
     data = torch.randint(0, V, (300,), dtype=torch.long)
     gen = torch.Generator().manual_seed(0)
     train_and_eval_student(
-        model, data, data, block_size=8, batch_size=2, steps=6,
-        base_lr=1e-3, warmup_steps=1, weight_decay=0.1, grad_clip=1.0,
-        beta1=0.9, beta2=0.95, eps=1e-8, lr_min_ratio=0.1, vocab_size=V,
-        device="cpu", generator=gen, training_recipe="speedrun_muon",
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=6,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
         batch_schedule_enabled=False,
         adam_on_odd_steps=True,
         grad_accum_embed_head_steps=grad_accum,
@@ -2201,7 +3122,9 @@ def test_grad_accum_microbatch_clip_cadence_unchanged(monkeypatch, grad_accum, m
 
 
 @pytest.mark.parametrize("grad_accum", [1, 2])
-def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(monkeypatch, grad_accum):
+def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(
+    monkeypatch, grad_accum
+):
     """For grad_accum in {1, >1}, loss-scaled microbatching must hand the speedrun
     optimizers the same embed/lm_head gradients as a single full-effective-batch
     backward at the optimizer-update boundary.
@@ -2264,3 +3187,157 @@ def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(monkeypatch, gra
     assert set(full) == set(micro)
     for name in full:
         assert torch.allclose(full[name], micro[name], rtol=1e-4, atol=1e-6), name
+
+
+# --- (N) Chunked scoring: bf16 hidden + fp32 lm_head ----------------------
+
+
+def test_score_hidden_chunked_bf16_hidden_fp32_head_cpu():
+    """``_score_hidden_chunked`` must accept bf16 hidden states and route them
+    through the model's centralized fp32 lm-head/softcap logic, and chunked
+    scoring must agree (modulo fp summation order) with the unchunked pass and
+    with a single full-vocab reference CE. Mirrors the bf16-on-CUDA trunk feeding
+    an fp32 ``lm_head``; the CPU bf16 injection keeps the test deterministic.
+    """
+    import torch.nn.functional as F
+
+    import pretrain_data_curator.student_train as st
+    from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
+    V, dim = 50, 32
+    model = SMC(
+        model_dim=dim, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1
+    ).build()  # exposes apply_lm_head (centralized fp32 path)
+
+    gen = torch.Generator().manual_seed(0)
+    n = 64
+    hidden_fp32 = torch.randn(n, dim, generator=gen)
+    hidden_bf16 = hidden_fp32.bfloat16()  # simulate bf16 CUDA trunk output
+    targets = torch.randint(0, V, (n,), generator=gen)
+
+    # Chunked vs unchunked via the centralized fp32 lm-head path.
+    full_loss, full_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=n
+    )
+    chunk_loss, chunk_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=8
+    )
+    assert chunk_correct == full_correct
+    assert chunk_loss == pytest.approx(full_loss, rel=1e-5)
+
+    # Reference: single full-vocab pass through apply_lm_head.
+    with torch.no_grad():
+        ref_logits = model.apply_lm_head(hidden_bf16.float())
+    ref_loss = F.cross_entropy(ref_logits.float(), targets).item()
+    ref_correct = (ref_logits.float().argmax(-1) == targets).sum().item()
+    assert chunk_correct == ref_correct
+    assert (chunk_loss / n) == pytest.approx(ref_loss, rel=1e-5)
+
+
+def _make_fp32_head_stub(dim: int, vocab: int, softcap: float):
+    """A head-only model WITHOUT ``apply_lm_head`` to exercise the generic
+    ``lm_head``/softcap fallback branch in ``_score_hidden_chunked``."""
+    import torch.nn as nn
+
+    class _Fp32HeadStub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(dim, vocab, bias=False)
+            self.softcap = float(softcap)
+
+    return _Fp32HeadStub()
+
+
+def test_score_hidden_chunked_else_branch_bf16_hidden_fp32_head_cpu():
+    """The generic ``lm_head``/softcap fallback branch must also accept bf16
+    hidden states and cast to fp32 before the fp32 linear layer, so bf16 hidden
+    + fp32 head works and chunked scoring agrees with the unchunked pass.
+    """
+    import torch.nn.functional as F
+
+    import pretrain_data_curator.student_train as st
+
+    V, dim, softcap = 50, 32, 30.0
+    model = _make_fp32_head_stub(dim, V, softcap)  # fp32 weights, no apply_lm_head
+    assert next(model.parameters()).dtype is torch.float32
+
+    gen = torch.Generator().manual_seed(1)
+    n = 64
+    hidden_fp32 = torch.randn(n, dim, generator=gen)
+    hidden_bf16 = hidden_fp32.bfloat16()
+    targets = torch.randint(0, V, (n,), generator=gen)
+
+    full_loss, full_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=n
+    )
+    chunk_loss, chunk_correct = st._score_hidden_chunked(
+        model, hidden_bf16, targets, vocab_size=V, logit_chunk_tokens=8
+    )
+    assert chunk_correct == full_correct
+    assert chunk_loss == pytest.approx(full_loss, rel=1e-5)
+
+    with torch.no_grad():
+        ref_logits = model.softcap * torch.tanh(
+            model.lm_head(hidden_bf16.float()).float() / model.softcap
+        )
+    ref_loss = F.cross_entropy(ref_logits.float(), targets).item()
+    ref_correct = (ref_logits.float().argmax(-1) == targets).sum().item()
+    assert chunk_correct == ref_correct
+    assert (chunk_loss / n) == pytest.approx(ref_loss, rel=1e-5)
+
+
+def test_untie_lm_head_adam_group_retains_betas(monkeypatch):
+    """When embed/lm_head are untied mid-training, the new ``lm_head`` Adam param
+    group must retain the speedrun recipe betas ``(0.5, 0.95)`` rather than
+    inheriting Adam defaults ``(0.9, 0.999)``.
+    """
+    import pretrain_data_curator.student_train as st
+    from pretrain_data_curator.student_model import StudentModelConfig as SMC
+
+    V = 32
+    cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
+    model = cfg.build()
+    data = torch.randint(0, V, (200,))
+    gen = torch.Generator().manual_seed(0)
+
+    captured = {}
+    real_build = st.build_speedrun_optimizers
+
+    def spy_build(m, **kw):
+        muon_opt, adam_opt = real_build(m, **kw)
+        captured["adam_opt"] = adam_opt
+        return muon_opt, adam_opt
+
+    monkeypatch.setattr(st, "build_speedrun_optimizers", spy_build)
+
+    train_and_eval_student(
+        model,
+        data,
+        data,
+        block_size=8,
+        batch_size=2,
+        steps=8,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.1,
+        grad_clip=1.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=0.1,
+        vocab_size=V,
+        device="cpu",
+        generator=gen,
+        training_recipe="speedrun_muon",
+        untie_at_frac=0.5,
+    )
+
+    adam_opt = captured["adam_opt"]
+    lm_head_groups = [
+        g
+        for g in adam_opt.param_groups
+        if any(p is model.lm_head.weight for p in g["params"])
+    ]
+    assert lm_head_groups, "expected an lm_head adam param group after untie"
+    for g in lm_head_groups:
+        assert g["betas"] == (0.5, 0.95), g["betas"]
