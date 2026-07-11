@@ -78,12 +78,28 @@ from .val_set import ValidationSetConfig, ValTokenLoader
 
 logger = logging.getLogger(__name__)
 TRAINER_ERROR_STR_LIMIT = 20_000
-HF_CLI_SKILL_FILENAME = "hf_cli_skill.md"
-_HF_CLI_SKILL = (
-    resources.files("pretrain_data_curator")
-    .joinpath(HF_CLI_SKILL_FILENAME)
-    .read_bytes()
-)
+# Canonical HF CLI skill (byte-for-byte) from huggingface/skills; docs:
+# https://huggingface.co/docs/hub/agents-cli and
+# https://github.com/huggingface/skills/tree/main/skills/hf-cli
+# Delivered at the project skill path agents expect from harness install.
+HF_CLI_SKILL_UPSTREAM_REVISION = "7039bdcf4510c30ec932637e8b2c1646aee7f185"
+HF_CLI_SKILL_UPSTREAM_PATH = "skills/hf-cli/SKILL.md"
+HF_CLI_SKILL_SHA256 = "a6b3fcf3bd0a6164aeda357f483295638cbaee54f56f0cec13462e647920ec37"
+HF_CLI_SKILL_RESOURCE = "skills/hf-cli/SKILL.md"
+HF_CLI_SKILL_RUNTIME_PATH = ".agents/skills/hf-cli/SKILL.md"
+# Backward-compatible alias used by older tests/imports.
+HF_CLI_SKILL_FILENAME = HF_CLI_SKILL_RUNTIME_PATH
+
+
+def hf_cli_skill_package_file():
+    """Locate the vendored skill via single-arg Traversable.joinpath (Py3.11+)."""
+    node = resources.files("pretrain_data_curator")
+    for part in HF_CLI_SKILL_RESOURCE.split("/"):
+        node = node.joinpath(part)
+    return node
+
+
+_HF_CLI_SKILL = hf_cli_skill_package_file().read_bytes()
 
 # --------------------------------------------------------------------------- #
 # manifest parsing (workspace file primary; assistant messages remain fallback)
@@ -466,10 +482,12 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     def _check_perf_scaling_exponent(self) -> "CuratorTasksetConfig":
         exp = self.perf_scaling_exponent
         if not math.isfinite(exp) or exp <= 0:
+            # fmt: off
             raise ValueError(
                 "perf_scaling_exponent must be finite and > 0 "
                 f"(got {exp})"
             )
+            # fmt: on
         return self
 
 
@@ -636,7 +654,7 @@ class CuratorTaskset(_TasksetBase):
                 decon_threshold=self.config.decon_threshold,
             ),
         )
-        await runtime.write(HF_CLI_SKILL_FILENAME, _HF_CLI_SKILL)
+        await runtime.write(HF_CLI_SKILL_RUNTIME_PATH, _HF_CLI_SKILL)
         if self.curator.use_real_trainer:
             await runtime.write(
                 SELF_SCORE_TRAIN_FILENAME,
@@ -990,9 +1008,11 @@ class CuratorTaskset(_TasksetBase):
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> str:
         await self._prepared(trace, runtime)
+        # fmt: off
         err = (RolloutStore.trainer_error(trace.state) or "")[
             :TRAINER_ERROR_STR_LIMIT
         ]
+        # fmt: on
         if err:
             logger.warning("trainer error: %s", err)
         return err
