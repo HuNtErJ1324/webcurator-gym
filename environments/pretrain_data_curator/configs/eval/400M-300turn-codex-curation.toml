@@ -70,14 +70,14 @@ weight_decay = 0.1
 adam_beta1 = 0.9
 adam_beta2 = 0.95
 adam_eps = 0.0000000001
-grad_clip = 1.0
+grad_clip = 0.0
 warmup_steps = 256
 lr_min_ratio = 0.1
 n_train_runs = 1
 
 training_recipe = "speedrun_muon"
 muon_lr = 0.023
-muon_weight_decay = 0.05
+muon_weight_decay = 1.2
 muon_momentum_min = 0.85
 muon_momentum_max = 0.95
 muon_warmup_steps = 300

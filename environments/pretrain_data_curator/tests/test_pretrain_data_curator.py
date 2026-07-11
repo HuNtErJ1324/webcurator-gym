@@ -521,9 +521,7 @@ def _400m_eval_config_names() -> list[str]:
 @pytest.mark.parametrize("config_name", _400m_eval_config_names())
 def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
     """Every *400M* eval config must use the baked hf+decon image, not bare pytorch."""
-    config_path = (
-        Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
-    )
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     proxy = config["args"]["proxy_student"]
     assert proxy["runtime_backend"] == "docker"
@@ -612,10 +610,10 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
     # LOG_FILE must capture the actual eval pipeline, not a dead declaration.
     assert 'LOG_FILE="$LOG_DIR/' in on_pod or "LOG_FILE=" in on_pod
     eval_pipeline = (
-        'uv run eval @ configs/eval/deepseek-v4-pro-400M-300turn-codex.toml'
+        "uv run eval @ configs/eval/deepseek-v4-pro-400M-300turn-codex.toml"
         ' 2>&1 | tee "$LOG_FILE"'
     )
-    assert eval_pipeline in on_pod, "eval must pipe into tee \"$LOG_FILE\""
+    assert eval_pipeline in on_pod, 'eval must pipe into tee "$LOG_FILE"'
     assert "exec uv run eval" not in on_pod
 
 
@@ -1205,9 +1203,6 @@ async def test_materialize_different_sample_sizes_do_not_share_cache_key():
     assert len(corpus_large.sources[0].documents) == 20
 
 
-
-
-
 # ---------------------------------------------------------------------------
 # Shared fakes for the robustness/concurrency tests.
 # ---------------------------------------------------------------------------
@@ -1426,7 +1421,6 @@ async def test_fetch_cache_same_key_identity_once():
     assert corpus_a.documents == corpus_b.documents
 
 
-
 @pytest.mark.asyncio
 async def test_materialize_preview_and_scoring_observe_same_docs():
     # A `materialize` preview and the final scoring share one per-rollout doc cache:
@@ -1532,7 +1526,6 @@ async def test_concurrent_same_key_fetch_coalesces_to_one_fetch():
     for docs, err in results:
         assert err is None
         assert docs == docs0
-
 
 
 class _CountingBuilder(CorpusBuilder):
@@ -1664,9 +1657,7 @@ def test_classify_exception_kinds():
     assert classify_exception(TimeoutError("t")) == "timeout"
     assert (
         classify_exception(
-            RuntimeError(
-                "Dataset scripts are no longer supported, but found legacy.py"
-            )
+            RuntimeError("Dataset scripts are no longer supported, but found legacy.py")
         )
         == "script_dataset"
     )
@@ -1742,6 +1733,8 @@ async def test_script_dataset_probe_blocks_unconditionally_with_guidance(monkeyp
         }
     ]
     assert load_calls == []
+
+
 def test_non_script_dataset_load_does_not_pass_trust_remote_code(monkeypatch):
     class FakeHfApi:
         def __init__(self, *, token):
@@ -1819,7 +1812,9 @@ def test_proxy_student_recipe_defaults_mirror_record01():
     assert (cfg.adam_beta1, cfg.adam_beta2, cfg.record_adam_eps) == (0.9, 0.95, 1e-8)
     assert cfg.adam_eps == 1e-10
     assert cfg.weight_decay == 0.1
-    assert cfg.grad_clip == 1.0
+    assert cfg.grad_clip == 0.0
+    assert cfg.muon_weight_decay == 1.2
+    assert cfg.nor_muon is True
     assert cfg.lr_min_ratio == 0.1
     assert cfg.n_train_runs == 1
     assert cfg.warmup_steps is None
@@ -1848,9 +1843,7 @@ def test_proxy_student_payload_routes_document_and_epsilon_fields():
 def test_proxy_student_legacy_training_names_remain_safe():
     cfg = ProxyStudentConfig(max_doc_len=512)
     assert cfg.max_document_tokens == cfg.max_doc_len == 512
-    legacy_record = ProxyStudentConfig(
-        training_recipe="record_01_adamw", adam_eps=3e-8
-    )
+    legacy_record = ProxyStudentConfig(training_recipe="record_01_adamw", adam_eps=3e-8)
     assert legacy_record.record_adam_eps == 3e-8
     with pytest.raises(ValidationError, match="eos_positions is no longer accepted"):
         ProxyStudentConfig(eos_positions=[10, 20])
@@ -1967,7 +1960,6 @@ async def test_reward_has_no_cost_total_metric():
     assert trace2.reward == pytest.approx(baseline_reward)
 
 
-
 # --- Tier M: single PTB-style prompt + leakage-safe self-score --------------
 
 
@@ -2022,7 +2014,10 @@ def test_discovery_has_no_call_or_output_stop():
 def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
     prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
 
-    assert '"sample_docs_per_source": <optional integer >= 1; omit for no per-source fetch cap — fetches are sized from weights and token_budget>' in prompt
+    assert (
+        '"sample_docs_per_source": <optional integer >= 1; omit for no per-source fetch cap — fetches are sized from weights and token_budget>'
+        in prompt
+    )
     manifest_fields = {
         "token_budget": 1_000,
         "sample_docs_per_source": 8,
@@ -2373,9 +2368,6 @@ async def test_val_loader_fetch_failure_raises_typed_error(tmp_path):
     with pytest.raises(DatasetAccessError) as excinfo:
         await loader.load()
     assert excinfo.value.kind == "network"
-
-
-
 
 
 @pytest.mark.asyncio
@@ -2847,9 +2839,7 @@ def test_extract_json_object_handles_braces_in_strings():
 
 
 def test_extract_hf_commands_splits_on_shell_separators():
-    cmds = extract_hf_commands(
-        "hf datasets ls --search a && hf datasets info b/c"
-    )
+    cmds = extract_hf_commands("hf datasets ls --search a && hf datasets info b/c")
     assert cmds == [["datasets", "ls", "--search", "a"], ["datasets", "info", "b/c"]]
 
 
@@ -2866,8 +2856,6 @@ class _FakeRuntime:
         if path in self._files:
             return self._files[path]
         raise FileNotFoundError(path)
-
-
 
 
 def _trace_with_final(task, state, final_text):
@@ -2900,6 +2888,7 @@ async def test_finalize_warns_when_fetch_cap_cannot_reach_token_budget(caplog):
         await curator.taskset.finalize(curator.task, trace, None)
 
     assert "TOKEN BUDGET IS NOT REACHABLE" in caplog.text
+
 
 @pytest.mark.asyncio
 async def test_finalize_populates_manifest_without_cost_ledger():
@@ -2960,9 +2949,7 @@ async def test_finalize_polls_for_late_workspace_manifest_file():
 
     async def write_manifest() -> None:
         await asyncio.sleep(curator.taskset._FINALIZE_GRACE_INTERVAL_SECONDS * 2)
-        runtime._files[MANIFEST_FILENAME] = (
-            b'{"sources": [{"id": "file/late"}]}'
-        )
+        runtime._files[MANIFEST_FILENAME] = b'{"sources": [{"id": "file/late"}]}'
 
     write = asyncio.create_task(write_manifest())
     await curator.taskset.finalize(curator.task, trace, runtime)
@@ -3384,10 +3371,7 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
     ).load_tasks()[0]
 
     assert "Local sources are disabled; use only Hugging Face sources" in task.prompt
-    assert (
-        "`2.0 * performance - 3.0 * leakage`"
-        in task.prompt
-    )
+    assert "`2.0 * performance - 3.0 * leakage`" in task.prompt
     assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
     assert (
         "read `/workspace/hf_cli_skill.md` for local CLI discovery and safety guidance"
@@ -3457,9 +3441,10 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
     assert b"hf --version" in runtime.files[HF_CLI_SKILL_FILENAME]
     assert b"hf --help" in runtime.files[HF_CLI_SKILL_FILENAME]
     assert b"Never print, echo, log, commit" in runtime.files[HF_CLI_SKILL_FILENAME]
-    assert taskset.curator.validation_set.dataset_id.encode() not in runtime.files[
-        SELF_SCORE_FILENAME
-    ]
+    assert (
+        taskset.curator.validation_set.dataset_id.encode()
+        not in runtime.files[SELF_SCORE_FILENAME]
+    )
     assert SELF_SCORE_TRAIN_FILENAME not in runtime.files
 
 
@@ -3470,9 +3455,10 @@ def test_hf_cli_skill_is_packaged():
     )
 
     assert skill.is_file()
-    assert "pretrain_data_curator/**/*.md" in build_config["tool"]["hatch"]["build"][
-        "include"
-    ]
+    assert (
+        "pretrain_data_curator/**/*.md"
+        in build_config["tool"]["hatch"]["build"]["include"]
+    )
 
 
 def test_self_score_train_script_renders_and_compiles():
@@ -3535,6 +3521,7 @@ async def test_runtime_read_reads_file_created_by_agent_shell():
         }
     finally:
         runtime.cleanup()
+
 
 def test_parse_manifest_prefers_last_sources_block_across_multiple_fences():
     # Multiple fenced blocks: a leading note (no sources), then a DRAFT manifest,
@@ -3610,7 +3597,6 @@ class _CorruptRuntime:
     ],
     ids=["no_runtime", "missing_log", "corrupt_log"],
 )
-
 def _real_trainer_taskset(**proxy_student):
     use_real = proxy_student.pop("use_real_trainer", True)
     ts = CuratorTaskset(
@@ -3758,7 +3744,9 @@ def test_baseline_relative_perf_reward_when_enabled():
     # Uses γ=1.0 so the linear assertions match the pre-gamma formula exactly.
     cfg = CuratorConfig(
         perf_scaling_exponent=1.0,
-        baseline_relative_perf=True, perf_baseline_loss=10.0, perf_target_loss=2.0
+        baseline_relative_perf=True,
+        perf_baseline_loss=10.0,
+        perf_target_loss=2.0,
     )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
     # Target-scaled relative reduction: (10 - 4)/((10 - 2)) = 0.75.
@@ -3838,7 +3826,18 @@ def test_val_build_eval_creates_valid_jsonl(tmp_path):
     from pretrain_data_curator.leakage import DeconLeakageDetector, _VAL_EVAL_KEY
 
     # Small synthetic val set: 10 tokens.
-    token_ids = [15496, 11, 682, 318, 257, 1438, 13, 198, 198, 318]  # "The,  island,..."
+    token_ids = [
+        15496,
+        11,
+        682,
+        318,
+        257,
+        1438,
+        13,
+        198,
+        198,
+        318,
+    ]  # "The,  island,..."
     val = _make_synthetic_val_set(token_ids)
     output = tmp_path / "heldout_val.jsonl"
 
@@ -3898,9 +3897,13 @@ def test_val_leakage_detected_when_corpus_contains_val_text(tmp_path):
     decon is invoked with the combined evals dir, it finds the match, and a
     report line is generated for the heldout_val eval key.
     """
-    from pretrain_data_curator.leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
+    from pretrain_data_curator.leakage import (
+        DEFAULT_EVAL_SETS_DIR,
+        DeconLeakageDetector,
+    )
 
     import tiktoken
+
     enc = tiktoken.get_encoding("gpt2")
     known_text = (
         "The Roman Empire was one of the largest empires in ancient history, "
@@ -3928,9 +3931,13 @@ def test_val_leakage_detected_when_corpus_contains_val_text(tmp_path):
 @pytest.mark.slow
 def test_clean_corpus_yields_zero_leakage_with_val_screening(tmp_path):
     """A corpus with no val-set overlap yields leakage 0."""
-    from pretrain_data_curator.leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
+    from pretrain_data_curator.leakage import (
+        DEFAULT_EVAL_SETS_DIR,
+        DeconLeakageDetector,
+    )
 
     import tiktoken
+
     enc = tiktoken.get_encoding("gpt2")
     val_text = (
         "Unique held-out validation text that should not appear elsewhere. "
@@ -3972,9 +3979,13 @@ def test_val_eval_never_in_bundled_evals():
 @pytest.mark.slow
 def test_val_eval_ephemeral_cleanup():
     """The temp dir used for the combined evals is cleaned up after score()."""
-    from pretrain_data_curator.leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
+    from pretrain_data_curator.leakage import (
+        DEFAULT_EVAL_SETS_DIR,
+        DeconLeakageDetector,
+    )
 
     import tiktoken
+
     enc = tiktoken.get_encoding("gpt2")
     val = _make_synthetic_val_set(enc.encode("Some val text."))
 
@@ -4001,6 +4012,7 @@ def test_decon_error_still_raises_with_val_set():
     from pretrain_data_curator.leakage import DeconError, DeconLeakageDetector
 
     import tiktoken
+
     enc = tiktoken.get_encoding("gpt2")
     val = _make_synthetic_val_set(enc.encode("Some val text."))
 
@@ -4155,7 +4167,7 @@ def _reduce_selfscore(lines, total_tokens):
 
     script = _self_score._SCRIPT
     match = re.search(
-        r'def _reduce_report\(report_lines, total_tokens\):.*?(?=\n\ndef |\n\n\n|\Z)',
+        r"def _reduce_report\(report_lines, total_tokens\):.*?(?=\n\ndef |\n\n\n|\Z)",
         script,
         re.DOTALL,
     )
@@ -4179,10 +4191,12 @@ def test_reduce_report_parity_empty():
 def test_reduce_report_parity_cluster_token_length():
     """(b) Match with cluster_token_length: token weight uses it directly."""
     lines = [
-        json.dumps(_synthetic_report_record(
-            contamination_score=0.5,
-            cluster_token_length=200,
-        ))
+        json.dumps(
+            _synthetic_report_record(
+                contamination_score=0.5,
+                cluster_token_length=200,
+            )
+        )
     ]
     prod = _reduce_leakage(lines, 1000)
     dev = _reduce_selfscore(lines, 1000)
@@ -4193,11 +4207,13 @@ def test_reduce_report_parity_cluster_token_length():
 def test_reduce_report_parity_span_fallback():
     """(c) Span-fallback match (no cluster_token_length)."""
     lines = [
-        json.dumps(_synthetic_report_record(
-            contamination_score=1.0,
-            answer_start_idx=0,
-            answer_end_idx=400,
-        ))
+        json.dumps(
+            _synthetic_report_record(
+                contamination_score=1.0,
+                answer_start_idx=0,
+                answer_end_idx=400,
+            )
+        )
     ]
     prod = _reduce_leakage(lines, 1000)
     dev = _reduce_selfscore(lines, 1000)
@@ -4208,18 +4224,22 @@ def test_reduce_report_parity_span_fallback():
 def test_reduce_report_parity_dedup():
     """(d) Dedup: multiple eval matches against same doc -> only highest counted."""
     lines = [
-        json.dumps(_synthetic_report_record(
-            training_file="corpus.jsonl",
-            training_line=0,
-            contamination_score=0.3,
-            cluster_token_length=200,
-        )),
-        json.dumps(_synthetic_report_record(
-            training_file="corpus.jsonl",
-            training_line=0,
-            contamination_score=0.9,
-            cluster_token_length=50,
-        )),
+        json.dumps(
+            _synthetic_report_record(
+                training_file="corpus.jsonl",
+                training_line=0,
+                contamination_score=0.3,
+                cluster_token_length=200,
+            )
+        ),
+        json.dumps(
+            _synthetic_report_record(
+                training_file="corpus.jsonl",
+                training_line=0,
+                contamination_score=0.9,
+                cluster_token_length=50,
+            )
+        ),
     ]
     prod = _reduce_leakage(lines, 1000)
     dev = _reduce_selfscore(lines, 1000)
@@ -4232,16 +4252,20 @@ def test_reduce_report_parity_dedup():
 def test_reduce_report_parity_clamp():
     """(e) Clamp: sum > total_tokens -> both clamp to 1.0."""
     lines = [
-        json.dumps(_synthetic_report_record(
-            training_file="a.jsonl",
-            contamination_score=0.9,
-            cluster_token_length=1000,
-        )),
-        json.dumps(_synthetic_report_record(
-            training_file="b.jsonl",
-            contamination_score=0.5,
-            cluster_token_length=800,
-        )),
+        json.dumps(
+            _synthetic_report_record(
+                training_file="a.jsonl",
+                contamination_score=0.9,
+                cluster_token_length=1000,
+            )
+        ),
+        json.dumps(
+            _synthetic_report_record(
+                training_file="b.jsonl",
+                contamination_score=0.5,
+                cluster_token_length=800,
+            )
+        ),
     ]
     prod = _reduce_leakage(lines, 1000)
     dev = _reduce_selfscore(lines, 1000)
@@ -4259,23 +4283,27 @@ def test_reduce_report_parity_clamp():
 def test_gamma_anchors_are_invariant():
     """p=0 → 0.0 and p=1 → 1.0 for any valid gamma (indep of exponent)."""
     for gamma in [1.0, 2.0, 3.0, 0.5]:
-        cfg = CuratorConfig(perf_scaling_exponent=gamma,
-                            perf_baseline_loss=10.0, perf_target_loss=2.0)
+        cfg = CuratorConfig(
+            perf_scaling_exponent=gamma, perf_baseline_loss=10.0, perf_target_loss=2.0
+        )
         scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
         # at target: loss=2.0 → p=(10-2)/(10-2)=1.0
-        at_target = TrainResult(loss=2.0, accuracy=0.4, flops=0.0,
-                                tokens_trained=0, backend="x")
+        at_target = TrainResult(
+            loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x"
+        )
         assert scorer._perf(at_target) == pytest.approx(1.0)
         # at baseline: loss=10.0 → p=0.0
-        at_baseline = TrainResult(loss=10.0, accuracy=0.0, flops=0.0,
-                                  tokens_trained=0, backend="x")
+        at_baseline = TrainResult(
+            loss=10.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+        )
         assert scorer._perf(at_baseline) == pytest.approx(0.0)
 
 
 def test_gamma_curvature():
     """γ=2, p=0.5 → 0.25 (exact)."""
-    cfg = CuratorConfig(perf_scaling_exponent=2.0,
-                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    cfg = CuratorConfig(
+        perf_scaling_exponent=2.0, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
     r = TrainResult(loss=6.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
     # p = (10-6)/(10-2) = 4/8 = 0.5 → 0.5**2 = 0.25
@@ -4284,21 +4312,25 @@ def test_gamma_curvature():
 
 def test_gamma_linear_when_one():
     """γ=1.0 recovers the previous linear values exactly."""
-    cfg = CuratorConfig(perf_scaling_exponent=1.0,
-                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    cfg = CuratorConfig(
+        perf_scaling_exponent=1.0, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
     r = TrainResult(loss=6.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x")
     # p = 0.5 → 0.5**1 = 0.5
     assert scorer._perf(r) == pytest.approx(0.5)
-    worse = TrainResult(loss=14.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    worse = TrainResult(
+        loss=14.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+    )
     # p = (10-14)/8 = -0.5 → -0.5 (linear branch)
     assert scorer._perf(worse) == pytest.approx(-0.5)
 
 
 def test_gamma_negative_stays_linear():
     """p<0 stays linear regardless of γ."""
-    cfg = CuratorConfig(perf_scaling_exponent=2.0,
-                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    cfg = CuratorConfig(
+        perf_scaling_exponent=2.0, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
     # loss=10.8 → p = (10-10.8)/8 = -0.1
     r = TrainResult(loss=10.8, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
@@ -4307,8 +4339,9 @@ def test_gamma_negative_stays_linear():
 
 def test_gamma_beyond_target():
     """p>1 (beating the target) is amplified: γ=2, p=1.2 → 1.44."""
-    cfg = CuratorConfig(perf_scaling_exponent=2.0,
-                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    cfg = CuratorConfig(
+        perf_scaling_exponent=2.0, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
     r = TrainResult(loss=0.4, accuracy=0.9, flops=0.0, tokens_trained=0, backend="x")
     # p = (10-0.4)/8 = 9.6/8 = 1.2 → 1.2**2 = 1.44
@@ -4317,11 +4350,13 @@ def test_gamma_beyond_target():
 
 def test_gamma_sentinel_still_zero():
     """Nonfinite loss → 0.0 regardless of gamma."""
-    cfg = CuratorConfig(perf_scaling_exponent=2.0,
-                        perf_baseline_loss=10.0, perf_target_loss=2.0)
+    cfg = CuratorConfig(
+        perf_scaling_exponent=2.0, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
-    sentinel = TrainResult(loss=float("inf"), accuracy=0.0, flops=0.0,
-                           tokens_trained=0, backend="error")
+    sentinel = TrainResult(
+        loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
+    )
     assert scorer._perf(sentinel) == 0.0
 
 
@@ -4329,11 +4364,16 @@ def test_gamma_sentinel_still_zero():
 def test_gamma_config_rejection(bad):
     """Exponent 0, negative, inf, nan all raise at config load."""
     with pytest.raises(ValidationError):
-        CuratorConfig(perf_scaling_exponent=bad,
-                      perf_baseline_loss=10.0, perf_target_loss=2.0)
+        CuratorConfig(
+            perf_scaling_exponent=bad, perf_baseline_loss=10.0, perf_target_loss=2.0
+        )
     with pytest.raises(ValidationError):
-        CuratorTasksetConfig(id="test", perf_scaling_exponent=bad,
-                             perf_baseline_loss=10.0, perf_target_loss=2.0)
+        CuratorTasksetConfig(
+            id="test",
+            perf_scaling_exponent=bad,
+            perf_baseline_loss=10.0,
+            perf_target_loss=2.0,
+        )
 
 
 def test_gamma_default_is_two():
@@ -4347,8 +4387,9 @@ def test_gamma_default_is_two():
 def test_load_environment_accepts_perf_scaling_exponent(monkeypatch):
     """load_environment threads perf_scaling_exponent correctly."""
     monkeypatch.setenv("HF_TOKEN", "test-token")
-    env = load_environment(perf_scaling_exponent=1.5,
-                           perf_baseline_loss=10.0, perf_target_loss=2.0)
+    env = load_environment(
+        perf_scaling_exponent=1.5, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
     assert env.taskset.curator.perf_scaling_exponent == pytest.approx(1.5)
     assert env.env_args["perf_scaling_exponent"] == 1.5
 
@@ -4378,13 +4419,15 @@ def test_self_score_perf_parity():
         for gamma in gammas:
             cfg = CuratorConfig(
                 perf_scaling_exponent=gamma,
-                perf_baseline_loss=bl, perf_target_loss=tl,
+                perf_baseline_loss=bl,
+                perf_target_loss=tl,
             )
             scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
             for p in p_values:
                 loss = bl - p * (bl - tl)
-                r = TrainResult(loss=loss, accuracy=0.4, flops=0.0,
-                                tokens_trained=0, backend="x")
+                r = TrainResult(
+                    loss=loss, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x"
+                )
                 prod_perf = scorer._perf(r)
                 script_perf = _perf_selfscore(cfg, loss)
                 assert prod_perf == pytest.approx(script_perf), (

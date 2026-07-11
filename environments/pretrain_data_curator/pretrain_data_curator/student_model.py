@@ -27,7 +27,7 @@ Components implemented (all CPU-runnable):
 * **tanh logit softcap** (default 30).
 * **U-net skips** with **sigmoid skip gates** (replacing raw skip weights).
 * **Sparse value embeddings** (SparsifyEmbeds): 3 distinct tables on first/last bands.
-* **Untied** zero-init ``lm_head``; vocab padded to 50304.
+* **Untied** ``lm_head`` with normal init (std=0.005); vocab padded to 50304.
 * **Bigram hash embedding** — 1/4 of ``model_dim`` via hashed bigrams with sign trick.
 * **Smear** — learned 1-token lookback on the embedding stream.
 * **Partial Key Offset** — offset key RoPE positions for context-length extrapolation.
@@ -108,10 +108,14 @@ class RotaryWithOffset(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 
-def _sliding_window_mask(seq_len: int, window_size: int, device: torch.device) -> torch.Tensor:
+def _sliding_window_mask(
+    seq_len: int, window_size: int, device: torch.device
+) -> torch.Tensor:
     """Causal band mask for SDPA: query i attends to keys in [i-window+1, i]."""
     idx = torch.arange(seq_len, device=device)
-    mask = (idx[None, :] > idx[:, None]) | (idx[None, :] < idx[:, None] - window_size + 1)
+    mask = (idx[None, :] > idx[:, None]) | (
+        idx[None, :] < idx[:, None] - window_size + 1
+    )
     return mask
 
 
@@ -121,7 +125,9 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
         super().__init__()
         if dim % num_heads != 0:
-            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+            raise ValueError(
+                f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+            )
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.attn_scale = float(attn_scale)
@@ -187,9 +193,13 @@ class PairedHeadAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
         super().__init__()
         if dim % num_heads != 0:
-            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+            raise ValueError(
+                f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+            )
         if num_heads % 2 != 0:
-            raise ValueError(f"PairedHeadAttention requires even num_heads, got {num_heads}")
+            raise ValueError(
+                f"PairedHeadAttention requires even num_heads, got {num_heads}"
+            )
         self.num_heads = num_heads
         self.num_pairs = num_heads // 2
         self.head_dim = dim // num_heads
@@ -237,7 +247,11 @@ class PairedHeadAttention(nn.Module):
         if window_size is not None and window_size < T:
             attn_mask = _sliding_window_mask(T, window_size, x.device)
             y = F.scaled_dot_product_attention(
-                q_t, k_t, v_t, attn_mask=attn_mask, scale=self.attn_scale,
+                q_t,
+                k_t,
+                v_t,
+                attn_mask=attn_mask,
+                scale=self.attn_scale,
             ).transpose(1, 2)
         else:
             y = F.scaled_dot_product_attention(
@@ -269,7 +283,15 @@ class MLP(nn.Module):
 class Block(nn.Module):
     """Pre-norm transformer block (residual/post lambdas live on ``GPT``)."""
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 4, *, attn_scale: float = 0.12, paired_head: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: int = 4,
+        *,
+        attn_scale: float = 0.12,
+        paired_head: bool = False,
+    ):
         super().__init__()
         attn_cls = PairedHeadAttention if paired_head else CausalSelfAttention
         self.attn = attn_cls(dim, num_heads, attn_scale=attn_scale)
@@ -285,7 +307,12 @@ class Block(nn.Module):
         window_size: int | None = None,
         partial_key_offset: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        attn_out = self.attn(self.norm1(x), value_embed, window_size=window_size, partial_key_offset=partial_key_offset)
+        attn_out = self.attn(
+            self.norm1(x),
+            value_embed,
+            window_size=window_size,
+            partial_key_offset=partial_key_offset,
+        )
         mlp_out = self.mlp(self.norm2(x))
         return attn_out, mlp_out
 
@@ -293,13 +320,17 @@ class Block(nn.Module):
 class ValueEmbedding(nn.Module):
     """Sparse per-token value embeddings (SparsifyEmbeds design)."""
 
-    def __init__(self, vocab_size: int, model_dim: int, num_layers: int, num_tables: int = 3):
+    def __init__(
+        self, vocab_size: int, model_dim: int, num_layers: int, num_tables: int = 3
+    ):
         super().__init__()
         self.num_layers = num_layers
         self.num_tables = max(1, min(num_tables, num_layers // 2))
         self.embed = nn.ModuleList(
             [nn.Embedding(vocab_size, model_dim) for _ in range(self.num_tables)]
         )
+        for table in self.embed:
+            nn.init.normal_(table.weight, mean=0.0, std=0.01)
 
     def forward(self, idx: torch.Tensor) -> list:
         tables = [emb(idx) for emb in self.embed]
@@ -318,24 +349,30 @@ class BigramHashEmbedding(nn.Module):
     def __init__(self, vocab_size: int, model_dim: int):
         super().__init__()
         if model_dim % 4 != 0:
-            raise ValueError(f"BigramHashEmbedding requires model_dim % 4 == 0, got {model_dim}")
+            raise ValueError(
+                f"BigramHashEmbedding requires model_dim % 4 == 0, got {model_dim}"
+            )
         self.full_dim = model_dim
         self.hash_dim = model_dim // 4
         self.token_embed = nn.Embedding(vocab_size, model_dim - self.hash_dim)
         rng = torch.Generator().manual_seed(42)
-        hash_seed = torch.randint(0, 2 ** 31, (vocab_size,), generator=rng, dtype=torch.long)
+        hash_seed = torch.randint(
+            0, 2**31, (vocab_size,), generator=rng, dtype=torch.long
+        )
         self.register_buffer("hash_seed", hash_seed, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T = x.shape
         tok_part = self.token_embed(x)
         if T < 2:
-            hash_part = torch.zeros(B, T, self.hash_dim, device=x.device, dtype=tok_part.dtype)
+            hash_part = torch.zeros(
+                B, T, self.hash_dim, device=x.device, dtype=tok_part.dtype
+            )
             return torch.cat([tok_part, hash_part], dim=-1)
         prev = x[:, :-1]
         curr = x[:, 1:]
         h = (self.hash_seed[prev] * 2654435761) ^ (self.hash_seed[curr] * 2246822519)
-        sign = (h.float() * (1.0 / 2 ** 31)).fmod(2.0).abs().sub(1.0).sign()
+        sign = (h.float() * (1.0 / 2**31)).fmod(2.0).abs().sub(1.0).sign()
         sign = sign.unsqueeze(-1).expand(-1, -1, self.hash_dim)
         pad_first = torch.zeros(B, 1, self.hash_dim, device=x.device, dtype=sign.dtype)
         hash_part = torch.cat([pad_first, sign], dim=1)
@@ -383,8 +420,12 @@ class MUDD(nn.Module):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if layer_idx >= self.num_skip_pairs:
             return None, None
-        resid = torch.sigmoid(self.resid_gates[layer_idx]) * self.resid_projs[layer_idx](source)
-        val = torch.sigmoid(self.value_gates[layer_idx]) * self.value_projs[layer_idx](source)
+        resid = torch.sigmoid(self.resid_gates[layer_idx]) * self.resid_projs[
+            layer_idx
+        ](source)
+        val = torch.sigmoid(self.value_gates[layer_idx]) * self.value_projs[layer_idx](
+            source
+        )
         return resid, val
 
 
@@ -418,9 +459,14 @@ class XSA(nn.Module):
         k = F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
         q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(
-            q_t, k_t, v_t, is_causal=False, scale=self.attn_scale
-        ).transpose(1, 2).contiguous().view(B, T, -1)
+        y = (
+            F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=False, scale=self.attn_scale
+            )
+            .transpose(1, 2)
+            .contiguous()
+            .view(B, T, -1)
+        )
         return torch.tanh(self.gate) * self.proj(y)
 
 
@@ -476,8 +522,10 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.skip_gates = nn.Parameter(torch.ones(self.num_decoder_layers))
         self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
-        self.resid_lambdas_attn = nn.Parameter(torch.ones(num_layers))
-        self.resid_lambdas_mlp = nn.Parameter(torch.ones(num_layers))
+        # sqrt(1.1) per sublayer so cumulative per-layer residual scale is 1.1
+        resid_init = math.sqrt(1.1)
+        self.resid_lambdas_attn = nn.Parameter(torch.full((num_layers,), resid_init))
+        self.resid_lambdas_mlp = nn.Parameter(torch.full((num_layers,), resid_init))
         self.x0_lambdas = nn.Parameter(torch.zeros(num_layers))
         self.exp_residual_decay = exp_residual_decay
 
@@ -501,7 +549,13 @@ class GPT(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, mlp_ratio, attn_scale=attn_scale, paired_head=paired_head)
+                Block(
+                    model_dim,
+                    num_heads,
+                    mlp_ratio,
+                    attn_scale=attn_scale,
+                    paired_head=paired_head,
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -518,7 +572,10 @@ class GPT(nn.Module):
         self.xsa_pairs = xsa_pairs
         if xsa_enabled and xsa_pairs > 0:
             self.xsa_modules = nn.ModuleList(
-                [XSA(model_dim, num_heads, attn_scale=attn_scale) for _ in range(xsa_pairs)]
+                [
+                    XSA(model_dim, num_heads, attn_scale=attn_scale)
+                    for _ in range(xsa_pairs)
+                ]
             )
             self.xsa_layer_map: list[tuple[int, int]] = []
 
@@ -531,15 +588,19 @@ class GPT(nn.Module):
         self.norm_in = RMSNorm(model_dim)
         self.norm_out = RMSNorm(model_dim)
         self.lm_head = nn.Linear(model_dim, vocab_size, bias=False)
-        self.lm_head.weight.data.zero_()
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.005)
 
-    def _apply_exp_residual_decay(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
+    def _apply_exp_residual_decay(
+        self, layer_idx: int, x: torch.Tensor
+    ) -> torch.Tensor:
         if self.exp_residual_decay is not None:
-            alpha = self.exp_residual_decay ** layer_idx
+            alpha = self.exp_residual_decay**layer_idx
             return x * alpha
         return x
 
-    def forward_hidden(self, idx: torch.Tensor, *, window_size: int | None = None) -> torch.Tensor:
+    def forward_hidden(
+        self, idx: torch.Tensor, *, window_size: int | None = None
+    ) -> torch.Tensor:
         """Run the trunk through ``norm_out`` without materializing full-vocab logits.
 
         Used by held-out validation to score CE in lm_head/softcap chunks so a
@@ -555,9 +616,13 @@ class GPT(nn.Module):
         skip_connections: list[torch.Tensor] = []
         encoder_outputs: list[torch.Tensor] = []
         for i in range(self.num_encoder_layers):
-            attn_out, mlp_out = self.blocks[i](x, ve_enc[i], window_size=ws, partial_key_offset=self.partial_key_offset)
+            attn_out, mlp_out = self.blocks[i](
+                x, ve_enc[i], window_size=ws, partial_key_offset=self.partial_key_offset
+            )
             x = (
-                self._apply_exp_residual_decay(i, x) if self.exp_residual_decay is not None else x
+                self._apply_exp_residual_decay(i, x)
+                if self.exp_residual_decay is not None
+                else x
             )
             x = (
                 self.resid_lambdas_attn[i] * x
@@ -587,13 +652,21 @@ class GPT(nn.Module):
             x = x + torch.sigmoid(self.skip_gates[i]) * skip_connections.pop()
 
             # XSA contribution
-            if self.xsa_enabled and self.xsa_pairs > 0 and i < self.xsa_pairs and xsa_src:
+            if (
+                self.xsa_enabled
+                and self.xsa_pairs > 0
+                and i < self.xsa_pairs
+                and xsa_src
+            ):
                 xsa_out = self.xsa_modules[i](x, xsa_src[i])
                 x = x + xsa_out
 
             # Determine attention input: single activation for last k layers
             attn_input = x
-            if self.single_act_last_k > 0 and i >= self.num_decoder_layers - self.single_act_last_k:
+            if (
+                self.single_act_last_k > 0
+                and i >= self.num_decoder_layers - self.single_act_last_k
+            ):
                 if single_act is not None:
                     attn_input = single_act
 
@@ -606,7 +679,10 @@ class GPT(nn.Module):
                     ve_i = ve_i + mudd_val
 
             attn_out, mlp_out = self.blocks[layer_idx](
-                attn_input, ve_i, window_size=ws, partial_key_offset=self.partial_key_offset
+                attn_input,
+                ve_i,
+                window_size=ws,
+                partial_key_offset=self.partial_key_offset,
             )
 
             # MUDD residual contribution
@@ -614,7 +690,9 @@ class GPT(nn.Module):
                 attn_out = attn_out + mudd_resid
 
             x = (
-                self._apply_exp_residual_decay(layer_idx, x) if self.exp_residual_decay is not None else x
+                self._apply_exp_residual_decay(layer_idx, x)
+                if self.exp_residual_decay is not None
+                else x
             )
             x = (
                 self.resid_lambdas_attn[layer_idx] * x
@@ -628,11 +706,21 @@ class GPT(nn.Module):
         return self.norm_out(x)
 
     def apply_lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Project hidden states through ``lm_head`` + tanh softcap."""
-        logits = self.lm_head(hidden)
+        """Project hidden states through ``lm_head`` + tanh softcap in float32.
+
+        Softcap and CE are always computed in fp32 even when the trunk runs in
+        bfloat16 on CUDA, matching speedrun numerical practice.
+        """
+        logits = self.lm_head(hidden.float()).float()
         return self.softcap * torch.tanh(logits / self.softcap)
 
-    def forward(self, idx: torch.Tensor, *, window_size: int | None = None, output_hidden: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        idx: torch.Tensor,
+        *,
+        window_size: int | None = None,
+        output_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden = self.forward_hidden(idx, window_size=window_size)
         out = self.apply_lm_head(hidden)
         if output_hidden:

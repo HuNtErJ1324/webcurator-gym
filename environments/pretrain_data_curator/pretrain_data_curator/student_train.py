@@ -45,6 +45,7 @@ from .student_optimizer import (
     build_batch_schedule,
     build_speedrun_optimizers,
     capture_initial_lrs,
+    classify_speedrun_params,
     clip_optimizer_grads,
     get_muon_momentum,
     init_speedrun_weights,
@@ -54,6 +55,29 @@ from .student_optimizer import (
     step_speedrun_optimizers,
 )
 from .val_set import plan_val_windows
+
+
+def _is_cuda_device(device) -> bool:
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    return isinstance(device, str) and device.startswith("cuda")
+
+
+def prepare_student_model_dtype(model, device):
+    """CUDA-only bfloat16 for Muon matrices; Adam groups stay float32.
+
+    CPU behavior is unchanged (all float32). On CUDA, cast the full module to
+    bfloat16 then restore Adam-managed parameters to float32 so optimizer state
+    and lm_head/softcap/CE remain numerically stable.
+    """
+    if not _is_cuda_device(device):
+        return model
+    model.to(dtype=torch.bfloat16)
+    _, adam = classify_speedrun_params(model)
+    for params in adam.values():
+        for param in params:
+            param.data = param.data.to(dtype=torch.float32)
+    return model
 
 
 def lr_at_step(step, total_steps, warmup_steps, base_lr, min_ratio):
@@ -179,9 +203,11 @@ def _score_hidden_chunked(model, hidden, targets, *, vocab_size, logit_chunk_tok
         if apply_head is not None:
             logits = apply_head(h)
         else:
-            logits = model.softcap * torch.tanh(model.lm_head(h) / model.softcap)
-        loss_sum += F.cross_entropy(logits, y, reduction="sum").item()
-        correct += (logits.argmax(-1) == y).sum().item()
+            logits = model.softcap * torch.tanh(
+                model.lm_head(h).float() / model.softcap
+            )
+        loss_sum += F.cross_entropy(logits.float(), y, reduction="sum").item()
+        correct += (logits.float().argmax(-1) == y).sum().item()
         del logits
     return loss_sum, correct
 
@@ -223,7 +249,9 @@ def _eval_val_loss(
                 starts.append(val_windows[wi][0])
                 wi += 1
             xb = torch.stack([val_data[s : s + length] for s in starts]).to(device)
-            yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(device)
+            yb = torch.stack([val_data[s + 1 : s + length + 1] for s in starts]).to(
+                device
+            )
             if forward_hidden is not None:
                 hidden = forward_hidden(xb)
                 chunk_loss, chunk_correct = _score_hidden_chunked(
@@ -240,11 +268,13 @@ def _eval_val_loss(
                 logits = model(xb)
                 if logit_chunk_tokens is None:
                     loss_sum += F.cross_entropy(
-                        logits.reshape(-1, vocab_size), yb.reshape(-1), reduction="sum"
+                        logits.float().reshape(-1, vocab_size),
+                        yb.reshape(-1),
+                        reduction="sum",
                     ).item()
-                    correct += (logits.argmax(-1) == yb).sum().item()
+                    correct += (logits.float().argmax(-1) == yb).sum().item()
                 else:
-                    flat_logits = logits.reshape(-1, vocab_size)
+                    flat_logits = logits.float().reshape(-1, vocab_size)
                     flat_y = yb.reshape(-1)
                     chunk = int(logit_chunk_tokens)
                     for start in range(0, flat_logits.size(0), chunk):
@@ -264,14 +294,18 @@ def _compute_multi_token_loss(logits, hidden, y, multi_heads, y_future, vocab_si
     Multi-token heads are applied to the final hidden states (pre-lm_head),
     not to logits, since the heads are ``nn.Linear(model_dim, vocab_size)``.
     """
-    main_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-    if multi_heads is None or not hasattr(multi_heads, 'heads') or not multi_heads.heads:
+    main_loss = F.cross_entropy(logits.float().view(-1, vocab_size), y.view(-1))
+    if (
+        multi_heads is None
+        or not hasattr(multi_heads, "heads")
+        or not multi_heads.heads
+    ):
         return main_loss
     mt_loss = 0.0
     mt_weight = 0.3
     for k, head in enumerate(multi_heads.heads):
         if k < len(y_future) and y_future[k] is not None:
-            head_logits = head(hidden)
+            head_logits = head(hidden).float()
             mt_loss = mt_loss + F.cross_entropy(
                 head_logits.view(-1, vocab_size), y_future[k].view(-1)
             )
@@ -331,7 +365,7 @@ def train_and_eval_student(
     run_label="",
     training_recipe="speedrun_muon",
     muon_lr=0.023,
-    muon_weight_decay=0.05,
+    muon_weight_decay=1.2,
     adam_lr=0.008,
     adam_eps=1e-10,
     adam_weight_decay=0.005,
@@ -361,13 +395,14 @@ def train_and_eval_student(
     multi_token_pred=0,
     untie_at_frac=0.0,
     cautious_wd=False,
-    nor_muon=False,
+    nor_muon=True,
     polar_express=False,
     train_microbatch_size=None,
     val_batch_size=None,
     val_logit_chunk_tokens=None,
 ):
     """Train ``model`` and score held-out CE; returns ``(val_loss, accuracy, tokens_trained)``."""
+    prepare_student_model_dtype(model, device)
     block = int(block_size)
     batch = int(batch_size)
     steps = int(steps)
@@ -427,7 +462,9 @@ def train_and_eval_student(
     ema_decay = 0.9
     start_time = time.time()
     desc = f"{run_label}train" if run_label else "train"
-    pbar = tqdm(range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout)
+    pbar = tqdm(
+        range(steps), total=steps, desc=desc, unit="step", leave=False, file=sys.stdout
+    )
 
     if training_recipe == "record_01_adamw":
         opt = torch.optim.AdamW(
@@ -453,26 +490,36 @@ def train_and_eval_student(
                 xb = x[start:end]
                 yb = y[start:end]
                 logits = model(xb)
-                loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                loss = F.cross_entropy(logits.float().view(-1, vocab_size), yb.view(-1))
                 _scaled_microbatch_loss(loss, end - start, batch).backward()
                 with torch.no_grad():
                     piece = loss.detach() * float(end - start)
-                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
+                    loss_weighted = (
+                        piece if loss_weighted is None else loss_weighted + piece
+                    )
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             tokens_trained += batch * current_block
             with torch.no_grad():
                 loss_detached = loss_weighted / float(batch)
-                ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
-                    ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                ema_loss_tensor = (
+                    loss_detached
+                    if ema_loss_tensor is None
+                    else (
+                        ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                    )
                 )
             completed = step + 1
             if step == 0 or completed == steps or completed % log_every == 0:
                 ema_loss = ema_loss_tensor.item()
                 elapsed = time.time() - start_time
                 tokens_per_sec = tokens_trained / elapsed if elapsed > 0 else 0.0
-                eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+                eta_seconds = (
+                    (elapsed / completed) * (steps - completed)
+                    if completed > 0
+                    else 0.0
+                )
                 pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
                 pbar.write(
                     f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
@@ -522,8 +569,16 @@ def train_and_eval_student(
             boundaries = [(0, steps)]
             stages = [BatchScheduleStage(batch_mul=1, lr_mul=1.0)]
             cd_start, cd_floor = steps, lr_cooldown_floor
-        muon_warm = muon_warmup_steps if muon_warmup_steps is not None else min(300, max(1, steps // 5))
-        muon_cd = muon_cooldown_steps if muon_cooldown_steps is not None else min(50, max(1, steps // 20))
+        muon_warm = (
+            muon_warmup_steps
+            if muon_warmup_steps is not None
+            else min(300, max(1, steps // 5))
+        )
+        muon_cd = (
+            muon_cooldown_steps
+            if muon_cooldown_steps is not None
+            else min(50, max(1, steps // 20))
+        )
         model.train()
         tokens_trained = 0
         accum_buffer_embed_head = None
@@ -563,7 +618,11 @@ def train_and_eval_student(
             x, y, batch_starts = next_batch(effective_batch, current_block)
 
             # --- Portable: multi-token prediction targets ---
-            use_mt = multi_token_pred > 0 and hasattr(model, 'multi_heads') and model.multi_heads is not None
+            use_mt = (
+                multi_token_pred > 0
+                and hasattr(model, "multi_heads")
+                and model.multi_heads is not None
+            )
             y_future = []
             if use_mt:
                 for k in range(multi_token_pred):
@@ -571,12 +630,22 @@ def train_and_eval_student(
                     future_targets = []
                     for sidx in batch_starts:
                         if sidx + shift + current_block <= len(train_src):
-                            future_targets.append(train_src[sidx + shift : sidx + shift + current_block])
+                            future_targets.append(
+                                train_src[sidx + shift : sidx + shift + current_block]
+                            )
                         else:
                             n_avail = max(0, len(train_src) - (sidx + shift))
                             if n_avail > 0:
-                                seg = train_src[sidx + shift:]
-                                seg = torch.cat([seg, torch.zeros(current_block - n_avail, dtype=train_src.dtype)])
+                                seg = train_src[sidx + shift :]
+                                seg = torch.cat(
+                                    [
+                                        seg,
+                                        torch.zeros(
+                                            current_block - n_avail,
+                                            dtype=train_src.dtype,
+                                        ),
+                                    ]
+                                )
                             else:
                                 seg = torch.zeros(current_block, dtype=train_src.dtype)
                             future_targets.append(seg)
@@ -589,7 +658,9 @@ def train_and_eval_student(
             if grad_accum_embed_head_steps <= 1:
                 muon_opt.zero_grad(set_to_none=True)
             loss_weighted = None
-            for start, end in _microbatch_ranges(effective_batch, train_microbatch_size):
+            for start, end in _microbatch_ranges(
+                effective_batch, train_microbatch_size
+            ):
                 xb = x[start:end]
                 yb = y[start:end]
                 logits = model(xb, output_hidden=use_mt)
@@ -597,20 +668,33 @@ def train_and_eval_student(
                     hidden = logits[1]
                     y_future_mb = [yf[start:end] for yf in y_future]
                     loss = _compute_multi_token_loss(
-                        logits[0], hidden, yb, model.multi_heads, y_future_mb, vocab_size
+                        logits[0],
+                        hidden,
+                        yb,
+                        model.multi_heads,
+                        y_future_mb,
+                        vocab_size,
                     )
                 else:
-                    loss = F.cross_entropy(logits.view(-1, vocab_size), yb.view(-1))
+                    loss = F.cross_entropy(
+                        logits.float().view(-1, vocab_size), yb.view(-1)
+                    )
                 _scaled_microbatch_loss(loss, end - start, effective_batch).backward()
                 with torch.no_grad():
                     piece = loss.detach() * float(end - start)
-                    loss_weighted = piece if loss_weighted is None else loss_weighted + piece
+                    loss_weighted = (
+                        piece if loss_weighted is None else loss_weighted + piece
+                    )
 
             # --- Portable: true N-step gradient accumulation for embed + lm_head ---
             if grad_accum_embed_head_steps > 1:
                 embed_head_params = []
                 for name, p in model.named_parameters():
-                    if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                    if (
+                        name.startswith("embed.")
+                        or name.startswith("lm_head.")
+                        or name.startswith("multi_heads.")
+                    ):
                         embed_head_params.append(p)
 
                 # backward() already ran per-microbatch above; grads for embed/head
@@ -634,9 +718,17 @@ def train_and_eval_student(
                 if accum_count >= grad_accum_embed_head_steps:
                     # Restore accumulated buffer to embed/head/multi-head param grads.
                     for name, p in model.named_parameters():
-                        if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+                        if (
+                            name.startswith("embed.")
+                            or name.startswith("lm_head.")
+                            or name.startswith("multi_heads.")
+                        ):
                             if id(p) in accum_buffer_embed_head:
-                                p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
+                                p.grad = (
+                                    accum_buffer_embed_head[id(p)]
+                                    .clone()
+                                    .to(device=p.device)
+                                )
                     # Per-optimizer clipping occurs inside the actual updates below.
                     # force_adam=True: a closing cycle always carries freshly
                     # restored embed/head/multi-head grads that must be applied
@@ -660,7 +752,11 @@ def train_and_eval_student(
                     adam_opt.zero_grad(set_to_none=True)
                 else:
                     clip_optimizer_grads(muon_opt, grad_clip)
-                    muon_opt.step(momentum=muon_momentum, cautious_wd=cautious_wd, lr_scale=lr_scale)
+                    muon_opt.step(
+                        momentum=muon_momentum,
+                        cautious_wd=cautious_wd,
+                        lr_scale=lr_scale,
+                    )
                     # Zero all grads between micro-steps so stale gradients do
                     # not accumulate for any param group.  Embed/head/multi-head
                     # grads are safe in the buffer; everything else must be
@@ -693,29 +789,44 @@ def train_and_eval_student(
 
             # --- Portable: untie embed and lm_head at 2/3 of training ---
             if untie_at_frac > 0.0 and step == int(steps * untie_at_frac):
-                if hasattr(model.embed, "weight") and model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr():
-                    model.lm_head.weight = nn.Parameter(model.lm_head.weight.data.clone())
+                if (
+                    hasattr(model.embed, "weight")
+                    and model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr()
+                ):
+                    model.lm_head.weight = nn.Parameter(
+                        model.lm_head.weight.data.clone()
+                    )
                     model.lm_head.weight.data.zero_()
                     lr_val = adam_lr * lm_head_lr_mul
                     wd_val = adam_weight_decay * lm_head_wd_mul
-                    adam_opt.add_param_group({
-                        "params": [model.lm_head.weight],
-                        "lr": lr_val,
-                        "weight_decay": wd_val,
-                    })
+                    adam_opt.add_param_group(
+                        {
+                            "params": [model.lm_head.weight],
+                            "lr": lr_val,
+                            "weight_decay": wd_val,
+                        }
+                    )
 
             tokens_trained += effective_batch * current_block
             with torch.no_grad():
                 loss_detached = loss_weighted / float(effective_batch)
-                ema_loss_tensor = loss_detached if ema_loss_tensor is None else (
-                    ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                ema_loss_tensor = (
+                    loss_detached
+                    if ema_loss_tensor is None
+                    else (
+                        ema_decay * ema_loss_tensor + (1.0 - ema_decay) * loss_detached
+                    )
                 )
             completed = step + 1
             if step == 0 or completed == steps or completed % log_every == 0:
                 ema_loss = ema_loss_tensor.item()
                 elapsed = time.time() - start_time
                 tokens_per_sec = tokens_trained / elapsed if elapsed > 0 else 0.0
-                eta_seconds = (elapsed / completed) * (steps - completed) if completed > 0 else 0.0
+                eta_seconds = (
+                    (elapsed / completed) * (steps - completed)
+                    if completed > 0
+                    else 0.0
+                )
                 pbar.set_postfix(loss=f"{ema_loss:.4f}", tok_s=f"{tokens_per_sec:.0f}")
                 pbar.write(
                     f"[{desc}] step {completed}/{steps} | loss {ema_loss:.4f} "
@@ -725,13 +836,22 @@ def train_and_eval_student(
 
     # Flush any remaining partial accumulation cycle so embed/head grads
     # from the last incomplete cycle are not silently dropped.
-    if training_recipe != "record_01_adamw" and grad_accum_embed_head_steps > 1 and accum_buffer_embed_head is not None:
+    if (
+        training_recipe != "record_01_adamw"
+        and grad_accum_embed_head_steps > 1
+        and accum_buffer_embed_head is not None
+    ):
         for name, p in model.named_parameters():
-            if name.startswith("embed.") or name.startswith("lm_head.") or name.startswith("multi_heads."):
+            if (
+                name.startswith("embed.")
+                or name.startswith("lm_head.")
+                or name.startswith("multi_heads.")
+            ):
                 if id(p) in accum_buffer_embed_head:
                     p.grad = accum_buffer_embed_head[id(p)].clone().to(device=p.device)
         step_speedrun_optimizers(
-            muon_opt, adam_opt,
+            muon_opt,
+            adam_opt,
             step=step,
             muon_momentum=muon_momentum,
             adam_on_odd_steps=adam_on_odd_steps,
@@ -798,7 +918,13 @@ def averaged_train_and_eval(
         accs.append(acc)
         total_flops += 6.0 * n_params * tokens_trained
         total_tokens += tokens_trained
-    return sum(losses) / len(losses), sum(accs) / len(accs), total_flops, total_tokens, n_params
+    return (
+        sum(losses) / len(losses),
+        sum(accs) / len(accs),
+        total_flops,
+        total_tokens,
+        n_params,
+    )
 
 
 _TRAINING_COMPONENTS = (
@@ -808,6 +934,8 @@ _TRAINING_COMPONENTS = (
     plan_eos_aligned_windows,
     shuffled_window_starts,
     make_seq_len_schedule,
+    _is_cuda_device,
+    prepare_student_model_dtype,
     _microbatch_ranges,
     _scaled_microbatch_loss,
     _score_hidden_chunked,

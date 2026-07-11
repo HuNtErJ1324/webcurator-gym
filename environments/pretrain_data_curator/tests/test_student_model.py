@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import math
 
 import pytest
 import torch
@@ -78,7 +79,10 @@ def test_gpt2_small_unet_halves_are_symmetric():
     assert model.value_embeds.num_tables == GPT2_SMALL.num_value_embeds == 3
     assert len(model.value_embeds.embed) == 3
     for table in model.value_embeds.embed:
-        assert tuple(table.weight.shape) == (GPT2_SMALL.vocab_size, GPT2_SMALL.model_dim)
+        assert tuple(table.weight.shape) == (
+            GPT2_SMALL.vocab_size,
+            GPT2_SMALL.model_dim,
+        )
 
 
 def test_value_embeddings_match_sparsify_embeds_pattern():
@@ -174,7 +178,9 @@ def test_rotary_sign_convention_and_half_truncation():
     # The half-truncated (zero-frequency) channels pass through unrotated: there
     # y1 == x1 == 1 and y2 == x2 == 0 at every position.
     assert torch.allclose(y[0, pos, 0, quarter:half], torch.ones(quarter), atol=1e-5)
-    assert torch.allclose(y[0, pos, 0, half + quarter :], torch.zeros(quarter), atol=1e-5)
+    assert torch.allclose(
+        y[0, pos, 0, half + quarter :], torch.zeros(quarter), atol=1e-5
+    )
 
 
 def test_qk_norm_makes_attention_invariant_to_qk_scale():
@@ -262,7 +268,16 @@ def test_sparse_value_layers_get_no_residual():
     # config with genuine None layers (L=8, k=2 -> layers 2..5 are None).
     model = GPT(64, num_layers=8, model_dim=32, num_heads=2, num_value_embeds=2).eval()
     ve = model.value_embeds(torch.randint(0, 64, (1, 5)))
-    assert [t is None for t in ve] == [False, False, True, True, True, True, False, False]
+    assert [t is None for t in ve] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
     _randomize(model)
     out = model(torch.randint(0, 64, (1, 6)))
     assert torch.isfinite(out).all()
@@ -300,6 +315,7 @@ def test_attn_gate_scales_attention_output():
 
 # --- (d) portable features: BigramHashEmbedding, Smear, PairedHeadAttention ----
 
+
 def test_bigram_hash_embedding_shape_and_sign_trick():
     model_dim = 16
     bhe = BigramHashEmbedding(32, model_dim)
@@ -309,7 +325,7 @@ def test_bigram_hash_embedding_shape_and_sign_trick():
     out = bhe(x)
     assert out.shape == (2, 10, model_dim)
     # Sign trick: hash part values are exactly -1 or +1 (position 0 is zero-padded)
-    hash_part = out[:, 1:, model_dim - model_dim // 4:]
+    hash_part = out[:, 1:, model_dim - model_dim // 4 :]
     assert ((hash_part == 1.0) | (hash_part == -1.0)).all()
 
 
@@ -319,7 +335,7 @@ def test_bigram_hash_embedding_single_token():
     x = torch.randint(0, 32, (1, 1))
     out = bhe(x)
     # Single token: hash part is all zeros (no pair)
-    hash_part = out[:, :, model_dim - model_dim // 4:]
+    hash_part = out[:, :, model_dim - model_dim // 4 :]
     assert (hash_part == 0.0).all()
 
 
@@ -408,6 +424,7 @@ def test_paired_head_attention_production_config_via_block():
 
 # --- (e) portable features: MUDD, XSA, MultiTokenHeads, RotaryWithOffset ----
 
+
 def test_mudd_returns_resid_and_value():
     mudd = MUDD(16, num_skip_pairs=2)
     src = torch.randn(2, 8, 16)
@@ -463,7 +480,11 @@ def test_gpt_multi_token_heads_use_hidden_not_logits():
     _, hidden = model(idx, output_hidden=True)
     with torch.no_grad():
         head0_out = model.multi_heads.heads[0](hidden)
-    assert head0_out.shape == (2, 8, 64)  # head produces vocab_logits from hidden states
+    assert head0_out.shape == (
+        2,
+        8,
+        64,
+    )  # head produces vocab_logits from hidden states
     # Verify that feeding logits (vocab_size=64) to the head would fail due to
     # shape mismatch — the head expects model_dim=32 input.
     with pytest.raises(RuntimeError):
@@ -482,6 +503,7 @@ def test_rotary_with_offset_changes_output():
 
 # --- (f) feature-rich GPT forward with all portable features enabled ---------
 
+
 def _randomize(model):
     with torch.no_grad():
         for p in model.parameters():
@@ -491,11 +513,20 @@ def _randomize(model):
 
 def test_gpt_with_all_portable_features():
     model = GPT(
-        vocab_size=64, num_layers=6, model_dim=32, num_heads=2,
-        bigram_hash_embed=True, smear_embed=True,
-        partial_key_offset=0.25, paired_head=True,
-        mudd_pairs=2, xsa_enabled=True, xsa_pairs=2,
-        single_act_last_k=2, exp_residual_decay=0.9, multi_token_pred=2,
+        vocab_size=64,
+        num_layers=6,
+        model_dim=32,
+        num_heads=2,
+        bigram_hash_embed=True,
+        smear_embed=True,
+        partial_key_offset=0.25,
+        paired_head=True,
+        mudd_pairs=2,
+        xsa_enabled=True,
+        xsa_pairs=2,
+        single_act_last_k=2,
+        exp_residual_decay=0.9,
+        multi_token_pred=2,
     )
     _randomize(model)
     idx = torch.randint(0, 64, (2, 12))
@@ -517,7 +548,7 @@ def test_gpt_with_all_portable_features():
     # Verify single_act_last_k
     assert model.single_act_last_k == 2
     # Verify bigram embed
-    assert hasattr(model.embed, 'hash_seed')
+    assert hasattr(model.embed, "hash_seed")
 
 
 def test_exp_residual_decay_changes_later_layers():
@@ -574,18 +605,30 @@ def test_partial_key_offset_affects_output():
 
 # --- (g) default-off feature flags produce identical output to baseline -------
 
+
 def test_gpt_with_portable_features_default_off_matches_baseline():
     # When all feature flags are at their defaults (False/0/None), the
     # backward-compatible path should match the original GPT exactly.
     torch.manual_seed(42)
-    cfg_baseline = StudentModelConfig(model_dim=32, num_layers=4, num_heads=2, vocab_size=64)
+    cfg_baseline = StudentModelConfig(
+        model_dim=32, num_layers=4, num_heads=2, vocab_size=64
+    )
     model_base = cfg_baseline.build()
     model_feat = StudentModelConfig(
-        model_dim=32, num_layers=4, num_heads=2, vocab_size=64,
-        bigram_hash_embed=False, smear_embed=False,
-        partial_key_offset=None, paired_head=False,
-        mudd_pairs=0, xsa_enabled=False, xsa_pairs=0,
-        single_act_last_k=0, exp_residual_decay=None, multi_token_pred=0,
+        model_dim=32,
+        num_layers=4,
+        num_heads=2,
+        vocab_size=64,
+        bigram_hash_embed=False,
+        smear_embed=False,
+        partial_key_offset=None,
+        paired_head=False,
+        mudd_pairs=0,
+        xsa_enabled=False,
+        xsa_pairs=0,
+        single_act_last_k=0,
+        exp_residual_decay=None,
+        multi_token_pred=0,
     ).build()
     for p, q in zip(model_base.parameters(), model_feat.parameters()):
         q.data.copy_(p.data)
@@ -638,3 +681,27 @@ def test_forward_hidden_and_apply_lm_head_match_forward():
     assert hidden.shape == (3, 7, 32)
     assert torch.allclose(full, rebuilt, atol=1e-6)
     assert torch.allclose(full, chunked, atol=1e-6)
+
+
+def test_resid_lambdas_initialized_to_sqrt_1_1():
+    model = GPT(64, num_layers=4, model_dim=32, num_heads=2)
+    expected = math.sqrt(1.1)
+    assert torch.allclose(model.resid_lambdas_attn, torch.full((4,), expected))
+    assert torch.allclose(model.resid_lambdas_mlp, torch.full((4,), expected))
+
+
+def test_lm_head_init_std_and_apply_lm_head_float32():
+    torch.manual_seed(1)
+    model = GPT(64, num_layers=2, model_dim=32, num_heads=2)
+    assert model.lm_head.weight.std().item() == pytest.approx(0.005, rel=0.4, abs=0.002)
+    hidden = torch.randn(2, 5, 32, dtype=torch.bfloat16)
+    out = model.apply_lm_head(hidden)
+    assert out.dtype == torch.float32
+    assert out.shape == (2, 5, 64)
+
+
+def test_value_embedding_init_std():
+    torch.manual_seed(2)
+    model = GPT(64, num_layers=4, model_dim=32, num_heads=2, num_value_embeds=2)
+    for table in model.value_embeds.embed:
+        assert table.weight.std().item() == pytest.approx(0.01, rel=0.4, abs=0.004)
