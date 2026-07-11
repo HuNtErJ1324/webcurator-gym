@@ -60,6 +60,7 @@ from .models import (
 )
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
+from .runtime_config import derive_task_runtime_updates
 from .self_score import (
     SELF_SCORE_FILENAME,
     SELF_SCORE_TRAIN_FILENAME,
@@ -600,42 +601,10 @@ class CuratorTaskset(_TasksetBase):
             lambda_leakage=self.curator.lambda_leakage,
             perf_target_loss=self.curator.perf_target_loss,
         )
-        updates: dict[str, Any] = {}
-        ps = self.curator.proxy_student
-        if self.curator.use_real_trainer and ps.runtime_backend == "docker":
-            updates.update(
-                {
-                    "image": ps.docker_image,
-                    "workdir": "/workspace",
-                    "resources": vf.TaskResources(
-                        cpu=float(ps.cpu_cores),
-                        memory=float(ps.memory_gb),
-                        gpu=str(ps.gpu_count) if ps.gpu_count > 0 else None,
-                        disk=float(ps.disk_size_gb),
-                    ),
-                    "timeout": vf.TaskTimeout(
-                        scoring=ps.effective_scoring_timeout_seconds
-                    ),
-                }
-            )
-        elif self.curator.use_real_trainer and ps.runtime_backend == "modal":
-            from .modal_backend import _modal_gpu_for
-
-            updates.update(
-                {
-                    "image": ps.docker_image,
-                    "workdir": "/workspace",
-                    "resources": vf.TaskResources(
-                        cpu=float(ps.cpu_cores),
-                        memory=float(ps.memory_gb),
-                        gpu=_modal_gpu_for(ps.modal_gpu),
-                        disk=float(ps.disk_size_gb),
-                    ),
-                    "timeout": vf.TaskTimeout(
-                        scoring=ps.effective_scoring_timeout_seconds
-                    ),
-                }
-            )
+        updates = derive_task_runtime_updates(
+            self.curator.proxy_student,
+            use_real_trainer=self.curator.use_real_trainer,
+        )
         return [task.model_copy(update=updates) for task in tasks]
 
     async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:

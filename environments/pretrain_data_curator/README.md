@@ -328,7 +328,6 @@ with provenance metrics.
 - `taskset.py` — `CuratorTaskset`, manifest parsing/recovery, `finalize()`, decorated rewards/metrics, and `@vf.stop` turn cap. No MCP tool server.
 - `tasks.py` — one typed v1 curation task rendered as the initial user prompt.
 - `self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace; runs decon against the bundled **benchmarks only** (never the held-out val set).
-- `eval_corpus.py` — legacy offline fallback corpus; no longer wired into scoring after the decon swap (pending removal).
 
 ## Notes And Limitations
 

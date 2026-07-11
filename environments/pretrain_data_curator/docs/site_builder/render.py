@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .collect import RunRecord, discover_runs, load_run_trace, run_to_manifest_entry
+from .collect import discover_runs, load_run_trace, run_to_manifest_entry
 from .debug_runs import build_debug_trace_payload, discover_debug_runs
 
 SITE_TITLE = "Pretrain Data Curator Bench"
