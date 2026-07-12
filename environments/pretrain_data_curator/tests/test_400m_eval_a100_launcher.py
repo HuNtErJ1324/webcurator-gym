@@ -91,7 +91,17 @@ set +e
 case "$1" in
   whoami) exit 0 ;;
   availability)
-    cat "${WCG_AVAIL_JSON:?}"
+    if [ -n "${WCG_AVAIL_DIR:-}" ]; then
+      gt=""
+      prev=""
+      for a in "$@"; do
+        if [ "$prev" = "--gpu-type" ]; then gt="$a"; fi
+        prev="$a"
+      done
+      cat "${WCG_AVAIL_DIR}/${gt}.json" 2>/dev/null || true
+    else
+      cat "${WCG_AVAIL_JSON:?}"
+    fi
     exit 0
     ;;
   pods)
@@ -172,18 +182,21 @@ def _run_script(
     tmp_path: Path,
     repo: Path,
     *,
-    avail,
+    avail=None,
     status,
     rsync_mode="ok",
     model="z-ai/glm-5.2",
+    avail_by_type=None,
 ):
-    """Run the actual launcher script inside ``repo`` via a fake PATH."""
+    """Run the actual launcher script inside ``repo`` via a fake PATH.
+
+    ``avail_by_type`` is a ``{gpu_type: payload}`` map; when given, the fake
+    ``prime availability`` returns a per-gpu-type JSON (enabling tiered-fallback
+    tests). Otherwise a single ``avail`` payload is used for every gpu-type.
+    """
     record_dir = tmp_path / "record"
     record_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = _build_fakes(record_dir)
-
-    avail_json = tmp_path / "avail.json"
-    avail_json.write_text(json.dumps(avail))
 
     home = tmp_path / "home"
     (home / ".ssh").mkdir(parents=True)
@@ -192,7 +205,16 @@ def _run_script(
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["HOME"] = str(home)
-    env["WCG_AVAIL_JSON"] = str(avail_json)
+    if avail_by_type is not None:
+        avail_dir = tmp_path / "avail"
+        avail_dir.mkdir(parents=True, exist_ok=True)
+        for gt, payload in avail_by_type.items():
+            (avail_dir / f"{gt}.json").write_text(json.dumps(payload))
+        env["WCG_AVAIL_DIR"] = str(avail_dir)
+    else:
+        avail_json = tmp_path / "avail.json"
+        avail_json.write_text(json.dumps(avail if avail is not None else {}))
+        env["WCG_AVAIL_JSON"] = str(avail_json)
     status_json = tmp_path / "status.json"
     status_json.write_text(status)
     env["WCG_POD_STATUS_JSON"] = str(status_json)
@@ -650,6 +672,291 @@ def test_preserves_a100_80gb_docker_artifacts_and_cleanup():
     cleanup = _extract_bash_function(text, "cleanup")
     assert "prime pods terminate" in cleanup
     assert 'exit "$code"' in cleanup
+
+
+# --- capacity-picker stdout hygiene (cloud_id must be captured clean) ---------
+
+def _run_pick_with_fallback(
+    tmp_path: Path,
+    *,
+    avail_by_type,
+    excluded: str = "",
+    curation_only: int = 0,
+    gpu_type: str = "A100_80GB",
+):
+    """Run the REAL ``pick_cloud_id_with_fallback`` (with its real ``log``/``die``
+    and python pickers) behind a fake ``prime`` whose availability branches on
+    gpu-type. Returns ``(stdout, stderr, rc)`` capturing stdout/stderr separately
+    so we can assert diagnostics never leak into the selected cloud ID.
+    """
+    avail_dir = tmp_path / "avail"
+    avail_dir.mkdir(parents=True, exist_ok=True)
+    for gt, payload in avail_by_type.items():
+        (avail_dir / f"{gt}.json").write_text(json.dumps(payload))
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    _write_script(
+        bin_dir / "prime",
+        """#!/usr/bin/env bash
+set +e
+case "$1" in
+  whoami) exit 0 ;;
+  availability)
+    gt=""; prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--gpu-type" ]; then gt="$a"; fi
+      prev="$a"
+    done
+    cat "${WCG_AVAIL_DIR:?}/${gt}.json" 2>/dev/null || true
+    exit 0
+    ;;
+  pods)
+    sub="$2"
+    if [ "$sub" = "create" ]; then echo "Successfully created pod POD123"; exit 0; fi
+    if [ "$sub" = "status" ]; then echo '{}'; exit 0; fi
+    if [ "$sub" = "terminate" ]; then exit 0; fi
+    ;;
+esac
+exit 0
+""",
+    )
+
+    text = EVAL_SCRIPT.read_text(encoding="utf-8")
+
+    def _full_function(name):
+        return f"{name}() {{\n{_extract_bash_function(text, name)}\n}}"
+
+    lib = "\n".join(
+        _full_function(name)
+        for name in (
+            "log",
+            "die",
+            "pick_cloud_id",
+            "pick_cpu_cloud_id",
+            "pick_cloud_id_with_fallback",
+        )
+    )
+    lib_file = tmp_path / "pick_lib.sh"
+    lib_file.write_text(lib + "\n")
+
+    driver = tmp_path / "driver.sh"
+    driver.write_text(
+        textwrap.dedent(
+            f"""#!/usr/bin/env bash
+set +e
+GPU_TYPE="{gpu_type}"
+CURATION_ONLY={curation_only}
+EXCLUDED_CLOUD_IDS="{excluded}"
+source "{lib_file}"
+pick_cloud_id_with_fallback
+"""
+        )
+    )
+    driver.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["WCG_AVAIL_DIR"] = str(avail_dir)
+
+    proc = subprocess.run(
+        ["bash", str(driver)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc.stdout, proc.stderr, proc.returncode
+
+
+def _ts_re():
+    # Matches the log() timestamp prefix, e.g. `[08:06:28]`.
+    return re.compile(r"\[\d{2}:\d{2}:\d{2}\]")
+
+
+def test_fallback_503_first_offer_then_40gb_is_clean_single_line(tmp_path):
+    out, err, rc = _run_pick_with_fallback(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "dc-80",
+                        "provider": "DataCrunch",
+                        "stock_status": "sold_out",  # 503-style unavailable
+                        "price_per_hour": "1.20",
+                        "is_spot": False,
+                        "gpu_type": "A100_80GB",
+                    }
+                ]
+            },
+            "A100_40GB": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "1A100.40S.22V",
+                        "provider": "DataCrunch",
+                        "stock_status": "available",
+                        "price_per_hour": "1.20",
+                        "is_spot": False,
+                        "gpu_type": "A100_40GB",
+                    }
+                ]
+            },
+            "CPU_NODE": {"gpu_resources": []},
+        },
+    )
+    assert rc == 0, f"rc={rc} stderr={err}"
+    assert out.strip() == "1A100.40S.22V", f"captured stdout={out!r}"
+    assert "\n" not in out.strip(), f"cloud_id must be one line: {out!r}"
+    assert not _ts_re().search(out), f"timestamp leaked into cloud_id: {out!r}"
+    assert "capacity" not in out, f"diagnostic leaked into cloud_id: {out!r}"
+    # stderr retains the diagnostic.
+    assert "No A100_80GB capacity; trying next option" in err
+
+
+def test_fallback_excluded_first_offer_then_40gb_is_clean_single_line(tmp_path):
+    out, err, rc = _run_pick_with_fallback(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "dc-80-excluded",
+                        "provider": "DataCrunch",
+                        "stock_status": "available",
+                        "price_per_hour": "1.20",
+                        "is_spot": False,
+                        "gpu_type": "A100_80GB",
+                    }
+                ]
+            },
+            "A100_40GB": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "1A100.40S.22V",
+                        "provider": "DataCrunch",
+                        "stock_status": "available",
+                        "price_per_hour": "1.20",
+                        "is_spot": False,
+                        "gpu_type": "A100_40GB",
+                    }
+                ]
+            },
+            "CPU_NODE": {"gpu_resources": []},
+        },
+        excluded="dc-80-excluded",
+    )
+    assert rc == 0, f"rc={rc} stderr={err}"
+    assert out.strip() == "1A100.40S.22V", f"captured stdout={out!r}"
+    assert "\n" not in out.strip()
+    assert not _ts_re().search(out)
+    assert "excluded" not in out
+    assert "No A100_80GB capacity; trying next option" in err
+
+
+def test_fallback_multiple_tiers_all_fail_returns_empty_stdout(tmp_path):
+    out, err, rc = _run_pick_with_fallback(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": {"gpu_resources": []},
+            "A100_40GB": {"gpu_resources": []},
+            "CPU_NODE": {"gpu_resources": []},
+        },
+    )
+    assert rc != 0, f"expected failure rc, got {rc}"
+    assert out.strip() == "", f"no-capacity stdout must be empty: {out!r}"
+    assert "No A100_80GB capacity; trying next option" in err
+    assert "No A100_40GB capacity; trying next option" in err
+
+
+def test_fallback_no_capacity_curation_only_cpu_empty_stdout(tmp_path):
+    out, err, rc = _run_pick_with_fallback(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": {"gpu_resources": []},
+            "A100_40GB": {"gpu_resources": []},
+            "CPU_NODE": {"gpu_resources": []},
+        },
+        curation_only=1,
+        gpu_type="CPU_NODE",
+    )
+    assert rc != 0, f"expected failure rc, got {rc}"
+    assert out.strip() == "", f"no-capacity stdout must be empty: {out!r}"
+    assert "FATAL" in err
+
+
+def test_fallback_curation_only_cpu_selected_clean(tmp_path):
+    out, err, rc = _run_pick_with_fallback(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": {"gpu_resources": []},
+            "A100_40GB": {"gpu_resources": []},
+            "CPU_NODE": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "dc-cpu-123",
+                        "provider": "DataCrunch",
+                        "stock_status": "available",
+                        "memory_gb": "64",
+                        "vcpus": "16",
+                        "price_per_hour": "1.20",
+                    }
+                ]
+            },
+        },
+        curation_only=1,
+        gpu_type="CPU_NODE",
+    )
+    assert rc == 0, f"rc={rc} stderr={err}"
+    assert out.strip() == "dc-cpu-123", f"captured stdout={out!r}"
+    assert "\n" not in out.strip()
+    assert not _ts_re().search(out)
+
+
+def test_launcher_passes_clean_cloud_id_to_pods_create_on_fallback(tmp_path):
+    """End-to-end: with no A100_80GB capacity, the launcher must fall back to
+    A100_40GB and hand ``prime pods create`` EXACTLY the clean cloud ID
+    (no timestamp/log text) on its single recorded line.
+    """
+    repo = _make_temp_repo(tmp_path)
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        avail_by_type={
+            "A100_80GB": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "mc-80",
+                        "provider": "MassedCompute",  # always excluded
+                        "stock_status": "available",
+                        "price_per_hour": "0.90",
+                        "is_spot": False,
+                        "gpu_type": "A100_80GB",
+                    }
+                ]
+            },
+            "A100_40GB": {
+                "gpu_resources": [
+                    {
+                        "cloud_id": "1A100.40S.22V",
+                        "provider": "DataCrunch",
+                        "stock_status": "available",
+                        "price_per_hour": "1.20",
+                        "is_spot": False,
+                        "gpu_type": "A100_40GB",
+                    }
+                ]
+            },
+            "CPU_NODE": {"gpu_resources": []},
+        },
+        status=_STATUS_ROOT,
+    )
+    picked = record / "picked.txt"
+    assert picked.exists(), f"prime pods create not invoked; stderr={result.stderr}"
+    lines = [ln for ln in picked.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected exactly one picked cloud_id, got {lines!r}"
+    assert lines[0] == "1A100.40S.22V", f"launcher passed contaminated id: {lines!r}"
+    assert _ts_re().search(lines[0]) is None
 
 
 # --- optional live Responses-API A/B (no GPU, no secret printing) ---------------

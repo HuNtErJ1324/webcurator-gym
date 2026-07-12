@@ -46,7 +46,7 @@ EVAL_CONFIG=""
 EVAL_CONFIG_PATH=""
 RUN_NAME=""
 
-log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 usage() {
