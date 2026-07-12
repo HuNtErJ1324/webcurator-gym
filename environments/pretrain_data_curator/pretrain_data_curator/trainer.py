@@ -232,6 +232,7 @@ sys.stderr = _stderr_fh
 atexit.register(_stderr_fh.flush)
 
 import json, math, os, subprocess, time
+from collections.abc import Sequence
 from dataclasses import dataclass
 # The full-vocab logits + tanh-softcap chain (out = softcap * tanh(logits/softcap))
 # allocates several (B*T, 50304) fp32 temporaries; at the largest batch-schedule
@@ -477,6 +478,39 @@ def _module_definitions_source(module_filename: str, names: tuple[str, ...]) -> 
     return "\n\n\n".join(by_name[name].rstrip() for name in names)
 
 
+def _batch_stage_boundaries_source() -> str:
+    """Embed the canonical ``batch_stage_boundaries`` (and its module-level
+    constant) verbatim from ``batch_schedule.py`` so the generated trainer does
+    not hit a ``NameError`` when ``student_optimizer.build_batch_schedule`` calls
+    it at step 0 of the remote ``/workspace/train.py``.
+
+    ``build_batch_schedule`` (embedded from ``student_optimizer.py``) calls
+    ``batch_stage_boundaries`` directly rather than duplicating the rounding
+    logic; because the canonical function lives in ``batch_schedule.py`` and is
+    otherwise only imported (not inlined) there, the assembly must include its
+    source. We embed the single canonical source -- not a divergent copy -- so
+    the runtime scheduler and the token-budget accounting path can never drift.
+    """
+    source = (Path(__file__).with_name("batch_schedule.py")).read_text()
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    parts: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            # Module-level constants referenced by batch_stage_boundaries
+            # (e.g. _FRAC_SUM_TOL). Capture them verbatim so the embedded copy
+            # is self-contained without re-deriving values by hand.
+            parts.append("\n".join(lines[node.lineno - 1 : node.end_lineno]))
+        elif isinstance(node, ast.FunctionDef) and node.name == "batch_stage_boundaries":
+            start = node.lineno
+            if node.decorator_list:
+                start = min(start, node.decorator_list[0].lineno)
+            parts.append("\n".join(lines[start - 1 : node.end_lineno]))
+    if not any("def batch_stage_boundaries(" in p for p in parts):
+        raise RuntimeError("could not embed batch_stage_boundaries source")
+    return "\n\n\n".join(parts)
+
+
 def _nanogpt_train_script() -> str:
     from .student_train import encode_document_tokens
 
@@ -516,7 +550,9 @@ def _nanogpt_train_script() -> str:
         )
         .replace(
             "# __STUDENT_OPTIMIZER__  (replaced with the verbatim student_optimizer.py source)",
-            _module_definitions_source(
+            _batch_stage_boundaries_source()
+            + "\n\n\n"
+            + _module_definitions_source(
                 "student_optimizer.py",
                 (
                     "zeropower_via_newtonschulz5",

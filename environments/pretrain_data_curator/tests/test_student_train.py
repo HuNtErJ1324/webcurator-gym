@@ -1791,6 +1791,65 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     assert "from tqdm import tqdm" in NANOGPT_TRAIN_SCRIPT
 
 
+def test_assembled_trainer_defines_batch_stage_boundaries_before_build_batch_schedule():
+    # Production regression: the generated /workspace/train.py embeds
+    # student_optimizer.build_batch_schedule, which calls batch_stage_boundaries
+    # (defined in batch_schedule.py and only *imported* there). The assembly must
+    # inline the canonical batch_stage_boundaries so the remote trainer does not
+    # raise NameError at step 0. We assemble the EXACT production payload and
+    # actually execute the embedded optimizer block to call build_batch_schedule.
+    script = NANOGPT_TRAIN_SCRIPT
+    ast.parse(script)  # assembled payload is valid Python
+
+    # batch_stage_boundaries must be embedded (regression for the missing-helper
+    # NameError) and must appear before build_batch_schedule in source order.
+    assert "def batch_stage_boundaries(" in script
+    assert script.index("def batch_stage_boundaries(") < script.index(
+        "def build_batch_schedule("
+    ), "batch_stage_boundaries must be defined before build_batch_schedule"
+
+    # Extract the embedded optimizer block verbatim -- from the batch_schedule
+    # embed (which carries its _FRAC_SUM_TOL constant) through the end of the
+    # optimizer defs, just before the training-recipe defs.
+    start = script.index("_FRAC_SUM_TOL")
+    end = script.index("def lr_at_step(")
+    block = script[start:end]
+
+    import math
+    from collections.abc import Sequence
+    import dataclasses
+
+    namespace = {
+        "math": math,
+        "Sequence": Sequence,
+        "dataclass": dataclasses.dataclass,
+        "torch": __import__("torch"),
+    }
+    try:
+        exec(block, namespace)
+    except NameError as exc:
+        pytest.fail(f"assembled optimizer block has an unresolved name: {exc}")
+
+    # Execute build_batch_schedule for the production total_steps with equal
+    # [1/3]*3 fractions and confirm the boundaries/stages are correct.
+    boundaries, stages, cd_start, cd_floor = namespace["build_batch_schedule"](
+        12208, stage_fracs=(1 / 3, 1 / 3, 1 / 3)
+    )
+    assert len(boundaries) == 3
+    assert boundaries[0][0] == 0
+    assert boundaries[-1][1] == 12208
+    for (s, e), (ns, ne) in zip(boundaries, boundaries[1:]):
+        assert e == ns, f"stage boundaries must be contiguous: {boundaries}"
+    # Each of the first two stages gets round(12208/3) = 4069 steps; the last
+    # absorbs the remainder exactly.
+    assert boundaries[0] == (0, 4069), boundaries
+    assert boundaries[1] == (4069, 8138), boundaries
+    assert boundaries[2] == (8138, 12208), boundaries
+    assert len(stages) == 3
+    assert cd_start == int(12208 * (1.0 - 0.60))
+    assert cd_floor == 0.15
+
+
 def test_sandbox_tqdm_fallback_shim_works_when_import_and_install_both_fail(
     monkeypatch, capsys
 ):
