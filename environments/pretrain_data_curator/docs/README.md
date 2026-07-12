@@ -47,6 +47,21 @@ environment: rollout lifecycle, repository layout, module map, and how this site
 is generated. It is a plain asset in `site_builder/assets/`; edit it there and
 rebuild.
 
+## Training-token budgets
+
+`proxy_student.train_token_budget` limits actual scheduled token presentations,
+not merely `steps × base_batch × block_size`. This matters because the
+NanoGPT-style batch schedule increases the effective batch during training. The
+shared `batch_schedule.py` helper computes the minimal number of optimizer steps
+whose staged presentations meet the configured budget, and the runtime optimizer
+uses the same stage-boundary implementation as accounting.
+
+For the standard 400M profile (`batch_size = 16`, `block_size = 1024`, equal
+stages with multipliers `1, 2, 3`), the token-aware schedule uses 12,208 steps.
+The previous base-batch calculation used 24,415 steps and presented about 800M
+tokens despite reporting a 400M budget. `train_microbatch_size` remains a
+memory-only control and does not change budget accounting.
+
 Debug curation snapshots under `outputs/debug/<run-name>/` are included automatically.
 Rebuild with `python docs/build_site.py` (omit them with `--no-debug`).
 
