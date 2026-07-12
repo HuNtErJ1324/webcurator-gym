@@ -20,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import textwrap
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -332,6 +333,30 @@ def _cpu_resource(cloud_id, provider, mem="64", vcpus="16", price="1.00"):
         "vcpus": vcpus,
         "price_per_hour": price,
     }
+
+
+def test_launcher_tracked_eval_configs_pin_train_microbatch_32():
+    """A100 launcher base + curation profiles must pin train_microbatch_size=32.
+
+    Extracts ``BASE_EVAL_CONFIG`` assignments from the real launcher script and
+    asserts each resolved TOML keeps the production microbatch pin (memory-only).
+    """
+    assert EVAL_SCRIPT.is_file()
+    text = EVAL_SCRIPT.read_text(encoding="utf-8")
+    rels = re.findall(r'BASE_EVAL_CONFIG="(configs/eval/[^"]+\.toml)"', text)
+    assert rels == [
+        "configs/eval/400M-300turn-codex.toml",
+        "configs/eval/400M-300turn-codex-curation.toml",
+    ], rels
+    env_dir = REPO_ROOT / "environments" / "pretrain_data_curator"
+    for rel in rels:
+        path = env_dir / rel
+        assert path.is_file(), path
+        proxy = tomllib.loads(path.read_text(encoding="utf-8"))["args"]["proxy_student"]
+        assert proxy["train_microbatch_size"] == 32, rel
+        assert proxy["batch_size"] == 16, rel
+        assert proxy["block_size"] == 1024, rel
+        assert proxy["batch_stage_muls"] == [1, 2, 3], rel
 
 
 def test_gpu_filter_cheapest_massedcompute_vs_datacrunch_picks_datacrunch():

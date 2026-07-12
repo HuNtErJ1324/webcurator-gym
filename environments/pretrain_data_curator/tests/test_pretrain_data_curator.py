@@ -517,11 +517,22 @@ def test_single_smoke_config_exhaustively_matches_source_options():
     assert ValidationSetConfig.model_validate(args["validation_set"])
 
 
+# Tracked production 400M eval profiles (Codex / DeepSeek / GLM / curation).
+_EXPECTED_400M_EVAL_CONFIG_NAMES = [
+    "400M-300turn-codex-curation.toml",
+    "400M-300turn-codex.toml",
+    "deepseek-v4-pro-400M-300turn-codex.toml",
+    "glm5.2-400M-300turn-codex.toml",
+]
+
+
 def _400m_eval_config_names() -> list[str]:
     """Every on-disk *400M* eval TOML (docker-backed agent runs)."""
     eval_dir = Path(__file__).resolve().parents[1] / "configs" / "eval"
     names = sorted(p.name for p in eval_dir.glob("*400M*.toml"))
-    assert names, f"expected *400M*.toml under {eval_dir}"
+    assert names == _EXPECTED_400M_EVAL_CONFIG_NAMES, (
+        f"tracked 400M profiles drifted under {eval_dir}: {names}"
+    )
     return names
 
 
@@ -657,6 +668,18 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
     )
     assert eval_pipeline in on_pod, 'eval must pipe into tee "$LOG_FILE"'
     assert "exec uv run eval" not in on_pod
+
+    # on-pod DeepSeek profile is one of the tracked 400M pins (microbatch=32).
+    on_pod_cfg = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "eval"
+        / "deepseek-v4-pro-400M-300turn-codex.toml"
+    )
+    on_pod_proxy = tomllib.loads(on_pod_cfg.read_text(encoding="utf-8"))["args"][
+        "proxy_student"
+    ]
+    assert on_pod_proxy["train_microbatch_size"] == 32
 
 
 def test_runtime_dockerfile_installs_zstandard_codec():

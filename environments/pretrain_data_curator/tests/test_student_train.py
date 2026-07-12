@@ -3034,30 +3034,28 @@ def test_microbatch_ranges_covers_effective_batch():
     assert list(_microbatch_ranges(48, 16)) == [(0, 16), (16, 32), (32, 48)]
     assert list(_microbatch_ranges(33, 16)) == [(0, 16), (16, 32), (32, 33)]
     # Production 400M pin: microbatch=32 -> 16/32 one shot, 48 as 32+16.
+    assert list(_microbatch_ranges(16, 32)) == [(0, 16)]
     assert list(_microbatch_ranges(32, 32)) == [(0, 32)]
     assert list(_microbatch_ranges(48, 32)) == [(0, 32), (32, 48)]
 
 
-def test_train_microbatch_accum_matches_full_batch_adamw_grads():
-    """Loss-scaled microbatch grads match a single full-batch backward (AdamW path).
-
-    Documented tolerance: exact equality on CPU fp32 for this tiny model; any
-    future softcap/bf16 path may need a small abs tolerance.
-    """
+def _assert_microbatch_grads_match_full_batch(
+    *, batch: int, microbatch: int, seq: int = 8, vocab: int = 64, seed: int = 0
+) -> None:
+    """Loss-scaled microbatch grads must equal a single full-batch backward."""
     from pretrain_data_curator.student_train import (
         _microbatch_ranges,
         _scaled_microbatch_loss,
     )
 
-    torch.manual_seed(0)
-    V = 64
-    model = _tiny_cfg(V).build()
-    x = torch.randint(0, V, (4, 8), dtype=torch.long)
-    y = torch.randint(0, V, (4, 8), dtype=torch.long)
+    torch.manual_seed(seed)
+    model = _tiny_cfg(vocab).build()
+    x = torch.randint(0, vocab, (batch, seq), dtype=torch.long)
+    y = torch.randint(0, vocab, (batch, seq), dtype=torch.long)
 
     model.zero_grad(set_to_none=True)
     logits = model(x)
-    full_loss = torch.nn.functional.cross_entropy(logits.view(-1, V), y.view(-1))
+    full_loss = torch.nn.functional.cross_entropy(logits.view(-1, vocab), y.view(-1))
     full_loss.backward()
     full_grads = {
         n: p.grad.detach().clone()
@@ -3066,12 +3064,17 @@ def test_train_microbatch_accum_matches_full_batch_adamw_grads():
     }
 
     model.zero_grad(set_to_none=True)
-    for start, end in _microbatch_ranges(4, 2):
+    ranges = list(_microbatch_ranges(batch, microbatch))
+    assert ranges, (batch, microbatch)
+    # Uneven production path: batch 48 / micro 32 must weight 32 then 16.
+    if batch == 48 and microbatch == 32:
+        assert ranges == [(0, 32), (32, 48)]
+    for start, end in ranges:
         logits = model(x[start:end])
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, V), y[start:end].view(-1)
+            logits.view(-1, vocab), y[start:end].view(-1)
         )
-        _scaled_microbatch_loss(loss, end - start, 4).backward()
+        _scaled_microbatch_loss(loss, end - start, batch).backward()
     micro_grads = {
         n: p.grad.detach().clone()
         for n, p in model.named_parameters()
@@ -3083,6 +3086,66 @@ def test_train_microbatch_accum_matches_full_batch_adamw_grads():
         assert torch.allclose(full_grads[name], micro_grads[name], rtol=0, atol=1e-6), (
             name
         )
+
+
+def test_train_microbatch_accum_matches_full_batch_adamw_grads():
+    """Loss-scaled microbatch grads match a single full-batch backward (AdamW path).
+
+    Documented tolerance: exact equality on CPU fp32 for this tiny model; any
+    future softcap/bf16 path may need a small abs tolerance.
+    """
+    _assert_microbatch_grads_match_full_batch(batch=4, microbatch=2)
+
+
+def test_train_microbatch_uneven_48_32_matches_full_batch_grads_and_adamw():
+    """Production uneven accumulate (48 = 32+16) preserves grads and AdamW weights.
+
+    Chunk-size weighting via ``_scaled_microbatch_loss`` must keep the net .grad
+    identical to one full-batch backward, and the optimizer step must land on the
+    same parameters as training without microbatching.
+    """
+    _assert_microbatch_grads_match_full_batch(batch=48, microbatch=32, seed=7)
+
+    V = 64
+    # Enough tokens for several full effective-batch draws at block_size=8.
+    data = torch.randint(0, V, (48 * 8 * 4,), dtype=torch.long)
+    common = dict(
+        block_size=8,
+        batch_size=48,
+        steps=2,
+        base_lr=1e-3,
+        warmup_steps=1,
+        weight_decay=0.0,
+        grad_clip=0.0,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        lr_min_ratio=1.0,
+        vocab_size=V,
+        device="cpu",
+        training_recipe="record_01_adamw",
+        batch_schedule_enabled=False,
+    )
+
+    torch.manual_seed(7)
+    model_full = _tiny_cfg(V).build()
+    gen_full = torch.Generator().manual_seed(7)
+    train_and_eval_student(
+        model_full, data, data, generator=gen_full, train_microbatch_size=None, **common
+    )
+
+    torch.manual_seed(7)
+    model_micro = _tiny_cfg(V).build()
+    gen_micro = torch.Generator().manual_seed(7)
+    train_and_eval_student(
+        model_micro, data, data, generator=gen_micro, train_microbatch_size=32, **common
+    )
+
+    for (n1, p1), (n2, p2) in zip(
+        model_full.named_parameters(), model_micro.named_parameters()
+    ):
+        assert n1 == n2
+        assert torch.allclose(p1, p2, rtol=1e-4, atol=1e-4), n1
 
 
 def test_train_microbatch_preserves_tokens_and_schedule_ramp(monkeypatch):
