@@ -288,43 +288,48 @@ print(resources[0]["cloud_id"])
 PY
 }
 
-pick_cloud_id_with_fallback() {
+pick_compute() {
+  # Emits "<gpu_type> <cloud_id>". Callers MUST parse both fields and assign
+  # GPU_TYPE themselves: this runs inside a command substitution (subshell), so
+  # any GPU_TYPE assignment made here is discarded when the subshell exits.
+  # (Observed 2026-07-12: the previous version assigned GPU_TYPE in-subshell and
+  # returned only the cloud_id, so after an A100_80GB->A100_40GB fallback the
+  # parent still believed GPU_TYPE=A100_80GB and logged it that way while
+  # provisioning a 40GB pod -- a silent, invisible GPU downgrade.)
   if [[ "$CURATION_ONLY" -eq 1 ]]; then
-    if CLOUD_ID="$(pick_cpu_cloud_id)"; then
-      GPU_TYPE="CPU_NODE"
-      echo "$CLOUD_ID"
+    local cpu_id
+    if cpu_id="$(pick_cpu_cloud_id)"; then
+      echo "CPU_NODE $cpu_id"
       return 0
     fi
     die "No available CPU_NODE slots with >=8 vCPU and >=32 GB RAM"
   fi
-  local types=("$GPU_TYPE")
-  if [[ "$GPU_TYPE" == "A100_80GB" ]]; then
-    types+=("A100_40GB")
+  # No GPU fallback: the requested --gpu-type is honored exactly, or we fail.
+  # Silently substituting a smaller/different GPU changes the economics and the
+  # memory envelope of a multi-hour paid training run, so an unavailable
+  # requested type is a hard error, not something to paper over.
+  local gpu_id
+  if gpu_id="$(pick_cloud_id "$GPU_TYPE")"; then
+    echo "$GPU_TYPE $gpu_id"
+    return 0
   fi
-  local t
-  for t in "${types[@]}"; do
-    if CLOUD_ID="$(pick_cloud_id "$t")"; then
-      GPU_TYPE="$t"
-      echo "$CLOUD_ID"
-      return 0
-    fi
-    log "No $t capacity; trying next option"
-  done
   return 1
 }
 
-pick_cloud_id_with_retries() {
+pick_compute_with_retries() {
+  # Emits "<gpu_type> <cloud_id>" (see pick_compute).
   # Shared inventory has been observed to flicker within single-digit seconds
   # (2026-07-08: an offer reported Available by `availability list` vanished
-  # 15-30s later). A single miss on re-pick shouldn't be fatal -- retry a few
-  # times with backoff before giving up.
+  # 15-30s later; 2026-07-12: A100_80GB capacity confirmed Available vanished
+  # within ~7s, before the pick). A single miss shouldn't be fatal -- retry a
+  # few times with backoff before giving up.
   local attempt picked
   for attempt in 1 2 3 4; do
-    if picked="$(pick_cloud_id_with_fallback)"; then
+    if picked="$(pick_compute)"; then
       echo "$picked"
       return 0
     fi
-    log "No compute slots on pick attempt $attempt/4; retrying in 10s"
+    log "No $GPU_TYPE capacity on pick attempt $attempt/4; retrying in 10s"
     sleep 10
   done
   return 1
@@ -974,7 +979,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-CLOUD_ID="$(pick_cloud_id_with_retries)" || die "No available compute slots ($GPU_TYPE fallback exhausted)"
+PICKED="$(pick_compute_with_retries)" || die "No available $GPU_TYPE capacity (no GPU fallback; not substituting another GPU type)"
+GPU_TYPE="${PICKED%% *}"
+CLOUD_ID="${PICKED##* }"
 log "Selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
 
 # Shared A100 inventory (e.g. the 22V pool) can flicker between
@@ -993,7 +1000,17 @@ for attempt in 1 2 3 4 5; do
     --image "$POD_IMAGE" \
     --yes --plain 2>&1 | tee "$CREATE_LOG"; then
     POD_ID="$(sed -n 's/.*Successfully created pod //p' "$CREATE_LOG" | awk '{print $1}')"
-    [[ -n "$POD_ID" ]] && break
+    if [[ -n "$POD_ID" ]]; then
+      # Last line of defense against a GPU downgrade: assert the pod Prime
+      # actually created matches the GPU type we asked for. POD_ID is already
+      # set, so the EXIT trap terminates the pod if this fails.
+      CREATED_GPU="$(sed -n 's/^gpuType:[[:space:]]*//p' "$CREATE_LOG" | head -n1 | tr -d '[:space:]')"
+      if [[ -n "$CREATED_GPU" && "$CREATED_GPU" != "$GPU_TYPE" ]]; then
+        die "pod $POD_ID was created as $CREATED_GPU but $GPU_TYPE was requested (no GPU fallback allowed) -- terminating"
+      fi
+      log "Verified created pod GPU type: ${CREATED_GPU:-unreported} (requested $GPU_TYPE)"
+      break
+    fi
   fi
   # Exclude the cloud_id that just failed so a single consistently-broken
   # offer (observed 2026-07-08: "1A100.40S.22V" repeatedly returned "No valid
@@ -1003,7 +1020,9 @@ for attempt in 1 2 3 4 5; do
   log "prime pods create attempt $attempt failed on cloud_id=$CLOUD_ID; excluding it and retrying in 15s"
   EXCLUDED_CLOUD_IDS="$EXCLUDED_CLOUD_IDS $CLOUD_ID"
   sleep 15
-  CLOUD_ID="$(pick_cloud_id_with_retries)" || die "No available compute slots ($GPU_TYPE fallback exhausted)"
+  PICKED="$(pick_compute_with_retries)" || die "No available $GPU_TYPE capacity (no GPU fallback; not substituting another GPU type)"
+  GPU_TYPE="${PICKED%% *}"
+  CLOUD_ID="${PICKED##* }"
   log "Re-selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
 done
 rm -f "$CREATE_LOG"

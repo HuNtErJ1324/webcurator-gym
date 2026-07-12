@@ -115,12 +115,26 @@ case "$1" in
         esac
       done
       printf '%s\\n' "$cid" >> "${WCG_RECORD_DIR:?}/picked.txt"
+      # Real `prime pods create` echoes a config summary including the GPU type
+      # it actually provisioned. Tests set WCG_CREATE_GPUTYPE to emulate the
+      # provider handing back a different GPU than was requested.
+      if [ -n "${WCG_CREATE_GPUTYPE:-}" ]; then
+        echo "gpuType: ${WCG_CREATE_GPUTYPE}"
+      fi
       echo "Successfully created pod POD123"
       exit 0
     elif [ "$sub" = "status" ]; then
       cat "${WCG_POD_STATUS_JSON:?}"
       exit 0
     elif [ "$sub" = "terminate" ]; then
+      pid=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          terminate) pid="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      printf '%s\\n' "$pid" >> "${WCG_RECORD_DIR:?}/terminated.txt"
       exit 0
     fi
     ;;
@@ -187,12 +201,20 @@ def _run_script(
     rsync_mode="ok",
     model="z-ai/glm-5.2",
     avail_by_type=None,
+    gpu_type=None,
+    create_gpu_type=None,
 ):
     """Run the actual launcher script inside ``repo`` via a fake PATH.
 
     ``avail_by_type`` is a ``{gpu_type: payload}`` map; when given, the fake
-    ``prime availability`` returns a per-gpu-type JSON (enabling tiered-fallback
-    tests). Otherwise a single ``avail`` payload is used for every gpu-type.
+    ``prime availability`` returns a per-gpu-type JSON (enabling per-gpu-type
+    capacity tests). Otherwise a single ``avail`` payload is used for every
+    gpu-type.
+
+    ``gpu_type`` passes ``--gpu-type`` through to the launcher.
+    ``create_gpu_type`` makes the fake ``prime pods create`` report that GPU
+    type back, emulating a provider that hands back a GPU different from the
+    one requested.
     """
     record_dir = tmp_path / "record"
     record_dir.mkdir(parents=True, exist_ok=True)
@@ -220,10 +242,15 @@ def _run_script(
     env["WCG_POD_STATUS_JSON"] = str(status_json)
     env["WCG_RSYNC_MODE"] = rsync_mode
     env["WCG_RECORD_DIR"] = str(record_dir)
+    if create_gpu_type is not None:
+        env["WCG_CREATE_GPUTYPE"] = create_gpu_type
 
     script = repo / "scripts" / EVAL_SCRIPT.name
+    argv = [str(script), "--model", model, "--skip-site"]
+    if gpu_type is not None:
+        argv += ["--gpu-type", gpu_type]
     result = subprocess.run(
-        [str(script), "--model", model, "--skip-site"],
+        argv,
         env=env,
         cwd=str(repo),
         capture_output=True,
@@ -659,9 +686,21 @@ def test_codex_patch_fails_fast_real_script_no_eval(tmp_path: Path):
 def test_preserves_a100_80gb_docker_artifacts_and_cleanup():
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
     assert 'GPU_TYPE="A100_80GB"' in text
-    fallback = _extract_bash_function(text, "pick_cloud_id_with_fallback")
-    assert "A100_80GB" in fallback
-    assert "A100_40GB" in fallback
+
+    # The picker must honor the requested GPU type verbatim and must never
+    # encode a substitute tier. (Regression: the old pick_cloud_id_with_fallback
+    # silently downgraded an A100_80GB request to A100_40GB.) Comments are
+    # stripped first -- they legitimately name A100_40GB to explain the history;
+    # what must not contain it is the executable body.
+    pick = _extract_bash_function(text, "pick_compute")
+    pick_code = "\n".join(
+        ln for ln in pick.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "A100_40GB" not in pick_code, (
+        "no substitute GPU tier may be hardcoded in pick_compute"
+    )
+    assert '"$GPU_TYPE"' in pick_code, "pick_compute must query the REQUESTED gpu type"
+    assert "pick_cloud_id_with_fallback" not in text, "fallback picker must be gone"
 
     gpu = _extract_bash_function(text, "remote_provision_gpu")
     assert "docker" in gpu
@@ -674,20 +713,49 @@ def test_preserves_a100_80gb_docker_artifacts_and_cleanup():
     assert 'exit "$code"' in cleanup
 
 
-# --- capacity-picker stdout hygiene (cloud_id must be captured clean) ---------
+# --- capacity picker: no silent GPU substitution, clean "<type> <cloud_id>" ---
+#
+# Regression context (2026-07-12, live paid run): pick_cloud_id_with_fallback
+# assigned GPU_TYPE inside a command-substitution subshell and returned only the
+# cloud_id, so when A100_80GB capacity vanished the launcher silently provisioned
+# an A100_40GB pod while still logging "(A100_80GB)". The picker now emits the
+# tuple "<gpu_type> <cloud_id>" and has no substitute tier at all.
 
-def _run_pick_with_fallback(
+_A40_ID = "1A100.40S.22V"
+
+
+def _avail(cloud_id, provider="DataCrunch", stock="available", **kw):
+    res = {
+        "cloud_id": cloud_id,
+        "provider": provider,
+        "stock_status": stock,
+        "price_per_hour": "1.20",
+        "is_spot": False,
+    }
+    res.update(kw)
+    return {"gpu_resources": [res]}
+
+
+def _run_pick_compute(
     tmp_path: Path,
     *,
     avail_by_type,
     excluded: str = "",
     curation_only: int = 0,
     gpu_type: str = "A100_80GB",
+    with_retries: bool = False,
+    flicker_empty_calls: int = 0,
 ):
-    """Run the REAL ``pick_cloud_id_with_fallback`` (with its real ``log``/``die``
-    and python pickers) behind a fake ``prime`` whose availability branches on
-    gpu-type. Returns ``(stdout, stderr, rc)`` capturing stdout/stderr separately
-    so we can assert diagnostics never leak into the selected cloud ID.
+    """Run the REAL ``pick_compute`` (or ``pick_compute_with_retries``) with its
+    real ``log``/``die`` and python pickers, behind a fake ``prime`` whose
+    availability branches on gpu-type.
+
+    ``flicker_empty_calls`` makes the fake report NO capacity for the first N
+    ``availability`` calls before the real payload appears, emulating shared
+    inventory that flickers between calls.
+
+    Returns ``(stdout, stderr, rc)`` with streams captured separately, so we can
+    assert diagnostics never leak into the selected value.
     """
     avail_dir = tmp_path / "avail"
     avail_dir.mkdir(parents=True, exist_ok=True)
@@ -708,38 +776,37 @@ case "$1" in
       if [ "$prev" = "--gpu-type" ]; then gt="$a"; fi
       prev="$a"
     done
+    # Emulate flickering inventory: the first N calls see nothing.
+    n=0
+    if [ -f "${WCG_CALLS_FILE:-/dev/null}" ]; then n="$(cat "$WCG_CALLS_FILE")"; fi
+    n=$((n + 1))
+    [ -n "${WCG_CALLS_FILE:-}" ] && echo "$n" > "$WCG_CALLS_FILE"
+    if [ "$n" -le "${WCG_FLICKER_EMPTY:-0}" ]; then
+      echo '{"gpu_resources": []}'
+      exit 0
+    fi
     cat "${WCG_AVAIL_DIR:?}/${gt}.json" 2>/dev/null || true
     exit 0
-    ;;
-  pods)
-    sub="$2"
-    if [ "$sub" = "create" ]; then echo "Successfully created pod POD123"; exit 0; fi
-    if [ "$sub" = "status" ]; then echo '{}'; exit 0; fi
-    if [ "$sub" = "terminate" ]; then exit 0; fi
     ;;
 esac
 exit 0
 """,
     )
+    # Keep pick_compute_with_retries' backoff instant.
+    _write_script(bin_dir / "sleep", """#!/usr/bin/env bash\nexit 0\n""")
 
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
 
     def _full_function(name):
         return f"{name}() {{\n{_extract_bash_function(text, name)}\n}}"
 
-    lib = "\n".join(
-        _full_function(name)
-        for name in (
-            "log",
-            "die",
-            "pick_cloud_id",
-            "pick_cpu_cloud_id",
-            "pick_cloud_id_with_fallback",
-        )
-    )
+    names = ["log", "die", "pick_cloud_id", "pick_cpu_cloud_id", "pick_compute"]
+    if with_retries:
+        names.append("pick_compute_with_retries")
     lib_file = tmp_path / "pick_lib.sh"
-    lib_file.write_text(lib + "\n")
+    lib_file.write_text("\n".join(_full_function(n) for n in names) + "\n")
 
+    entry = "pick_compute_with_retries" if with_retries else "pick_compute"
     driver = tmp_path / "driver.sh"
     driver.write_text(
         textwrap.dedent(
@@ -749,7 +816,7 @@ GPU_TYPE="{gpu_type}"
 CURATION_ONLY={curation_only}
 EXCLUDED_CLOUD_IDS="{excluded}"
 source "{lib_file}"
-pick_cloud_id_with_fallback
+{entry}
 """
         )
     )
@@ -758,13 +825,11 @@ pick_cloud_id_with_fallback
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["WCG_AVAIL_DIR"] = str(avail_dir)
+    env["WCG_FLICKER_EMPTY"] = str(flicker_empty_calls)
+    env["WCG_CALLS_FILE"] = str(tmp_path / "calls.txt")
 
     proc = subprocess.run(
-        ["bash", str(driver)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
+        ["bash", str(driver)], env=env, capture_output=True, text=True, timeout=60
     )
     return proc.stdout, proc.stderr, proc.returncode
 
@@ -774,189 +839,235 @@ def _ts_re():
     return re.compile(r"\[\d{2}:\d{2}:\d{2}\]")
 
 
-def test_fallback_503_first_offer_then_40gb_is_clean_single_line(tmp_path):
-    out, err, rc = _run_pick_with_fallback(
+def test_pick_compute_emits_clean_type_and_cloud_id_tuple(tmp_path):
+    """Happy path: the picker emits exactly "<gpu_type> <cloud_id>" on one line,
+    with no log text or timestamp contaminating the captured value.
+    """
+    out, err, rc = _run_pick_compute(
         tmp_path,
-        avail_by_type={
-            "A100_80GB": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "dc-80",
-                        "provider": "DataCrunch",
-                        "stock_status": "sold_out",  # 503-style unavailable
-                        "price_per_hour": "1.20",
-                        "is_spot": False,
-                        "gpu_type": "A100_80GB",
-                    }
-                ]
-            },
-            "A100_40GB": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "1A100.40S.22V",
-                        "provider": "DataCrunch",
-                        "stock_status": "available",
-                        "price_per_hour": "1.20",
-                        "is_spot": False,
-                        "gpu_type": "A100_40GB",
-                    }
-                ]
-            },
-            "CPU_NODE": {"gpu_resources": []},
-        },
+        avail_by_type={"A100_80GB": _avail("dc-80"), "A100_40GB": _avail(_A40_ID)},
     )
     assert rc == 0, f"rc={rc} stderr={err}"
-    assert out.strip() == "1A100.40S.22V", f"captured stdout={out!r}"
-    assert "\n" not in out.strip(), f"cloud_id must be one line: {out!r}"
-    assert not _ts_re().search(out), f"timestamp leaked into cloud_id: {out!r}"
-    assert "capacity" not in out, f"diagnostic leaked into cloud_id: {out!r}"
-    # stderr retains the diagnostic.
-    assert "No A100_80GB capacity; trying next option" in err
+    assert out.strip() == "A100_80GB dc-80", f"captured stdout={out!r}"
+    assert "\n" not in out.strip(), f"tuple must be one line: {out!r}"
+    assert not _ts_re().search(out), f"timestamp leaked into tuple: {out!r}"
+
+    # The parent parses these two fields; both must round-trip exactly.
+    gpu_type, _, cloud_id = out.strip().partition(" ")
+    assert gpu_type == "A100_80GB"
+    assert cloud_id == "dc-80"
 
 
-def test_fallback_excluded_first_offer_then_40gb_is_clean_single_line(tmp_path):
-    out, err, rc = _run_pick_with_fallback(
+def test_no_a100_40gb_fallback_when_80gb_has_no_capacity(tmp_path):
+    """The core regression: A100_80GB sold out, A100_40GB sitting there available.
+    The picker must FAIL rather than silently substituting the 40GB offer.
+    """
+    out, err, rc = _run_pick_compute(
         tmp_path,
         avail_by_type={
-            "A100_80GB": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "dc-80-excluded",
-                        "provider": "DataCrunch",
-                        "stock_status": "available",
-                        "price_per_hour": "1.20",
-                        "is_spot": False,
-                        "gpu_type": "A100_80GB",
-                    }
-                ]
-            },
-            "A100_40GB": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "1A100.40S.22V",
-                        "provider": "DataCrunch",
-                        "stock_status": "available",
-                        "price_per_hour": "1.20",
-                        "is_spot": False,
-                        "gpu_type": "A100_40GB",
-                    }
-                ]
-            },
-            "CPU_NODE": {"gpu_resources": []},
+            "A100_80GB": _avail("dc-80", stock="sold_out"),  # 503-style unavailable
+            "A100_40GB": _avail(_A40_ID),  # available, must NOT be taken
+        },
+    )
+    assert rc != 0, f"expected failure, got rc={rc} stdout={out!r}"
+    assert out.strip() == "", f"no-capacity stdout must be empty: {out!r}"
+    assert "A100_40GB" not in out, f"40GB substituted into stdout: {out!r}"
+    assert _A40_ID not in out, f"40GB cloud_id leaked: {out!r}"
+    assert _A40_ID not in err, f"40GB offer must not even be queried: {err!r}"
+
+
+def test_requested_gpu_type_never_substituted_when_only_excluded_providers(tmp_path):
+    """A100_80GB exists but only from rejected providers; a 40GB offer is available
+    from a good provider. Still a hard fail -- provider rejection must not become
+    a back door to a different GPU type.
+    """
+    out, _err, rc = _run_pick_compute(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": _avail("mc-80", provider="MassedCompute"),
+            "A100_40GB": _avail(_A40_ID),
+        },
+    )
+    assert rc != 0, f"expected failure, got rc={rc} stdout={out!r}"
+    assert out.strip() == ""
+    assert _A40_ID not in out
+
+
+def test_excluded_cloud_id_does_not_downgrade_gpu_type(tmp_path):
+    """The only A100_80GB offer is on the exclusion list (a broken offer). The
+    picker must fail on the requested type, not drop to A100_40GB.
+    """
+    out, _err, rc = _run_pick_compute(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": _avail("dc-80-excluded"),
+            "A100_40GB": _avail(_A40_ID),
         },
         excluded="dc-80-excluded",
     )
+    assert rc != 0, f"expected failure, got rc={rc} stdout={out!r}"
+    assert out.strip() == ""
+    assert _A40_ID not in out
+
+
+def test_pick_compute_with_retries_survives_capacity_flicker(tmp_path):
+    """Shared inventory flickers: the first two availability calls report nothing,
+    then the A100_80GB offer reappears. Retries must ride this out and still
+    return the REQUESTED type -- never downgrade because of a transient miss.
+    """
+    out, err, rc = _run_pick_compute(
+        tmp_path,
+        avail_by_type={"A100_80GB": _avail("dc-80"), "A100_40GB": _avail(_A40_ID)},
+        with_retries=True,
+        flicker_empty_calls=2,
+    )
     assert rc == 0, f"rc={rc} stderr={err}"
-    assert out.strip() == "1A100.40S.22V", f"captured stdout={out!r}"
+    assert out.strip() == "A100_80GB dc-80", f"captured stdout={out!r}"
+    assert "No A100_80GB capacity on pick attempt" in err, err
+    assert _A40_ID not in out
+
+
+def test_pick_compute_with_retries_exhausted_fails_without_substitution(tmp_path):
+    """Capacity never returns: retries are exhausted and the picker fails with
+    empty stdout -- it does not reach for the available 40GB offer.
+    """
+    out, err, rc = _run_pick_compute(
+        tmp_path,
+        avail_by_type={
+            "A100_80GB": {"gpu_resources": []},
+            "A100_40GB": _avail(_A40_ID),
+        },
+        with_retries=True,
+    )
+    assert rc != 0, f"expected failure, got rc={rc}"
+    assert out.strip() == "", f"no-capacity stdout must be empty: {out!r}"
+    assert "No A100_80GB capacity on pick attempt 4/4" in err, err
+    assert _A40_ID not in out
+
+
+def test_curation_only_cpu_selected_clean_tuple(tmp_path):
+    """CPU curation path stays explicit: it emits the CPU_NODE type in the tuple."""
+    out, err, rc = _run_pick_compute(
+        tmp_path,
+        avail_by_type={
+            "CPU_NODE": _avail("dc-cpu-123", memory_gb="64", vcpus="16"),
+        },
+        curation_only=1,
+        gpu_type="CPU_NODE",
+    )
+    assert rc == 0, f"rc={rc} stderr={err}"
+    assert out.strip() == "CPU_NODE dc-cpu-123", f"captured stdout={out!r}"
     assert "\n" not in out.strip()
     assert not _ts_re().search(out)
-    assert "excluded" not in out
-    assert "No A100_80GB capacity; trying next option" in err
 
 
-def test_fallback_multiple_tiers_all_fail_returns_empty_stdout(tmp_path):
-    out, err, rc = _run_pick_with_fallback(
+def test_curation_only_cpu_no_capacity_dies_with_empty_stdout(tmp_path):
+    """CPU curation with no eligible CPU node is a hard FATAL, never a GPU pod."""
+    out, err, rc = _run_pick_compute(
         tmp_path,
-        avail_by_type={
-            "A100_80GB": {"gpu_resources": []},
-            "A100_40GB": {"gpu_resources": []},
-            "CPU_NODE": {"gpu_resources": []},
-        },
-    )
-    assert rc != 0, f"expected failure rc, got {rc}"
-    assert out.strip() == "", f"no-capacity stdout must be empty: {out!r}"
-    assert "No A100_80GB capacity; trying next option" in err
-    assert "No A100_40GB capacity; trying next option" in err
-
-
-def test_fallback_no_capacity_curation_only_cpu_empty_stdout(tmp_path):
-    out, err, rc = _run_pick_with_fallback(
-        tmp_path,
-        avail_by_type={
-            "A100_80GB": {"gpu_resources": []},
-            "A100_40GB": {"gpu_resources": []},
-            "CPU_NODE": {"gpu_resources": []},
-        },
+        avail_by_type={"CPU_NODE": {"gpu_resources": []}, "A100_80GB": _avail("dc-80")},
         curation_only=1,
         gpu_type="CPU_NODE",
     )
     assert rc != 0, f"expected failure rc, got {rc}"
     assert out.strip() == "", f"no-capacity stdout must be empty: {out!r}"
     assert "FATAL" in err
+    assert "dc-80" not in out, "curation-only must never select a GPU offer"
 
 
-def test_fallback_curation_only_cpu_selected_clean(tmp_path):
-    out, err, rc = _run_pick_with_fallback(
+# --- end-to-end: pods create receives the requested type, or nothing at all ----
+
+
+def test_launcher_passes_clean_cloud_id_to_pods_create(tmp_path):
+    """End-to-end: the launcher hands ``prime pods create`` EXACTLY the clean
+    cloud ID (no timestamp/log text) on its single recorded line, having picked
+    the requested A100_80GB from the non-excluded provider.
+    """
+    repo = _make_temp_repo(tmp_path)
+    result, record = _run_script(
         tmp_path,
-        avail_by_type={
-            "A100_80GB": {"gpu_resources": []},
-            "A100_40GB": {"gpu_resources": []},
-            "CPU_NODE": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "dc-cpu-123",
-                        "provider": "DataCrunch",
-                        "stock_status": "available",
-                        "memory_gb": "64",
-                        "vcpus": "16",
-                        "price_per_hour": "1.20",
-                    }
-                ]
-            },
-        },
-        curation_only=1,
-        gpu_type="CPU_NODE",
+        repo,
+        avail_by_type={"A100_80GB": _AVAIL_MIXED, "A100_40GB": _avail(_A40_ID)},
+        status=_STATUS_ROOT,
+        gpu_type="A100_80GB",
     )
-    assert rc == 0, f"rc={rc} stderr={err}"
-    assert out.strip() == "dc-cpu-123", f"captured stdout={out!r}"
-    assert "\n" not in out.strip()
-    assert not _ts_re().search(out)
+    picked = record / "picked.txt"
+    assert picked.exists(), f"prime pods create not invoked; stderr={result.stderr}"
+    lines = [ln for ln in picked.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected exactly one picked cloud_id, got {lines!r}"
+    assert lines[0] == "dc-a100", f"launcher passed wrong/contaminated id: {lines!r}"
+    assert _ts_re().search(lines[0]) is None
 
 
-def test_launcher_passes_clean_cloud_id_to_pods_create_on_fallback(tmp_path):
-    """End-to-end: with no A100_80GB capacity, the launcher must fall back to
-    A100_40GB and hand ``prime pods create`` EXACTLY the clean cloud ID
-    (no timestamp/log text) on its single recorded line.
+def test_launcher_creates_no_pod_when_requested_gpu_type_unavailable(tmp_path):
+    """End-to-end regression for the live incident: A100_80GB gone, A100_40GB
+    available. The launcher must create NO pod at all and fail loudly, rather
+    than provisioning a downgraded 40GB pod.
     """
     repo = _make_temp_repo(tmp_path)
     result, record = _run_script(
         tmp_path,
         repo,
         avail_by_type={
-            "A100_80GB": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "mc-80",
-                        "provider": "MassedCompute",  # always excluded
-                        "stock_status": "available",
-                        "price_per_hour": "0.90",
-                        "is_spot": False,
-                        "gpu_type": "A100_80GB",
-                    }
-                ]
-            },
-            "A100_40GB": {
-                "gpu_resources": [
-                    {
-                        "cloud_id": "1A100.40S.22V",
-                        "provider": "DataCrunch",
-                        "stock_status": "available",
-                        "price_per_hour": "1.20",
-                        "is_spot": False,
-                        "gpu_type": "A100_40GB",
-                    }
-                ]
-            },
-            "CPU_NODE": {"gpu_resources": []},
+            "A100_80GB": {"gpu_resources": []},
+            "A100_40GB": _avail(_A40_ID),
         },
         status=_STATUS_ROOT,
+        gpu_type="A100_80GB",
     )
-    picked = record / "picked.txt"
-    assert picked.exists(), f"prime pods create not invoked; stderr={result.stderr}"
-    lines = [ln for ln in picked.read_text().splitlines() if ln.strip()]
-    assert len(lines) == 1, f"expected exactly one picked cloud_id, got {lines!r}"
-    assert lines[0] == "1A100.40S.22V", f"launcher passed contaminated id: {lines!r}"
-    assert _ts_re().search(lines[0]) is None
+    assert result.returncode != 0, (
+        "launcher must fail when requested GPU is unavailable"
+    )
+    assert not (record / "picked.txt").exists(), (
+        f"no pod may be created on a GPU downgrade; picked="
+        f"{(record / 'picked.txt').read_text() if (record / 'picked.txt').exists() else ''!r}"
+    )
+    assert not (record / "eval_ran.log").exists(), "eval must not run"
+    assert "no GPU fallback" in result.stderr, result.stderr
+
+
+def test_created_pod_gpu_type_mismatch_aborts_and_terminates(tmp_path):
+    """Last line of defense: if the provider hands back a GPU different from the
+    one requested, the launcher aborts and the EXIT trap terminates the pod so
+    no paid training runs on the wrong hardware.
+    """
+    repo = _make_temp_repo(tmp_path)
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        avail_by_type={"A100_80GB": _AVAIL_MIXED},
+        status=_STATUS_ROOT,
+        gpu_type="A100_80GB",
+        create_gpu_type="A100_40GB",  # provider lies / substitutes
+    )
+    assert result.returncode != 0, "GPU-type mismatch must abort the run"
+    assert not (record / "eval_ran.log").exists(), "eval must not run on the wrong GPU"
+
+    terminated = record / "terminated.txt"
+    assert terminated.exists(), (
+        f"mismatched pod was not terminated; stderr={result.stderr}"
+    )
+    assert "POD123" in terminated.read_text()
+    assert "was created as A100_40GB" in result.stderr, result.stderr
+
+
+def test_created_pod_gpu_type_match_proceeds(tmp_path):
+    """Control for the mismatch test: when the created pod reports the requested
+    GPU type, the run proceeds (and the type is confirmed in the log).
+    """
+    repo = _make_temp_repo(tmp_path)
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        avail_by_type={"A100_80GB": _AVAIL_MIXED},
+        status=_STATUS_ROOT,
+        gpu_type="A100_80GB",
+        create_gpu_type="A100_80GB",
+    )
+    assert (record / "eval_ran.log").exists(), (
+        f"eval should run on a matching GPU; rc={result.returncode} stderr={result.stderr}"
+    )
+    assert "Verified created pod GPU type: A100_80GB" in result.stderr, result.stderr
 
 
 # --- optional live Responses-API A/B (no GPU, no secret printing) ---------------
