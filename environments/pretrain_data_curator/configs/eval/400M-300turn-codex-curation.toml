@@ -19,7 +19,6 @@ rich = true
 [sampling]
 temperature = 0.6
 top_p = 0.9
-top_k = 0.9
 
 [args]
 cutoff_date = "2024-12-31"

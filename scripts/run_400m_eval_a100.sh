@@ -163,8 +163,8 @@ upload_secrets() {
   # Enforce restrictive perms on the remote secrets file: a world-readable
   # secrets.env is a leak vector. Fail the run (never leaving secrets exposed)
   # if chmod cannot be applied. Secret contents are never logged.
-  if ! remote chmod 600 /root/webcurator-gym/secrets.env; then
-    die "Failed to chmod 600 the remote secrets file at /root/webcurator-gym/secrets.env"
+  if ! remote chmod 0600 /root/webcurator-gym/secrets.env; then
+    die "Failed to chmod 0600 the remote secrets file at /root/webcurator-gym/secrets.env"
   fi
 }
 
@@ -483,7 +483,12 @@ remote_rsync() {
   # Permanent, non-transient rsync failures. A retried rsync would only
   # re-trigger the same fatal error and burn the whole retry budget on a
   # known-dead run, so these fail fast (one attempt, no sleep).
-  local -r PERMANENT_RE='permission denied|cannot stat|link_stat|mkdir failed|read-only file system|read-only filesystem'
+  # Covers permission errors and path errors (e.g. a missing destination
+  # directory: `rsync: mkdir "/root/webcurator-gym" failed: No such file or
+  # directory (2)`) even when no "permission denied" text is present. Must
+  # NOT match transient connection errors (Connection refused/timed out,
+  # "connection unexpectedly closed", timeouts, I/O errors).
+  local -r PERMANENT_RE='permission denied|no such file or directory|cannot stat|link_stat|mkdir .*failed|read-only file system|read-only filesystem'
   for attempt in 1 2 3 4 5; do
     stderr="$(mktemp)"
     if rsync -az --delete \
@@ -647,30 +652,215 @@ echo "=== PROVISION DONE ==="
 REMOTE
 }
 
-run_remote_eval() {
-  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
-  if [[ "$CURATION_ONLY" -eq 1 ]]; then
-    log "Launching curation-only eval on CPU pod (heuristic trainer, ~30-60 min)"
-  else
-    log "Launching eval on pod (this can take ~2h for 400M)"
-  fi
-  remote bash -s <<REMOTE
+remote_patch_codex_for_prime_inference() {
+  # Codex 0.137.0 enables stable `type=namespace` features by default
+  # (`apps` and `multi_agent`). Prime Inference rejects every Responses-API
+  # `type=namespace` tool (HTTP 400 invalid_request) on the Codex/Responses
+  # models used by the 400M eval, so disable BOTH namespace features at the
+  # Codex harness boundary (idempotently, via a marker) before launching eval.
+  # Function tools, web_search, the shell tool, and HF CLI skill access are
+  # left intact -- only the namespace-producing features are disabled.
+  log "Patching remote Codex harness to --disable apps --disable multi_agent (Prime Inference compat)"
+  remote bash -s <<'REMOTE' || die "remote Codex harness patch failed (Prime Inference namespace-tool compat); refusing to launch eval against an unpatched harness"
 set -euo pipefail
-export PATH="$REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator/decon/bin:\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
-cd $REMOTE_ROOT/webcurator-gym
-set -a
-source secrets.env
-set +a
-: "\${HF_TOKEN:?HF_TOKEN missing in secrets.env}"
-: "\${PRIME_API_KEY:?PRIME_API_KEY missing in secrets.env}"
-cd environments/pretrain_data_curator
-uv run eval -m "${MODEL}" @ ${EVAL_CONFIG} 2>&1 | tee ${remote_log}
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+cd /root/webcurator-gym/environments/pretrain_data_curator
+uv run python <<'PY'
+from pathlib import Path
+import verifiers
+
+path = Path(verifiers.__file__).parent / "v1/harnesses/codex/harness.py"
+text = path.read_text()
+marker = "PRIME_INFERENCE_DISABLE_NAMESPACE_TOOLS"
+if marker in text:
+    print(f"already patched: {path}")
+else:
+    needle = (
+        "        tool_config = [\n"
+        "            arg\n"
+        "            for tool in self.config.disabled_tools or []\n"
+        "            for arg in (\"--disable\", tool)\n"
+        "        ]"
+    )
+    if needle not in text:
+        raise SystemExit(f"codex harness patch needle missing in {path}")
+    repl = (
+        "        # "
+        + marker
+        + "\n"
+        "        _disabled = list(self.config.disabled_tools or [])\n"
+        "        for _feature in (\"apps\", \"multi_agent\"):\n"
+        "            if _feature not in _disabled:\n"
+        "                _disabled.append(_feature)\n"
+        "        tool_config = [\n"
+        "            arg\n"
+        "            for tool in _disabled\n"
+        "            for arg in (\"--disable\", tool)\n"
+        "        ]"
+    )
+    path.write_text(text.replace(needle, repl, 1))
+    print(f"patched: {path}")
+PY
 REMOTE
 }
 
+run_remote_eval() {
+  # Durable, detached remote eval. The eval is launched under setsid/nohup on the
+  # pod with a PID marker, a RUNNING status marker, and a durable remote log, so a
+  # transient SSH disconnect during the multi-hour run cannot kill it. The local
+  # launcher only polls status over fresh SSH connections (tolerating bounded
+  # transient SSH failures with backoff) and proceeds to result validation only
+  # after confirmed remote completion. The EXIT trap still terminates the pod.
+  local run_dir="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.d"
+  local eval_log="$run_dir/eval.log"
+  local eval_pid="$run_dir/eval.pid"
+  local eval_status="$run_dir/status"
+  if [[ "$CURATION_ONLY" -eq 1 ]]; then
+    log "Launching curation-only eval on CPU pod (detached, ~30-60 min)"
+  else
+    log "Launching eval on pod (detached; this can take ~2h for 400M)"
+  fi
+  # Prime Inference compat: disable Codex's default namespace tools before eval.
+  remote_patch_codex_for_prime_inference
+
+  # --- durable detached launch ------------------------------------------------
+  # Writes eval.sh + PID marker + RUNNING status. Idempotent: if a live eval is
+  # already tracked (PID marker present and process alive), do NOT start a
+  # duplicate -- this protects reconnect/re-entry while a prior eval runs.
+  # All dynamic values (paths, MODEL, EVAL_CONFIG, REMOTE_ROOT) are passed as
+  # positional args to a QUOTED heredoc, so user-controlled values (MODEL /
+  # EVAL_CONFIG) are never embedded unescaped in remote shell text -- this
+  # prevents local command-substitution / quote breakout.
+  remote bash -s "$run_dir" "$eval_log" "$eval_pid" "$eval_status" "$MODEL" "$EVAL_CONFIG" "$REMOTE_ROOT" <<'REMOTE'
+set -euo pipefail
+export PATH="$7/webcurator-gym/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+RD="$1"; LOG="$2"; PID="$3"; ST="$4"
+MODEL="$5"; EVAL_CONFIG="$6"
+mkdir -p "$RD"
+cat > "$RD/eval.sh" <<'EVAL'
+#!/usr/bin/env bash
+# Detached Codex/Responses eval wrapper. Secrets are sourced (never echoed).
+set -uo pipefail
+export PATH="/root/webcurator-gym/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+MODEL="$1"
+EVAL_CONFIG="$2"
+ST="$3"
+cd /root/webcurator-gym
+set -a
+source secrets.env
+set +a
+: "${HF_TOKEN:?HF_TOKEN missing in secrets.env}"
+: "${PRIME_API_KEY:?PRIME_API_KEY missing in secrets.env}"
+cd environments/pretrain_data_curator
+uv run eval -m "$MODEL" @ "$EVAL_CONFIG"
+rc=$?
+# Atomic status completion: write to a temp file, then rename into place.
+echo "EXIT=$rc" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+exit $rc
+EVAL
+chmod +x "$RD/eval.sh"
+if [[ -f "$PID" ]]; then
+  OPID=$(cat "$PID" 2>/dev/null || true)
+  if [[ -n "$OPID" ]] && kill -0 "$OPID" 2>/dev/null; then
+    echo "eval already running (pid=$OPID); not starting duplicate"
+    exit 0
+  fi
+fi
+echo "RUNNING" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+setsid nohup bash "$RD/eval.sh" "$MODEL" "$EVAL_CONFIG" "$ST" > "$LOG" 2>&1 &
+echo $! > "$PID"
+echo "launched eval (pid=$(cat "$PID"), log=$LOG)"
+REMOTE
+
+  # --- monitor (tolerates transient SSH disconnects) --------------------------
+  monitor_remote_eval "$run_dir" "$eval_log" "$eval_pid" "$eval_status"
+}
+
+# Read the durable status marker over a fresh SSH connection.
+# Args: run_dir eval_log eval_pid eval_status
+_remote_eval_probe() {
+  remote bash -s "$1" "$2" "$3" "$4" <<'RM'
+# WCG_PROBE
+RD="$1"; LOG="$2"; PID="$3"; ST="$4"
+if [[ -f "$ST" ]]; then
+  s=$(cat "$ST")
+  if [[ "$s" == EXIT=* ]]; then echo "STATUS=done EXIT=${s#EXIT=}"; exit 0; fi
+  echo "STATUS=running"; exit 0
+fi
+if [[ -f "$PID" ]]; then
+  OPID=$(cat "$PID" 2>/dev/null || true)
+  if [[ -n "$OPID" ]] && kill -0 "$OPID" 2>/dev/null; then echo "STATUS=running"; exit 0; fi
+  echo "STATUS=nostatus_deadpid"; exit 0
+fi
+echo "STATUS=nostatus_nopid"; exit 0
+RM
+}
+
+# Best-effort progress tail; never owns the remote process lifetime.
+_remote_tail_progress() {
+  remote bash -s "$1" <<'RT' 2>/dev/null || true
+# WCG_TAIL
+LOG="$1"
+if [[ -f "$LOG" ]]; then tail -c 2000 "$LOG"; fi
+RT
+}
+
+# Poll the remote status over fresh SSH connections. Tolerates bounded transient
+# SSH failures (retries + backoff) without killing the detached remote eval; only
+# proceeds after confirmed completion, or fails safe / times out.
+monitor_remote_eval() {
+  local run_dir="$1" eval_log="$2" eval_pid="$3" eval_status="$4"
+  local timeout="${WCG_EVAL_TIMEOUT_SECONDS:-$(( CURATION_ONLY == 1 ? 7200 : 14400 ))}"
+  local poll="${WCG_EVAL_POLL_INTERVAL:-60}"
+  local retries="${WCG_EVAL_MON_RETRIES:-5}"
+  local backoff="${WCG_EVAL_MON_BACKOFF:-10}"
+  local deadline=$(( $(date +%s) + timeout ))
+  log "Monitoring remote eval (log=$eval_log, timeout=${timeout}s, poll=${poll}s)"
+  while true; do
+    local now; now=$(date +%s)
+    if (( now > deadline )); then
+      die "eval monitor timed out after ${timeout}s (transient SSH limit / pod unresponsive); remote log+status preserved at ${run_dir}"
+    fi
+    local probe="" ok=0
+    local attempt
+    for attempt in $(seq 1 "$retries"); do
+      if probe_out=$(_remote_eval_probe "$run_dir" "$eval_log" "$eval_pid" "$eval_status"); then
+        probe="$probe_out"; ok=1; break
+      fi
+      sleep "$backoff"
+    done
+    if (( ok )); then
+      local st; st=$(printf '%s\n' "$probe" | grep -E '^STATUS=' | tail -1)
+      case "$st" in
+        STATUS=done*)
+          local code="${st#STATUS=done EXIT=}"
+          if [[ "$code" == "0" ]]; then
+            log "remote eval completed successfully"
+            return 0
+          fi
+          die "remote eval exited non-zero (code=$code); see remote log $eval_log"
+          ;;
+        STATUS=running)
+          : ;;
+        STATUS=nostatus_deadpid|STATUS=nostatus_nopid)
+          die "remote eval has no completion marker and no live PID; failing safe (log $eval_log)"
+          ;;
+        *)
+          log "monitor probe inconclusive; will retry"
+          ;;
+      esac
+    else
+      log "monitor SSH probe failed (transient); will retry while pod active"
+    fi
+    _remote_tail_progress "$eval_log" || true
+    sleep "$poll"
+  done
+}
+
 find_remote_results_dir() {
-  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
+  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.d/eval.log"
   remote bash -s <<REMOTE
+# WCG_FIND_RESULTS
 set -euo pipefail
 LOG="${remote_log}"
 if [[ -f "\$LOG" ]]; then
@@ -713,7 +903,7 @@ download_results() {
     "$LOCAL_OUT_DIR/"
   [[ -s "$LOCAL_OUT_DIR/results.jsonl" ]] || die "Downloaded results.jsonl is empty"
   write_resolved_config "$LOCAL_OUT_DIR/config.toml"
-  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
+  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.d/eval.log"
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
     "${SSH_USER}@${SSH_HOST}:${remote_log}" "$LOCAL_OUT_DIR/eval-stream.log" >/dev/null 2>&1 || true
   if [[ "$CURATION_ONLY" -eq 1 ]]; then
