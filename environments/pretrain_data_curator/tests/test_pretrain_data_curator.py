@@ -569,6 +569,8 @@ def _assert_ordered_runtime_provision(body: str, *, label: str) -> None:
         )
     preflight = body.find("command -v hf")
     hub_import = body.find("import huggingface_hub")
+    zstd_import = body.find("import zstandard")
+    zstd_decompress = body.find("zstandard.ZstdDecompressor")
     decon_exec = body.find("test -x /workspace/decon/bin/decon")
     if decon_exec < 0:
         decon_exec = body.find("test -x ${AGENT_DECON_BIN}")
@@ -581,18 +583,22 @@ def _assert_ordered_runtime_provision(body: str, *, label: str) -> None:
     assert image_build >= 0, f"{label}: missing webcurator-runtime:latest build"
     assert preflight >= 0, f"{label}: missing in-container hf preflight"
     assert hub_import >= 0, f"{label}: missing huggingface_hub import preflight"
+    assert zstd_import >= 0, f"{label}: missing zstandard import preflight"
+    assert zstd_decompress >= 0, f"{label}: missing zstd decompression round-trip preflight"
     assert decon_exec >= 0, f"{label}: missing executable /workspace/decon check"
     assert decon_run >= 0, f"{label}: missing /workspace/decon --version preflight"
     assert "/workspace/decon/bin/decon" in body or (
         'AGENT_DECON_BIN="/workspace/decon/bin/decon"' in body
     ), f"{label}: preflight must target agent-mounted /workspace/decon"
 
-    # Order: decon verify/fallback → image build → hf → hub → executable decon.
+    # Order: decon verify/fallback → image build → hf → hub → zstd → executable decon.
     assert decon_verify < image_build, f"{label}: decon verify before image build"
     assert decon_fallback < image_build, f"{label}: decon fallback before image build"
     assert image_build < preflight, f"{label}: image build before hf preflight"
     assert preflight < hub_import, f"{label}: hf before huggingface_hub"
-    assert hub_import < decon_exec, f"{label}: huggingface_hub before decon test -x"
+    assert hub_import < zstd_import, f"{label}: huggingface_hub before zstandard preflight"
+    assert zstd_import < zstd_decompress, f"{label}: zstandard import before decompress check"
+    assert zstd_decompress < decon_exec, f"{label}: zstd preflight before decon test -x"
     assert decon_exec <= decon_run, f"{label}: test -x before decon --version"
 
 
@@ -621,6 +627,51 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
     )
     assert eval_pipeline in on_pod, 'eval must pipe into tee "$LOG_FILE"'
     assert "exec uv run eval" not in on_pod
+
+
+def test_runtime_dockerfile_installs_zstandard_codec():
+    # The webcurator-runtime image must ship the zstandard codec so the
+    # datasets/fsspec read path can materialize zstd-compressed Hub datasets
+    # (mlfoundations/dclm-baseline-1.0, monology/pile-uncopyrighted) instead of
+    # failing with "Compression type zstd not supported".
+    dockerfile = (
+        Path(__file__).resolve().parents[3]
+        / "environments"
+        / "pretrain_data_curator"
+        / "Dockerfile.runtime"
+    )
+    text = dockerfile.read_text(encoding="utf-8")
+    assert "zstandard" in text, "Dockerfile.runtime must install zstandard"
+    assert "pip install" in text, "Dockerfile.runtime must pip install its deps"
+    # The package must also declare it so `uv pip install -e .` pulls it in on
+    # the host that runs `uv run eval` (which materializes the same datasets).
+    pyproject = (
+        Path(__file__).resolve().parents[3]
+        / "environments"
+        / "pretrain_data_curator"
+        / "pyproject.toml"
+    )
+    assert "zstandard" in pyproject.read_text(encoding="utf-8")
+
+
+def test_zstandard_codec_installed_and_decompresses():
+    # Deterministic, offline proof that the zstd codec the runtime images now
+    # ship actually opens/decompresses zstd content through fsspec -- the exact
+    # path datasets uses to read zstd-compressed parquet from the Hub. Skips if
+    # zstandard is not installed (it must be, per the dependency above).
+    zstandard = pytest.importorskip("zstandard")
+    fsspec = pytest.importorskip("fsspec")
+    import os
+    import tempfile
+
+    data = b"webcurator corpus materialization round-trip\n" * 200
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "sample.zst")
+        with open(p, "wb") as f:
+            f.write(zstandard.ZstdCompressor().compress(data))
+        with fsspec.open(p, "rb", compression="zstd") as fh:
+            out = fh.read()
+    assert out == data
 
 
 @pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])

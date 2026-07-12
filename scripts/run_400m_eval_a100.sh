@@ -564,10 +564,14 @@ echo "=== build custom harness-runtime image (hf + decon for the agent container
 # Build only after decon is compiled so COPY decon/ picks up a runnable binary.
 cd $REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator
 docker build -f Dockerfile.runtime -t webcurator-runtime:latest .
-echo "--- preflight: hf/huggingface_hub + /workspace/decon/bin/decon ---"
+echo "--- preflight: hf/huggingface_hub + zstd codec + /workspace/decon/bin/decon ---"
 # Validate the same absolute path self_score.py probes in the agent container.
+# The zstd round-trip guards against the production "Compression type zstd not
+# supported" failure when materializing zstd-compressed Hub datasets
+# (e.g. mlfoundations/dclm-baseline-1.0, monology/pile-uncopyrighted): the
+# datasets/fsspec read path needs the zstandard codec installed in the image.
 docker run --rm -w /workspace webcurator-runtime:latest bash -lc \
-  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
+  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && python -c "import zstandard; c=zstandard.ZstdCompressor(); d=zstandard.ZstdDecompressor(); raw=b\"webcurator-zstd-preflight\"; assert d.decompress(c.compress(raw))==raw; print(\"zstandard\", zstandard.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
 
 echo "=== PROVISION DONE ==="
 REMOTE
@@ -642,10 +646,14 @@ echo "=== build custom harness-runtime image (hf + decon for the agent container
 # 400M configs point docker_image at "webcurator-runtime:latest".
 cd $REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator
 docker build -f Dockerfile.runtime -t webcurator-runtime:latest .
-echo "--- preflight: hf/huggingface_hub + /workspace/decon/bin/decon ---"
+echo "--- preflight: hf/huggingface_hub + zstd codec + /workspace/decon/bin/decon ---"
 # Validate the same absolute path self_score.py probes in the agent container.
+# The zstd round-trip guards against the production "Compression type zstd not
+# supported" failure when materializing zstd-compressed Hub datasets
+# (e.g. mlfoundations/dclm-baseline-1.0, monology/pile-uncopyrighted): the
+# datasets/fsspec read path needs the zstandard codec installed in the image.
 docker run --rm -w /workspace webcurator-runtime:latest bash -lc \
-  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
+  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && python -c "import zstandard; c=zstandard.ZstdCompressor(); d=zstandard.ZstdDecompressor(); raw=b\"webcurator-zstd-preflight\"; assert d.decompress(c.compress(raw))==raw; print(\"zstandard\", zstandard.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
 docker run --rm --gpus all webcurator-runtime:latest nvidia-smi -L
 
 echo "=== PROVISION DONE ==="
