@@ -231,7 +231,7 @@ _stderr_fh = open(_stderr_path, "w", buffering=1)
 sys.stderr = _stderr_fh
 atexit.register(_stderr_fh.flush)
 
-import json, math, os, subprocess, time
+import bisect, json, math, os, subprocess, time
 from collections.abc import Sequence
 from dataclasses import dataclass
 # The full-vocab logits + tanh-softcap chain (out = softcap * tanh(logits/softcap))

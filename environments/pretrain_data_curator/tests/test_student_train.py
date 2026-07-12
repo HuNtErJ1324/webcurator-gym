@@ -760,6 +760,42 @@ def test_window_document_ids_cover_packed_span():
     assert mask.shape == (1, 8, 8)
 
 
+def test_window_document_ids_bisect_locates_window_deep_in_corpus():
+    """Regression: the old implementation linearly scanned every document, so
+    it always found the right answer regardless of ``start``. The bisect-based
+    lookup must correctly locate a window that starts far past many earlier
+    documents, not just windows near position 0 (which a bisect index of 0 or
+    an off-by-one could accidentally still get right).
+    """
+    # 100 documents of length 10 each: doc i covers [10*i, 10*i + 10).
+    ranges = [(10 * i, 10 * i + 10) for i in range(100)]
+    # Window entirely inside document 42, away from either edge.
+    ids = window_document_ids(423, 4, ranges)
+    assert ids.tolist() == [42, 42, 42, 42]
+    # Window straddling the boundary between documents 42 and 43.
+    ids = window_document_ids(428, 4, ranges)
+    assert ids.tolist() == [42, 42, 43, 43]
+    # Window starting exactly on a document boundary.
+    ids = window_document_ids(430, 5, ranges)
+    assert ids.tolist() == [43, 43, 43, 43, 43]
+
+
+def test_sandbox_script_imports_bisect_for_embedded_window_document_ids():
+    """``window_document_ids`` (embedded verbatim, see
+    ``test_sandbox_script_embeds_training_recipe_verbatim``) calls
+    ``bisect.bisect_right``, but only the function *body* is spliced into
+    ``NANOGPT_TRAIN_SCRIPT`` -- the module-level ``import bisect`` has to be
+    added separately to the script's own header, exactly like the earlier
+    ``dataclass`` import gap. Without it, the very first training window
+    NameErrors before any GPU work starts.
+    """
+    assert "import bisect" in NANOGPT_TRAIN_SCRIPT
+    # Must be bound before window_document_ids's definition, not after.
+    assert NANOGPT_TRAIN_SCRIPT.index("import bisect") < NANOGPT_TRAIN_SCRIPT.index(
+        "def window_document_ids("
+    )
+
+
 def test_seq_len_schedule_warmup():
     block_fn = make_seq_len_schedule(100, 64)
     assert block_fn(0) == 8  # min block

@@ -32,6 +32,7 @@ Portable features (all opt-in):
 
 from __future__ import annotations
 
+import bisect
 import inspect
 import math
 import sys
@@ -209,17 +210,34 @@ def plan_eos_aligned_windows(n_tokens, block, document_ranges, lookahead=1):
 
 
 def window_document_ids(start, length, document_ranges, device=None):
-    """Per-position document ids for ``train_src[start:start+length]``."""
+    """Per-position document ids for ``train_src[start:start+length]``.
+
+    ``document_ranges`` are sorted, disjoint, and contiguous (no gaps) per the
+    contract documented on :func:`plan_eos_aligned_windows`, so only documents
+    overlapping ``[start, start+length)`` are relevant. Binary-search for the
+    first candidate instead of scanning every document in the corpus: with a
+    few hundred thousand documents, a per-window O(num_documents) scan (called
+    per training step, per batch item) made per-step wall time dominated by
+    this loop instead of GPU compute.
+    """
     start = int(start)
     length = int(length)
     ids = torch.full((length,), -1, dtype=torch.long, device=device)
     end = start + length
-    for doc_id, (raw_start, raw_end) in enumerate(document_ranges or ()):
-        doc_start, doc_end = int(raw_start), int(raw_end)
+    ranges = document_ranges or ()
+    if not ranges:
+        return ids
+    doc_id = bisect.bisect_right(ranges, start, key=lambda r: r[0]) - 1
+    if doc_id < 0:
+        doc_id = 0
+    for i in range(doc_id, len(ranges)):
+        doc_start, doc_end = int(ranges[i][0]), int(ranges[i][1])
+        if doc_start >= end:
+            break
         lo = max(doc_start, start)
         hi = min(doc_end, end)
         if lo < hi:
-            ids[lo - start : hi - start] = doc_id
+            ids[lo - start : hi - start] = i
     return ids
 
 
