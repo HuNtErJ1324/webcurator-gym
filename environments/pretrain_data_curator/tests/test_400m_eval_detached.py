@@ -168,7 +168,19 @@ fi
 
 # FIND RESULTS
 if printf '%s' "$stdin" | grep -q "WCG_FIND_RESULTS"; then
-  # log path is in the heredoc (LOG="..."); echo deterministic result dir
+  # mirror the real function: grep the remote log for `results: outputs/...`,
+  # strip exactly one leading outputs/, and reject unsafe paths.
+  logf=$(printf '%s' "$stdin" | sed -n 's/.*LOG="\([^"]*\)".*/\1/p' | head -1)
+  line=$(grep -Eo 'results: outputs/[^[:space:]]+' "$(map "$logf")" 2>/dev/null | tail -1)
+  if [ -n "$line" ]; then
+    rel="${line#results: }"
+    rel="${rel#outputs/}"
+    case "$rel" in
+      ""|/*|*..*|*/.|*/.|./*) exit 1 ;;
+    esac
+    echo "$rel"; exit 0
+  fi
+  # fallback: deterministic relative dir (no outputs/ prefix), contract identical
   echo "2026-01-01/run0"; exit 0
 fi
 
@@ -187,6 +199,7 @@ exit 0
 
 
 _RSYNC_FAKE = r'''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${WCG_RECORD_DIR:?}/rsync_args.log"
 printf 'rsync\n' >> "${WCG_RECORD_DIR:?}/rsync_count.txt"
 mode="${WCG_RSYNC_MODE:-ok}"
 if [ "$mode" = "permanent" ]; then
@@ -306,7 +319,12 @@ def _extract_bash_heredoc(text: str, marker: str) -> str:
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
-        if f"<<'{marker}'" in line or f"<<-{marker}'" in line:
+        if (
+            f"<<'{marker}'" in line
+            or f"<<-{marker}'" in line
+            or f"<<{marker}" in line
+            or f"<<-{marker}" in line
+        ):
             start = i + 1
             break
     if start is None:
@@ -331,6 +349,32 @@ def _run_bash_heredoc(body: str, *args: str) -> subprocess.CompletedProcess:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+    ) as proc:
+        out, err = proc.communicate(body)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def _run_find_results(body: str, remote_root: Path, run_name: str) -> subprocess.CompletedProcess:
+    """Execute the find_remote_results_dir heredoc (the remote-side body) with
+    remote_log/REMOTE_ROOT set, mirroring what the launcher's `remote` wrapper
+    would expand before invoking `bash -s` on the pod.
+
+    The heredoc is unquoted in the script, so the source escapes `$` (e.g.
+    `\\$LOG`); unescape to simulate the text the remote bash actually receives.
+    The nested `<<'PY'` fallback block is quoted, so `$REMOTE_ROOT` is expanded
+    by the outer heredoc on the launcher host -- substitute it textually here.
+    """
+    body = body.replace("\\$", "$").replace("$REMOTE_ROOT", str(remote_root))
+    env = dict(os.environ)
+    env["REMOTE_ROOT"] = str(remote_root)
+    env["remote_log"] = str(remote_root / f"wcg-eval-{run_name}.d" / "eval.log")
+    with subprocess.Popen(
+        ["bash", "-s"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
     ) as proc:
         out, err = proc.communicate(body)
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
@@ -559,3 +603,101 @@ def test_hostile_model_value_cannot_break_out(tmp_path: Path):
     launch_stdin = (record / "launch_stdin.log").read_text()
     assert 'MODEL="$5"' in launch_stdin
     assert hostile not in launch_stdin
+
+
+# --- find_remote_results_dir / download path logic (artifact-path blocker) ---
+
+def test_find_remote_results_strips_outputs_prefix(tmp_path: Path):
+    """The real function must return the results dir RELATIVE to the outputs
+    root (strip exactly one leading `outputs/`), not `outputs/...`."""
+    text = EVAL_SCRIPT.read_text(encoding="utf-8")
+    body = _extract_function_heredoc(text, "find_remote_results_dir", "REMOTE")
+    run_dir = tmp_path / "wcg-eval-x.d"
+    run_dir.mkdir()
+    (run_dir / "eval.log").write_text(
+        "some preamble\nresults: outputs/pretrain-data-curator--abc/uuid-123\n"
+    )
+    out = _run_find_results(body, tmp_path, "x")
+    assert out.returncode == 0, out.stdout + out.stderr
+    rel = out.stdout.strip()
+    assert rel == "pretrain-data-curator--abc/uuid-123"
+    assert not rel.startswith("outputs/")
+
+
+def test_find_remote_results_rejects_unsafe_paths(tmp_path: Path):
+    cases = {
+        "empty after strip": "results: outputs/\n",
+        "absolute after strip": "results: outputs//abs/path\n",
+        "parent traversal": "results: outputs/foo/../bar\n",
+        "no expected prefix": "results: other/foo\n",
+    }
+    text = EVAL_SCRIPT.read_text(encoding="utf-8")
+    body = _extract_function_heredoc(text, "find_remote_results_dir", "REMOTE")
+    for name, content in cases.items():
+        run_dir = tmp_path / f"wcg-eval-{name.replace(' ', '_')}.d"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "eval.log").write_text(content)
+        out = _run_find_results(body, tmp_path, name.replace(" ", "_"))
+        # unsafe -> fail safe (non-zero), nothing emitted to stdout
+        assert out.returncode != 0, f"{name}: expected fail-safe, got {out.stdout!r}"
+        assert out.stdout.strip() == "", f"{name}: must not emit an unsafe path"
+
+
+def test_find_remote_results_fallback_returns_relative(tmp_path: Path):
+    """Fallback (no results line in log) scans outputs/ and returns a path
+    relative to the outputs root -- identical contract to the grep path."""
+    text = EVAL_SCRIPT.read_text(encoding="utf-8")
+    body = _extract_function_heredoc(text, "find_remote_results_dir", "REMOTE")
+    run_dir = tmp_path / "wcg-eval-x.d"
+    run_dir.mkdir()
+    (run_dir / "eval.log").write_text("no results line here\n")
+    outputs_root = (
+        tmp_path / "webcurator-gym" / "environments" / "pretrain_data_curator" / "outputs"
+    )
+    run = outputs_root / "pretrain-data-curator--abc" / "run-uuid"
+    run.mkdir(parents=True)
+    (run / "results.jsonl").write_text(
+        json.dumps({"is_completed": True, "rewards": {"reward": 0.42}})
+    )
+    out = _run_find_results(body, tmp_path, "x")
+    assert out.returncode == 0, out.stdout + out.stderr
+    rel = out.stdout.strip()
+    assert rel == "pretrain-data-curator--abc/run-uuid"
+    assert not rel.startswith("outputs/")
+
+
+def test_download_constructs_single_outputs_and_lands_local(tmp_path: Path):
+    """End-to-end: downloaded artifacts land in the requested local dir, and the
+    rsync source contains exactly one `/outputs/` (no doubled prefix)."""
+    repo = _make_temp_repo(tmp_path)
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        modes={
+            "WCG_EVAL_TIMEOUT_SECONDS": 30,
+            "WCG_EVAL_POLL_INTERVAL": 1,
+            "WCG_EVAL_MON_RETRIES": 2,
+            "WCG_EVAL_MON_BACKOFF": 1,
+            "WCG_DONE_AFTER_PROBES": 1,
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    local_dir = (
+        repo
+        / "environments"
+        / "pretrain_data_curator"
+        / "outputs"
+        / "evals-400m"
+        / "z-ai-glm-5.2-400M-300turn-codex"
+    )
+    assert (local_dir / "results.jsonl").exists()
+    # the rsync SOURCE contains the relative results dir under exactly one
+    # /outputs/ (no doubled prefix from caller + function)
+    args = (record / "rsync_args.log").read_text()
+    assert "outputs/2026-01-01/run0/" in args
+    assert "/outputs/outputs/" not in args
+    # the rsync SOURCE (remote) carries exactly one /outputs/ prefix
+    src = "root@203.0.113.9:/root/webcurator-gym/environments/pretrain_data_curator/outputs/2026-01-01/run0/"
+    assert src in args
+    assert src.count("/outputs/") == 1
+    assert "/outputs/outputs/" not in args

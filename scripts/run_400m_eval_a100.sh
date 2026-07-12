@@ -863,10 +863,22 @@ find_remote_results_dir() {
 # WCG_FIND_RESULTS
 set -euo pipefail
 LOG="${remote_log}"
+_normalize_rel() {
+  # Accept only a non-empty, relative, traversal-free outputs subpath.
+  local p="\$1"
+  [[ -n "\$p" ]] || return 1
+  [[ "\$p" == /* ]] && return 1
+  [[ "\$p" == *".."* ]] && return 1
+  [[ "\$p" == *"/./"* || "\$p" == */. || "\$p" == ./* ]] && return 1
+  return 0
+}
 if [[ -f "\$LOG" ]]; then
   RESULTS_LINE="\$(grep -Eo 'results: outputs/[^[:space:]]+' "\$LOG" | tail -1 || true)"
   if [[ -n "\$RESULTS_LINE" ]]; then
-    echo "\${RESULTS_LINE#results: }"
+    REL="\${RESULTS_LINE#results: }"
+    REL="\${REL#outputs/}"            # strip exactly one leading outputs/
+    _normalize_rel "\$REL" || exit 1
+    echo "\$REL"
     exit 0
   fi
 fi
