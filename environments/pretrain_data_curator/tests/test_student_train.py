@@ -1755,6 +1755,29 @@ def test_prepare_student_model_dtype_cuda_casts_muon_keeps_adam_fp32(monkeypatch
         assert table.weight.dtype == torch.float32
 
 
+def test_prepare_student_model_dtype_cuda_forward_runs_end_to_end(monkeypatch):
+    """A forward pass must not crash on the float32/bfloat16 boundary.
+
+    Regression test: embed/value_embeds/lambdas stay float32 (Adam-managed)
+    while blocks are cast to bfloat16 (Muon-managed), and forward_hidden must
+    cast the activations it hands to the blocks accordingly. Mock
+    ``_is_cuda_device`` so this runs on CPU-resident bfloat16 tensors.
+    """
+    import pretrain_data_curator.student_train as st
+
+    monkeypatch.setattr(st, "_is_cuda_device", lambda device: True)
+    V = 64
+    model = _tiny_cfg(V).build()
+    prepare_student_model_dtype(model, "cuda")
+    idx = torch.randint(0, V, (2, 16))
+
+    out, hidden = model(idx, output_hidden=True)
+
+    assert hidden.dtype == torch.bfloat16
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+
+
 def test_sandbox_script_embeds_training_recipe_verbatim():
     # The GPU-only script must run the SAME tested components. Document encoding
     # is embedded before corpus construction; the remaining recipe follows later.

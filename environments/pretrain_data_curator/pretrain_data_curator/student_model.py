@@ -666,8 +666,19 @@ class GPT(nn.Module):
         x = self.norm_in(self.embed(idx))
         if self.smear is not None:
             x = self.smear(x)
+        # embed/smear are Adam-managed and stay float32 (see
+        # student_train.prepare_student_model_dtype) even when the Muon-managed
+        # blocks run in bfloat16 on CUDA. Cast the trunk activations (and the
+        # value embeddings mixed into attention, which are Adam-managed too) to
+        # the blocks' own dtype here so every block's Linear sees a matching
+        # input dtype instead of failing on the first CUDA forward pass.
+        trunk_dtype = self.blocks[0].attn.q.weight.dtype
+        x = x.to(dtype=trunk_dtype)
         x0 = x
-        ve = self.value_embeds(idx)
+        ve = [
+            v.to(dtype=trunk_dtype) if v is not None else None
+            for v in self.value_embeds(idx)
+        ]
         ve_enc, ve_dec = ve[: self.num_encoder_layers], ve[self.num_encoder_layers :]
         skip_connections: list[torch.Tensor] = []
         encoder_outputs: list[torch.Tensor] = []
