@@ -158,8 +158,14 @@ upload_secrets() {
     printf 'PRIME_API_KEY=%s\n' "$(prime_api_key_from_cli)" >> "$tmp"
   fi
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
-    "$tmp" "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/secrets.env" >/dev/null
+    "$tmp" "${SSH_USER}@${SSH_HOST}:/root/webcurator-gym/secrets.env" >/dev/null
   rm -f "$tmp"
+  # Enforce restrictive perms on the remote secrets file: a world-readable
+  # secrets.env is a leak vector. Fail the run (never leaving secrets exposed)
+  # if chmod cannot be applied. Secret contents are never logged.
+  if ! remote chmod 600 /root/webcurator-gym/secrets.env; then
+    die "Failed to chmod 600 the remote secrets file at /root/webcurator-gym/secrets.env"
+  fi
 }
 
 SSH_KEY="$(python3 - <<'PY'
@@ -212,11 +218,15 @@ resources = [
     r for r in data.get("gpu_resources", [])
     if (r.get("stock_status") or "").lower() == "available"
     and r.get("cloud_id") not in excluded
-    # crusoecloud pods (observed 2026-07-08 on a100-80gb.1x) default to a
-    # non-root "ubuntu" login user, but this script's remote paths (repo
-    # sync destination, secrets.env, decon binary, etc.) all assume a root
-    # home directory -- skip that provider rather than special-case paths.
+    # crusoecloud and massedcompute pods default to a non-root "ubuntu" login
+    # user (observed 2026-07-08 on crusoecloud's a100-80gb.1x; MassedCompute
+    # ships ubuntu images). This launcher is root-home/rootful-Docker only:
+    # every remote path (repo sync destination, secrets.env, decon binary,
+    # Docker) assumes a root home directory, and rootful Docker is required.
+    # MassedCompute ubuntu is unsupported -- skip both providers rather than
+    # special-case paths or add rootless-Docker / single-shell support.
     and (r.get("provider") or "").lower() != "crusoecloud"
+    and (r.get("provider") or "").lower() != "massedcompute"
 ]
 if not resources:
     raise SystemExit(1)
@@ -246,7 +256,11 @@ data = json.loads(sys.argv[1])
 resources = [
     r for r in data.get("gpu_resources", [])
     if (r.get("stock_status") or "").lower() == "available"
+    # crusoecloud and massedcompute default to a non-root "ubuntu" login user
+    # and this launcher is root-home/rootful-Docker only (MassedCompute ubuntu
+    # is unsupported). Skip both rather than special-case paths.
     and (r.get("provider") or "").lower() != "crusoecloud"
+    and (r.get("provider") or "").lower() != "massedcompute"
 ]
 
 def memory_gb(r):
@@ -403,14 +417,9 @@ PY
         SSH_HOST="${_ssh_parts[1]:-}"
         SSH_PORT="${_ssh_parts[2]:-22}"
         [[ -n "$SSH_HOST" ]] || die "Could not parse SSH target from pod status"
-        # Some provider images (massedcompute DGX_A100, crusoecloud) log in as a
-        # non-root user (ubuntu) whose home is /home/$SSH_USER, not /root. Derive
-        # the remote repo root so all remote paths land somewhere the user can write.
-        if [[ "$SSH_USER" == "root" ]]; then
-          REMOTE_ROOT="/root"
-        else
-          REMOTE_ROOT="/home/${SSH_USER}"
-        fi
+        # Root-home/rootful-Docker only: remote paths assume /root. Non-root
+        # provider images are rejected after SSH auth (see main flow).
+        REMOTE_ROOT="/root"
         # Cloud IPs get recycled across pods; a stale known_hosts entry from a
         # prior pod at this same IP makes even StrictHostKeyChecking=no refuse
         # to connect (observed 2026-07-08 after a spot-instance reclaim).
@@ -469,9 +478,14 @@ wait_for_ssh_auth() {
 }
 
 remote_rsync() {
-  local attempt
-  local ssh_cmd="ssh -T -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT"
+  local attempt stderr ssh_cmd
+  ssh_cmd="ssh -T -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT"
+  # Permanent, non-transient rsync failures. A retried rsync would only
+  # re-trigger the same fatal error and burn the whole retry budget on a
+  # known-dead run, so these fail fast (one attempt, no sleep).
+  local -r PERMANENT_RE='permission denied|cannot stat|link_stat|mkdir failed|read-only file system|read-only filesystem'
   for attempt in 1 2 3 4 5; do
+    stderr="$(mktemp)"
     if rsync -az --delete \
       --exclude '.git/' \
       --exclude '.venv/' \
@@ -482,9 +496,17 @@ remote_rsync() {
       --exclude '**/.mypy_cache/' \
       --exclude 'docs/site/data/' \
       -e "$ssh_cmd" \
-      "$ROOT/" "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/"; then
+      "$ROOT/" "${SSH_USER}@${SSH_HOST}:/root/webcurator-gym/" 2>"$stderr"; then
+      rm -f "$stderr"
       return 0
     fi
+    if grep -Eqi "$PERMANENT_RE" "$stderr"; then
+      local reason
+      reason="$(grep -Ei "$PERMANENT_RE" "$stderr" | head -n1)"
+      rm -f "$stderr"
+      die "rsync permanent failure (no retry): $reason"
+    fi
+    rm -f "$stderr"
     log "rsync attempt $attempt failed; retrying in 20s"
     sleep 20
   done
@@ -780,6 +802,16 @@ rm -f "$CREATE_LOG"
 log "Created pod $POD_ID ($POD_NAME)"
 wait_for_pod "$POD_ID"
 wait_for_ssh_auth
+
+# This launcher is root-home/rootful-Docker only: every remote path
+# (/root/webcurator-gym, secrets.env, decon binary, Docker) assumes a root
+# login. A pod that authenticated as a non-root user (e.g. MassedCompute /
+# crusoecloud ubuntu images) is unsupported and would silently corrupt the
+# run, so fail fast. The EXIT trap terminates the pod before we bail out.
+if [[ "$SSH_USER" != "root" ]]; then
+  die "FATAL: pod authenticated as non-root user '$SSH_USER'; this launcher requires root SSH access (rootful Docker / root home). Unsupported provider image -- terminating pod."
+fi
+REMOTE_ROOT="/root"
 
 log "Syncing repository to pod"
 remote_rsync
