@@ -536,6 +536,35 @@ def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
     assert "pytorch/pytorch" not in proxy["docker_image"]
 
 
+@pytest.mark.parametrize("config_name", _400m_eval_config_names())
+def test_400m_eval_configs_set_train_microbatch_32(config_name):
+    """Production 400M profiles pin microbatch=32 without changing schedule math.
+
+    Memory-only: effective batch 16/32 run as one microbatch; 48 accumulates 32+16.
+    Optimizer cadence stays schedule-driven (batch_size=16, muls=[1,2,3]).
+    """
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
+    raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    proxy = raw["args"]["proxy_student"]
+    assert proxy["batch_size"] == 16
+    assert proxy["block_size"] == 1024
+    assert proxy["batch_stage_muls"] == [1, 2, 3]
+    assert proxy["train_microbatch_size"] == 32
+    assert proxy["train_token_budget"] == 400_000_000
+
+    cfg = ProxyStudentConfig.model_validate(proxy)
+    assert cfg.train_microbatch_size == 32
+    assert cfg.effective_steps == 12_208
+    assert cfg.effective_train_tokens == 400_048_128
+
+    # Same profile without microbatch must keep identical accounting.
+    baseline = ProxyStudentConfig.model_validate(
+        {**proxy, "train_microbatch_size": None}
+    )
+    assert baseline.effective_steps == cfg.effective_steps == 12_208
+    assert baseline.effective_train_tokens == cfg.effective_train_tokens == 400_048_128
+
+
 def _extract_bash_function(script: str, name: str) -> str:
     """Return the body of ``name() { ... }`` (outermost braces), or raise."""
     header = f"{name}()"
@@ -1844,6 +1873,7 @@ def test_train_token_budget_equal_stages_400m_is_schedule_aware():
     # Old base-batch formula would have doubled the step count.
     assert cfg.effective_steps != 24_415
     tokens = cfg.effective_train_tokens
+    assert tokens == 400_048_128
     assert tokens == scheduled_presentation_tokens(
         cfg.effective_steps,
         batch_size=16,
@@ -1966,6 +1996,7 @@ def test_train_token_budget_accounting_parity_with_schedule_sum():
 
 
 def test_train_token_budget_microbatch_does_not_change_steps_or_tokens():
+    """train_microbatch_size is memory-only; 400M schedule stays 12,208 / 400,048,128."""
     a = ProxyStudentConfig(
         train_token_budget=400_000_000,
         batch_size=16,
@@ -1978,8 +2009,19 @@ def test_train_token_budget_microbatch_does_not_change_steps_or_tokens():
         block_size=1024,
         train_microbatch_size=16,
     )
-    assert a.effective_steps == b.effective_steps == 12_208
-    assert a.effective_train_tokens == b.effective_train_tokens
+    c = ProxyStudentConfig(
+        train_token_budget=400_000_000,
+        batch_size=16,
+        block_size=1024,
+        train_microbatch_size=32,
+    )
+    assert a.effective_steps == b.effective_steps == c.effective_steps == 12_208
+    assert (
+        a.effective_train_tokens
+        == b.effective_train_tokens
+        == c.effective_train_tokens
+        == 400_048_128
+    )
 
 
 @pytest.mark.parametrize("budget", [0, 1_000_000_001])

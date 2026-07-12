@@ -3033,6 +3033,9 @@ def test_microbatch_ranges_covers_effective_batch():
     assert list(_microbatch_ranges(32, 16)) == [(0, 16), (16, 32)]
     assert list(_microbatch_ranges(48, 16)) == [(0, 16), (16, 32), (32, 48)]
     assert list(_microbatch_ranges(33, 16)) == [(0, 16), (16, 32), (32, 33)]
+    # Production 400M pin: microbatch=32 -> 16/32 one shot, 48 as 32+16.
+    assert list(_microbatch_ranges(32, 32)) == [(0, 32)]
+    assert list(_microbatch_ranges(48, 32)) == [(0, 32), (32, 48)]
 
 
 def test_train_microbatch_accum_matches_full_batch_adamw_grads():
