@@ -46,7 +46,7 @@ EVAL_CONFIG=""
 EVAL_CONFIG_PATH=""
 RUN_NAME=""
 
-log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
 usage() {
@@ -158,8 +158,14 @@ upload_secrets() {
     printf 'PRIME_API_KEY=%s\n' "$(prime_api_key_from_cli)" >> "$tmp"
   fi
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
-    "$tmp" "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/secrets.env" >/dev/null
+    "$tmp" "${SSH_USER}@${SSH_HOST}:/root/webcurator-gym/secrets.env" >/dev/null
   rm -f "$tmp"
+  # Enforce restrictive perms on the remote secrets file: a world-readable
+  # secrets.env is a leak vector. Fail the run (never leaving secrets exposed)
+  # if chmod cannot be applied. Secret contents are never logged.
+  if ! remote chmod 0600 /root/webcurator-gym/secrets.env; then
+    die "Failed to chmod 0600 the remote secrets file at /root/webcurator-gym/secrets.env"
+  fi
 }
 
 SSH_KEY="$(python3 - <<'PY'
@@ -212,11 +218,15 @@ resources = [
     r for r in data.get("gpu_resources", [])
     if (r.get("stock_status") or "").lower() == "available"
     and r.get("cloud_id") not in excluded
-    # crusoecloud pods (observed 2026-07-08 on a100-80gb.1x) default to a
-    # non-root "ubuntu" login user, but this script's remote paths (repo
-    # sync destination, secrets.env, decon binary, etc.) all assume a root
-    # home directory -- skip that provider rather than special-case paths.
+    # crusoecloud and massedcompute pods default to a non-root "ubuntu" login
+    # user (observed 2026-07-08 on crusoecloud's a100-80gb.1x; MassedCompute
+    # ships ubuntu images). This launcher is root-home/rootful-Docker only:
+    # every remote path (repo sync destination, secrets.env, decon binary,
+    # Docker) assumes a root home directory, and rootful Docker is required.
+    # MassedCompute ubuntu is unsupported -- skip both providers rather than
+    # special-case paths or add rootless-Docker / single-shell support.
     and (r.get("provider") or "").lower() != "crusoecloud"
+    and (r.get("provider") or "").lower() != "massedcompute"
 ]
 if not resources:
     raise SystemExit(1)
@@ -246,7 +256,11 @@ data = json.loads(sys.argv[1])
 resources = [
     r for r in data.get("gpu_resources", [])
     if (r.get("stock_status") or "").lower() == "available"
+    # crusoecloud and massedcompute default to a non-root "ubuntu" login user
+    # and this launcher is root-home/rootful-Docker only (MassedCompute ubuntu
+    # is unsupported). Skip both rather than special-case paths.
     and (r.get("provider") or "").lower() != "crusoecloud"
+    and (r.get("provider") or "").lower() != "massedcompute"
 ]
 
 def memory_gb(r):
@@ -274,43 +288,48 @@ print(resources[0]["cloud_id"])
 PY
 }
 
-pick_cloud_id_with_fallback() {
+pick_compute() {
+  # Emits "<gpu_type> <cloud_id>". Callers MUST parse both fields and assign
+  # GPU_TYPE themselves: this runs inside a command substitution (subshell), so
+  # any GPU_TYPE assignment made here is discarded when the subshell exits.
+  # (Observed 2026-07-12: the previous version assigned GPU_TYPE in-subshell and
+  # returned only the cloud_id, so after an A100_80GB->A100_40GB fallback the
+  # parent still believed GPU_TYPE=A100_80GB and logged it that way while
+  # provisioning a 40GB pod -- a silent, invisible GPU downgrade.)
   if [[ "$CURATION_ONLY" -eq 1 ]]; then
-    if CLOUD_ID="$(pick_cpu_cloud_id)"; then
-      GPU_TYPE="CPU_NODE"
-      echo "$CLOUD_ID"
+    local cpu_id
+    if cpu_id="$(pick_cpu_cloud_id)"; then
+      echo "CPU_NODE $cpu_id"
       return 0
     fi
     die "No available CPU_NODE slots with >=8 vCPU and >=32 GB RAM"
   fi
-  local types=("$GPU_TYPE")
-  if [[ "$GPU_TYPE" == "A100_80GB" ]]; then
-    types+=("A100_40GB")
+  # No GPU fallback: the requested --gpu-type is honored exactly, or we fail.
+  # Silently substituting a smaller/different GPU changes the economics and the
+  # memory envelope of a multi-hour paid training run, so an unavailable
+  # requested type is a hard error, not something to paper over.
+  local gpu_id
+  if gpu_id="$(pick_cloud_id "$GPU_TYPE")"; then
+    echo "$GPU_TYPE $gpu_id"
+    return 0
   fi
-  local t
-  for t in "${types[@]}"; do
-    if CLOUD_ID="$(pick_cloud_id "$t")"; then
-      GPU_TYPE="$t"
-      echo "$CLOUD_ID"
-      return 0
-    fi
-    log "No $t capacity; trying next option"
-  done
   return 1
 }
 
-pick_cloud_id_with_retries() {
+pick_compute_with_retries() {
+  # Emits "<gpu_type> <cloud_id>" (see pick_compute).
   # Shared inventory has been observed to flicker within single-digit seconds
   # (2026-07-08: an offer reported Available by `availability list` vanished
-  # 15-30s later). A single miss on re-pick shouldn't be fatal -- retry a few
-  # times with backoff before giving up.
+  # 15-30s later; 2026-07-12: A100_80GB capacity confirmed Available vanished
+  # within ~7s, before the pick). A single miss shouldn't be fatal -- retry a
+  # few times with backoff before giving up.
   local attempt picked
   for attempt in 1 2 3 4; do
-    if picked="$(pick_cloud_id_with_fallback)"; then
+    if picked="$(pick_compute)"; then
       echo "$picked"
       return 0
     fi
-    log "No compute slots on pick attempt $attempt/4; retrying in 10s"
+    log "No $GPU_TYPE capacity on pick attempt $attempt/4; retrying in 10s"
     sleep 10
   done
   return 1
@@ -403,14 +422,9 @@ PY
         SSH_HOST="${_ssh_parts[1]:-}"
         SSH_PORT="${_ssh_parts[2]:-22}"
         [[ -n "$SSH_HOST" ]] || die "Could not parse SSH target from pod status"
-        # Some provider images (massedcompute DGX_A100, crusoecloud) log in as a
-        # non-root user (ubuntu) whose home is /home/$SSH_USER, not /root. Derive
-        # the remote repo root so all remote paths land somewhere the user can write.
-        if [[ "$SSH_USER" == "root" ]]; then
-          REMOTE_ROOT="/root"
-        else
-          REMOTE_ROOT="/home/${SSH_USER}"
-        fi
+        # Root-home/rootful-Docker only: remote paths assume /root. Non-root
+        # provider images are rejected after SSH auth (see main flow).
+        REMOTE_ROOT="/root"
         # Cloud IPs get recycled across pods; a stale known_hosts entry from a
         # prior pod at this same IP makes even StrictHostKeyChecking=no refuse
         # to connect (observed 2026-07-08 after a spot-instance reclaim).
@@ -469,9 +483,19 @@ wait_for_ssh_auth() {
 }
 
 remote_rsync() {
-  local attempt
-  local ssh_cmd="ssh -T -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT"
+  local attempt stderr ssh_cmd
+  ssh_cmd="ssh -T -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT"
+  # Permanent, non-transient rsync failures. A retried rsync would only
+  # re-trigger the same fatal error and burn the whole retry budget on a
+  # known-dead run, so these fail fast (one attempt, no sleep).
+  # Covers permission errors and path errors (e.g. a missing destination
+  # directory: `rsync: mkdir "/root/webcurator-gym" failed: No such file or
+  # directory (2)`) even when no "permission denied" text is present. Must
+  # NOT match transient connection errors (Connection refused/timed out,
+  # "connection unexpectedly closed", timeouts, I/O errors).
+  local -r PERMANENT_RE='permission denied|no such file or directory|cannot stat|link_stat|mkdir .*failed|read-only file system|read-only filesystem'
   for attempt in 1 2 3 4 5; do
+    stderr="$(mktemp)"
     if rsync -az --delete \
       --exclude '.git/' \
       --exclude '.venv/' \
@@ -482,9 +506,17 @@ remote_rsync() {
       --exclude '**/.mypy_cache/' \
       --exclude 'docs/site/data/' \
       -e "$ssh_cmd" \
-      "$ROOT/" "${SSH_USER}@${SSH_HOST}:$REMOTE_ROOT/webcurator-gym/"; then
+      "$ROOT/" "${SSH_USER}@${SSH_HOST}:/root/webcurator-gym/" 2>"$stderr"; then
+      rm -f "$stderr"
       return 0
     fi
+    if grep -Eqi "$PERMANENT_RE" "$stderr"; then
+      local reason
+      reason="$(grep -Ei "$PERMANENT_RE" "$stderr" | head -n1)"
+      rm -f "$stderr"
+      die "rsync permanent failure (no retry): $reason"
+    fi
+    rm -f "$stderr"
     log "rsync attempt $attempt failed; retrying in 20s"
     sleep 20
   done
@@ -537,10 +569,14 @@ echo "=== build custom harness-runtime image (hf + decon for the agent container
 # Build only after decon is compiled so COPY decon/ picks up a runnable binary.
 cd $REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator
 docker build -f Dockerfile.runtime -t webcurator-runtime:latest .
-echo "--- preflight: hf/huggingface_hub + /workspace/decon/bin/decon ---"
+echo "--- preflight: hf/huggingface_hub + zstd codec + /workspace/decon/bin/decon ---"
 # Validate the same absolute path self_score.py probes in the agent container.
+# The zstd round-trip guards against the production "Compression type zstd not
+# supported" failure when materializing zstd-compressed Hub datasets
+# (e.g. mlfoundations/dclm-baseline-1.0, monology/pile-uncopyrighted): the
+# datasets/fsspec read path needs the zstandard codec installed in the image.
 docker run --rm -w /workspace webcurator-runtime:latest bash -lc \
-  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
+  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && python -c "import zstandard; c=zstandard.ZstdCompressor(); d=zstandard.ZstdDecompressor(); raw=b\"webcurator-zstd-preflight\"; assert d.decompress(c.compress(raw))==raw; print(\"zstandard\", zstandard.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
 
 echo "=== PROVISION DONE ==="
 REMOTE
@@ -615,46 +651,247 @@ echo "=== build custom harness-runtime image (hf + decon for the agent container
 # 400M configs point docker_image at "webcurator-runtime:latest".
 cd $REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator
 docker build -f Dockerfile.runtime -t webcurator-runtime:latest .
-echo "--- preflight: hf/huggingface_hub + /workspace/decon/bin/decon ---"
+echo "--- preflight: hf/huggingface_hub + zstd codec + /workspace/decon/bin/decon ---"
 # Validate the same absolute path self_score.py probes in the agent container.
+# The zstd round-trip guards against the production "Compression type zstd not
+# supported" failure when materializing zstd-compressed Hub datasets
+# (e.g. mlfoundations/dclm-baseline-1.0, monology/pile-uncopyrighted): the
+# datasets/fsspec read path needs the zstandard codec installed in the image.
 docker run --rm -w /workspace webcurator-runtime:latest bash -lc \
-  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
+  'command -v hf && python -c "import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)" && python -c "import zstandard; c=zstandard.ZstdCompressor(); d=zstandard.ZstdDecompressor(); raw=b\"webcurator-zstd-preflight\"; assert d.decompress(c.compress(raw))==raw; print(\"zstandard\", zstandard.__version__)" && test -x /workspace/decon/bin/decon && /workspace/decon/bin/decon --version'
 docker run --rm --gpus all webcurator-runtime:latest nvidia-smi -L
 
 echo "=== PROVISION DONE ==="
 REMOTE
 }
 
-run_remote_eval() {
-  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
-  if [[ "$CURATION_ONLY" -eq 1 ]]; then
-    log "Launching curation-only eval on CPU pod (heuristic trainer, ~30-60 min)"
-  else
-    log "Launching eval on pod (this can take ~2h for 400M)"
-  fi
-  remote bash -s <<REMOTE
+remote_patch_codex_for_prime_inference() {
+  # Codex 0.137.0 enables stable `type=namespace` features by default
+  # (`apps` and `multi_agent`). Prime Inference rejects every Responses-API
+  # `type=namespace` tool (HTTP 400 invalid_request) on the Codex/Responses
+  # models used by the 400M eval, so disable BOTH namespace features at the
+  # Codex harness boundary (idempotently, via a marker) before launching eval.
+  # Function tools, web_search, the shell tool, and HF CLI skill access are
+  # left intact -- only the namespace-producing features are disabled.
+  log "Patching remote Codex harness to --disable apps --disable multi_agent (Prime Inference compat)"
+  remote bash -s <<'REMOTE' || die "remote Codex harness patch failed (Prime Inference namespace-tool compat); refusing to launch eval against an unpatched harness"
 set -euo pipefail
-export PATH="$REMOTE_ROOT/webcurator-gym/environments/pretrain_data_curator/decon/bin:\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
-cd $REMOTE_ROOT/webcurator-gym
-set -a
-source secrets.env
-set +a
-: "\${HF_TOKEN:?HF_TOKEN missing in secrets.env}"
-: "\${PRIME_API_KEY:?PRIME_API_KEY missing in secrets.env}"
-cd environments/pretrain_data_curator
-uv run eval -m "${MODEL}" @ ${EVAL_CONFIG} 2>&1 | tee ${remote_log}
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+cd /root/webcurator-gym/environments/pretrain_data_curator
+uv run python <<'PY'
+from pathlib import Path
+import verifiers
+
+path = Path(verifiers.__file__).parent / "v1/harnesses/codex/harness.py"
+text = path.read_text()
+marker = "PRIME_INFERENCE_DISABLE_NAMESPACE_TOOLS"
+if marker in text:
+    print(f"already patched: {path}")
+else:
+    needle = (
+        "        tool_config = [\n"
+        "            arg\n"
+        "            for tool in self.config.disabled_tools or []\n"
+        "            for arg in (\"--disable\", tool)\n"
+        "        ]"
+    )
+    if needle not in text:
+        raise SystemExit(f"codex harness patch needle missing in {path}")
+    repl = (
+        "        # "
+        + marker
+        + "\n"
+        "        _disabled = list(self.config.disabled_tools or [])\n"
+        "        for _feature in (\"apps\", \"multi_agent\"):\n"
+        "            if _feature not in _disabled:\n"
+        "                _disabled.append(_feature)\n"
+        "        tool_config = [\n"
+        "            arg\n"
+        "            for tool in _disabled\n"
+        "            for arg in (\"--disable\", tool)\n"
+        "        ]"
+    )
+    path.write_text(text.replace(needle, repl, 1))
+    print(f"patched: {path}")
+PY
 REMOTE
 }
 
+run_remote_eval() {
+  # Durable, detached remote eval. The eval is launched under setsid/nohup on the
+  # pod with a PID marker, a RUNNING status marker, and a durable remote log, so a
+  # transient SSH disconnect during the multi-hour run cannot kill it. The local
+  # launcher only polls status over fresh SSH connections (tolerating bounded
+  # transient SSH failures with backoff) and proceeds to result validation only
+  # after confirmed remote completion. The EXIT trap still terminates the pod.
+  local run_dir="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.d"
+  local eval_log="$run_dir/eval.log"
+  local eval_pid="$run_dir/eval.pid"
+  local eval_status="$run_dir/status"
+  if [[ "$CURATION_ONLY" -eq 1 ]]; then
+    log "Launching curation-only eval on CPU pod (detached, ~30-60 min)"
+  else
+    log "Launching eval on pod (detached; this can take ~2h for 400M)"
+  fi
+  # Prime Inference compat: disable Codex's default namespace tools before eval.
+  remote_patch_codex_for_prime_inference
+
+  # --- durable detached launch ------------------------------------------------
+  # Writes eval.sh + PID marker + RUNNING status. Idempotent: if a live eval is
+  # already tracked (PID marker present and process alive), do NOT start a
+  # duplicate -- this protects reconnect/re-entry while a prior eval runs.
+  # All dynamic values (paths, MODEL, EVAL_CONFIG, REMOTE_ROOT) are passed as
+  # positional args to a QUOTED heredoc, so user-controlled values (MODEL /
+  # EVAL_CONFIG) are never embedded unescaped in remote shell text -- this
+  # prevents local command-substitution / quote breakout.
+  remote bash -s "$run_dir" "$eval_log" "$eval_pid" "$eval_status" "$MODEL" "$EVAL_CONFIG" "$REMOTE_ROOT" <<'REMOTE'
+set -euo pipefail
+export PATH="$7/webcurator-gym/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+RD="$1"; LOG="$2"; PID="$3"; ST="$4"
+MODEL="$5"; EVAL_CONFIG="$6"
+mkdir -p "$RD"
+cat > "$RD/eval.sh" <<'EVAL'
+#!/usr/bin/env bash
+# Detached Codex/Responses eval wrapper. Secrets are sourced (never echoed).
+set -uo pipefail
+export PATH="/root/webcurator-gym/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+MODEL="$1"
+EVAL_CONFIG="$2"
+ST="$3"
+cd /root/webcurator-gym
+set -a
+source secrets.env
+set +a
+: "${HF_TOKEN:?HF_TOKEN missing in secrets.env}"
+: "${PRIME_API_KEY:?PRIME_API_KEY missing in secrets.env}"
+cd environments/pretrain_data_curator
+uv run eval -m "$MODEL" @ "$EVAL_CONFIG"
+rc=$?
+# Atomic status completion: write to a temp file, then rename into place.
+echo "EXIT=$rc" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+exit $rc
+EVAL
+chmod +x "$RD/eval.sh"
+if [[ -f "$PID" ]]; then
+  OPID=$(cat "$PID" 2>/dev/null || true)
+  if [[ -n "$OPID" ]] && kill -0 "$OPID" 2>/dev/null; then
+    echo "eval already running (pid=$OPID); not starting duplicate"
+    exit 0
+  fi
+fi
+echo "RUNNING" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+setsid nohup bash "$RD/eval.sh" "$MODEL" "$EVAL_CONFIG" "$ST" > "$LOG" 2>&1 &
+echo $! > "$PID"
+echo "launched eval (pid=$(cat "$PID"), log=$LOG)"
+REMOTE
+
+  # --- monitor (tolerates transient SSH disconnects) --------------------------
+  monitor_remote_eval "$run_dir" "$eval_log" "$eval_pid" "$eval_status"
+}
+
+# Read the durable status marker over a fresh SSH connection.
+# Args: run_dir eval_log eval_pid eval_status
+_remote_eval_probe() {
+  remote bash -s "$1" "$2" "$3" "$4" <<'RM'
+# WCG_PROBE
+RD="$1"; LOG="$2"; PID="$3"; ST="$4"
+if [[ -f "$ST" ]]; then
+  s=$(cat "$ST")
+  if [[ "$s" == EXIT=* ]]; then echo "STATUS=done EXIT=${s#EXIT=}"; exit 0; fi
+  echo "STATUS=running"; exit 0
+fi
+if [[ -f "$PID" ]]; then
+  OPID=$(cat "$PID" 2>/dev/null || true)
+  if [[ -n "$OPID" ]] && kill -0 "$OPID" 2>/dev/null; then echo "STATUS=running"; exit 0; fi
+  echo "STATUS=nostatus_deadpid"; exit 0
+fi
+echo "STATUS=nostatus_nopid"; exit 0
+RM
+}
+
+# Best-effort progress tail; never owns the remote process lifetime.
+_remote_tail_progress() {
+  remote bash -s "$1" <<'RT' 2>/dev/null || true
+# WCG_TAIL
+LOG="$1"
+if [[ -f "$LOG" ]]; then tail -c 2000 "$LOG"; fi
+RT
+}
+
+# Poll the remote status over fresh SSH connections. Tolerates bounded transient
+# SSH failures (retries + backoff) without killing the detached remote eval; only
+# proceeds after confirmed completion, or fails safe / times out.
+monitor_remote_eval() {
+  local run_dir="$1" eval_log="$2" eval_pid="$3" eval_status="$4"
+  local timeout="${WCG_EVAL_TIMEOUT_SECONDS:-$(( CURATION_ONLY == 1 ? 7200 : 14400 ))}"
+  local poll="${WCG_EVAL_POLL_INTERVAL:-60}"
+  local retries="${WCG_EVAL_MON_RETRIES:-5}"
+  local backoff="${WCG_EVAL_MON_BACKOFF:-10}"
+  local deadline=$(( $(date +%s) + timeout ))
+  log "Monitoring remote eval (log=$eval_log, timeout=${timeout}s, poll=${poll}s)"
+  while true; do
+    local now; now=$(date +%s)
+    if (( now > deadline )); then
+      die "eval monitor timed out after ${timeout}s (transient SSH limit / pod unresponsive); remote log+status preserved at ${run_dir}"
+    fi
+    local probe="" ok=0
+    local attempt
+    for attempt in $(seq 1 "$retries"); do
+      if probe_out=$(_remote_eval_probe "$run_dir" "$eval_log" "$eval_pid" "$eval_status"); then
+        probe="$probe_out"; ok=1; break
+      fi
+      sleep "$backoff"
+    done
+    if (( ok )); then
+      local st; st=$(printf '%s\n' "$probe" | grep -E '^STATUS=' | tail -1)
+      case "$st" in
+        STATUS=done*)
+          local code="${st#STATUS=done EXIT=}"
+          if [[ "$code" == "0" ]]; then
+            log "remote eval completed successfully"
+            return 0
+          fi
+          die "remote eval exited non-zero (code=$code); see remote log $eval_log"
+          ;;
+        STATUS=running)
+          : ;;
+        STATUS=nostatus_deadpid|STATUS=nostatus_nopid)
+          die "remote eval has no completion marker and no live PID; failing safe (log $eval_log)"
+          ;;
+        *)
+          log "monitor probe inconclusive; will retry"
+          ;;
+      esac
+    else
+      log "monitor SSH probe failed (transient); will retry while pod active"
+    fi
+    _remote_tail_progress "$eval_log" || true
+    sleep "$poll"
+  done
+}
+
 find_remote_results_dir() {
-  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
+  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.d/eval.log"
   remote bash -s <<REMOTE
+# WCG_FIND_RESULTS
 set -euo pipefail
 LOG="${remote_log}"
+_normalize_rel() {
+  # Accept only a non-empty, relative, traversal-free outputs subpath.
+  local p="\$1"
+  [[ -n "\$p" ]] || return 1
+  [[ "\$p" == /* ]] && return 1
+  [[ "\$p" == *".."* ]] && return 1
+  [[ "\$p" == *"/./"* || "\$p" == */. || "\$p" == ./* ]] && return 1
+  return 0
+}
 if [[ -f "\$LOG" ]]; then
   RESULTS_LINE="\$(grep -Eo 'results: outputs/[^[:space:]]+' "\$LOG" | tail -1 || true)"
   if [[ -n "\$RESULTS_LINE" ]]; then
-    echo "\${RESULTS_LINE#results: }"
+    REL="\${RESULTS_LINE#results: }"
+    REL="\${REL#outputs/}"            # strip exactly one leading outputs/
+    _normalize_rel "\$REL" || exit 1
+    echo "\$REL"
     exit 0
   fi
 fi
@@ -691,7 +928,7 @@ download_results() {
     "$LOCAL_OUT_DIR/"
   [[ -s "$LOCAL_OUT_DIR/results.jsonl" ]] || die "Downloaded results.jsonl is empty"
   write_resolved_config "$LOCAL_OUT_DIR/config.toml"
-  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.log"
+  local remote_log="$REMOTE_ROOT/wcg-eval-${RUN_NAME}.d/eval.log"
   scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -P "$SSH_PORT" \
     "${SSH_USER}@${SSH_HOST}:${remote_log}" "$LOCAL_OUT_DIR/eval-stream.log" >/dev/null 2>&1 || true
   if [[ "$CURATION_ONLY" -eq 1 ]]; then
@@ -742,7 +979,9 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-CLOUD_ID="$(pick_cloud_id_with_retries)" || die "No available compute slots ($GPU_TYPE fallback exhausted)"
+PICKED="$(pick_compute_with_retries)" || die "No available $GPU_TYPE capacity (no GPU fallback; not substituting another GPU type)"
+GPU_TYPE="${PICKED%% *}"
+CLOUD_ID="${PICKED##* }"
 log "Selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
 
 # Shared A100 inventory (e.g. the 22V pool) can flicker between
@@ -761,7 +1000,17 @@ for attempt in 1 2 3 4 5; do
     --image "$POD_IMAGE" \
     --yes --plain 2>&1 | tee "$CREATE_LOG"; then
     POD_ID="$(sed -n 's/.*Successfully created pod //p' "$CREATE_LOG" | awk '{print $1}')"
-    [[ -n "$POD_ID" ]] && break
+    if [[ -n "$POD_ID" ]]; then
+      # Last line of defense against a GPU downgrade: assert the pod Prime
+      # actually created matches the GPU type we asked for. POD_ID is already
+      # set, so the EXIT trap terminates the pod if this fails.
+      CREATED_GPU="$(sed -n 's/^gpuType:[[:space:]]*//p' "$CREATE_LOG" | head -n1 | tr -d '[:space:]')"
+      if [[ -n "$CREATED_GPU" && "$CREATED_GPU" != "$GPU_TYPE" ]]; then
+        die "pod $POD_ID was created as $CREATED_GPU but $GPU_TYPE was requested (no GPU fallback allowed) -- terminating"
+      fi
+      log "Verified created pod GPU type: ${CREATED_GPU:-unreported} (requested $GPU_TYPE)"
+      break
+    fi
   fi
   # Exclude the cloud_id that just failed so a single consistently-broken
   # offer (observed 2026-07-08: "1A100.40S.22V" repeatedly returned "No valid
@@ -771,7 +1020,9 @@ for attempt in 1 2 3 4 5; do
   log "prime pods create attempt $attempt failed on cloud_id=$CLOUD_ID; excluding it and retrying in 15s"
   EXCLUDED_CLOUD_IDS="$EXCLUDED_CLOUD_IDS $CLOUD_ID"
   sleep 15
-  CLOUD_ID="$(pick_cloud_id_with_retries)" || die "No available compute slots ($GPU_TYPE fallback exhausted)"
+  PICKED="$(pick_compute_with_retries)" || die "No available $GPU_TYPE capacity (no GPU fallback; not substituting another GPU type)"
+  GPU_TYPE="${PICKED%% *}"
+  CLOUD_ID="${PICKED##* }"
   log "Re-selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
 done
 rm -f "$CREATE_LOG"
@@ -780,6 +1031,16 @@ rm -f "$CREATE_LOG"
 log "Created pod $POD_ID ($POD_NAME)"
 wait_for_pod "$POD_ID"
 wait_for_ssh_auth
+
+# This launcher is root-home/rootful-Docker only: every remote path
+# (/root/webcurator-gym, secrets.env, decon binary, Docker) assumes a root
+# login. A pod that authenticated as a non-root user (e.g. MassedCompute /
+# crusoecloud ubuntu images) is unsupported and would silently corrupt the
+# run, so fail fast. The EXIT trap terminates the pod before we bail out.
+if [[ "$SSH_USER" != "root" ]]; then
+  die "FATAL: pod authenticated as non-root user '$SSH_USER'; this launcher requires root SSH access (rootful Docker / root home). Unsupported provider image -- terminating pod."
+fi
+REMOTE_ROOT="/root"
 
 log "Syncing repository to pod"
 remote_rsync

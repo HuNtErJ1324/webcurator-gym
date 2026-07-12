@@ -36,9 +36,9 @@ echo "[setup] building $RUNTIME_IMAGE from Dockerfile.runtime (after decon)..."
 # Agent harness runs inside this image; bare pytorch lacks hf + decon.
 docker build -f Dockerfile.runtime -t "$RUNTIME_IMAGE" .
 
-echo "[setup] preflight inside $RUNTIME_IMAGE (hf/huggingface_hub + $AGENT_DECON_BIN)..."
+echo "[setup] preflight inside $RUNTIME_IMAGE (hf/huggingface_hub + zstd codec + $AGENT_DECON_BIN)..."
 docker run --rm -w /workspace "$RUNTIME_IMAGE" bash -lc \
-  "command -v hf && python -c 'import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)' && test -x ${AGENT_DECON_BIN} && ${AGENT_DECON_BIN} --version"
+  "command -v hf && python -c 'import huggingface_hub; print(\"huggingface_hub\", huggingface_hub.__version__)' && python -c 'import zstandard; c=zstandard.ZstdCompressor(); d=zstandard.ZstdDecompressor(); raw=b\"webcurator-zstd-preflight\"; assert d.decompress(c.compress(raw))==raw; print(\"zstandard\", zstandard.__version__)' && test -x ${AGENT_DECON_BIN} && ${AGENT_DECON_BIN} --version"
 
 echo "[setup] verifying GPU docker access with $RUNTIME_IMAGE..."
 docker run --rm --gpus 1 "$RUNTIME_IMAGE" nvidia-smi

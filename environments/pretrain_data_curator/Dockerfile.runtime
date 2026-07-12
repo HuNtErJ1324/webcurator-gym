@@ -10,7 +10,8 @@ RUN python -m pip install --no-cache-dir \
     "huggingface-hub>=0.34" \
     tiktoken \
     tqdm \
-    uv
+    uv \
+    "zstandard>=0.23.0"
 
 # Bake the decon Rust n-gram detector binary and its bundled public-benchmark
 # eval sets for fully offline contamination detection.

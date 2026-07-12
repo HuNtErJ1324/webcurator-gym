@@ -760,6 +760,42 @@ def test_window_document_ids_cover_packed_span():
     assert mask.shape == (1, 8, 8)
 
 
+def test_window_document_ids_bisect_locates_window_deep_in_corpus():
+    """Regression: the old implementation linearly scanned every document, so
+    it always found the right answer regardless of ``start``. The bisect-based
+    lookup must correctly locate a window that starts far past many earlier
+    documents, not just windows near position 0 (which a bisect index of 0 or
+    an off-by-one could accidentally still get right).
+    """
+    # 100 documents of length 10 each: doc i covers [10*i, 10*i + 10).
+    ranges = [(10 * i, 10 * i + 10) for i in range(100)]
+    # Window entirely inside document 42, away from either edge.
+    ids = window_document_ids(423, 4, ranges)
+    assert ids.tolist() == [42, 42, 42, 42]
+    # Window straddling the boundary between documents 42 and 43.
+    ids = window_document_ids(428, 4, ranges)
+    assert ids.tolist() == [42, 42, 43, 43]
+    # Window starting exactly on a document boundary.
+    ids = window_document_ids(430, 5, ranges)
+    assert ids.tolist() == [43, 43, 43, 43, 43]
+
+
+def test_sandbox_script_imports_bisect_for_embedded_window_document_ids():
+    """``window_document_ids`` (embedded verbatim, see
+    ``test_sandbox_script_embeds_training_recipe_verbatim``) calls
+    ``bisect.bisect_right``, but only the function *body* is spliced into
+    ``NANOGPT_TRAIN_SCRIPT`` -- the module-level ``import bisect`` has to be
+    added separately to the script's own header, exactly like the earlier
+    ``dataclass`` import gap. Without it, the very first training window
+    NameErrors before any GPU work starts.
+    """
+    assert "import bisect" in NANOGPT_TRAIN_SCRIPT
+    # Must be bound before window_document_ids's definition, not after.
+    assert NANOGPT_TRAIN_SCRIPT.index("import bisect") < NANOGPT_TRAIN_SCRIPT.index(
+        "def window_document_ids("
+    )
+
+
 def test_seq_len_schedule_warmup():
     block_fn = make_seq_len_schedule(100, 64)
     assert block_fn(0) == 8  # min block
@@ -1755,6 +1791,29 @@ def test_prepare_student_model_dtype_cuda_casts_muon_keeps_adam_fp32(monkeypatch
         assert table.weight.dtype == torch.float32
 
 
+def test_prepare_student_model_dtype_cuda_forward_runs_end_to_end(monkeypatch):
+    """A forward pass must not crash on the float32/bfloat16 boundary.
+
+    Regression test: embed/value_embeds/lambdas stay float32 (Adam-managed)
+    while blocks are cast to bfloat16 (Muon-managed), and forward_hidden must
+    cast the activations it hands to the blocks accordingly. Mock
+    ``_is_cuda_device`` so this runs on CPU-resident bfloat16 tensors.
+    """
+    import pretrain_data_curator.student_train as st
+
+    monkeypatch.setattr(st, "_is_cuda_device", lambda device: True)
+    V = 64
+    model = _tiny_cfg(V).build()
+    prepare_student_model_dtype(model, "cuda")
+    idx = torch.randint(0, V, (2, 16))
+
+    out, hidden = model(idx, output_hidden=True)
+
+    assert hidden.dtype == torch.bfloat16
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+
+
 def test_sandbox_script_embeds_training_recipe_verbatim():
     # The GPU-only script must run the SAME tested components. Document encoding
     # is embedded before corpus construction; the remaining recipe follows later.
@@ -1789,6 +1848,65 @@ def test_sandbox_script_embeds_training_recipe_verbatim():
     # The sandbox script imports tqdm (installed on demand, like tiktoken) so the
     # embedded training loop's progress bar/logging actually runs there too.
     assert "from tqdm import tqdm" in NANOGPT_TRAIN_SCRIPT
+
+
+def test_assembled_trainer_defines_batch_stage_boundaries_before_build_batch_schedule():
+    # Production regression: the generated /workspace/train.py embeds
+    # student_optimizer.build_batch_schedule, which calls batch_stage_boundaries
+    # (defined in batch_schedule.py and only *imported* there). The assembly must
+    # inline the canonical batch_stage_boundaries so the remote trainer does not
+    # raise NameError at step 0. We assemble the EXACT production payload and
+    # actually execute the embedded optimizer block to call build_batch_schedule.
+    script = NANOGPT_TRAIN_SCRIPT
+    ast.parse(script)  # assembled payload is valid Python
+
+    # batch_stage_boundaries must be embedded (regression for the missing-helper
+    # NameError) and must appear before build_batch_schedule in source order.
+    assert "def batch_stage_boundaries(" in script
+    assert script.index("def batch_stage_boundaries(") < script.index(
+        "def build_batch_schedule("
+    ), "batch_stage_boundaries must be defined before build_batch_schedule"
+
+    # Extract the embedded optimizer block verbatim -- from the batch_schedule
+    # embed (which carries its _FRAC_SUM_TOL constant) through the end of the
+    # optimizer defs, just before the training-recipe defs.
+    start = script.index("_FRAC_SUM_TOL")
+    end = script.index("def lr_at_step(")
+    block = script[start:end]
+
+    import math
+    from collections.abc import Sequence
+    import dataclasses
+
+    namespace = {
+        "math": math,
+        "Sequence": Sequence,
+        "dataclass": dataclasses.dataclass,
+        "torch": __import__("torch"),
+    }
+    try:
+        exec(block, namespace)
+    except NameError as exc:
+        pytest.fail(f"assembled optimizer block has an unresolved name: {exc}")
+
+    # Execute build_batch_schedule for the production total_steps with equal
+    # [1/3]*3 fractions and confirm the boundaries/stages are correct.
+    boundaries, stages, cd_start, cd_floor = namespace["build_batch_schedule"](
+        12208, stage_fracs=(1 / 3, 1 / 3, 1 / 3)
+    )
+    assert len(boundaries) == 3
+    assert boundaries[0][0] == 0
+    assert boundaries[-1][1] == 12208
+    for (s, e), (ns, ne) in zip(boundaries, boundaries[1:]):
+        assert e == ns, f"stage boundaries must be contiguous: {boundaries}"
+    # Each of the first two stages gets round(12208/3) = 4069 steps; the last
+    # absorbs the remainder exactly.
+    assert boundaries[0] == (0, 4069), boundaries
+    assert boundaries[1] == (4069, 8138), boundaries
+    assert boundaries[2] == (8138, 12208), boundaries
+    assert len(stages) == 3
+    assert cd_start == int(12208 * (1.0 - 0.60))
+    assert cd_floor == 0.15
 
 
 def test_sandbox_tqdm_fallback_shim_works_when_import_and_install_both_fail(
