@@ -1317,12 +1317,172 @@ def test_train_token_budget_default_preserves_step_behavior():
         (10, 1, 8, 2),  # ceil(10/8) rounds up, never truncates
     ],
 )
-def test_train_token_budget_derives_steps(budget, batch, block, expected_steps):
+def test_train_token_budget_constant_batch_derives_steps(
+    budget, batch, block, expected_steps
+):
+    """With schedule disabled, budget → steps is still ceil(budget/(batch*block))."""
     cfg = ProxyStudentConfig(
-        train_token_budget=budget, batch_size=batch, block_size=block
+        train_token_budget=budget,
+        batch_size=batch,
+        block_size=block,
+        batch_schedule_enabled=False,
     )
     assert cfg.effective_steps == expected_steps
     assert cfg.effective_train_tokens == expected_steps * batch * block
+
+
+def test_train_token_budget_equal_stages_400m_is_schedule_aware():
+    """400M / 16 / 1024 under [1,2,3] equal stages ≈ 12,208 steps (not 24,415)."""
+    from pretrain_data_curator.batch_schedule import scheduled_presentation_tokens
+
+    cfg = ProxyStudentConfig(
+        train_token_budget=400_000_000,
+        batch_size=16,
+        block_size=1024,
+        batch_schedule_enabled=True,
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_stage_muls=(1, 2, 3),
+    )
+    assert cfg.effective_steps == 12_208
+    # Old base-batch formula would have doubled the step count.
+    assert cfg.effective_steps != 24_415
+    tokens = cfg.effective_train_tokens
+    assert tokens == scheduled_presentation_tokens(
+        cfg.effective_steps,
+        batch_size=16,
+        block_size=1024,
+        batch_stage_muls=(1, 2, 3),
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_schedule_enabled=True,
+    )
+    assert tokens >= 400_000_000
+    # Boundary rule: at most one final scheduled step of overshoot.
+    prev = scheduled_presentation_tokens(
+        cfg.effective_steps - 1,
+        batch_size=16,
+        block_size=1024,
+        batch_stage_muls=(1, 2, 3),
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_schedule_enabled=True,
+    )
+    assert prev < 400_000_000
+    # Overshoot is exactly the last step's presentations.
+    assert tokens - 400_000_000 < tokens - prev
+
+
+def test_train_token_budget_irregular_stage_fractions():
+    from pretrain_data_curator.batch_schedule import scheduled_presentation_tokens
+
+    fracs = (0.1, 0.2, 0.7)
+    muls = (1, 2, 4)
+    budget = 100_000
+    cfg = ProxyStudentConfig(
+        train_token_budget=budget,
+        batch_size=4,
+        block_size=32,
+        batch_schedule_enabled=True,
+        batch_stage_fracs=fracs,
+        batch_stage_muls=muls,
+    )
+    n = cfg.effective_steps
+    tokens = cfg.effective_train_tokens
+    assert tokens == scheduled_presentation_tokens(
+        n,
+        batch_size=4,
+        block_size=32,
+        batch_stage_muls=muls,
+        batch_stage_fracs=fracs,
+        batch_schedule_enabled=True,
+    )
+    assert tokens >= budget
+    if n > 1:
+        assert (
+            scheduled_presentation_tokens(
+                n - 1,
+                batch_size=4,
+                block_size=32,
+                batch_stage_muls=muls,
+                batch_stage_fracs=fracs,
+                batch_schedule_enabled=True,
+            )
+            < budget
+        )
+
+
+def test_train_token_budget_small_budget_rounds_deterministically():
+    from pretrain_data_curator.batch_schedule import scheduled_presentation_tokens
+
+    cfg = ProxyStudentConfig(
+        train_token_budget=10,
+        batch_size=1,
+        block_size=8,
+        batch_schedule_enabled=True,
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_stage_muls=(1, 2, 3),
+    )
+    # ceil under staged muls: still at least 2 base-equivalent presentations.
+    assert cfg.effective_steps == 2
+    assert cfg.effective_train_tokens >= 10
+    assert cfg.effective_train_tokens == scheduled_presentation_tokens(
+        2,
+        batch_size=1,
+        block_size=8,
+        batch_stage_muls=(1, 2, 3),
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_schedule_enabled=True,
+    )
+
+
+def test_train_token_budget_accounting_parity_with_schedule_sum():
+    """effective_train_tokens equals the explicit sum of staged presentations."""
+    from pretrain_data_curator.batch_schedule import (
+        batch_stage_boundaries,
+        scheduled_presentation_tokens,
+    )
+
+    cfg = ProxyStudentConfig(
+        train_token_budget=50_000,
+        batch_size=2,
+        block_size=16,
+        batch_schedule_enabled=True,
+        batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+        batch_stage_muls=(1, 2, 3),
+        train_microbatch_size=1,  # must not affect token accounting
+    )
+    n = cfg.effective_steps
+    manual = 0
+    for (start, end), mul in zip(
+        batch_stage_boundaries(n, cfg.batch_stage_fracs),
+        cfg.batch_stage_muls,
+        strict=True,
+    ):
+        manual += (end - start) * cfg.batch_size * mul * cfg.block_size
+    assert cfg.effective_train_tokens == manual
+    assert manual == scheduled_presentation_tokens(
+        n,
+        batch_size=cfg.batch_size,
+        block_size=cfg.block_size,
+        batch_stage_muls=cfg.batch_stage_muls,
+        batch_stage_fracs=cfg.batch_stage_fracs,
+        batch_schedule_enabled=True,
+    )
+
+
+def test_train_token_budget_microbatch_does_not_change_steps_or_tokens():
+    a = ProxyStudentConfig(
+        train_token_budget=400_000_000,
+        batch_size=16,
+        block_size=1024,
+        train_microbatch_size=None,
+    )
+    b = ProxyStudentConfig(
+        train_token_budget=400_000_000,
+        batch_size=16,
+        block_size=1024,
+        train_microbatch_size=16,
+    )
+    assert a.effective_steps == b.effective_steps == 12_208
+    assert a.effective_train_tokens == b.effective_train_tokens
 
 
 @pytest.mark.parametrize("budget", [0, 1_000_000_001])
