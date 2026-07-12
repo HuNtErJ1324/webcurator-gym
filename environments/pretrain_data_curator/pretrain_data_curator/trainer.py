@@ -132,9 +132,10 @@ class HeuristicProxyTrainer:
             )
         tokens = corpus.total_tokens
         # ``effective_train_tokens`` folds in ``train_token_budget`` (steps derived
-        # from the budget when set), so a larger budget raises the data the schedule
-        # would consume; ``tokens_trained`` is still capped at the corpus's tokens,
-        # so the heuristic never bills for data it does not have and stays cheap.
+        # so scheduled presentations under batch_stage_muls meet the budget when
+        # set), so a larger budget raises the data the schedule would consume;
+        # ``tokens_trained`` is still capped at the corpus's tokens, so the
+        # heuristic never bills for data it does not have and stays cheap.
         target_tokens = max(config.effective_train_tokens, 1)
         tokens_trained = min(tokens, target_tokens)
 

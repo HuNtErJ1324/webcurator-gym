@@ -18,10 +18,11 @@ GPU kernels, distributed comms, FlexAttention, FP8, or ``torch.compile``:
 from __future__ import annotations
 
 import inspect
-import math
 from dataclasses import dataclass
 
 import torch
+
+from .batch_schedule import batch_stage_boundaries
 
 
 def zeropower_via_newtonschulz5(g: torch.Tensor) -> torch.Tensor:
@@ -206,25 +207,21 @@ def build_batch_schedule(
     """Return stage boundaries, stage lookup metadata, cooldown start, and floor.
 
     Stage boundaries are ``(start_step, end_step)`` half-open intervals covering
-    ``[0, total_steps)``. ``cooldown_frac`` applies to the *scheduled* portion
-    (all but the optional extension steps — we have none in the proxy trainer).
+    ``[0, total_steps)``, computed by ``batch_schedule.batch_stage_boundaries``
+    -- the single canonical implementation shared with the token-budget
+    accounting path, so the two can never drift apart. ``cooldown_frac``
+    applies to the *scheduled* portion (all but the optional extension steps —
+    we have none in the proxy trainer).
     """
     if len(stage_fracs) != len(batch_muls) or len(stage_fracs) != len(lr_muls):
         raise ValueError("stage_fracs, batch_muls, and lr_muls must have equal length")
-    if not math.isclose(sum(stage_fracs), 1.0, rel_tol=0, abs_tol=1e-6):
-        raise ValueError(f"stage_fracs must sum to 1.0, got {sum(stage_fracs)}")
     total_steps = max(1, int(total_steps))
-    scheduled = total_steps
-    ends = [0]
-    for frac in stage_fracs[:-1]:
-        ends.append(min(scheduled, ends[-1] + max(1, round(frac * scheduled))))
-    ends.append(scheduled)
-    boundaries = [(ends[i], ends[i + 1]) for i in range(len(stage_fracs))]
+    boundaries = batch_stage_boundaries(total_steps, stage_fracs)
     stages = [
         BatchScheduleStage(batch_mul=m, lr_mul=lr)
         for m, lr in zip(batch_muls, lr_muls, strict=True)
     ]
-    cd_start = int(scheduled * (1.0 - cooldown_frac))
+    cd_start = int(total_steps * (1.0 - cooldown_frac))
     return boundaries, stages, cd_start, cooldown_floor
 
 

@@ -12,6 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_serializer, model_validator
 
+from .batch_schedule import scheduled_presentation_tokens, steps_for_token_budget
 from .val_set import ValidationSetConfig
 
 MANIFEST_FILENAME = "manifest.json"
@@ -30,6 +31,8 @@ _RESERVED_WORKSPACE_FILES = frozenset(
 # The real (sandbox) trainer's training length, corpus cap, and sandbox lifetime
 # all derive from ``train_token_budget`` so a single token knob scales the whole
 # run from a cheap default up to an H100/H200-scale few-hundred-million-token run.
+# When set, steps are chosen so *scheduled* presentations under ``batch_stage_muls``
+# meet the budget (not base-batch alone); see ``batch_schedule.py``.
 _MAX_TRAIN_TOKEN_BUDGET = 1_000_000_000  # generous H100/H200 upper bound
 _CHARS_PER_TOKEN = 4  # matches hf_access.estimate_tokens (chars // 4)
 _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
@@ -162,11 +165,14 @@ class ProxyStudentConfig(BaseModel):
     # ``None`` scores a whole microbatch at once (legacy behavior).
     val_logit_chunk_tokens: int | None = Field(default=None, ge=1, le=1_048_576)
     steps: int = Field(default=200, ge=1, le=100_000)
-    # Token-oriented training budget. When set it OVERRIDES ``steps`` (the real
-    # training length becomes ``effective_steps`` = ceil(budget / (batch*block))),
-    # letting a run scale up to ~1e9 tokens for H100/H200. ``None`` (default) keeps
-    # the historical ``steps``-driven behavior exactly — so default/CPU/heuristic
-    # runs stay cheap and unchanged.
+    # Token-oriented training budget. When set it OVERRIDES ``steps``: the real
+    # training length becomes the minimal ``effective_steps`` whose *scheduled*
+    # token presentations (base batch × ``batch_stage_muls`` over stage fracs)
+    # meet the budget — not ``ceil(budget / (batch*block))``. See
+    # ``batch_schedule.steps_for_token_budget`` for the single-step overshoot
+    # boundary rule. ``train_microbatch_size`` does not affect this (memory-only).
+    # ``None`` (default) keeps the historical ``steps``-driven behavior exactly —
+    # so default/CPU/heuristic runs stay cheap and unchanged.
     train_token_budget: int | None = Field(
         default=None, ge=1, le=_MAX_TRAIN_TOKEN_BUDGET
     )
@@ -310,12 +316,22 @@ class ProxyStudentConfig(BaseModel):
 
     @property
     def effective_steps(self) -> int:
-        """Training steps actually run: derived from ``train_token_budget`` when
-        set (ceil(budget / (batch_size * block_size))), else the explicit ``steps``."""
+        """Training steps actually run.
+
+        With ``train_token_budget`` set: minimal N whose staged presentations
+        meet the budget (see ``batch_schedule.steps_for_token_budget``).
+        Otherwise: the explicit ``steps`` field (unchanged historical path).
+        """
         if self.train_token_budget is None:
             return self.steps
-        per_step = self.batch_size * self.block_size
-        return max(1, math.ceil(self.train_token_budget / per_step))
+        return steps_for_token_budget(
+            self.train_token_budget,
+            batch_size=self.batch_size,
+            block_size=self.block_size,
+            batch_stage_muls=self.batch_stage_muls,
+            batch_stage_fracs=self.batch_stage_fracs,
+            batch_schedule_enabled=self.batch_schedule_enabled,
+        )
 
     @property
     def effective_warmup_steps(self) -> int:
@@ -402,13 +418,26 @@ class ProxyStudentConfig(BaseModel):
 
     @property
     def effective_train_tokens(self) -> int:
-        """Tokens the fixed schedule consumes: ``effective_steps * batch * block``.
+        """Tokens billed / consumed for the configured training length.
 
-        This is the token count the sandbox script trains on and bills FLOPs for
-        (``6 * n_params * effective_train_tokens``), so FLOP cost scales with the
-        budget without any separate accounting change.
+        * No ``train_token_budget``: historical ``effective_steps * batch * block``
+          (unchanged even when the speedrun batch schedule is enabled).
+        * With ``train_token_budget``: actual scheduled presentations under
+          ``batch_stage_muls`` / fracs (see ``batch_schedule``), matching sandbox
+          ``tokens_trained``. ``train_microbatch_size`` does not change the total.
+
+        FLOP billing uses ``6 * n_params * effective_train_tokens``.
         """
-        return self.effective_steps * self.batch_size * self.block_size
+        if self.train_token_budget is None:
+            return self.effective_steps * self.batch_size * self.block_size
+        return scheduled_presentation_tokens(
+            self.effective_steps,
+            batch_size=self.batch_size,
+            block_size=self.block_size,
+            batch_stage_muls=self.batch_stage_muls,
+            batch_stage_fracs=self.batch_stage_fracs,
+            batch_schedule_enabled=self.batch_schedule_enabled,
+        )
 
     @property
     def effective_max_corpus_chars(self) -> int:

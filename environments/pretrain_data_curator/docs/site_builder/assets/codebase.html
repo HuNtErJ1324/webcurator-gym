@@ -188,6 +188,14 @@ environments/pretrain_data_curator/
       </div>
 
       <h3>Proxy-student training</h3>
+      <p>
+        Training budgets are measured in actual token presentations across the staged batch schedule.
+        <code>batch_schedule.py</code> finds the minimal optimizer-step count whose scheduled batches meet
+        <code>train_token_budget</code>, and <code>student_optimizer.py</code> uses the same boundary helper at
+        runtime. For the standard 400M profile (batch 16, block 1024, equal <code>1×/2×/3×</code> stages),
+        this yields 12,208 steps. The older base-batch-only calculation used 24,415 steps and presented
+        roughly 800M tokens. Microbatch size remains a memory control and does not affect this accounting.
+      </p>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Module</th><th>Role</th></tr></thead>
@@ -197,6 +205,7 @@ environments/pretrain_data_curator/
             <tr><td><code>modal_backend.py</code></td><td>Same contract on a rollout-owned Modal GPU sandbox (GPU-type mapping, token auth, identical result validation).</td></tr>
             <tr><td><code>docker_network.py</code></td><td>WSL2 shim: advertises the interception server on an address Docker Desktop containers can actually reach.</td></tr>
             <tr><td><code>student_model.py</code></td><td>The fixed modded-nanogpt-style student architecture, embedded into the sandbox training script.</td></tr>
+            <tr><td><code>batch_schedule.py</code></td><td>Canonical stage boundaries and token-aware step budgeting. Shared by configuration accounting and the runtime optimizer so reported and processed token counts cannot drift.</td></tr>
             <tr><td><code>student_train.py</code></td><td>The training loop embedded alongside it: LR schedule, contiguous batching, EOT-packed windows, multi-run averaging.</td></tr>
             <tr><td><code>student_optimizer.py</code></td><td>Single-device port of the speedrun optimizer recipe (Muon / Polar Express / NorMuon on block weights, AdamW elsewhere).</td></tr>
             <tr><td><code>debug_train.py</code></td><td>Manifest-backed debug workflow: materialize a corpus bundle once locally, then re-run the real training path against it repeatedly.</td></tr>
