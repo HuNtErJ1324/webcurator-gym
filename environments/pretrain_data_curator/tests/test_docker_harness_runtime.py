@@ -62,7 +62,9 @@ PIP_ROOT_WARNING = (
 
 
 class FakeRuntime:
-    def __init__(self, result=None, runtime_type="docker") -> None:
+    def __init__(
+        self, result=None, runtime_type="docker", *, hang_on_train: bool = False
+    ) -> None:
         self.config = SimpleNamespace(type=runtime_type)
         self.result = result or SimpleNamespace(
             stdout=_result(), stderr="", exit_code=0
@@ -70,6 +72,7 @@ class FakeRuntime:
         self.files: dict[str, bytes] = {}
         self.commands: list[tuple[list[str], dict[str, str]]] = []
         self.stop_calls = 0
+        self.hang_on_train = hang_on_train
 
     @property
     def type(self) -> str:
@@ -85,10 +88,26 @@ class FakeRuntime:
 
     async def run(self, argv: list[str], env: dict[str, str]):
         self.commands.append((argv, env))
+        if self.hang_on_train and argv == ["python", "/workspace/train.py"]:
+            await asyncio.Event().wait()
+        if argv[:2] == ["python", "-c"] and "CGROUP_JSON" in (
+            argv[2] if len(argv) > 2 else ""
+        ):
+            return SimpleNamespace(
+                stdout='CGROUP_JSON {"error": null, "events": {}, "memory_max": null}\n',
+                stderr="",
+                exit_code=0,
+            )
         return self.result
 
     async def stop(self) -> None:
         self.stop_calls += 1
+
+    @property
+    def train_commands(self) -> list[tuple[list[str], dict[str, str]]]:
+        return [
+            cmd for cmd in self.commands if cmd[0] == ["python", "/workspace/train.py"]
+        ]
 
 
 @pytest.mark.asyncio
@@ -111,12 +130,19 @@ async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
         "/workspace/train_stderr_redirect.log",
         "/workspace/train_oom_diagnostics.json",
     }
-    assert runtime.commands == [(["python", "/workspace/train.py"], {})]
+    assert runtime.train_commands == [(["python", "/workspace/train.py"], {})]
+    assert any(
+        cmd[0][:2] == ["python", "-c"] and "memory.events" in cmd[0][2]
+        for cmd in runtime.commands
+    )
     # The rollout owns the successful runtime until all scoring finishes.
     assert runtime.stop_calls == 0
     assert runtime.files["/workspace/train_stdout.log"] == _result().encode()
     assert runtime.files["/workspace/train_stderr.log"] == b""
     assert runtime.files["/workspace/train_stderr_redirect.log"] == b""
+    diag = json.loads(runtime.files["/workspace/train_oom_diagnostics.json"])
+    assert "kill_class" in diag
+    assert "cgroup_events_before" in diag
 
 
 class _CorpusBuilder:
@@ -180,16 +206,12 @@ async def test_reward_threads_injected_runtime_through_scoring_chain():
 
 @pytest.mark.asyncio
 async def test_training_timeout_stops_runtime_without_hanging(monkeypatch):
-    class BlockingRuntime(FakeRuntime):
-        async def run(self, argv, env):
-            await asyncio.Event().wait()
-
     monkeypatch.setattr(
         ProxyStudentConfig,
         "effective_timeout_minutes",
         property(lambda self: 0.0005),
     )
-    runtime = BlockingRuntime()
+    runtime = FakeRuntime(hang_on_train=True)
 
     with pytest.raises(TrainerError, match="timed out"):
         await asyncio.wait_for(

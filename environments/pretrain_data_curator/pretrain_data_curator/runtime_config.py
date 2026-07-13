@@ -30,8 +30,9 @@ def derive_trainer_resources(
     is the GPU specifier: Docker passes ``gpu_count`` (``None`` when zero), while
     Modal maps ``modal_gpu`` through ``_modal_gpu_for`` (lazy import).
 
-    Container memory honors ``PDC_CONTAINER_MEMORY_GB`` when set so production
-    pods can raise the Docker ``--memory`` pin without editing eval TOMLs.
+    Docker container memory honors ``PDC_DOCKER_CONTAINER_MEMORY_GB`` (legacy
+    ``PDC_CONTAINER_MEMORY_GB``) when set so production pods can raise the Docker
+    ``--memory`` pin without editing eval TOMLs. Modal ignores those overrides.
     """
     if backend == "modal":
         from .modal_backend import _modal_gpu_for
@@ -43,7 +44,7 @@ def derive_trainer_resources(
         "image": ps.docker_image,
         "workdir": "/workspace",
         "cpu": float(ps.cpu_cores),
-        "memory": resolve_container_memory_gb(ps.memory_gb),
+        "memory": resolve_container_memory_gb(ps.memory_gb, backend=backend),
         "gpu": gpu,
         "disk": float(ps.disk_size_gb),
         "scoring_timeout_seconds": ps.effective_scoring_timeout_seconds,

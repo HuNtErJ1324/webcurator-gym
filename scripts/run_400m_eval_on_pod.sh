@@ -44,8 +44,12 @@ echo "[setup] verifying GPU docker access with $RUNTIME_IMAGE..."
 docker run --rm --gpus 1 "$RUNTIME_IMAGE" nvidia-smi
 
 EVAL_TOML="${EVAL_TOML:-configs/eval/deepseek-v4-pro-400M-300turn-codex.toml}"
+export EVAL_TOML
 echo "[setup] host memory preflight for $EVAL_TOML..."
-uv run python - <<PY
+# Quoted heredoc: path comes from the environment, never shell-expanded into Python.
+uv run python - <<'PY'
+import os
+import sys
 from pathlib import Path
 import tomllib
 from pretrain_data_curator.container_memory import (
@@ -53,9 +57,22 @@ from pretrain_data_curator.container_memory import (
     resolve_container_memory_gb,
 )
 
-raw = tomllib.loads(Path("$EVAL_TOML").read_text(encoding="utf-8"))
-configured = raw.get("args", {}).get("proxy_student", {}).get("memory_gb", 96)
-memory_gb = resolve_container_memory_gb(configured)
+eval_toml = os.environ.get("EVAL_TOML") or (sys.argv[1] if len(sys.argv) > 1 else None)
+if not eval_toml:
+    raise SystemExit("EVAL_TOML is required for host memory preflight")
+raw = tomllib.loads(Path(eval_toml).read_text(encoding="utf-8"))
+proxy = (raw.get("args") or {}).get("proxy_student")
+if not isinstance(proxy, dict) or "memory_gb" not in proxy:
+    raise SystemExit(
+        f"{eval_toml}: args.proxy_student.memory_gb is required "
+        "(no silent default)"
+    )
+configured = proxy["memory_gb"]
+if not isinstance(configured, (int, float)) or isinstance(configured, bool):
+    raise SystemExit(
+        f"{eval_toml}: args.proxy_student.memory_gb must be a number, got {configured!r}"
+    )
+memory_gb = resolve_container_memory_gb(configured, backend="docker")
 assert_host_supports_container_memory(memory_gb)
 print(f"host memory OK for container limit {memory_gb:g} GiB")
 PY

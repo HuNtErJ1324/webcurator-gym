@@ -720,6 +720,11 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
         'EVAL_TOML="${EVAL_TOML:-configs/eval/deepseek-v4-pro-400M-300turn-codex.toml}"'
         in on_pod
     )
+    assert "export EVAL_TOML" in on_pod
+    assert "uv run python - <<'PY'" in on_pod
+    assert 'os.environ.get("EVAL_TOML")' in on_pod
+    assert "memory_gb is required" in on_pod
+    assert 'Path("$EVAL_TOML")' not in on_pod
     assert "exec uv run eval" not in on_pod
 
     # on-pod DeepSeek profile is one of the tracked 400M pins (microbatch=32).

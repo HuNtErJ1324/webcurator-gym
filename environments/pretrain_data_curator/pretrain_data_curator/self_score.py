@@ -305,11 +305,110 @@ def _read_trainer_stderr_tail(workdir, *, max_chars=8000):
 
 # Single-flight GPU trainer lock for this evaluation container. Concurrent
 # `python self_score.py` invocations serialize here so at most one proxy trainer
-# occupies the GPU.
+# occupies the GPU. The lock fd is passed into the trainer process group so an
+# orphaned group continues to hold the flock until it exits; the lock file also
+# records the trainer pgid for stale-group recovery after a crash.
 _TRAIN_LOCK_PATH = os.environ.get(
     "PDC_SELF_SCORE_LOCK", "/tmp/pdc_self_score_train.lock"
 )
 _ACTIVE_TRAIN_PROC = None
+_ACTIVE_LOCK_FH = None
+_SIGNAL_HANDLERS_INSTALLED = False
+
+
+def _clear_fd_cloexec(fd):
+    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+    fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+
+
+def _write_lock_pgid(fh, pgid):
+    fh.seek(0)
+    fh.truncate()
+    if pgid is not None:
+        fh.write("%s\n" % int(pgid))
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def _read_lock_pgid(fh):
+    fh.seek(0)
+    text = (fh.read() or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text.splitlines()[0].strip())
+    except ValueError:
+        return None
+
+
+def _pgid_alive(pgid):
+    if pgid is None:
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_pgid(pgid, *, grace_seconds=5.0):
+    details = {
+        "pgid": pgid,
+        "terminated": False,
+        "killed": False,
+        "reaped": False,
+        "error": None,
+    }
+    if pgid is None:
+        details["reaped"] = True
+        return details
+    if not _pgid_alive(pgid):
+        details["reaped"] = True
+        return details
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        details["terminated"] = True
+    except ProcessLookupError:
+        details["reaped"] = True
+        return details
+    except Exception as exc:
+        details["error"] = "term:%s" % exc
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _pgid_alive(pgid):
+            details["reaped"] = True
+            return details
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        details["killed"] = True
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        details["error"] = "kill:%s" % exc
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _pgid_alive(pgid):
+            details["reaped"] = True
+            return details
+        time.sleep(0.05)
+    details["reaped"] = not _pgid_alive(pgid)
+    return details
+
+
+def _reap_stale_lock_holder(fh):
+    """After acquiring the exclusive lock, terminate any recorded stale trainer pgid."""
+    stale = _read_lock_pgid(fh)
+    if stale is None:
+        return None
+    details = _terminate_pgid(stale)
+    _write_lock_pgid(fh, None)
+    return details
 
 
 def _train_lock(lock_path=None):
@@ -317,6 +416,7 @@ def _train_lock(lock_path=None):
     path = lock_path or _TRAIN_LOCK_PATH
     fh = open(path, "a+", encoding="utf-8")
     fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    _reap_stale_lock_holder(fh)
     return fh
 
 
@@ -324,6 +424,10 @@ def _release_train_lock(fh):
     if fh is None:
         return
     try:
+        try:
+            _write_lock_pgid(fh, None)
+        except Exception:
+            pass
         fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     finally:
         fh.close()
@@ -333,71 +437,94 @@ def _terminate_process_group(proc, *, grace_seconds=5.0):
     """SIGTERM then SIGKILL an entire session/process group and reap it."""
     details = {
         "pid": getattr(proc, "pid", None),
+        "pgid": getattr(proc, "pid", None),
         "returncode": proc.poll(),
         "terminated": False,
         "killed": False,
         "reaped": False,
         "error": None,
+        "grandchild_pids": [],
     }
     if proc.poll() is not None:
         details["reaped"] = True
         details["returncode"] = proc.returncode
         return details
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        details["terminated"] = True
-    except ProcessLookupError:
-        details["reaped"] = True
-        details["returncode"] = proc.poll()
-        return details
-    except Exception as exc:
-        details["error"] = "term:%s" % exc
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            details["reaped"] = True
-            details["returncode"] = proc.returncode
-            return details
-        time.sleep(0.05)
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-        details["killed"] = True
-    except ProcessLookupError:
-        pass
-    except Exception as exc:
-        details["error"] = "kill:%s" % exc
+    pg = _terminate_pgid(proc.pid, grace_seconds=grace_seconds)
+    details.update({k: pg[k] for k in ("terminated", "killed", "reaped", "error") if k in pg})
     try:
         proc.wait(timeout=grace_seconds)
     except Exception:
         pass
     details["returncode"] = proc.poll()
-    details["reaped"] = details["returncode"] is not None
+    details["reaped"] = details["returncode"] is not None and not _pgid_alive(proc.pid)
     return details
 
 
 def _cleanup_active_train_proc():
-    global _ACTIVE_TRAIN_PROC
+    global _ACTIVE_TRAIN_PROC, _ACTIVE_LOCK_FH
     proc = _ACTIVE_TRAIN_PROC
+    lock_fh = _ACTIVE_LOCK_FH
     _ACTIVE_TRAIN_PROC = None
     if proc is not None and proc.poll() is None:
         _terminate_process_group(proc)
+    if lock_fh is not None:
+        try:
+            _write_lock_pgid(lock_fh, None)
+        except Exception:
+            pass
+
+
+def _self_score_signal_handler(signum, frame):
+    """Clean the active trainer group, restore default disposition, re-raise."""
+    _cleanup_active_train_proc()
+    signal.signal(signum, signal.SIG_DFL)
+    try:
+        os.kill(os.getpid(), signum)
+    except Exception:
+        raise SystemExit(128 + int(signum))
+
+
+def _install_train_signal_handlers():
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED:
+        return
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _self_score_signal_handler)
+        except Exception:
+            pass
+    _SIGNAL_HANDLERS_INSTALLED = True
 
 
 atexit.register(_cleanup_active_train_proc)
 
 
-def _run_in_process_group(argv, *, timeout):
+def _run_in_process_group(argv, *, timeout, lock_fh=None):
     """Run argv in a new session; on timeout/error kill the whole process group."""
-    global _ACTIVE_TRAIN_PROC
+    global _ACTIVE_TRAIN_PROC, _ACTIVE_LOCK_FH
+    pass_fds = ()
+    if lock_fh is not None:
+        _clear_fd_cloexec(lock_fh.fileno())
+        pass_fds = (lock_fh.fileno(),)
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        pass_fds=pass_fds,
     )
     _ACTIVE_TRAIN_PROC = proc
-    pg_details = {"pid": proc.pid, "returncode": None, "timed_out": False}
+    _ACTIVE_LOCK_FH = lock_fh
+    if lock_fh is not None:
+        _write_lock_pgid(lock_fh, proc.pid)
+    pg_details = {
+        "pid": proc.pid,
+        "pgid": proc.pid,
+        "returncode": None,
+        "timed_out": False,
+        "grandchild_pids": [],
+    }
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
         pg_details["returncode"] = proc.returncode
@@ -418,10 +545,18 @@ def _run_in_process_group(argv, *, timeout):
         pg_details.update(_terminate_process_group(proc))
         raise
     finally:
-        if _ACTIVE_TRAIN_PROC is proc:
-            _ACTIVE_TRAIN_PROC = None
+        # Hold the flock until group cleanup is complete, then clear pgid.
         if proc.poll() is None:
             pg_details.update(_terminate_process_group(proc))
+        if lock_fh is not None:
+            try:
+                _write_lock_pgid(lock_fh, None)
+            except Exception:
+                pass
+        if _ACTIVE_TRAIN_PROC is proc:
+            _ACTIVE_TRAIN_PROC = None
+        if _ACTIVE_LOCK_FH is lock_fh:
+            _ACTIVE_LOCK_FH = None
 
 
 def decon_score(docs):
@@ -534,6 +669,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
     lock_fh = None
     pg_details = None
     try:
+        _install_train_signal_handlers()
         # Serialize GPU trainers across concurrent self_score invocations.
         lock_fh = _train_lock()
         steps = int(max_steps if max_steps is not None else STUDENT_CONFIG["steps"])
@@ -546,18 +682,33 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             json.dump(payload, fh)
         with open(os.path.join(tmp, "corpus.txt"), "w", encoding="utf-8") as fh:
             fh.write(text)
+        events_before = _snapshot_cgroup_memory()
         result, pg_details = _run_in_process_group(
             [sys.executable, str(train_script), tmp],
             timeout=train_timeout,
+            lock_fh=lock_fh,
         )
+        events_after = _snapshot_cgroup_memory()
         if result.returncode != 0:
             # Trainer redirects its own stderr into WORKDIR/stderr.txt (line-buffered).
             # Read that tail BEFORE cleanup — captured process stderr is often empty.
             file_stderr = _read_trainer_stderr_tail(tmp)
             detail = file_stderr or result.stderr or result.stdout or ""
+            kill_class = _classify_trainer_kill(
+                returncode=result.returncode,
+                stderr=detail,
+                timed_out=False,
+                events_before=events_before,
+                events_after=events_after,
+                process_group=pg_details,
+            )
             print(
                 "[self-score] WARNING: proxy training exited %d: %s"
                 % (result.returncode, detail[:2000]),
+                file=sys.stderr,
+            )
+            print(
+                "[self-score] kill_class=%s" % kill_class,
                 file=sys.stderr,
             )
             if pg_details is not None:
@@ -566,6 +717,14 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
                     % json.dumps(pg_details, sort_keys=True),
                     file=sys.stderr,
                 )
+            print(
+                "[self-score] cgroup_events=%s"
+                % json.dumps(
+                    {"before": events_before, "after": events_after},
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
             return None, None, None
         marker = "RESULT_JSON "
         line = next(
@@ -598,6 +757,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             % (train_timeout, (detail or "")[:2000]),
             file=sys.stderr,
         )
+        print("[self-score] kill_class=timeout", file=sys.stderr)
         if pg is not None:
             print(
                 "[self-score] process_group=%s" % json.dumps(pg, sort_keys=True),
@@ -624,6 +784,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
 
 
 def main():
+    _install_train_signal_handlers()
     parser = argparse.ArgumentParser(
         description="Leakage-safe development proxy for a draft curator manifest."
     )

@@ -164,16 +164,27 @@ class HarnessRuntimeProxyTrainer:
         self, runtime: vf.Runtime, config: ProxyStudentConfig
     ) -> Any:
         timeout = config.effective_timeout_minutes * 60
+        events_before = await self._read_cgroup_memory_snapshot(runtime, config)
+        timed_out = False
         try:
             result = await asyncio.wait_for(
                 runtime.run(["python", "/workspace/train.py"], {}),
                 timeout=timeout,
             )
         except (asyncio.TimeoutError, TimeoutError) as exc:
+            timed_out = True
+            events_after = await self._read_cgroup_memory_snapshot(runtime, config)
             raise TrainerError(
                 f"proxy-student training timed out after {timeout}s",
-                stderr_tail=self._memory_diagnostic(runtime, config),
+                stderr_tail=await self._memory_diagnostic_async(
+                    runtime,
+                    config,
+                    events_before=events_before,
+                    events_after=events_after,
+                    timed_out=True,
+                ),
             ) from exc
+        events_after = await self._read_cgroup_memory_snapshot(runtime, config)
         file_stderr = await self._read_redirected_stderr(runtime, config)
         merged_stderr = self._merge_stderr(getattr(result, "stderr", None), file_stderr)
         await self._persist_training_logs(
@@ -182,12 +193,22 @@ class HarnessRuntimeProxyTrainer:
             config,
             file_stderr=file_stderr,
             merged_stderr=merged_stderr,
+            events_before=events_before,
+            events_after=events_after,
+            timed_out=timed_out,
         )
         if result.exit_code not in (0, None):
             raise TrainerError(
                 f"proxy-student training exited with code {result.exit_code}",
-                stderr_tail=self._training_diagnostic(
-                    result.stdout, merged_stderr, runtime=runtime, config=config
+                stderr_tail=await self._training_diagnostic_async(
+                    result.stdout,
+                    merged_stderr,
+                    runtime=runtime,
+                    config=config,
+                    events_before=events_before,
+                    events_after=events_after,
+                    returncode=result.exit_code,
+                    timed_out=timed_out,
                 ),
             )
         return SimpleNamespace(
@@ -195,6 +216,45 @@ class HarnessRuntimeProxyTrainer:
             stderr=merged_stderr,
             exit_code=getattr(result, "exit_code", None),
         )
+
+    async def _read_cgroup_memory_snapshot(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> dict[str, Any]:
+        """Read cgroup v2 memory.events / memory.max inside the trainer container."""
+        script = (
+            "from pathlib import Path\n"
+            "import json\n"
+            "events=Path('/sys/fs/cgroup/memory.events')\n"
+            "mmax=Path('/sys/fs/cgroup/memory.max')\n"
+            "payload={'events':{}, 'memory_max': None, 'error': None}\n"
+            "try:\n"
+            "    if events.is_file():\n"
+            "        for line in events.read_text().splitlines():\n"
+            "            parts=line.split()\n"
+            "            if len(parts)==2 and parts[1].lstrip('-').isdigit():\n"
+            "                payload['events'][parts[0]]=int(parts[1])\n"
+            "    if mmax.is_file():\n"
+            "        raw=mmax.read_text().strip()\n"
+            "        payload['memory_max']=None if raw=='max' else int(raw)\n"
+            "except Exception as exc:\n"
+            "    payload['error']=str(exc)\n"
+            "print('CGROUP_JSON '+json.dumps(payload, sort_keys=True))\n"
+        )
+        try:
+            result = await asyncio.wait_for(
+                runtime.run(["python", "-c", script], {}),
+                timeout=min(30.0, config.upload_timeout_seconds),
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not raise
+            return {"events": {}, "memory_max": None, "error": str(exc)}
+        stdout = getattr(result, "stdout", "") or ""
+        for line in reversed(stdout.splitlines()):
+            if line.startswith("CGROUP_JSON "):
+                try:
+                    return json.loads(line[len("CGROUP_JSON ") :])
+                except json.JSONDecodeError:
+                    break
+        return {"events": {}, "memory_max": None, "error": "missing CGROUP_JSON"}
 
     async def _read_redirected_stderr(
         self, runtime: vf.Runtime, config: ProxyStudentConfig
@@ -262,8 +322,19 @@ class HarnessRuntimeProxyTrainer:
         *,
         file_stderr: str = "",
         merged_stderr: str = "",
+        events_before: dict[str, Any] | None = None,
+        events_after: dict[str, Any] | None = None,
+        timed_out: bool = False,
     ) -> None:
-        diagnostics = self._oom_diagnostics_payload(runtime, config)
+        diagnostics = await self._oom_diagnostics_payload_async(
+            runtime,
+            config,
+            events_before=events_before,
+            events_after=events_after,
+            returncode=getattr(result, "exit_code", None),
+            stderr=merged_stderr or file_stderr,
+            timed_out=timed_out,
+        )
         logs = {
             "/workspace/train_stdout.log": (getattr(result, "stdout", "") or ""),
             "/workspace/train_stderr.log": merged_stderr
@@ -288,9 +359,15 @@ class HarnessRuntimeProxyTrainer:
         config: ProxyStudentConfig | None,
         *,
         process_group: dict[str, Any] | None = None,
+        events_before: dict[str, Any] | None = None,
+        events_after: dict[str, Any] | None = None,
+        returncode: int | None = None,
+        stderr: str | None = None,
+        timed_out: bool = False,
+        inspect_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         configured = (
-            resolve_container_memory_gb(config.memory_gb)
+            resolve_container_memory_gb(config.memory_gb, backend="docker")
             if config is not None
             else None
         )
@@ -301,19 +378,48 @@ class HarnessRuntimeProxyTrainer:
             container = getattr(runtime, "_container", None) or getattr(
                 runtime, "name", None
             )
-            if container:
+            if container and inspect_info is None:
                 try:
-                    info = inspect_container_memory(str(container))
-                    oom_killed = bool(info.get("oom_killed"))
-                    effective = info.get("memory_bytes")
+                    inspect_info = inspect_container_memory(str(container))
                 except Exception as exc:  # noqa: BLE001 - best-effort diagnostics
                     logger.debug("oom inspect failed: %s", exc)
+            if inspect_info:
+                oom_killed = bool(inspect_info.get("oom_killed"))
+                effective = inspect_info.get("memory_bytes")
         return collect_oom_diagnostics(
             configured_gb=configured,
             effective_memory_bytes=effective,
             oom_killed=oom_killed,
             container=str(container) if container else None,
             process_group=process_group,
+            events_before=events_before,
+            events_after=events_after,
+            returncode=returncode,
+            stderr=stderr,
+            timed_out=timed_out,
+        )
+
+    async def _oom_diagnostics_payload_async(
+        self,
+        runtime: vf.Runtime | None,
+        config: ProxyStudentConfig | None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        inspect_info = None
+        container = None
+        if runtime is not None:
+            container = getattr(runtime, "_container", None) or getattr(
+                runtime, "name", None
+            )
+            if container:
+                try:
+                    inspect_info = await asyncio.to_thread(
+                        inspect_container_memory, str(container)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("oom inspect failed: %s", exc)
+        return self._oom_diagnostics_payload(
+            runtime, config, inspect_info=inspect_info, **kwargs
         )
 
     def _memory_diagnostic(
@@ -322,9 +428,33 @@ class HarnessRuntimeProxyTrainer:
         config: ProxyStudentConfig | None = None,
         *,
         process_group: dict[str, Any] | None = None,
+        events_before: dict[str, Any] | None = None,
+        events_after: dict[str, Any] | None = None,
+        returncode: int | None = None,
+        stderr: str | None = None,
+        timed_out: bool = False,
     ) -> str:
         return format_oom_diagnostics(
-            self._oom_diagnostics_payload(runtime, config, process_group=process_group)
+            self._oom_diagnostics_payload(
+                runtime,
+                config,
+                process_group=process_group,
+                events_before=events_before,
+                events_after=events_after,
+                returncode=returncode,
+                stderr=stderr,
+                timed_out=timed_out,
+            )
+        )
+
+    async def _memory_diagnostic_async(
+        self,
+        runtime: vf.Runtime | None = None,
+        config: ProxyStudentConfig | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return format_oom_diagnostics(
+            await self._oom_diagnostics_payload_async(runtime, config, **kwargs)
         )
 
     def _training_diagnostic(
@@ -335,6 +465,10 @@ class HarnessRuntimeProxyTrainer:
         runtime: vf.Runtime | None = None,
         config: ProxyStudentConfig | None = None,
         process_group: dict[str, Any] | None = None,
+        events_before: dict[str, Any] | None = None,
+        events_after: dict[str, Any] | None = None,
+        returncode: int | None = None,
+        timed_out: bool = False,
     ) -> str:
         parts = [
             "--- stdout tail ---",
@@ -344,8 +478,43 @@ class HarnessRuntimeProxyTrainer:
         ]
         if runtime is not None or config is not None or process_group is not None:
             parts.append(
-                self._memory_diagnostic(runtime, config, process_group=process_group)
+                self._memory_diagnostic(
+                    runtime,
+                    config,
+                    process_group=process_group,
+                    events_before=events_before,
+                    events_after=events_after,
+                    returncode=returncode,
+                    stderr=stderr,
+                    timed_out=timed_out,
+                )
             )
+        return "\n".join(parts)
+
+    async def _training_diagnostic_async(
+        self,
+        stdout: str | None,
+        stderr: str | None,
+        **kwargs: Any,
+    ) -> str:
+        parts = [
+            "--- stdout tail ---",
+            self._diagnostic_stream(stdout or ""),
+            "--- stderr tail ---",
+            self._diagnostic_stream(stderr or ""),
+        ]
+        parts.append(
+            await self._memory_diagnostic_async(
+                kwargs.get("runtime"),
+                kwargs.get("config"),
+                process_group=kwargs.get("process_group"),
+                events_before=kwargs.get("events_before"),
+                events_after=kwargs.get("events_after"),
+                returncode=kwargs.get("returncode"),
+                stderr=stderr,
+                timed_out=bool(kwargs.get("timed_out")),
+            )
+        )
         return "\n".join(parts)
 
     def _diagnostic_stream(self, text: str) -> str:
