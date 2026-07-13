@@ -15,7 +15,7 @@ TASK_PROMPT = """We want to train a fixed small language model on the strongest 
 ## Objective
 Research and iterate autonomously, then write the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
-Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill installed for this harness). Environment overrides take priority over any conflicting generic text in that skill: the preinstalled metered/local `hf` command in this workspace is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token guidance in the skill as inapplicable here.
+Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill installed for this harness). Environment overrides take priority over any conflicting generic text in that skill: the preinstalled `hf` command in this workspace is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token guidance in the skill as inapplicable here.
 
 ## Research
 Feel free to explore broadly before you lock in a mixture. Search the web, read papers and technical writeups, and investigate modern pretraining data practice — there is no prescribed recipe. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
@@ -43,7 +43,8 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 }}
 ```
 
-`kind` defaults to `"hf"`. A local source instead uses `"kind": "local"`, a workspace-relative `"local_path"`, and optional `"local_format": "auto" | "jsonl" | "txt"`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
+`kind` defaults to `"hf"`. A local source instead uses `"kind": "local"`, a workspace-relative `"local_path"` (no absolute path or `..`), and optional `"local_format": "auto" | "jsonl" | "txt"`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
+If a Hugging Face dataset needs a loading script or otherwise cannot be consumed by the normal HF loader, do not submit it as `kind: "hf"` expecting the materializer to execute that script. Download artifacts with the normal preinstalled `hf` CLI, prefer converting inspected raw files with local tooling over running untrusted remote dataset code, write a workspace `.jsonl` or `.txt`, and cite it as `kind: "local"` with `local_path`, correct `local_format`, and `text_field` when JSONL. That local file must exist before manifest finalization.
 
 ## Self-score (you run it)
 Save a draft manifest and score it yourself with the workspace `self_score.py` script. You choose every development knob via CLI flags:

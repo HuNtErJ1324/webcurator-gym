@@ -2782,6 +2782,23 @@ def test_task_prompt_contract():
     assert '"local_path"' in prompt
     assert "min_chars" in prompt
     assert "dedup_exact" in prompt
+    assert "Hugging Face `hf` CLI" in prompt
+    assert "metered" not in prompt.lower()
+    assert "unmetered" not in prompt.lower()
+    assert "billed" not in prompt.lower()
+    assert "/workspace/manifest.json" in prompt
+    # Script-backed HF datasets: download → convert → kind=local
+    assert (
+        'do not submit it as `kind: "hf"` expecting the materializer to execute that script'
+        in prompt
+    )
+    assert "normal preinstalled `hf` CLI" in prompt
+    assert "untrusted remote dataset code" in prompt
+    assert "`.jsonl` or `.txt`" in prompt
+    assert '`kind: "local"`' in prompt
+    assert "no absolute path or `..`" in prompt
+    assert "text_field` when JSONL" in prompt
+    assert "must exist before manifest finalization" in prompt
 
 
 def test_discovery_has_no_call_or_output_stop():
@@ -4465,9 +4482,11 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
         task.prompt
     )
     assert (
-        "preinstalled metered/local `hf` command in this workspace is the only allowed "
-        "HF CLI" in task.prompt
+        "preinstalled `hf` command in this workspace is the only allowed HF CLI"
+        in task.prompt
     )
+    assert "metered" not in task.prompt.lower()
+    assert "unmetered" not in task.prompt.lower()
     assert "never install, upgrade, replace, shadow, or bypass it" in task.prompt
     assert "never run `hf skills add`" in task.prompt
     assert (
