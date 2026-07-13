@@ -2748,11 +2748,11 @@ def test_task_prompt_contract():
     prompt = task.prompt
 
     assert task.system_prompt is None
-    assert len(prompt) < 6_000
+    assert len(prompt) <= 5_850
     assert "complete freedom" in prompt
     assert '"token_budget": 1000000' in prompt
     assert '"sources"' in prompt
-    assert "python self_score.py draft.json" in prompt
+    assert "python self_score.py /workspace/manifest.json" in prompt
     assert "--limit N" in prompt
     assert "--max-steps N" in prompt
     assert "Never ask the user" in prompt
@@ -2766,7 +2766,6 @@ def test_task_prompt_contract():
     # frame curation as a cost-economy tradeoff.
     assert "cost" not in prompt.lower()
     assert "telemetry" not in prompt.lower()
-    assert "there is no positive performance score" in prompt
     assert "hf datasets ls" not in prompt
     assert "pip install" not in prompt
     assert "wikimedia/wikipedia" not in prompt
@@ -2800,6 +2799,53 @@ def test_task_prompt_contract():
     assert "no absolute path or `..`" in prompt
     assert "text_field` when JSONL" in prompt
     assert "must exist before manifest finalization" in prompt
+
+
+def test_task_prompt_recurring_finalization_contract():
+    """Early manifest.json is authoritative/live, not episode completion; research kept."""
+    prompt = (
+        CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7))
+        .load_tasks()[0]
+        .prompt
+    )
+
+    # Self-score targets the authoritative path (no separate draft.json workflow).
+    assert "python self_score.py /workspace/manifest.json" in prompt
+    assert "draft.json" not in prompt
+    assert "Self-score that exact file" in prompt
+
+    # Early create + continuous best preservation; experiments must not wipe it.
+    assert (
+        "As soon as you have a viable candidate, create `/workspace/manifest.json`"
+        in prompt
+    )
+    assert "continuously keep the best currently known mixture there" in prompt
+    assert (
+        "Before further experiments or voluntary completion, keep "
+        "`/workspace/manifest.json` a valid non-empty manifest" in prompt
+    )
+    assert "best-known scoreable mixture must stay at the authoritative path" in prompt
+
+    # Early file creation is not episode completion; end-of-rollout contents are scored.
+    assert (
+        "Creating `/workspace/manifest.json` early does not end the episode" in prompt
+    )
+    assert "scoring uses the file's contents at actual rollout end" in prompt
+    assert "completion signal" not in prompt
+    assert (
+        "Maintain a valid non-empty manifest at that path through completion" in prompt
+    )
+    assert "there is no positive performance score" in prompt
+
+    # Restored research directions (plus hf papers, retained elsewhere in contract).
+    assert "source discovery and vetting" in prompt
+    assert "quality and toxicity filtering" in prompt
+    assert "domain/reasoning/code/math balancing" in prompt
+    assert "synthetic or rewritten corpora" in prompt
+    assert "mixture-weighting heuristics" in prompt
+    assert "installed `hf papers` CLI" in prompt
+
+    assert len(prompt) <= 5_850
 
 
 def test_discovery_has_no_call_or_output_stop():
@@ -4475,17 +4521,9 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
     assert "Local sources are disabled; use only Hugging Face sources" in task.prompt
     assert "`2.0 * performance - 3.0 * leakage`" in task.prompt
     assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
-    assert (
-        "read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill"
-        in task.prompt
-    )
-    assert "Environment overrides take priority over any conflicting generic text" in (
-        task.prompt
-    )
-    assert (
-        "preinstalled `hf` command in this workspace is the only allowed HF CLI"
-        in task.prompt
-    )
+    assert "read `/workspace/.agents/skills/hf-cli/SKILL.md`" in task.prompt
+    assert "Environment overrides win over conflicting skill text" in task.prompt
+    assert "preinstalled `hf` is the only allowed HF CLI" in task.prompt
     assert "metered" not in task.prompt.lower()
     assert "unmetered" not in task.prompt.lower()
     assert "never install, upgrade, replace, shadow, or bypass it" in task.prompt
@@ -4495,7 +4533,7 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
         in task.prompt
     )
     assert (
-        "Treat install/regenerate/auth-token guidance in the skill as inapplicable here."
+        "Treat install/regenerate/auth-token skill guidance as inapplicable here."
         in task.prompt
     )
     assert "final response must contain" not in task.prompt

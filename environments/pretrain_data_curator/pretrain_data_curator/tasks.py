@@ -13,15 +13,15 @@ _GOALS = [
 TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to {goal}
 
 ## Objective
-Research and iterate autonomously, then write the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
+Research and iterate autonomously while maintaining the authoritative manifest JSON for the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
-Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill installed for this harness). Environment overrides take priority over any conflicting generic text in that skill: the preinstalled `hf` command in this workspace is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token guidance in the skill as inapplicable here.
+Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md`. Environment overrides win over conflicting skill text: the preinstalled `hf` is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token skill guidance as inapplicable here.
 
 ## Research
-Feel free to explore broadly before you lock in a mixture. Search the web, read papers and technical writeups, and investigate modern pretraining data practice — there is no prescribed recipe. You can use the installed `hf papers` CLI to discover or access relevant papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
+Explore broadly before locking a mixture: search the web, read papers/writeups, and study modern pretraining practice — no prescribed recipe. Use the installed `hf papers` CLI to discover or access papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
 
 ## Deliverable
-When finished, write your final manifest as a single JSON object to `{manifest_path}` with this contract:
+Write the mixture as one JSON object to `{manifest_path}` with this contract:
 
 ```text
 {{
@@ -43,35 +43,29 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 }}
 ```
 
-`kind` defaults to `"hf"`. A local source instead uses `"kind": "local"`, a workspace-relative `"local_path"` (no absolute path or `..`), and optional `"local_format": "auto" | "jsonl" | "txt"`. Supported filters are `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, and `dedup_exact`.
-If a Hugging Face dataset needs a loading script or otherwise cannot be consumed by the normal HF loader, do not submit it as `kind: "hf"` expecting the materializer to execute that script. Download artifacts with the normal preinstalled `hf` CLI, prefer converting inspected raw files with local tooling over running untrusted remote dataset code, write a workspace `.jsonl` or `.txt`, and cite it as `kind: "local"` with `local_path`, correct `local_format`, and `text_field` when JSONL. That local file must exist before manifest finalization.
+`kind` defaults to `"hf"`. A local source uses `"kind": "local"`, a workspace-relative `"local_path"` (no absolute path or `..`), and optional `"local_format": "auto" | "jsonl" | "txt"`. Supported filters: `min_chars`, `max_chars`, `min_tokens`, `max_symbol_ratio`, `min_alpha_ratio`, `drop_regex`, `keep_regex`, `dedup_exact`.
+If a Hugging Face dataset needs a loading script or cannot use the normal HF loader, do not submit it as `kind: "hf"` expecting the materializer to execute that script. Download with the normal preinstalled `hf` CLI, prefer converting inspected raw files with local tooling over running untrusted remote dataset code, write a workspace `.jsonl` or `.txt`, and cite it as `kind: "local"` with `local_path`, correct `local_format`, and `text_field` when JSONL. That local file must exist before manifest finalization.
 
 ## Self-score (you run it)
-Save a draft manifest and score it yourself with the workspace `self_score.py` script. You choose every development knob via CLI flags:
-
+As soon as you have a viable candidate, create `{manifest_path}` and continuously keep the best currently known mixture there. Self-score that exact file:
 ```text
-python self_score.py draft.json [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
+python self_score.py {manifest_path} [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
 ```
-
-- `--limit N` — documents sampled per source (default 8 if omitted).
-- `--max-steps N` — proxy-training steps (default: production student config steps).
-- `--max-corpus-chars N` — character cap on joined training text (default: all sampled text).
-- `--train-timeout SEC` — proxy-training wall clock in seconds (default 900).
-
-The script samples your draft sources, trains the fixed proxy student on that sample (corpus-split cross-entropy), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward shape as final scoring. It never uses final held-out validation data; treat it as a directional dev signal, not a full-budget score.
+Flags: `--limit N` docs/source (default 8); `--max-steps N` proxy steps (default: production student steps); `--max-corpus-chars N` joined-text cap (default: all sampled); `--train-timeout SEC` (default 900).
+Samples sources, trains the proxy student (corpus-split CE), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (no held-out validation). Before further experiments or voluntary completion, keep `{manifest_path}` a valid non-empty manifest; temporary experimental variants are fine, but the best-known scoreable mixture must stay at the authoritative path.
 
 ## Setup
-- The sole curation budget is {token_budget} tokens.
-- Use only data modified on or before {cutoff_date}. Local sources are {local_source_status}.
-- Scoring trains the fixed student and applies `{alpha_perf} * performance - {lambda_leakage} * leakage`.
-- Performance is scaled from a neutral baseline so progress near the target loss counts more: validation loss `{perf_target_loss}` scores `1.0`, worse than the neutral baseline is negative, and beating `{perf_target_loss}` exceeds `1.0`.
+- Sole curation budget: {token_budget} tokens.
+- Data cutoff: on or before {cutoff_date}. Local sources are {local_source_status}.
+- Scoring: `{alpha_perf} * performance - {lambda_leakage} * leakage` on the fixed student.
+- Performance scales from a neutral baseline: validation loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
 
 ## Rules
-1. Use exact dataset IDs and configs observed during this rollout. An invented or incompatible source materializes no data, so it produces no performance.
-2. Your corpus is checked for data contamination against public benchmark eval sets (AGI Eval, GSM8K, MMLU) AND the held-out validation set using the decon n-gram detector. Contamination against any eval set incurs the leakage penalty in the reward.
-3. Set the manifest's `token_budget` field to exactly {token_budget}. Fetching or processing beyond what can fill that token allocation does not increase the scored corpus.
-4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
-5. Create the final manifest file through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.
+1. Use exact dataset IDs/configs observed this rollout. Invented or incompatible sources materialize no data and yield no performance.
+2. Contamination vs public benchmark evals (AGI Eval, GSM8K, MMLU) AND the held-out validation set is checked with decon n-gram detection. Contamination against any eval set incurs the leakage penalty in the reward.
+3. Set manifest `token_budget` to exactly {token_budget}. Fetching or processing beyond what can fill that allocation does not increase the scored corpus.
+4. Use only genuine downloaded data; local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected.
+5. Creating `{manifest_path}` early does not end the episode — scoring uses the file's contents at actual rollout end. Maintain a valid non-empty manifest at that path through completion via the shell; without one, there is no positive performance score.
 
 There will be no user interaction. Never ask the user for feedback or clarification; operate autonomously and execute the actions that make the most sense."""
 
