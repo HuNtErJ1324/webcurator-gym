@@ -481,9 +481,27 @@ class CorpusBuilder:
         self._client = client
         self._filter = document_filter or DocumentFilter()
         self._retry = retry_policy or RetryPolicy()
+        # `fetch_limit` bounds both the Hub fetch fan-out and the full
+        # fetch→filter→scratch-write pipeline. It must be a positive integer:
+        # 0 (or None/negative) would build a zero-bounded semaphore and hang
+        # the pipeline forever instead of failing, so reject it up front.
+        if not isinstance(fetch_limit, int) or isinstance(fetch_limit, bool):
+            raise ValueError(
+                f"fetch_limit must be a positive int, got {fetch_limit!r} "
+                f"({type(fetch_limit).__name__})"
+            )
+        if fetch_limit < 1:
+            raise ValueError(f"fetch_limit must be >= 1, got {fetch_limit}")
         self._fetch_limit = fetch_limit
         self._allow_local_sources = allow_local_sources
         self._max_local_source_bytes = max_local_source_bytes
+        # Serializes the offloaded `RolloutStore.store_docs` writes so the
+        # shared `CuratorState` read-modify-write (scratch filename -> doc_cache)
+        # never runs concurrently across worker threads. This is an *asyncio*
+        # lock: it is acquired/released on the event-loop thread and is never
+        # held on a worker thread while awaiting `asyncio.to_thread`, so the
+        # event loop stays free while the disk write is offloaded.
+        self._store_lock = asyncio.Lock()
         # Loop-local single-flight guard: concurrent fetches sharing one
         # (rollout, source key) coalesce onto a single Hub fetch. Locks bind to
         # their running loop, and the rollout
@@ -513,6 +531,44 @@ class CorpusBuilder:
         locks = self._fetch_locks.get(loop)
         if locks is not None:
             locks.pop(lock_key, None)
+
+    @staticmethod
+    async def _offloaded_to_completion(fn, *args, **kwargs):
+        """Await ``asyncio.to_thread(fn, *args, **kwargs)`` for a blocking write.
+
+        If *this* coroutine is cancelled while the worker thread is still running,
+        we do **not** release the surrounding critical-section guard (an asyncio
+        lock or the pipeline semaphore) until the worker has actually finished:
+        the underlying task is created explicitly, shielded from the cancellation,
+        and awaited to completion inside the guard before the ``CancelledError`` is
+        re-raised. Callers must therefore hold the relevant guard around this call
+        (the store-lock for ``store_docs``, the pipeline semaphore for
+        ``from_docs``) so a follower can never observe a half-written state or
+        transiently exceed ``fetch_limit``.
+
+        Exactly-once / error semantics:
+        - Normal completion: the result is returned and the guard releases.
+        - Worker error, no cancellation: the worker's exception propagates
+          unchanged (it is not wrapped in ``CancelledError``).
+        - Cancellation while the worker is still running: we wait for the worker;
+          if the worker then succeeds we re-raise ``CancelledError``, and if the
+          worker itself fails we re-raise the worker's exception (the cancellation
+          does not mask the real error).
+        """
+        worker = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        shielded = asyncio.shield(worker)
+        try:
+            return await shielded
+        except asyncio.CancelledError:
+            # The caller was cancelled, but the worker thread is still running
+            # (shield keeps it alive). Stay inside the guard and wait for the
+            # worker to finish so the write completes before any follower enters.
+            try:
+                await worker
+            except BaseException as exc:
+                # The worker failed: surface its error, not the cancellation.
+                raise exc
+            raise
 
     async def fetch_source_docs(
         self, state: CuratorState, key: FetchKey
@@ -560,7 +616,17 @@ class CorpusBuilder:
                     RolloutStore.record_tool_error(state, exc.kind)
                     RolloutStore.set_external_failure(state, True)
                     return [], exc.as_dict()
-                RolloutStore.store_docs(state, cache_key, docs)
+                # Offloaded write to the shared rollout state. `async with
+                # self._store_lock` serializes these across worker threads so the
+                # state's read-modify-write stays race-free; the lock lives on the
+                # event-loop thread and is never held on a worker thread. The
+                # helper holds the lock until the worker *completes*, so a
+                # cancellation mid-write cannot release the lock early and let a
+                # second write race or observe a half-written state.
+                async with self._store_lock:
+                    await self._offloaded_to_completion(
+                        RolloutStore.store_docs, state, cache_key, docs
+                    )
                 return docs, None
         finally:
             self._discard_fetch_lock(lock_key)
@@ -667,7 +733,10 @@ class CorpusBuilder:
                 finally:
                     raw_path.unlink(missing_ok=True)
 
-                RolloutStore.store_docs(state, cache_key, docs)
+                async with self._store_lock:
+                    await self._offloaded_to_completion(
+                        RolloutStore.store_docs, state, cache_key, docs
+                    )
                 truncated = size > cap
                 RolloutStore.add_local_source(
                     state,
@@ -704,6 +773,15 @@ class CorpusBuilder:
         # underlying fetch parameters are then identical.
         cap = manifest.sample_docs_per_source
         dest_dir = RolloutStore.scratch_dir(state)
+        # Bound the full fetch→filter→scratch-write pipeline per source. The Hub
+        # fetch semaphore alone releases before `from_docs`; without this, the
+        # to_thread offload would let the next source fetch while the prior
+        # source's docs are still being written, stacking payloads in memory.
+        # Matching `fetch_limit` preserves concurrent fan-out when configured
+        # and keeps the fetch_limit=1 disk-streaming peak flat. The slot is held
+        # until the `from_docs` worker completes (see `_offloaded_to_completion`),
+        # so a cancellation mid-write cannot transiently release it.
+        pipeline_sem = asyncio.Semaphore(self._fetch_limit)
 
         async def materialize_source(
             source: Source,
@@ -722,50 +800,56 @@ class CorpusBuilder:
                     },
                     False,
                 )
-            if source.kind == "local":
-                key = self._local_fetch_key(source)
-                raw, error = await self.fetch_local_docs(state, source, runtime)
-            else:
-                if weight_target is not None:
-                    n = _est_fetch_docs(weight_target, cap)
-                elif cap is not None:
-                    n = cap
+            async with pipeline_sem:
+                if source.kind == "local":
+                    key = self._local_fetch_key(source)
+                    raw, error = await self.fetch_local_docs(state, source, runtime)
                 else:
-                    n = max(manifest.token_budget // EST_TOKENS_PER_DOC, 1)
-                key = FetchKey(
-                    dataset_id=source.dataset_id,
-                    config=source.config,
-                    split=source.split,
-                    text_field=source.text_field,
-                    n=n,
+                    if weight_target is not None:
+                        n = _est_fetch_docs(weight_target, cap)
+                    elif cap is not None:
+                        n = cap
+                    else:
+                        n = max(manifest.token_budget // EST_TOKENS_PER_DOC, 1)
+                    key = FetchKey(
+                        dataset_id=source.dataset_id,
+                        config=source.config,
+                        split=source.split,
+                        text_field=source.text_field,
+                        n=n,
+                    )
+                    raw, error = await self.fetch_source_docs(state, key)
+                filtered_count = 0
+                filtered_exhausted = False
+
+                def tracked_filtered() -> Iterator[str]:
+                    nonlocal filtered_count, filtered_exhausted
+                    for doc in self._filter.apply_iter(raw, source.filters):
+                        filtered_count += 1
+                        yield doc
+                    filtered_exhausted = True
+
+                filtered = tracked_filtered()
+                sampled = _iter_sampling(filtered, source, weight_target)
+                # Persistent write, offloaded. This runs inside `async with
+                # pipeline_sem` above, and the helper keeps the semaphore held
+                # until the worker finishes, so a cancellation mid-write cannot
+                # transiently release the slot and let another pipeline's write
+                # overlap beyond `fetch_limit`.
+                corpus = await self._offloaded_to_completion(
+                    SourceCorpus.from_docs,
+                    source.dataset_id,
+                    source.config,
+                    source.weight,
+                    sampled,
+                    dest_dir=dest_dir,
                 )
-                raw, error = await self.fetch_source_docs(state, key)
-            filtered_count = 0
-            filtered_exhausted = False
-
-            def tracked_filtered() -> Iterator[str]:
-                nonlocal filtered_count, filtered_exhausted
-                for doc in self._filter.apply_iter(raw, source.filters):
-                    filtered_count += 1
-                    yield doc
-                filtered_exhausted = True
-
-            filtered = tracked_filtered()
-            sampled = _iter_sampling(filtered, source, weight_target)
-            corpus = await asyncio.to_thread(
-                SourceCorpus.from_docs,
-                source.dataset_id,
-                source.config,
-                source.weight,
-                sampled,
-                dest_dir=dest_dir,
-            )
-            return (
-                corpus,
-                key,
-                error,
-                not filtered_exhausted or filtered_count > corpus.doc_count,
-            )
+                return (
+                    corpus,
+                    key,
+                    error,
+                    not filtered_exhausted or filtered_count > corpus.doc_count,
+                )
 
         materialized = await asyncio.gather(
             *(materialize_source(source) for source in manifest.sources)
@@ -795,7 +879,8 @@ class CorpusBuilder:
                     continue
                 filtered = self._filter.apply_iter(raw, source.filters)
                 surplus = _iter_unsampled(filtered, corpus.iter_documents())
-                _, added_tokens = corpus.append_iter(
+                _, added_tokens = await asyncio.to_thread(
+                    corpus.append_iter,
                     _iter_sampling(
                         surplus,
                         source,
