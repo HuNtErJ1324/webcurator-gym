@@ -43,9 +43,26 @@ docker run --rm -w /workspace "$RUNTIME_IMAGE" bash -lc \
 echo "[setup] verifying GPU docker access with $RUNTIME_IMAGE..."
 docker run --rm --gpus 1 "$RUNTIME_IMAGE" nvidia-smi
 
+EVAL_TOML="${EVAL_TOML:-configs/eval/deepseek-v4-pro-400M-300turn-codex.toml}"
+echo "[setup] host memory preflight for $EVAL_TOML..."
+uv run python - <<PY
+from pathlib import Path
+import tomllib
+from pretrain_data_curator.container_memory import (
+    assert_host_supports_container_memory,
+    resolve_container_memory_gb,
+)
+
+raw = tomllib.loads(Path("$EVAL_TOML").read_text(encoding="utf-8"))
+configured = raw.get("args", {}).get("proxy_student", {}).get("memory_gb", 96)
+memory_gb = resolve_container_memory_gb(configured)
+assert_host_supports_container_memory(memory_gb)
+print(f"host memory OK for container limit {memory_gb:g} GiB")
+PY
+
 echo "[run] starting 400M / 300-turn eval at $(date -u) (log: $LOG_FILE)"
 set +e
-uv run eval @ configs/eval/deepseek-v4-pro-400M-300turn-codex.toml 2>&1 | tee "$LOG_FILE"
+uv run eval @ "$EVAL_TOML" 2>&1 | tee "$LOG_FILE"
 status=${PIPESTATUS[0]}
 set -e
 exit "$status"

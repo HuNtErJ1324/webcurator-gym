@@ -28,15 +28,19 @@ _SCRIPT = r'''
 #!/usr/bin/env python3
 """Development sample scorer: corpus-split CE + benchmark decon only."""
 import argparse
+import atexit
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -299,6 +303,127 @@ def _read_trainer_stderr_tail(workdir, *, max_chars=8000):
     return text[-max_chars:]
 
 
+# Single-flight GPU trainer lock for this evaluation container. Concurrent
+# `python self_score.py` invocations serialize here so at most one proxy trainer
+# occupies the GPU.
+_TRAIN_LOCK_PATH = os.environ.get(
+    "PDC_SELF_SCORE_LOCK", "/tmp/pdc_self_score_train.lock"
+)
+_ACTIVE_TRAIN_PROC = None
+
+
+def _train_lock(lock_path=None):
+    """Exclusive file lock so only one self_score trainer runs at a time."""
+    path = lock_path or _TRAIN_LOCK_PATH
+    fh = open(path, "a+", encoding="utf-8")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+def _release_train_lock(fh):
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def _terminate_process_group(proc, *, grace_seconds=5.0):
+    """SIGTERM then SIGKILL an entire session/process group and reap it."""
+    details = {
+        "pid": getattr(proc, "pid", None),
+        "returncode": proc.poll(),
+        "terminated": False,
+        "killed": False,
+        "reaped": False,
+        "error": None,
+    }
+    if proc.poll() is not None:
+        details["reaped"] = True
+        details["returncode"] = proc.returncode
+        return details
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        details["terminated"] = True
+    except ProcessLookupError:
+        details["reaped"] = True
+        details["returncode"] = proc.poll()
+        return details
+    except Exception as exc:
+        details["error"] = "term:%s" % exc
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            details["reaped"] = True
+            details["returncode"] = proc.returncode
+            return details
+        time.sleep(0.05)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+        details["killed"] = True
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        details["error"] = "kill:%s" % exc
+    try:
+        proc.wait(timeout=grace_seconds)
+    except Exception:
+        pass
+    details["returncode"] = proc.poll()
+    details["reaped"] = details["returncode"] is not None
+    return details
+
+
+def _cleanup_active_train_proc():
+    global _ACTIVE_TRAIN_PROC
+    proc = _ACTIVE_TRAIN_PROC
+    _ACTIVE_TRAIN_PROC = None
+    if proc is not None and proc.poll() is None:
+        _terminate_process_group(proc)
+
+
+atexit.register(_cleanup_active_train_proc)
+
+
+def _run_in_process_group(argv, *, timeout):
+    """Run argv in a new session; on timeout/error kill the whole process group."""
+    global _ACTIVE_TRAIN_PROC
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    _ACTIVE_TRAIN_PROC = proc
+    pg_details = {"pid": proc.pid, "returncode": None, "timed_out": False}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        pg_details["returncode"] = proc.returncode
+        return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr), pg_details
+    except subprocess.TimeoutExpired:
+        pg_details["timed_out"] = True
+        pg_details.update(_terminate_process_group(proc))
+        stdout = stderr = ""
+        try:
+            out, err = proc.communicate(timeout=1)
+            stdout, stderr = out or "", err or ""
+        except Exception:
+            pass
+        exc = subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr)
+        exc.process_group = pg_details  # type: ignore[attr-defined]
+        raise exc
+    except Exception:
+        pg_details.update(_terminate_process_group(proc))
+        raise
+    finally:
+        if _ACTIVE_TRAIN_PROC is proc:
+            _ACTIVE_TRAIN_PROC = None
+        if proc.poll() is None:
+            pg_details.update(_terminate_process_group(proc))
+
+
 def decon_score(docs):
     """Run decon on sampled documents, return (leakage_score, num_matches) or (None, None)."""
     # ``DECON_BINARY``/``DECON_EVALS_DIR`` are baked as host absolute paths at
@@ -406,7 +531,11 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
         return None, None, None
 
     tmp = tempfile.mkdtemp(prefix="selfscore_train_")
+    lock_fh = None
+    pg_details = None
     try:
+        # Serialize GPU trainers across concurrent self_score invocations.
+        lock_fh = _train_lock()
         steps = int(max_steps if max_steps is not None else STUDENT_CONFIG["steps"])
         warmup_steps = min(int(STUDENT_CONFIG["warmup_steps"]), steps)
         payload = dict(STUDENT_CONFIG)
@@ -417,10 +546,8 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             json.dump(payload, fh)
         with open(os.path.join(tmp, "corpus.txt"), "w", encoding="utf-8") as fh:
             fh.write(text)
-        result = subprocess.run(
+        result, pg_details = _run_in_process_group(
             [sys.executable, str(train_script), tmp],
-            capture_output=True,
-            text=True,
             timeout=train_timeout,
         )
         if result.returncode != 0:
@@ -433,6 +560,12 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
                 % (result.returncode, detail[:2000]),
                 file=sys.stderr,
             )
+            if pg_details is not None:
+                print(
+                    "[self-score] process_group=%s"
+                    % json.dumps(pg_details, sort_keys=True),
+                    file=sys.stderr,
+                )
             return None, None, None
         marker = "RESULT_JSON "
         line = next(
@@ -459,11 +592,17 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
     except subprocess.TimeoutExpired as exc:
         file_stderr = _read_trainer_stderr_tail(tmp)
         detail = file_stderr or getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
+        pg = getattr(exc, "process_group", None) or pg_details
         print(
             "[self-score] WARNING: proxy training timed out after %ds: %s"
             % (train_timeout, (detail or "")[:2000]),
             file=sys.stderr,
         )
+        if pg is not None:
+            print(
+                "[self-score] process_group=%s" % json.dumps(pg, sort_keys=True),
+                file=sys.stderr,
+            )
         return None, None, None
     except Exception as exc:
         file_stderr = _read_trainer_stderr_tail(tmp)
@@ -472,8 +611,15 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             "[self-score] WARNING: proxy training failed: %s" % detail[:2000],
             file=sys.stderr,
         )
+        if pg_details is not None:
+            print(
+                "[self-score] process_group=%s"
+                % json.dumps(pg_details, sort_keys=True),
+                file=sys.stderr,
+            )
         return None, None, None
     finally:
+        _release_train_lock(lock_fh)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

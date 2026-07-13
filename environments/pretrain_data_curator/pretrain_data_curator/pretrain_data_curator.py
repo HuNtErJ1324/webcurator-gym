@@ -154,6 +154,14 @@ def load_environment(
                 "runtime Docker backend; run the rollout and Docker daemon on the "
                 "same machine and leave docker_host unset"
             )
+        # Fail before evaluation when the pod cannot back the Docker --memory pin
+        # (production 400M default is 96 GiB plus host headroom).
+        from .container_memory import (
+            assert_host_supports_container_memory,
+            resolve_container_memory_gb,
+        )
+
+        assert_host_supports_container_memory(resolve_container_memory_gb(ps.memory_gb))
         # The v1 bash harness runs as a cached PEP 723 uv script. On local Docker
         # trainer runs, a stale script env can miss pydantic-core's compiled
         # extension and fail before reward training starts. Reinstall only that

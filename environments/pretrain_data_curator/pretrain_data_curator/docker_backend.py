@@ -17,6 +17,12 @@ from typing import Any
 
 import verifiers.v1 as vf
 
+from .container_memory import (
+    collect_oom_diagnostics,
+    format_oom_diagnostics,
+    inspect_container_memory,
+    resolve_container_memory_gb,
+)
 from .corpus import CuratedCorpus
 from .models import ProxyStudentConfig
 from .trainer import (
@@ -165,17 +171,24 @@ class HarnessRuntimeProxyTrainer:
             )
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise TrainerError(
-                f"proxy-student training timed out after {timeout}s"
+                f"proxy-student training timed out after {timeout}s",
+                stderr_tail=self._memory_diagnostic(runtime, config),
             ) from exc
         file_stderr = await self._read_redirected_stderr(runtime, config)
         merged_stderr = self._merge_stderr(getattr(result, "stderr", None), file_stderr)
         await self._persist_training_logs(
-            runtime, result, config, file_stderr=file_stderr, merged_stderr=merged_stderr
+            runtime,
+            result,
+            config,
+            file_stderr=file_stderr,
+            merged_stderr=merged_stderr,
         )
         if result.exit_code not in (0, None):
             raise TrainerError(
                 f"proxy-student training exited with code {result.exit_code}",
-                stderr_tail=self._training_diagnostic(result.stdout, merged_stderr),
+                stderr_tail=self._training_diagnostic(
+                    result.stdout, merged_stderr, runtime=runtime, config=config
+                ),
             )
         return SimpleNamespace(
             stdout=getattr(result, "stdout", "") or "",
@@ -250,11 +263,15 @@ class HarnessRuntimeProxyTrainer:
         file_stderr: str = "",
         merged_stderr: str = "",
     ) -> None:
+        diagnostics = self._oom_diagnostics_payload(runtime, config)
         logs = {
             "/workspace/train_stdout.log": (getattr(result, "stdout", "") or ""),
             "/workspace/train_stderr.log": merged_stderr
             or (getattr(result, "stderr", "") or ""),
             "/workspace/train_stderr_redirect.log": file_stderr,
+            "/workspace/train_oom_diagnostics.json": json.dumps(
+                diagnostics, sort_keys=True, default=str
+            ),
         }
         try:
             for path, text in logs.items():
@@ -265,15 +282,71 @@ class HarnessRuntimeProxyTrainer:
         except Exception:
             logger.warning("failed to persist docker training logs", exc_info=True)
 
-    def _training_diagnostic(self, stdout: str | None, stderr: str | None) -> str:
-        return "\n".join(
-            [
-                "--- stdout tail ---",
-                self._diagnostic_stream(stdout or ""),
-                "--- stderr tail ---",
-                self._diagnostic_stream(stderr or ""),
-            ]
+    def _oom_diagnostics_payload(
+        self,
+        runtime: vf.Runtime | None,
+        config: ProxyStudentConfig | None,
+        *,
+        process_group: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        configured = (
+            resolve_container_memory_gb(config.memory_gb)
+            if config is not None
+            else None
         )
+        container = None
+        oom_killed = None
+        effective = None
+        if runtime is not None:
+            container = getattr(runtime, "_container", None) or getattr(
+                runtime, "name", None
+            )
+            if container:
+                try:
+                    info = inspect_container_memory(str(container))
+                    oom_killed = bool(info.get("oom_killed"))
+                    effective = info.get("memory_bytes")
+                except Exception as exc:  # noqa: BLE001 - best-effort diagnostics
+                    logger.debug("oom inspect failed: %s", exc)
+        return collect_oom_diagnostics(
+            configured_gb=configured,
+            effective_memory_bytes=effective,
+            oom_killed=oom_killed,
+            container=str(container) if container else None,
+            process_group=process_group,
+        )
+
+    def _memory_diagnostic(
+        self,
+        runtime: vf.Runtime | None = None,
+        config: ProxyStudentConfig | None = None,
+        *,
+        process_group: dict[str, Any] | None = None,
+    ) -> str:
+        return format_oom_diagnostics(
+            self._oom_diagnostics_payload(runtime, config, process_group=process_group)
+        )
+
+    def _training_diagnostic(
+        self,
+        stdout: str | None,
+        stderr: str | None,
+        *,
+        runtime: vf.Runtime | None = None,
+        config: ProxyStudentConfig | None = None,
+        process_group: dict[str, Any] | None = None,
+    ) -> str:
+        parts = [
+            "--- stdout tail ---",
+            self._diagnostic_stream(stdout or ""),
+            "--- stderr tail ---",
+            self._diagnostic_stream(stderr or ""),
+        ]
+        if runtime is not None or config is not None or process_group is not None:
+            parts.append(
+                self._memory_diagnostic(runtime, config, process_group=process_group)
+            )
+        return "\n".join(parts)
 
     def _diagnostic_stream(self, text: str) -> str:
         marker_at = text.find(self.TRACEBACK_MARKER)

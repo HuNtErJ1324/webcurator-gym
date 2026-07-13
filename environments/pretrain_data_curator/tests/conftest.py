@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import pytest
+
 from pretrain_data_curator.leakage import LeakageScores
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.taskset import CuratorTaskset
+
+
+@pytest.fixture(autouse=True)
+def _skip_host_memory_preflight_in_unit_tests(monkeypatch):
+    """Unit tests must not depend on pod-sized host RAM; dedicated tests cover preflight."""
+    monkeypatch.setenv("PDC_SKIP_MEMORY_PREFLIGHT", "1")
 
 
 class NoOpLeakageDetector:
     """Skip the vendored decon subprocess in unit tests (see DeconLeakageDetector._check_binary fallback)."""
 
     def score(self, docs, val_set=None) -> LeakageScores:
-        return LeakageScores(0.0, 0, ())
+        return LeakageScores(0.0, 0, [])
 
 
 def bind_fast_scorer(

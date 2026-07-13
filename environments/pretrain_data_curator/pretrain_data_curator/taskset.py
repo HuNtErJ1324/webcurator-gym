@@ -681,6 +681,19 @@ class CuratorTaskset(_TasksetBase):
             )
         if runtime.type == "docker":
             DockerHostReachability.configure()
+            # Confirm the live cgroup / HostConfig.Memory matches the configured
+            # Docker --memory pin before the agent starts spending turns.
+            from .container_memory import (
+                resolve_container_memory_gb,
+                verify_runtime_memory_limit,
+            )
+
+            verify_runtime_memory_limit(
+                runtime,
+                configured_gb=resolve_container_memory_gb(
+                    self.curator.proxy_student.memory_gb
+                ),
+            )
         await runtime.write(
             SELF_SCORE_FILENAME,
             render_self_score_script(

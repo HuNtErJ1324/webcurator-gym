@@ -15,6 +15,7 @@ from typing import Any
 
 import verifiers.v1 as vf
 
+from .container_memory import resolve_container_memory_gb
 from .models import ProxyStudentConfig
 
 
@@ -28,6 +29,9 @@ def derive_trainer_resources(
     ``backend`` is ``"docker"`` or ``"modal"``. The only backend-specific field
     is the GPU specifier: Docker passes ``gpu_count`` (``None`` when zero), while
     Modal maps ``modal_gpu`` through ``_modal_gpu_for`` (lazy import).
+
+    Container memory honors ``PDC_CONTAINER_MEMORY_GB`` when set so production
+    pods can raise the Docker ``--memory`` pin without editing eval TOMLs.
     """
     if backend == "modal":
         from .modal_backend import _modal_gpu_for
@@ -39,7 +43,7 @@ def derive_trainer_resources(
         "image": ps.docker_image,
         "workdir": "/workspace",
         "cpu": float(ps.cpu_cores),
-        "memory": float(ps.memory_gb),
+        "memory": resolve_container_memory_gb(ps.memory_gb),
         "gpu": gpu,
         "disk": float(ps.disk_size_gb),
         "scoring_timeout_seconds": ps.effective_scoring_timeout_seconds,

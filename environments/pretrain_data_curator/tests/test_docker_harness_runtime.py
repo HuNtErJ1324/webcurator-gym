@@ -102,6 +102,7 @@ async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
         "/workspace/train_stdout.log",
         "/workspace/train_stderr.log",
         "/workspace/train_stderr_redirect.log",
+        "/workspace/train_oom_diagnostics.json",
     }
     assert runtime.commands == [(["python", "/workspace/train.py"], {})]
     # The rollout owns the successful runtime until all scoring finishes.
