@@ -9,7 +9,12 @@ override ``Taskset.tools``), it satisfies the non-MCP harness gate at
 default / bash harnesses.
 
 After generation, ``finalize`` (run before scoring, while the runtime is live)
-reads and parses the manifest JSON from the runtime workspace.
+reads and parses the manifest JSON from the runtime workspace. Production
+benchmarks require a valid non-empty ``/workspace/manifest.json``: missing or
+invalid files leave ``finalized=0``, skip materialize/train, and record
+``manifest_provenance`` (``missing`` vs ``invalid_workspace_file``, also in
+``trace.info``). Assistant-message / opt-in trace candidates remain telemetry
+only under ``manifest_candidate`` and never override those workspace outcomes.
 
 Scoring is unchanged from v1: the finalized manifest's datasets are materialized
 and used to train the fixed proxy student, and the composite reward is:
@@ -38,7 +43,7 @@ import os
 import re
 from importlib import resources
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import verifiers.v1 as vf
 from pydantic import ValidationError, field_validator, model_validator
@@ -52,8 +57,15 @@ from .leakage import DEFAULT_DECON_BINARY, DEFAULT_EVAL_SETS_DIR
 from .models import (
     CuratorConfig,
     FilterSpec,
+    MANIFEST_CANDIDATE_ASSISTANT_MESSAGE,
+    MANIFEST_CANDIDATE_TRACE_FALLBACK,
     MANIFEST_FILENAME,
+    MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE,
+    MANIFEST_PROVENANCE_MISSING,
+    MANIFEST_PROVENANCE_WORKSPACE_FILE,
     Manifest,
+    ManifestCandidate,
+    ManifestProvenance,
     ProxyStudentConfig,
     Sampling,
     Source,
@@ -117,8 +129,15 @@ _SUPPORTED_FILTER_KINDS = {
 }
 _FENCE_RE = re.compile(r"```(?:json|jsonc|JSON)?\s*(.*?)```", re.DOTALL)
 
+# Owner/name with optional trailing /config. Name body is alphanumeric chunks
+# joined by ._- so three-segment prose (dataset/config) cannot backtrack into
+# truncated two-segment fragments (e.g. OpenHermes-2.5/default → OpenHermes-2 +
+# 5/default), and sentence-trailing ``building/starting.`` does not match.
 _HF_ID_RE = re.compile(
-    r"(?<![:/\w])([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]+)(?![/\w])"
+    r"(?<![:/\w])"
+    r"([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)"
+    r"(?:/[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
+    r"(?![A-Za-z0-9_./-])"
 )
 
 _NOT_HF_NAMESPACES = frozenset(
@@ -169,6 +188,27 @@ _FILE_EXTS = frozenset(
 )
 
 
+def _shell_command_from_tool_args(arguments: Any) -> str:
+    """Extract a shell command string from tool-call arguments.
+
+    Codex-style harnesses emit ``{"cmd": "..."}`` while bash/default harnesses
+    use ``{"command": "..."}``. Prefer ``command`` when both are present.
+    """
+    if arguments is None:
+        return ""
+    raw = arguments if isinstance(arguments, str) else str(arguments)
+    try:
+        payload = json.loads(raw or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return raw
+    if isinstance(payload, dict):
+        for key in ("command", "cmd"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return raw
+
+
 def _looks_like_hf_id(s: str) -> bool:
     if "/" not in s:
         return False
@@ -186,12 +226,7 @@ def _ids_from_trace(trace: vf.Trace) -> list[str]:
     inspected: dict[str, None] = {}
     for msg in trace.assistant_messages:
         for tc in msg.tool_calls or []:
-            try:
-                cmd = json.loads(getattr(tc, "arguments", "") or "{}").get(
-                    "command", ""
-                )
-            except (json.JSONDecodeError, AttributeError):
-                cmd = getattr(tc, "arguments", "") or ""
+            cmd = _shell_command_from_tool_args(getattr(tc, "arguments", "") or "")
             for argv in extract_hf_commands(cmd):
                 if (
                     len(argv) >= 3
@@ -436,6 +471,7 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     hf_token_env: str = "HF_TOKEN"
     manifest_filename: str = MANIFEST_FILENAME
     candidate_limit: int = 8
+    allow_trace_id_manifest_fallback: bool = False
     allow_local_sources: bool = True
     max_local_source_bytes: int = 33_554_432
     max_turns: int = 64
@@ -516,6 +552,7 @@ class CuratorTaskset(_TasksetBase):
             cutoff_date=config.cutoff_date,
             token_budget=config.token_budget,
             candidate_limit=config.candidate_limit,
+            allow_trace_id_manifest_fallback=config.allow_trace_id_manifest_fallback,
             allow_local_sources=config.allow_local_sources,
             max_local_source_bytes=config.max_local_source_bytes,
             max_turns=config.max_turns,
@@ -675,17 +712,27 @@ class CuratorTaskset(_TasksetBase):
         return msgs[-1].content or ""
 
     async def _manifest_from_workspace_file(
-        self, task: CuratorTask, runtime: Any, *, warn_invalid: bool = False
-    ) -> Manifest | None:
+        self,
+        task: CuratorTask,
+        runtime: Any,
+        *,
+        warn_invalid: bool = False,
+    ) -> tuple[Literal["absent", "invalid", "valid"], Manifest | None]:
         """Read the agent-written manifest from the runtime workspace.
+
+        Distinguishes three outcomes so finalize telemetry can separate a missing
+        file from a present-but-invalid one:
+
+        - ``absent``: runtime missing or the configured filename is not readable
+        - ``invalid``: file exists but is not a valid non-empty manifest
+        - ``valid``: parseable manifest with a non-empty ``sources`` list
 
         Runtime paths are relative to the configured workdir. Docker and Modal
         resolve this filename under ``/workspace``; the subprocess runtime
-        resolves it under its per-rollout workspace. Missing, partially written,
-        or malformed files return ``None`` so the bounded poll can retry them.
+        resolves it under its per-rollout workspace.
         """
         if runtime is None:
-            return None
+            return "absent", None
         try:
             raw = await runtime.read(self.config.manifest_filename)
             text = raw.decode("utf-8")
@@ -695,9 +742,9 @@ class CuratorTaskset(_TasksetBase):
                 "Manifest file %r exists but is not valid UTF-8",
                 self.config.manifest_filename,
             )
-            return None
+            return "invalid", None
         except Exception:  # noqa: BLE001 - runtime backends use different not-found errors
-            return None
+            return "absent", None
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
@@ -707,14 +754,15 @@ class CuratorTaskset(_TasksetBase):
             default_token_budget=task.token_budget,
             reserved_local_filename=self.config.manifest_filename,
         )
-        if manifest is None:
+        if manifest is None or not manifest.sources:
             log = logger.warning if warn_invalid else logger.debug
             log(
                 "Manifest file %r exists but does not contain a valid non-empty "
                 "manifest",
                 self.config.manifest_filename,
             )
-        return manifest
+            return "invalid", None
+        return "valid", manifest
 
     def _manifest_from_messages(
         self, task: CuratorTask, trace: vf.Trace
@@ -757,45 +805,83 @@ class CuratorTaskset(_TasksetBase):
 
     async def _await_final_manifest(
         self, task: CuratorTask, trace: vf.Trace, runtime: Any
-    ) -> Manifest | None:
+    ) -> tuple[Literal["absent", "invalid", "valid"], Manifest | None]:
         """Poll briefly for the agent's workspace manifest before fallbacks.
 
         The shell command that writes the file and ``finalize()`` can become
         observable in either order. Retrying also tolerates reading while a shell
-        redirection is still writing the JSON. The bounded sleeps preserve the
-        previous grace period for a late trace append before message recovery.
+        redirection is still writing the JSON. A present-but-invalid read mid-poll
+        is retried (partial write); the final attempt's status is authoritative.
         """
+        status: Literal["absent", "invalid", "valid"] = "absent"
+        manifest: Manifest | None = None
         for attempt in range(self._FINALIZE_GRACE_ATTEMPTS):
             await asyncio.sleep(self._FINALIZE_GRACE_INTERVAL_SECONDS)
-            manifest = await self._manifest_from_workspace_file(
+            status, manifest = await self._manifest_from_workspace_file(
                 task,
                 runtime,
                 warn_invalid=attempt == self._FINALIZE_GRACE_ATTEMPTS - 1,
             )
-            if manifest is not None:
-                return manifest
-        return None
+            if status == "valid":
+                return status, manifest
+        return status, manifest
 
     async def finalize(self, task: CuratorTask, trace: vf.Trace, runtime: Any) -> None:
         """Read the agent's manifest from the runtime workspace.
 
         Positional signature as invoked at ``verifiers/v1/rollout.py:241``; runs
-        after generation and before ``score``. The workspace file is the primary
-        and required agent-facing path. A short grace-period poll handles the
-        shell-write/finalize race. Assistant-message parsing and trace-ID synthesis
-        remain compatibility fallbacks. Tolerant of a missing/garbled rollout (no
-        usable manifest anywhere -> "not finalized" -> the scorer returns the zero
-        sentinel).
+        after generation and before ``score``. Production benchmarks require an
+        explicit valid non-empty workspace ``manifest.json``: only that path sets
+        ``finalized=1`` and may materialize/train. A short grace-period poll
+        handles the shell-write/finalize race.
+
+        Workspace outcomes are reported distinctly via ``manifest_provenance``:
+
+        - ``workspace_file``: valid non-empty file
+        - ``invalid_workspace_file``: file present but malformed/empty/invalid
+        - ``missing``: file absent (even if assistant-message / opt-in trace
+          candidates exist for telemetry under ``manifest_candidate``)
+
+        Missing/invalid outcomes leave ``finalized=0`` and score as the zero
+        sentinel (no materialize/train).
         """
         state = trace.state
-        manifest = await self._manifest_from_workspace_file(task, runtime)
-        if manifest is None:
-            manifest = await self._await_final_manifest(task, trace, runtime)
-        if manifest is None:
-            manifest = self._manifest_from_messages(task, trace)
-        if manifest is None:
-            manifest = self._manifest_from_trace_ids(task, trace)
-        if manifest is not None and manifest.sources:
+        status, manifest = await self._manifest_from_workspace_file(task, runtime)
+        if status != "valid":
+            status, manifest = await self._await_final_manifest(task, trace, runtime)
+
+        candidate: ManifestCandidate | None = None
+        telemetry_manifest: Manifest | None = None
+        if status == "valid":
+            provenance: ManifestProvenance = MANIFEST_PROVENANCE_WORKSPACE_FILE
+        elif status == "invalid":
+            provenance = MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+        else:
+            provenance = MANIFEST_PROVENANCE_MISSING
+            message_manifest = self._manifest_from_messages(task, trace)
+            if message_manifest is not None:
+                telemetry_manifest = message_manifest
+                candidate = MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
+            elif self.curator.allow_trace_id_manifest_fallback:
+                trace_manifest = self._manifest_from_trace_ids(task, trace)
+                if trace_manifest is not None:
+                    telemetry_manifest = trace_manifest
+                    candidate = MANIFEST_CANDIDATE_TRACE_FALLBACK
+
+        RolloutStore.set_manifest_provenance(state, provenance)
+        trace.info["manifest_provenance"] = provenance
+        if candidate is not None:
+            trace.info["manifest_candidate"] = candidate
+        else:
+            trace.info.pop("manifest_candidate", None)
+
+        production_ok = (
+            provenance == MANIFEST_PROVENANCE_WORKSPACE_FILE
+            and manifest is not None
+            and bool(manifest.sources)
+        )
+        if production_ok:
+            assert manifest is not None  # for type checkers
             if manifest.sample_docs_per_source is not None:
                 fetch_cap = manifest.sample_docs_per_source
                 reachable_tokens = (
@@ -815,6 +901,9 @@ class CuratorTaskset(_TasksetBase):
             RolloutStore.set_manifest(state, manifest)
             RolloutStore.set_finalized(state, True)
         else:
+            if telemetry_manifest is not None and telemetry_manifest.sources:
+                # Retain non-production candidates for telemetry; do not score them.
+                RolloutStore.set_manifest(state, telemetry_manifest)
             RolloutStore.set_finalized(state, False)
         validation_id = self.curator.validation_set.dataset_id
         accessed_validation_set = False
@@ -823,11 +912,9 @@ class CuratorTaskset(_TasksetBase):
                 accessed_validation_set = True
                 break
             for tool_call in message.tool_calls or []:
-                arguments = getattr(tool_call, "arguments", "") or ""
-                try:
-                    command = json.loads(arguments).get("command", "")
-                except (json.JSONDecodeError, AttributeError):
-                    command = arguments
+                command = _shell_command_from_tool_args(
+                    getattr(tool_call, "arguments", "") or ""
+                )
                 if validation_id in str(command):
                     accessed_validation_set = True
                     break
@@ -979,6 +1066,26 @@ class CuratorTaskset(_TasksetBase):
         return 1.0 if RolloutStore.is_finalized(trace.state) else 0.0
 
     @vf.metric
+    async def manifest_missing(self, trace: vf.Trace) -> float:
+        """1.0 when the workspace manifest file was absent."""
+        return (
+            1.0
+            if RolloutStore.manifest_provenance(trace.state)
+            == MANIFEST_PROVENANCE_MISSING
+            else 0.0
+        )
+
+    @vf.metric
+    async def manifest_invalid(self, trace: vf.Trace) -> float:
+        """1.0 when a workspace manifest file was present but invalid."""
+        return (
+            1.0
+            if RolloutStore.manifest_provenance(trace.state)
+            == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+            else 0.0
+        )
+
+    @vf.metric
     async def tool_error_count(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> float:
@@ -1027,6 +1134,7 @@ class CuratorTaskset(_TasksetBase):
 __all__ = [
     "CuratorTaskset",
     "_ids_from_trace",
+    "_shell_command_from_tool_args",
     "parse_manifest",
     "extract_json_object",
 ]
