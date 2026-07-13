@@ -285,7 +285,7 @@ def _load_self_score_helpers():
     from pretrain_data_curator import self_score as mod
 
     script = mod._SCRIPT
-    start = script.index("# Single-flight GPU trainer lock")
+    start = script.index("# --- Progress heartbeats")
     end = script.index("\ndef decon_score")
     ns: dict[str, object] = {
         "os": os,
@@ -592,7 +592,7 @@ def test_signal_delivery_terminates_trainer_group_and_exits(tmp_path):
     from pretrain_data_curator import self_score as mod
 
     script = mod._SCRIPT
-    hs = script.index("# Single-flight GPU trainer lock")
+    hs = script.index("# --- Progress heartbeats")
     he = script.index("\ndef decon_score")
     helper_src = script[hs:he]
     ready = tmp_path / "ready.txt"

@@ -754,11 +754,64 @@ cat > "$RD/eval.sh" <<'EVAL'
 #!/usr/bin/env bash
 # Detached Codex/Responses eval wrapper. Secrets are sourced (never echoed).
 set -uo pipefail
-export PATH="/root/webcurator-gym/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+REPO_ROOT="${WCG_REPO_ROOT:-/root/webcurator-gym}"
+export PATH="$REPO_ROOT/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 MODEL="$1"
 EVAL_CONFIG="$2"
 ST="$3"
-cd /root/webcurator-gym
+LOG="$4"
+
+# `uv run eval` exits 0 even when the rollout itself failed (harness error,
+# truncation, no metrics), so rc=0 alone must never be reported as success.
+# Validate the exact results dir this run logged -- never a repo-wide scan.
+validate_run_results() {
+  local log="$1" line rel
+  line="$(grep -Eo 'results: outputs/[^[:space:]]+' "$log" 2>/dev/null | tail -1 || true)"
+  rel="${line#results: }"
+  if [[ -z "$rel" || "$rel" == /* || "$rel" == *".."* ]]; then
+    echo "[validate] FAIL: no usable results path logged by this run" >&2
+    return 1
+  fi
+  python3 - "$PWD/$rel/results.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+
+def bad(message):
+    print("[validate] FAIL: %s (%s)" % (message, path), file=sys.stderr)
+    raise SystemExit(1)
+
+
+if not path.is_file() or path.stat().st_size == 0:
+    bad("results.jsonl is missing or empty")
+rows = [line for line in path.read_text().splitlines() if line.strip()]
+if not rows:
+    bad("results.jsonl has no rows")
+for index, line in enumerate(rows):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError as exc:
+        bad("row %d is not valid JSON: %s" % (index, exc))
+    if not row.get("is_completed"):
+        bad("row %d is not finalized (is_completed is false)" % index)
+    stop = row.get("stop_condition")
+    if stop in ("error", "truncation"):
+        bad("row %d stop_condition=%s" % (index, stop))
+    errors = row.get("errors") or []
+    if errors:
+        bad("row %d has %d rollout error(s): %s" % (index, len(errors), str(errors[0])[:300]))
+    if not (row.get("metrics") or {}):
+        bad("row %d has empty metrics" % index)
+    if "reward" not in (row.get("rewards") or {}) and row.get("reward") is None:
+        bad("row %d has no reward" % index)
+print("[validate] OK: %d finalized row(s) with metrics in %s" % (len(rows), path))
+PY
+}
+
+cd "$REPO_ROOT"
 set -a
 source secrets.env
 set +a
@@ -767,6 +820,9 @@ set +a
 cd environments/pretrain_data_curator
 uv run eval -m "$MODEL" @ "$EVAL_CONFIG"
 rc=$?
+if [[ $rc -eq 0 ]]; then
+  validate_run_results "$LOG" || rc=65
+fi
 # Atomic status completion: write to a temp file, then rename into place.
 echo "EXIT=$rc" > "$ST.tmp" && mv "$ST.tmp" "$ST"
 exit $rc
@@ -780,7 +836,7 @@ if [[ -f "$PID" ]]; then
   fi
 fi
 echo "RUNNING" > "$ST.tmp" && mv "$ST.tmp" "$ST"
-setsid nohup bash "$RD/eval.sh" "$MODEL" "$EVAL_CONFIG" "$ST" > "$LOG" 2>&1 &
+setsid nohup bash "$RD/eval.sh" "$MODEL" "$EVAL_CONFIG" "$ST" "$LOG" > "$LOG" 2>&1 &
 echo $! > "$PID"
 echo "launched eval (pid=$(cat "$PID"), log=$LOG)"
 REMOTE

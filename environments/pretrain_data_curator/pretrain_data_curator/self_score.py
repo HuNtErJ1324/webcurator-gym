@@ -70,6 +70,13 @@ def fail(message):
     raise SystemExit(2)
 
 
+def text_field_of(row, requested):
+    """Return the row key `text_from_row` would read, or None when none matches."""
+    if requested and requested in row:
+        return requested
+    return next((k for k in TEXT_FIELDS if k in row), None)
+
+
 def request_json(path, params):
     url = DATASETS_SERVER + path + "?" + urllib.parse.urlencode(params)
     headers = {"User-Agent": "pretrain-data-curator-self-score/1"}
@@ -106,26 +113,49 @@ def text_from_row(row, requested):
 
 
 def local_docs(source, limit):
+    """Return (docs, meta); meta records what was actually observed on disk."""
     path = Path(str(source.get("local_path") or ""))
     if not path.is_file() or path.is_absolute() or ".." in path.parts:
         raise ValueError("local_path is missing or unsafe")
     raw = path.read_bytes()[:1_048_576].decode("utf-8", "replace")
     fmt = source.get("local_format", "auto")
+    meta = {
+        "read_kind": "local",
+        "bytes_read": len(raw.encode("utf-8", "replace")),
+        "records_read": 0,
+        "records_parsed": 0,
+        "empty_text_records": 0,
+        "observed_fields": [],
+        "matched_text_field": None,
+    }
     if fmt == "jsonl" or (fmt == "auto" and path.suffix.lower() == ".jsonl"):
+        meta["read_kind"] = "local_jsonl"
         docs = []
         for line in raw.splitlines():
             if len(docs) >= limit:
                 break
+            meta["records_read"] += 1
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            meta["records_parsed"] += 1
             if isinstance(value, str):
                 docs.append(value)
             elif isinstance(value, dict):
+                if not meta["observed_fields"]:
+                    meta["observed_fields"] = sorted(value)[:20]
+                matched = text_field_of(value, source.get("text_field"))
+                if matched and not meta["matched_text_field"]:
+                    meta["matched_text_field"] = matched
                 docs.append(text_from_row(value, source.get("text_field")))
-        return docs
-    return [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()][:limit]
+        meta["empty_text_records"] = sum(1 for x in docs if not x)
+        return docs, meta
+    meta["read_kind"] = "local_text"
+    blocks = [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()]
+    meta["records_read"] = len(blocks)
+    meta["records_parsed"] = len(blocks)
+    return blocks[:limit], meta
 
 
 def source_dataset_id(source):
@@ -146,6 +176,7 @@ def is_forbidden_source(dataset_id):
 
 
 def remote_docs(source, limit):
+    """Return (docs, meta); meta records the rows datasets-server actually served."""
     dataset_id = str(source_dataset_id(source))
     if is_forbidden_source(dataset_id):
         raise ValueError("source is reserved for final validation")
@@ -164,10 +195,26 @@ def remote_docs(source, limit):
         "/first-rows",
         {"dataset": dataset_id, "config": config, "split": split},
     )
-    return [
-        text_from_row(item.get("row") or {}, source.get("text_field"))
-        for item in payload.get("rows", [])[:limit]
-    ]
+    rows = [item.get("row") or {} for item in payload.get("rows", [])[:limit]]
+    meta = {
+        "read_kind": "hf_first_rows",
+        "config": config,
+        "split": split,
+        "records_read": len(rows),
+        "records_parsed": len(rows),
+        "observed_fields": sorted(rows[0])[:20] if rows else [],
+        "matched_text_field": next(
+            (
+                field
+                for field in (text_field_of(row, source.get("text_field")) for row in rows)
+                if field
+            ),
+            None,
+        ),
+    }
+    docs = [text_from_row(row, source.get("text_field")) for row in rows]
+    meta["empty_text_records"] = sum(1 for x in docs if not x)
+    return docs, meta
 
 
 def estimate_tokens(text):
@@ -284,6 +331,61 @@ def _reduce_report(report_lines, total_tokens):
     return leakage, len(best_per_doc)
 
 
+# --- Progress heartbeats ----------------------------------------------------
+# A healthy run is silent for many minutes (corpus sampling, materialization,
+# decon, trainer startup). Without progress output an agent cannot tell a slow
+# run from a hang and may try to kill it -- which can take down its own harness.
+# Heartbeats go to stderr, flushed, at a bounded interval; stdout stays reserved
+# for the single machine-readable JSON result.
+_START_TIME = time.monotonic()
+
+
+def _heartbeat_seconds():
+    raw = os.environ.get("PDC_SELF_SCORE_HEARTBEAT_SECONDS", "30")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 30.0
+    return min(600.0, max(1.0, value))
+
+
+def progress(phase, **fields):
+    """Emit one flushed stderr heartbeat: `[self-score] phase=... elapsed=...`."""
+    parts = [
+        "[self-score] phase=%s elapsed=%ds"
+        % (phase, int(time.monotonic() - _START_TIME))
+    ]
+    parts.extend("%s=%s" % (key, fields[key]) for key in sorted(fields))
+    sys.stderr.write(" ".join(parts) + "\n")
+    sys.stderr.flush()
+
+
+def _communicate_with_heartbeat(proc, timeout, phase, **fields):
+    """``proc.communicate(timeout=...)`` with bounded periodic heartbeats.
+
+    Waits in heartbeat-sized slices so a long child (proxy trainer, decon) keeps
+    reporting liveness, and still raises ``TimeoutExpired`` exactly at the
+    caller's overall timeout.
+    """
+    interval = _heartbeat_seconds()
+    deadline = None if timeout is None else time.monotonic() + float(timeout)
+    budget = "none" if timeout is None else "%ds" % int(timeout)
+    while True:
+        if deadline is None:
+            slice_seconds = interval
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            slice_seconds = min(interval, remaining)
+        try:
+            return proc.communicate(timeout=slice_seconds)
+        except subprocess.TimeoutExpired:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
+            progress(phase, pid=proc.pid, timeout=budget, **fields)
+
+
 def _read_trainer_stderr_tail(workdir, *, max_chars=8000):
     """Read trainer-redirected stderr before the temp workdir is deleted.
 
@@ -321,14 +423,14 @@ def _clear_fd_cloexec(fd):
     fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
 
 
-def _pgid_starttime(pgid):
-    """Return /proc/<pid>/stat starttime, or None if unavailable."""
-    if pgid is None:
+def _proc_stat_fields(pid):
+    """Return /proc/<pid>/stat fields after comm (index 0 == state), or None."""
+    if pid is None:
         return None
     try:
-        with open("/proc/%s/stat" % int(pgid), "r", encoding="utf-8") as fh:
+        with open("/proc/%s/stat" % int(pid), "r", encoding="utf-8") as fh:
             stat = fh.read()
-    except OSError:
+    except (OSError, ValueError):
         return None
     close = stat.rfind(")")
     if close < 0:
@@ -336,7 +438,24 @@ def _pgid_starttime(pgid):
     fields = stat[close + 2 :].split()
     if len(fields) < 20:
         return None
-    return fields[19]
+    return fields
+
+
+def _pgid_starttime(pgid):
+    """Return /proc/<pid>/stat starttime, or None if unavailable."""
+    fields = _proc_stat_fields(pgid)
+    return None if fields is None else fields[19]
+
+
+def _process_pgid(pid):
+    """Return the process group id recorded in /proc/<pid>/stat, or None."""
+    fields = _proc_stat_fields(pid)
+    if fields is None:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
 
 
 def _pgid_identity(pgid):
@@ -407,6 +526,30 @@ def _identity_matches(pgid, expected_starttime):
     return current == "%s:%s" % (int(pgid), expected_starttime)
 
 
+def _group_signal_guard(pgid, expected_starttime=None, allow_missing_leader=False):
+    """Return a skip reason when signalling this group would be unsafe, else None.
+
+    ``killpg`` hits every member of a group, so a recorded pid whose identity no
+    longer holds must never be signalled: after PID reuse the same number can
+    name an unrelated leader (in the eval container, plausibly the harness's own
+    session). We only signal when /proc still shows the pid as its own group
+    leader (pid == pgid) with the expected starttime. ``allow_missing_leader``
+    is for a group we created ourselves and still hold a handle to: once its
+    leader is reaped the pgid cannot be reused while members survive, so
+    signalling remains safe and is required to sweep grandchildren.
+    """
+    if pgid is None:
+        return "no_pgid"
+    fields = _proc_stat_fields(pgid)
+    if fields is None:
+        return None if allow_missing_leader else "leader_gone"
+    if _process_pgid(pgid) != int(pgid):
+        return "not_session_leader"
+    if expected_starttime is not None and not _identity_matches(pgid, expected_starttime):
+        return "identity_mismatch"
+    return None
+
+
 def _poll_reap_child(proc, timeout):
     """Reap a direct child if possible; return True when wait completed."""
     if proc is None:
@@ -422,7 +565,14 @@ def _poll_reap_child(proc, timeout):
         return proc.poll() is not None
 
 
-def _terminate_pgid(pgid, *, grace_seconds=5.0, child_proc=None):
+def _terminate_pgid(
+    pgid,
+    *,
+    grace_seconds=5.0,
+    child_proc=None,
+    expected_starttime=None,
+    allow_missing_leader=False,
+):
     details = {
         "pgid": pgid,
         "terminated": False,
@@ -432,6 +582,27 @@ def _terminate_pgid(pgid, *, grace_seconds=5.0, child_proc=None):
     }
     if pgid is None:
         details["reaped"] = True
+        return details
+
+    def _guard():
+        """Skip signalling (never killpg) when the group is not verifiably ours."""
+        reason = _group_signal_guard(
+            pgid,
+            expected_starttime=expected_starttime,
+            allow_missing_leader=allow_missing_leader,
+        )
+        if reason is None:
+            return False
+        details["skipped"] = True
+        details["reason"] = reason
+        details["reaped"] = (
+            child_proc.poll() is not None
+            if child_proc is not None
+            else not _pgid_alive(pgid)
+        )
+        return True
+
+    if _guard():
         return details
     if child_proc is not None and child_proc.poll() is not None and not _pgid_alive(pgid):
         details["reaped"] = True
@@ -473,6 +644,8 @@ def _terminate_pgid(pgid, *, grace_seconds=5.0, child_proc=None):
 
     if _grace_wait():
         return details
+    if _guard():
+        return details
     try:
         os.killpg(pgid, signal.SIGKILL)
         details["killed"] = True
@@ -491,17 +664,22 @@ def _terminate_pgid(pgid, *, grace_seconds=5.0, child_proc=None):
 
 
 def _reap_stale_lock_holder(fh):
-    """After acquiring the exclusive lock, terminate any recorded stale trainer pgid."""
+    """After acquiring the exclusive lock, terminate any recorded stale trainer pgid.
+
+    The recorded pid is only signalled when it is still the live leader of its own
+    group with the recorded starttime; on any mismatch (exited, PID reused, no
+    longer a group leader) the record is cleared and nothing is signalled.
+    """
     stale, expected_start = _read_lock_holder(fh)
     if stale is None:
         return None
-    if not _identity_matches(stale, expected_start):
-        # Process gone or PID reused — never kill on identity mismatch.
+    reason = _group_signal_guard(stale, expected_starttime=expected_start)
+    if reason is not None:
         _write_lock_pgid(fh, None)
         return {
             "pgid": stale,
             "skipped": True,
-            "reason": "identity_mismatch_or_gone",
+            "reason": reason,
             "expected_starttime": expected_start,
             "current_identity": _pgid_identity(stale),
             "terminated": False,
@@ -509,7 +687,7 @@ def _reap_stale_lock_holder(fh):
             "reaped": True,
             "error": None,
         }
-    details = _terminate_pgid(stale)
+    details = _terminate_pgid(stale, expected_starttime=expected_start)
     _write_lock_pgid(fh, None)
     return details
 
@@ -559,8 +737,13 @@ def _release_train_lock(fh):
         fh.close()
 
 
-def _terminate_process_group(proc, *, grace_seconds=5.0):
-    """SIGTERM then SIGKILL an entire session/process group and reap it."""
+def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None):
+    """SIGTERM then SIGKILL an entire session/process group and reap it.
+
+    The group was created here (``start_new_session=True``), so its leader is our
+    own child: signalling is allowed even once the leader is reaped, which is what
+    sweeps surviving grandchildren.
+    """
     details = {
         "pid": getattr(proc, "pid", None),
         "pgid": getattr(proc, "pid", None),
@@ -575,9 +758,19 @@ def _terminate_process_group(proc, *, grace_seconds=5.0):
         details["reaped"] = True
         details["returncode"] = proc.returncode
         return details
-    pg = _terminate_pgid(proc.pid, grace_seconds=grace_seconds, child_proc=proc)
+    pg = _terminate_pgid(
+        proc.pid,
+        grace_seconds=grace_seconds,
+        child_proc=proc,
+        expected_starttime=expected_starttime,
+        allow_missing_leader=True,
+    )
     details.update(
-        {k: pg[k] for k in ("terminated", "killed", "reaped", "error") if k in pg}
+        {
+            k: pg[k]
+            for k in ("terminated", "killed", "reaped", "error", "skipped", "reason")
+            if k in pg
+        }
     )
     if proc.poll() is None:
         _poll_reap_child(proc, min(grace_seconds, 1.0))
@@ -645,6 +838,7 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
     _ACTIVE_LOCK_FH = lock_fh
     if lock_fh is not None:
         _write_lock_pgid(lock_fh, proc.pid)
+    starttime = _pgid_starttime(proc.pid)
     pg_details = {
         "pid": proc.pid,
         "pgid": proc.pid,
@@ -653,13 +847,16 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         "cleanup_reason": None,
         "grandchild_pids": [],
     }
+    progress("train_started", pid=proc.pid, timeout="none" if timeout is None else "%ds" % int(timeout))
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = _communicate_with_heartbeat(proc, timeout, "train_running")
         pg_details["returncode"] = proc.returncode
+        progress("train_exited", pid=proc.pid, returncode=proc.returncode)
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr), pg_details
     except subprocess.TimeoutExpired:
         pg_details["timed_out"] = True
-        term = _terminate_process_group(proc)
+        progress("train_timeout", pid=proc.pid, timeout="%ss" % timeout)
+        term = _terminate_process_group(proc, expected_starttime=starttime)
         term["cleanup_reason"] = "timeout"
         pg_details.update(term)
         stdout = stderr = ""
@@ -672,14 +869,14 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         exc.process_group = pg_details  # type: ignore[attr-defined]
         raise exc
     except Exception:
-        term = _terminate_process_group(proc)
+        term = _terminate_process_group(proc, expected_starttime=starttime)
         term["cleanup_reason"] = "error"
         pg_details.update(term)
         raise
     finally:
         # Hold the flock until group cleanup is complete, then clear pgid.
         if proc.poll() is None:
-            term = _terminate_process_group(proc)
+            term = _terminate_process_group(proc, expected_starttime=starttime)
             if pg_details.get("cleanup_reason") is None:
                 term["cleanup_reason"] = "error"
             pg_details.update(term)
@@ -836,7 +1033,8 @@ def decon_score(docs):
 
         report_dir = os.path.join(tmp, "report")
         os.makedirs(report_dir, exist_ok=True)
-        result = subprocess.run(
+        progress("decon_started", documents=len(docs), timeout="600s")
+        proc = subprocess.Popen(
             [
                 binary, "detect",
                 "--training-dir", tmp,
@@ -845,11 +1043,17 @@ def decon_score(docs):
                 "--report-output-dir", report_dir,
                 "--contamination-score-threshold", str(DECON_THRESHOLD),
             ],
-            capture_output=True, text=True, timeout=600,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        if result.returncode != 0:
+        try:
+            _stdout, decon_stderr = _communicate_with_heartbeat(proc, 600, "decon_running")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        if proc.returncode != 0:
             print("[self-score] WARNING: decon exited %d: %s" % (
-                result.returncode, result.stderr[:200],
+                proc.returncode, (decon_stderr or "")[:200],
             ), file=sys.stderr)
             return None, None
 
@@ -895,6 +1099,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
     try:
         _install_train_signal_handlers()
         # Serialize GPU trainers across concurrent self_score invocations.
+        progress("train_lock_wait", documents=len(docs), corpus_chars=len(text))
         lock_fh = _train_lock()
         steps = int(max_steps if max_steps is not None else STUDENT_CONFIG["steps"])
         warmup_steps = min(int(STUDENT_CONFIG["warmup_steps"]), steps)
@@ -906,6 +1111,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             json.dump(payload, fh)
         with open(os.path.join(tmp, "corpus.txt"), "w", encoding="utf-8") as fh:
             fh.write(text)
+        progress("train_materialized", corpus_chars=len(text), steps=steps)
         events_before = _snapshot_cgroup_memory()
         result, pg_details = _run_in_process_group(
             [sys.executable, str(train_script), tmp],
@@ -971,6 +1177,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             parsed = json.loads(line[len(marker):])
         loss = float(parsed.get("loss", float("inf")))
         backend = str(parsed.get("val_source") or "sample_ce")
+        progress("train_scored", loss="%.4f" % loss, backend=backend)
         return loss, scaled_perf(loss), backend
     except subprocess.TimeoutExpired as exc:
         file_stderr = _read_trainer_stderr_tail(tmp)
@@ -1005,6 +1212,51 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
     finally:
         _release_train_lock(lock_fh)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def sample_reason(source, meta, sampled_texts, kept_docs):
+    """Explain why a source yielded no usable documents, or None when it did.
+
+    Reports what was actually observed (line/row counts, the fields present in
+    the rows, whether filters removed everything) so a zero-document source is
+    actionable instead of silently scoring zero.
+    """
+    if kept_docs:
+        return None
+    kind = source.get("kind", "hf")
+    records = int(meta.get("records_read", 0) or 0)
+    parsed = int(meta.get("records_parsed", 0) or 0)
+    fields = meta.get("observed_fields") or []
+    unit = "lines" if meta.get("read_kind") == "local_jsonl" else "rows"
+    if records == 0:
+        if kind == "local":
+            return (
+                "read 0 %s from local_path=%r (bytes_read=%s): the file is empty, "
+                "or local_path/local_format is wrong"
+                % (unit, source.get("local_path"), meta.get("bytes_read"))
+            )
+        return (
+            "datasets-server returned 0 rows for config=%r split=%r: check the "
+            "dataset id, config and split" % (meta.get("config"), meta.get("split"))
+        )
+    if parsed == 0:
+        return (
+            "read %d %s but parsed 0 records: local_format=%r does not match the "
+            "file contents"
+            % (records, unit, source.get("local_format", "auto"))
+        )
+    nonempty = [x for x in sampled_texts if x]
+    if not nonempty:
+        return (
+            "all %d sampled %s produced empty text: text_field=%r matched no field; "
+            "observed fields: %s"
+            % (parsed, unit, source.get("text_field"), ", ".join(fields) or "<none>")
+        )
+    kinds = [str((spec or {}).get("kind")) for spec in (source.get("filters") or [])]
+    return (
+        "filters removed all %d sampled documents (filters: %s): loosen or remove them"
+        % (len(nonempty), ", ".join(kinds) or "<none>")
+    )
 
 
 def main():
@@ -1073,10 +1325,12 @@ def main():
     if total_weight <= 0:
         fail("at least one source weight must be positive")
 
+    progress("start", manifest=args.manifest, sources=len(sources), limit=args.limit)
+
     source_stats = []
     estimated_total = 0
     all_docs: list[str] = []
-    for source, weight in zip(sources, weights):
+    for index, (source, weight) in enumerate(zip(sources, weights), start=1):
         kind = source.get("kind", "hf")
         dataset_id = str(source_dataset_id(source))
         if kind == "local":
@@ -1085,13 +1339,15 @@ def main():
             label = REDACTED_SOURCE_LABEL
         else:
             label = dataset_id
+        progress("sampling", source=label, index="%d/%d" % (index, len(sources)))
+        meta = {}
         try:
-            docs = (
+            sampled, meta = (
                 local_docs(source, args.limit)
                 if kind == "local"
                 else remote_docs(source, args.limit)
             )
-            docs = [x for x in apply_filters(docs, source.get("filters")) if x]
+            docs = [x for x in apply_filters(sampled, source.get("filters")) if x]
             all_docs.extend(docs)
             sample_tokens = sum(estimate_tokens(x) for x in docs)
             average_tokens = sample_tokens / len(docs) if docs else 0.0
@@ -1104,17 +1360,38 @@ def main():
                 requested = 0
             estimated_tokens = min(target, int(average_tokens * requested))
             error = None
+            reason = sample_reason(source, meta, sampled, docs)
         except Exception as exc:
             docs, sample_tokens, estimated_tokens = [], 0, 0
             error = f"{type(exc).__name__}: {exc}"
+            reason = error
         estimated_total += estimated_tokens
         source_stats.append({
             "source": label,
+            "ok": bool(docs),
             "sampled_documents": len(docs),
             "sampled_tokens": sample_tokens,
             "estimated_materialized_tokens": estimated_tokens,
             "error": error,
+            "reason": reason,
+            "observed": meta,
         })
+        progress(
+            "sampled",
+            source=label,
+            documents=len(docs),
+            tokens=sample_tokens,
+        )
+
+    failed = [stat for stat in source_stats if not stat["ok"]]
+    sampled_documents = len(all_docs)
+    sampled_tokens = sum(stat["sampled_tokens"] for stat in source_stats)
+    progress(
+        "corpus_complete",
+        documents=sampled_documents,
+        tokens=sampled_tokens,
+        failed_sources=len(failed),
+    )
 
     fill = min(1.0, estimated_total / token_budget)
     perf_loss, perf, train_backend = train_perf(
@@ -1124,15 +1401,43 @@ def main():
         train_timeout=args.train_timeout,
     )
     leakage_score, num_matches = decon_score(all_docs) if all_docs else (None, None)
+    progress("scoring", perf_loss=perf_loss, leakage_score=leakage_score)
 
-    perf_reward = ALPHA_PERF * (perf or 0.0)
-    leakage_penalty = (
-        -LAMBDA_LEAKAGE * leakage_score if leakage_score is not None else 0.0
+    if sampled_documents == 0 or sampled_tokens == 0:
+        # Nothing was sampled, so nothing was trained: there is no reward to
+        # report. Reporting 0.0 here would be indistinguishable from a trained
+        # candidate that genuinely scored 0.
+        perf_reward = None
+        leakage_penalty = None
+        reward = None
+    else:
+        perf_reward = ALPHA_PERF * (perf or 0.0)
+        leakage_penalty = (
+            -LAMBDA_LEAKAGE * leakage_score if leakage_score is not None else 0.0
+        )
+        reward = perf_reward + leakage_penalty
+
+    error = None
+    if failed:
+        error = "%d of %d sources sampled zero documents -- %s" % (
+            len(failed),
+            len(source_stats),
+            "; ".join(
+                "%s: %s" % (stat["source"], stat["reason"]) for stat in failed
+            ),
+        )
+
+    progress(
+        "complete",
+        ok=not failed and sampled_documents > 0,
+        reward=reward,
+        documents=sampled_documents,
     )
-    reward = perf_reward + leakage_penalty
-
     print(json.dumps({
-        "ok": True,
+        "ok": not failed and sampled_documents > 0 and sampled_tokens > 0,
+        "error": error,
+        "sampled_documents": sampled_documents,
+        "sampled_tokens": sampled_tokens,
         "signal": (
             "development sample; corpus-split cross-entropy + benchmark decon only; "
             "not the final held-out validation score"

@@ -52,7 +52,9 @@ As soon as you have a viable candidate, create `{manifest_path}` and continuousl
 python self_score.py {manifest_path} [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
 ```
 Flags: `--limit N` docs/source (default 8); `--max-steps N` proxy steps (default: production student steps); `--max-corpus-chars N` joined-text cap (default: all sampled); `--train-timeout SEC` (default 900).
-Samples sources, trains the proxy student (corpus-split CE), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (no held-out validation). Before further experiments or voluntary completion, keep `{manifest_path}` a valid non-empty manifest; temporary experimental variants are fine, but the best-known scoreable mixture must stay at the authoritative path.
+Samples sources, trains the proxy student (corpus-split CE), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (no held-out validation). `"ok": false` means a source sampled zero documents; see `reason`.
+It often runs many minutes with no GPU use or output; `[self-score] phase=` heartbeats on stderr show liveness. Never kill or signal self_score, python, or any process group/shell — that can kill your own harness and end the episode. Wait for it to return or time out.
+Before further experiments or voluntary completion, keep `{manifest_path}` a valid non-empty manifest; temporary experimental variants are fine, but the best-known scoreable mixture must stay at the authoritative path.
 
 ## Setup
 - Sole curation budget: {token_budget} tokens.
