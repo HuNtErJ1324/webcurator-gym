@@ -13,15 +13,15 @@ _GOALS = [
 TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to {goal}
 
 ## Objective
-Research and iterate autonomously, then write the final manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
+Research and iterate autonomously, and maintain the authoritative manifest JSON that defines the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
 Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md` (the Hugging Face CLI skill installed for this harness). Environment overrides take priority over any conflicting generic text in that skill: the preinstalled `hf` command in this workspace is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token guidance in the skill as inapplicable here.
 
 ## Research
-Feel free to explore broadly before you lock in a mixture. Search the web, read papers and technical writeups, and investigate modern pretraining data practice — there is no prescribed recipe. You can use the installed `hf papers` CLI to discover or access relevant papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
+Feel free to explore broadly before you lock in a mixture. Search the web, read papers and technical writeups, and investigate modern pretraining data practice — there is no prescribed recipe. You can use the installed `hf papers` CLI to discover or access relevant papers. Useful directions include source discovery, quality/toxicity filtering, deduplication, domain/code/math balancing, synthetic data, multilingual tradeoffs, and mixture weighting. Let what you learn inform your manifest design and filtering choices.
 
 ## Deliverable
-When finished, write your final manifest as a single JSON object to `{manifest_path}` with this contract:
+Write your mixture as a single JSON object to `{manifest_path}` with this contract:
 
 ```text
 {{
@@ -47,18 +47,18 @@ When finished, write your final manifest as a single JSON object to `{manifest_p
 If a Hugging Face dataset needs a loading script or otherwise cannot be consumed by the normal HF loader, do not submit it as `kind: "hf"` expecting the materializer to execute that script. Download artifacts with the normal preinstalled `hf` CLI, prefer converting inspected raw files with local tooling over running untrusted remote dataset code, write a workspace `.jsonl` or `.txt`, and cite it as `kind: "local"` with `local_path`, correct `local_format`, and `text_field` when JSONL. That local file must exist before manifest finalization.
 
 ## Self-score (you run it)
-Save a draft manifest and score it yourself with the workspace `self_score.py` script. You choose every development knob via CLI flags:
+Create `{manifest_path}` as soon as you have a viable candidate and continuously keep the best currently known mixture at that exact path. Self-score that exact file with `self_score.py` (choose knobs via CLI flags):
 
 ```text
-python self_score.py draft.json [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
+python self_score.py {manifest_path} [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
 ```
 
-- `--limit N` — documents sampled per source (default 8 if omitted).
-- `--max-steps N` — proxy-training steps (default: production student config steps).
-- `--max-corpus-chars N` — character cap on joined training text (default: all sampled text).
-- `--train-timeout SEC` — proxy-training wall clock in seconds (default 900).
+- `--limit N` — docs per source (default 8).
+- `--max-steps N` — proxy-training steps (default: production student steps).
+- `--max-corpus-chars N` — joined-text character cap (default: all sampled).
+- `--train-timeout SEC` — proxy-training seconds (default 900).
 
-The script samples your draft sources, trains the fixed proxy student on that sample (corpus-split cross-entropy), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward shape as final scoring. It never uses final held-out validation data; treat it as a directional dev signal, not a full-budget score.
+Samples your sources, trains the proxy student (corpus-split CE), runs benchmark decon leakage, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (no held-out validation). Before any further experiment or voluntary completion, `{manifest_path}` must remain a valid non-empty manifest; experimental variants may be temporary, but the best-known scoreable mixture must stay at the authoritative path.
 
 ## Setup
 - The sole curation budget is {token_budget} tokens.
@@ -71,7 +71,7 @@ The script samples your draft sources, trains the fixed proxy student on that sa
 2. Your corpus is checked for data contamination against public benchmark eval sets (AGI Eval, GSM8K, MMLU) AND the held-out validation set using the decon n-gram detector. Contamination against any eval set incurs the leakage penalty in the reward.
 3. Set the manifest's `token_budget` field to exactly {token_budget}. Fetching or processing beyond what can fill that token allocation does not increase the scored corpus.
 4. Use only genuine downloaded data, and keep local paths relative with no leading `/` or `..`. Fabricated data or unsafe paths are rejected and cannot improve the score.
-5. Create the final manifest file through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.
+5. Create and maintain `{manifest_path}` through the shell. Its existence is the completion signal; without a valid non-empty manifest at `{manifest_path}`, there is no positive performance score.
 
 There will be no user interaction. Never ask the user for feedback or clarification; operate autonomously and execute the actions that make the most sense."""
 

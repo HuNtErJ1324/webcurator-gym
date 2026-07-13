@@ -2752,7 +2752,16 @@ def test_task_prompt_contract():
     assert "complete freedom" in prompt
     assert '"token_budget": 1000000' in prompt
     assert '"sources"' in prompt
-    assert "python self_score.py draft.json" in prompt
+    assert "python self_score.py /workspace/manifest.json" in prompt
+    assert "python self_score.py draft.json" not in prompt
+    assert "draft.json" not in prompt
+    assert "as soon as you have a viable candidate" in prompt
+    assert "continuously keep the best currently known mixture" in prompt
+    assert (
+        "Before any further experiment or voluntary completion, "
+        "`/workspace/manifest.json` must remain a valid non-empty manifest" in prompt
+    )
+    assert "best-known scoreable mixture must stay at the authoritative path" in prompt
     assert "--limit N" in prompt
     assert "--max-steps N" in prompt
     assert "Never ask the user" in prompt
@@ -2767,6 +2776,7 @@ def test_task_prompt_contract():
     assert "cost" not in prompt.lower()
     assert "telemetry" not in prompt.lower()
     assert "there is no positive performance score" in prompt
+    assert "Create and maintain `/workspace/manifest.json` through the shell" in prompt
     assert "hf datasets ls" not in prompt
     assert "pip install" not in prompt
     assert "wikimedia/wikipedia" not in prompt
@@ -2800,6 +2810,37 @@ def test_task_prompt_contract():
     assert "no absolute path or `..`" in prompt
     assert "text_field` when JSONL" in prompt
     assert "must exist before manifest finalization" in prompt
+
+
+def test_task_prompt_recurring_finalization_contract():
+    """Prompt requires early manifest.json + continuous best preservation (no draft.json)."""
+    prompt = (
+        CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7))
+        .load_tasks()[0]
+        .prompt
+    )
+
+    assert "python self_score.py /workspace/manifest.json" in prompt
+    assert "python self_score.py draft.json" not in prompt
+    assert "draft.json" not in prompt
+    assert (
+        "Create `/workspace/manifest.json` as soon as you have a viable candidate"
+        in prompt
+    )
+    assert (
+        "continuously keep the best currently known mixture at that exact path"
+        in prompt
+    )
+    assert "Self-score that exact file" in prompt
+    assert (
+        "Before any further experiment or voluntary completion, "
+        "`/workspace/manifest.json` must remain a valid non-empty manifest" in prompt
+    )
+    assert "experimental variants may be temporary" in prompt
+    assert "best-known scoreable mixture must stay at the authoritative path" in prompt
+    assert "without a valid non-empty manifest at `/workspace/manifest.json`" in prompt
+    assert "there is no positive performance score" in prompt
+    assert len(prompt) < 6_000
 
 
 def test_discovery_has_no_call_or_output_stop():
