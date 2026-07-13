@@ -3743,7 +3743,9 @@ async def test_finalize_absent_workspace_manifest_reports_missing_with_assistant
 
     # Workspace file absent → provenance missing even when assistant JSON exists.
     assert not RolloutStore.is_finalized(curator.state)
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_MISSING
     assert trace.info["manifest_candidate"] == MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
     assert [
@@ -3778,7 +3780,9 @@ async def test_finalize_malformed_workspace_manifest_reports_invalid(
         RolloutStore.manifest_provenance(curator.state)
         == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
     )
-    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+    assert (
+        trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+    )
     assert "manifest_candidate" not in trace.info
     # Invalid workspace outcome must not collapse into assistant-message provenance.
     assert not RolloutStore.manifest(curator.state).sources
@@ -3807,7 +3811,9 @@ async def test_finalize_empty_sources_workspace_manifest_reports_invalid():
         RolloutStore.manifest_provenance(curator.state)
         == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
     )
-    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+    assert (
+        trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+    )
     assert "manifest_candidate" not in trace.info
     assert not RolloutStore.manifest(curator.state).sources
     scoring = await curator.prepared()
@@ -3825,7 +3831,9 @@ async def test_finalize_graceful_zero_when_no_manifest():
     await curator.taskset.finalize(curator.task, trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_MISSING
     assert "manifest_candidate" not in trace.info
     # Scoring degrades to the defined zero sentinel rather than crashing.
@@ -3890,7 +3898,9 @@ async def test_finalize_records_mid_rollout_assistant_manifest_without_finalizin
     await curator.taskset.finalize(curator.task, trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_candidate"] == MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
     manifest = RolloutStore.manifest(curator.state)
     assert {s.dataset_id for s in manifest.sources} == {
@@ -3920,7 +3930,9 @@ async def test_finalize_message_probe_prefers_latest_manifest():
     await curator.taskset.finalize(curator.task, trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_candidate"] == MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
     manifest = RolloutStore.manifest(curator.state)
     assert [s.dataset_id for s in manifest.sources] == ["good/science"]
@@ -4013,7 +4025,9 @@ async def test_finalize_opt_in_trace_fallback_records_inspected_ids(arg_key):
     assert not RolloutStore.is_finalized(curator.state), (
         "trace fallback must not production-finalize"
     )
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_MISSING
     assert trace.info["manifest_candidate"] == MANIFEST_CANDIDATE_TRACE_FALLBACK
     manifest = RolloutStore.manifest(curator.state)
@@ -4098,7 +4112,9 @@ async def test_finalize_message_probe_wins_over_trace_ids():
     await curator.taskset.finalize(curator.task, trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_candidate"] == MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
     manifest = RolloutStore.manifest(curator.state)
     assert [s.dataset_id for s in manifest.sources] == ["good/science"]
@@ -4280,7 +4296,9 @@ async def test_missing_workspace_manifest_skips_materialize_and_training():
     await curator.taskset.score(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
-    assert RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_MISSING
     assert trace.info["manifest_candidate"] == MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
     assert builder.materialize_calls == 0
@@ -4313,7 +4331,9 @@ async def test_invalid_workspace_manifest_skips_materialize_and_training():
         RolloutStore.manifest_provenance(curator.state)
         == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
     )
-    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+    assert (
+        trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+    )
     assert "manifest_candidate" not in trace.info
     assert builder.materialize_calls == 0
     assert trainer.calls == 0
