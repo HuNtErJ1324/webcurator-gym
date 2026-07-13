@@ -2783,6 +2783,7 @@ def test_task_prompt_contract():
     assert "min_chars" in prompt
     assert "dedup_exact" in prompt
     assert "Hugging Face `hf` CLI" in prompt
+    assert "installed `hf papers` CLI" in prompt
     assert "metered" not in prompt.lower()
     assert "unmetered" not in prompt.lower()
     assert "billed" not in prompt.lower()
