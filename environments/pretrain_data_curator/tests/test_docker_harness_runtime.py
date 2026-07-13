@@ -9,7 +9,12 @@ import verifiers.v1 as vf
 
 from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
 from pretrain_data_curator.docker_backend import HarnessRuntimeProxyTrainer
-from pretrain_data_curator.models import CuratorConfig, Manifest, ProxyStudentConfig, Source
+from pretrain_data_curator.models import (
+    CuratorConfig,
+    Manifest,
+    ProxyStudentConfig,
+    Source,
+)
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
 from pretrain_data_curator.tasks import build_tasks
@@ -51,7 +56,9 @@ Traceback (most recent call last):
     main()
 RuntimeError: loss is non-finite
 """
-PIP_ROOT_WARNING = "WARNING: Running pip as the 'root' user can result in broken permissions"
+PIP_ROOT_WARNING = (
+    "WARNING: Running pip as the 'root' user can result in broken permissions"
+)
 
 
 class FakeRuntime:
@@ -156,9 +163,7 @@ async def test_reward_threads_injected_runtime_through_scoring_chain():
             proxy_student={"runtime_backend": "docker"},
         )
     )
-    taskset._scorer = CuratorScorer(
-        config, _CorpusBuilder(), trainer, _Leakage()
-    )
+    taskset._scorer = CuratorScorer(config, _CorpusBuilder(), trainer, _Leakage())
     state = CuratorState()
     RolloutStore.set_manifest(
         state, Manifest(sources=[Source(dataset_id="owner/data")])
@@ -336,7 +341,9 @@ async def test_training_crash_surfaces_redirected_stderr_file():
 
     assert "CUDA out of memory" in excinfo.value.stderr_tail
     assert "out of memory" in runtime.files["/workspace/train_stderr.log"].decode()
-    assert b"CUDA out of memory" in runtime.files["/workspace/train_stderr_redirect.log"]
+    assert (
+        b"CUDA out of memory" in runtime.files["/workspace/train_stderr_redirect.log"]
+    )
 
 
 @pytest.mark.asyncio
@@ -402,9 +409,7 @@ async def test_build_real_trainer_dispatches_by_runtime_type():
     # _build_real_trainer() always builds ONE RuntimeSelectedTrainer regardless
     # of runtime_backend; which concrete trainer actually runs is decided
     # ENTIRELY by the live runtime.type passed to train_and_eval at score time.
-    taskset = CuratorTaskset(
-        CuratorTasksetConfig(id="test", use_real_trainer=True)
-    )
+    taskset = CuratorTaskset(CuratorTasksetConfig(id="test", use_real_trainer=True))
     trainer = taskset._build_real_trainer()
     assert isinstance(trainer, RuntimeSelectedTrainer)
 

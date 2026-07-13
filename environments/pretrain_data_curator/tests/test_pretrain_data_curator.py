@@ -714,11 +714,12 @@ def test_400m_pod_scripts_build_runtime_after_decon_and_preflight():
 
     # LOG_FILE must capture the actual eval pipeline, not a dead declaration.
     assert 'LOG_FILE="$LOG_DIR/' in on_pod or "LOG_FILE=" in on_pod
-    eval_pipeline = (
-        "uv run eval @ configs/eval/deepseek-v4-pro-400M-300turn-codex.toml"
-        ' 2>&1 | tee "$LOG_FILE"'
-    )
+    eval_pipeline = 'uv run eval @ "$EVAL_TOML" 2>&1 | tee "$LOG_FILE"'
     assert eval_pipeline in on_pod, 'eval must pipe into tee "$LOG_FILE"'
+    assert (
+        'EVAL_TOML="${EVAL_TOML:-configs/eval/deepseek-v4-pro-400M-300turn-codex.toml}"'
+        in on_pod
+    )
     assert "exec uv run eval" not in on_pod
 
     # on-pod DeepSeek profile is one of the tracked 400M pins (microbatch=32).
