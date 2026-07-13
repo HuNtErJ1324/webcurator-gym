@@ -587,6 +587,41 @@ def test_400m_eval_configs_set_train_microbatch_32(config_name):
     assert baseline.effective_train_tokens == cfg.effective_train_tokens == 400_048_128
 
 
+@pytest.mark.parametrize("config_name", _400m_eval_config_names())
+def test_400m_eval_configs_set_val_logit_chunk_1024(config_name):
+    """Production 400M profiles pin validation logit chunking at 1024 tokens.
+
+    Validation-only memory knob: must not change microbatch=32, schedule math, or
+    token-aware budget expectations. Aggregate CE/accuracy semantics are covered by
+    ``test_eval_val_loss_chunked_matches_full_vocab_semantics``.
+    """
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
+    raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    proxy = raw["args"]["proxy_student"]
+    assert proxy["train_microbatch_size"] == 32
+    assert proxy["val_logit_chunk_tokens"] == 1024
+    assert proxy["batch_size"] == 16
+    assert proxy["block_size"] == 1024
+    assert proxy["batch_stage_muls"] == [1, 2, 3]
+    assert proxy["train_token_budget"] == 400_000_000
+    assert "val_batch_size" not in proxy
+
+    cfg = ProxyStudentConfig.model_validate(proxy)
+    assert cfg.train_microbatch_size == 32
+    assert cfg.val_logit_chunk_tokens == 1024
+    assert cfg.val_batch_size is None
+    assert cfg.effective_steps == 12_208
+    assert cfg.effective_train_tokens == 400_048_128
+    assert cfg.training_payload()["val_logit_chunk_tokens"] == 1024
+
+    # Chunking must not affect token-aware schedule accounting.
+    baseline = ProxyStudentConfig.model_validate(
+        {**proxy, "val_logit_chunk_tokens": None}
+    )
+    assert baseline.effective_steps == cfg.effective_steps == 12_208
+    assert baseline.effective_train_tokens == cfg.effective_train_tokens == 400_048_128
+
+
 def _extract_bash_function(script: str, name: str) -> str:
     """Return the body of ``name() { ... }`` (outermost braces), or raise."""
     header = f"{name}()"
