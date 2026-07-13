@@ -24,7 +24,7 @@ from typing import Any
 import verifiers.v1 as vf
 from pydantic import Field
 
-from .models import Manifest
+from .models import MANIFEST_PROVENANCE_MISSING, Manifest, ManifestProvenance
 
 
 class CuratorState(vf.State):
@@ -49,6 +49,9 @@ class CuratorState(vf.State):
     tool_errors: dict[str, int] = Field(default_factory=dict)
     external_failure: bool = False
     manifest_finalized: bool = False
+    # Stable finalize provenance enum; also mirrored into ``trace.info`` because
+    # ``state`` is excluded from results serialization.
+    manifest_provenance: ManifestProvenance = MANIFEST_PROVENANCE_MISSING
     trainer_error: str | None = None
     budget_fill_ratio: float = 0.0
     source_doc_counts: list[int] = Field(default_factory=list)
@@ -90,6 +93,16 @@ class RolloutStore:
     @classmethod
     def set_finalized(cls, state: CuratorState, value: bool) -> None:
         state.manifest_finalized = value
+
+    @classmethod
+    def manifest_provenance(cls, state: CuratorState) -> ManifestProvenance:
+        return state.manifest_provenance
+
+    @classmethod
+    def set_manifest_provenance(
+        cls, state: CuratorState, value: ManifestProvenance
+    ) -> None:
+        state.manifest_provenance = value
 
     # ---- per-rollout scratch directory (backs doc_cache + materialized corpora) --
     @classmethod

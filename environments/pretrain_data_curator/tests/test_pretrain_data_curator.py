@@ -41,6 +41,10 @@ from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
     MANIFEST_FILENAME,
+    MANIFEST_PROVENANCE_ASSISTANT_MESSAGE,
+    MANIFEST_PROVENANCE_MISSING,
+    MANIFEST_PROVENANCE_TRACE_FALLBACK,
+    MANIFEST_PROVENANCE_WORKSPACE_FILE,
     Manifest,
     ProxyStudentConfig,
     Sampling,
@@ -65,6 +69,8 @@ from pretrain_data_curator.taskset import (
     HF_CLI_SKILL_UPSTREAM_REVISION,
     CuratorTaskset,
     CuratorTasksetConfig,
+    _ids_from_trace,
+    _shell_command_from_tool_args,
     extract_json_object,
     hf_cli_skill_package_file,
     parse_manifest,
@@ -213,6 +219,10 @@ class _Curator:
         manifest = Manifest(token_budget=self.config.token_budget, sources=srcs)
         RolloutStore.set_manifest(self.state, manifest)
         RolloutStore.set_finalized(self.state, finalize)
+        if finalize:
+            RolloutStore.set_manifest_provenance(
+                self.state, MANIFEST_PROVENANCE_WORKSPACE_FILE
+            )
         return self.state
 
     # -- scoring: drive the real taskset @vf.reward/@vf.metric over a Trace -----
@@ -625,7 +635,9 @@ def _assert_ordered_runtime_provision(body: str, *, label: str) -> None:
     assert preflight >= 0, f"{label}: missing in-container hf preflight"
     assert hub_import >= 0, f"{label}: missing huggingface_hub import preflight"
     assert zstd_import >= 0, f"{label}: missing zstandard import preflight"
-    assert zstd_decompress >= 0, f"{label}: missing zstd decompression round-trip preflight"
+    assert zstd_decompress >= 0, (
+        f"{label}: missing zstd decompression round-trip preflight"
+    )
     assert decon_exec >= 0, f"{label}: missing executable /workspace/decon check"
     assert decon_run >= 0, f"{label}: missing /workspace/decon --version preflight"
     assert "/workspace/decon/bin/decon" in body or (
@@ -637,8 +649,12 @@ def _assert_ordered_runtime_provision(body: str, *, label: str) -> None:
     assert decon_fallback < image_build, f"{label}: decon fallback before image build"
     assert image_build < preflight, f"{label}: image build before hf preflight"
     assert preflight < hub_import, f"{label}: hf before huggingface_hub"
-    assert hub_import < zstd_import, f"{label}: huggingface_hub before zstandard preflight"
-    assert zstd_import < zstd_decompress, f"{label}: zstandard import before decompress check"
+    assert hub_import < zstd_import, (
+        f"{label}: huggingface_hub before zstandard preflight"
+    )
+    assert zstd_import < zstd_decompress, (
+        f"{label}: zstandard import before decompress check"
+    )
     assert zstd_decompress < decon_exec, f"{label}: zstd preflight before decon test -x"
     assert decon_exec <= decon_run, f"{label}: test -x before decon --version"
 
@@ -1358,9 +1374,9 @@ async def test_materialize_serializes_store_docs_state_writes(monkeypatch):
         sources=[Source(dataset_id=f"src/{i}", weight=1.0) for i in range(num_sources)],
     )
     state = CuratorState()
-    corpus = await CorpusBuilder(
-        client=_Client(), fetch_limit=fetch_limit
-    ).materialize(manifest, state)
+    corpus = await CorpusBuilder(client=_Client(), fetch_limit=fetch_limit).materialize(
+        manifest, state
+    )
 
     # Serialization caps concurrent store_docs at one, even with fetch_limit > 1.
     assert max_active == 1
@@ -2291,7 +2307,7 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     funcs = discover_decorated(curator.taskset, "reward") + discover_decorated(
         curator.taskset, "metric"
     )
-    assert len(funcs) == 21  # 2 rewards + 19 diagnostic metrics (cost_total removed)
+    assert len(funcs) == 22  # 2 rewards + 20 diagnostic metrics
     await asyncio.gather(*[f(trace) for f in funcs])
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
@@ -2696,7 +2712,7 @@ def test_task_prompt_contract():
     prompt = task.prompt
 
     assert task.system_prompt is None
-    assert len(prompt) < 5_000
+    assert len(prompt) < 6_000
     assert "complete freedom" in prompt
     assert '"token_budget": 1000000' in prompt
     assert '"sources"' in prompt
@@ -3606,30 +3622,46 @@ def _trace_with_final(task, state, final_text):
 @pytest.mark.asyncio
 async def test_finalize_warns_when_fetch_cap_cannot_reach_token_budget(caplog):
     curator = await _make()
-    trace = _trace_with_final(
-        curator.task,
-        curator.state,
-        '```json\n{"token_budget": 1000, "sample_docs_per_source": 2, "sources": [{"id": "a/b"}]}\n```',
+    trace = _trace_with_final(curator.task, curator.state, "Done.")
+    runtime = _FakeRuntime(
+        files={
+            MANIFEST_FILENAME: (
+                b'{"token_budget": 1000, "sample_docs_per_source": 2, '
+                b'"sources": [{"id": "a/b"}]}'
+            )
+        }
     )
 
     with caplog.at_level("WARNING"):
-        await curator.taskset.finalize(curator.task, trace, None)
+        await curator.taskset.finalize(curator.task, trace, runtime)
 
     assert "TOKEN BUDGET IS NOT REACHABLE" in caplog.text
+    assert RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    )
 
 
 @pytest.mark.asyncio
 async def test_finalize_populates_manifest_without_cost_ledger():
     curator = await _make()
-    final = (
-        "```json\n"
-        '{"sources": [{"id": "good/encyclopedia", "weight": 1.0},'
-        ' {"id": "good/science", "weight": 2.0}]}\n'
-        "```"
+    trace = _trace_with_final(curator.task, curator.state, "Done.")
+    runtime = _FakeRuntime(
+        files={
+            MANIFEST_FILENAME: (
+                b'{"sources": [{"id": "good/encyclopedia", "weight": 1.0},'
+                b' {"id": "good/science", "weight": 2.0}]}'
+            )
+        }
     )
-    trace = _trace_with_final(curator.task, curator.state, final)
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.taskset.finalize(curator.task, trace, runtime)
     assert RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    )
+    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_WORKSPACE_FILE
     manifest = RolloutStore.manifest(curator.state)
     assert [s.dataset_id for s in manifest.sources] == [
         "good/encyclopedia",
@@ -3661,6 +3693,10 @@ async def test_finalize_prefers_valid_workspace_manifest_file():
 
     manifest = RolloutStore.manifest(curator.state)
     assert RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    )
     assert manifest.token_budget == 1234
     assert [source.dataset_id for source in manifest.sources] == ["file/primary"]
 
@@ -3683,13 +3719,18 @@ async def test_finalize_polls_for_late_workspace_manifest_file():
     await curator.taskset.finalize(curator.task, trace, runtime)
     await write
 
+    assert RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    )
     assert [
         source.dataset_id for source in RolloutStore.manifest(curator.state).sources
     ] == ["file/late"]
 
 
 @pytest.mark.asyncio
-async def test_finalize_absent_workspace_manifest_falls_back_to_messages():
+async def test_finalize_absent_workspace_manifest_records_assistant_message_only():
     curator = await _make()
     trace = _trace_with_final(
         curator.task,
@@ -3699,14 +3740,24 @@ async def test_finalize_absent_workspace_manifest_falls_back_to_messages():
 
     await curator.taskset.finalize(curator.task, trace, _FakeRuntime())
 
-    assert RolloutStore.is_finalized(curator.state)
+    # Assistant text is telemetry-only: never production-final, never trains.
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    )
+    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
     assert [
         source.dataset_id for source in RolloutStore.manifest(curator.state).sources
     ] == ["message/fallback"]
+    scoring = await curator.prepared()
+    assert scoring["perf"] == 0.0
+    assert scoring["flops"] == 0.0
+    assert scoring["tokens"] == 0
 
 
 @pytest.mark.asyncio
-async def test_finalize_malformed_workspace_manifest_warns_and_falls_back(
+async def test_finalize_malformed_workspace_manifest_warns_and_does_not_finalize(
     caplog,
 ):
     curator = await _make()
@@ -3721,6 +3772,11 @@ async def test_finalize_malformed_workspace_manifest_warns_and_falls_back(
         await curator.taskset.finalize(curator.task, trace, runtime)
 
     assert "does not contain a valid non-empty manifest" in caplog.text
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    )
     assert [
         source.dataset_id for source in RolloutStore.manifest(curator.state).sources
     ] == ["message/fallback"]
@@ -3735,10 +3791,17 @@ async def test_finalize_graceful_zero_when_no_manifest():
     await curator.taskset.finalize(curator.task, trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
+    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_MISSING
     # Scoring degrades to the defined zero sentinel rather than crashing.
     scoring = await curator.prepared()
     assert scoring["perf"] == 0.0
     assert scoring["num_sources"] == 0
+    assert scoring["flops"] == 0.0
+    assert scoring["tokens"] == 0
+    assert await curator.taskset.manifest_missing(trace) == 1.0
 
 
 # --- finalize: cross-turn fallback + turn-budget prompt --------------------
@@ -3767,12 +3830,11 @@ def _trace_with_turns(task, state, assistant_texts):
 
 
 @pytest.mark.asyncio
-async def test_finalize_falls_back_to_mid_rollout_manifest_at_turn_cap():
+async def test_finalize_records_mid_rollout_assistant_manifest_without_finalizing():
     # The agent emits a VALID manifest mid-rollout (turn 1), then keeps issuing `hf`
     # discovery calls until the turn cap trips on a trailing tool call whose message
-    # carries no manifest. The OLD finalize parsed ONLY the last message -> not
-    # finalized -> num_sources=0 -> perf=0. finalize must now fall back to the most
-    # recent ```json manifest across ALL assistant turns, so the rollout finalizes.
+    # carries no manifest. Without a workspace file this must NOT production-finalize
+    # or train, but provenance still records the latest assistant-message mixture.
     curator = await _make(max_turns=3)
     manifest_turn = (
         "Here is my mixture so far.\n```json\n"
@@ -3793,24 +3855,26 @@ async def test_finalize_falls_back_to_mid_rollout_manifest_at_turn_cap():
 
     await curator.taskset.finalize(curator.task, trace, None)
 
-    # The mid-rollout manifest still finalizes despite the trailing hf calls.
-    assert RolloutStore.is_finalized(curator.state)
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    )
     manifest = RolloutStore.manifest(curator.state)
     assert {s.dataset_id for s in manifest.sources} == {
         "good/encyclopedia",
         "good/science",
     }
-    # The training/perf reward stage is now actually reached.
     scoring = await curator.prepared()
-    assert scoring["num_sources"] == 2
-    assert scoring["num_sources"] > 0
-    assert scoring["perf"] > 0.0
+    assert scoring["num_sources"] == 0
+    assert scoring["perf"] == 0.0
+    assert scoring["flops"] == 0.0
 
 
 @pytest.mark.asyncio
-async def test_finalize_message_fallback_prefers_latest_manifest():
-    # With no workspace file, the compatibility fallback prefers a later message
-    # manifest over an earlier draft.
+async def test_finalize_message_probe_prefers_latest_manifest():
+    # With no workspace file, the assistant-message probe prefers a later message
+    # manifest over an earlier draft, but still does not production-finalize.
     curator = await _make()
     draft = (
         "Draft mixture:\n```json\n"
@@ -3823,7 +3887,11 @@ async def test_finalize_message_fallback_prefers_latest_manifest():
     trace = _trace_with_turns(curator.task, curator.state, [draft, final])
     await curator.taskset.finalize(curator.task, trace, None)
 
-    assert RolloutStore.is_finalized(curator.state)
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    )
     manifest = RolloutStore.manifest(curator.state)
     assert [s.dataset_id for s in manifest.sources] == ["good/science"]
     assert manifest.sources[0].weight == 2.0
@@ -3832,20 +3900,19 @@ async def test_finalize_message_fallback_prefers_latest_manifest():
 # --- finalize: trace-fallback manifest synthesis ----------------------------
 
 
-def _trace_with_bash_calls(task, state, calls):
+def _trace_with_bash_calls(task, state, calls, *, arg_key: str = "command"):
     """A multi-turn trace where every assistant turn is a bash tool call.
 
     ``calls`` is a list of ``(command, result_text)`` pairs.  The result text
     is injected as a ToolMessage into the next turn's context so that
     ``trace.tool_messages`` is populated for all but the last call.
     Returns a trace with NO final text manifest (all turns are tool calls).
+    ``arg_key`` selects ``command`` (bash) or ``cmd`` (Codex-style) tool args.
     """
     trace = vf.Trace(task=task, state=state)
     conversation = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     for i, (cmd, result) in enumerate(calls):
-        tc = vf.ToolCall(
-            id=f"tc{i}", name="bash", arguments=json.dumps({"command": cmd})
-        )
+        tc = vf.ToolCall(id=f"tc{i}", name="bash", arguments=json.dumps({arg_key: cmd}))
         graph.prepare_turn(trace, conversation).commit(
             vf.Response(
                 id=f"r{i}",
@@ -3862,11 +3929,33 @@ def _trace_with_bash_calls(task, state, calls):
 
 
 @pytest.mark.asyncio
-async def test_finalize_synthesizes_manifest_from_inspected_tool_call_ids():
-    # When the agent runs only bash tool calls and never emits a JSON manifest,
-    # finalize must still produce a non-empty manifest from the ids the agent
-    # explicitly inspected via `hf datasets info <id>` tool calls.
+async def test_finalize_trace_fallback_disabled_by_default():
     curator = await _make(max_turns=4)
+    calls = [
+        (
+            "hf datasets info meta-math/MetaMathQA --expand downloads,likes,tags",
+            "Dataset: meta-math/MetaMathQA\ndownloads: 456789\nlicense: mit",
+        ),
+    ]
+    trace = _trace_with_bash_calls(curator.task, curator.state, calls)
+    await curator.taskset.finalize(curator.task, trace, None)
+
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
+    assert not RolloutStore.manifest(curator.state).sources
+    scoring = await curator.prepared()
+    assert scoring["flops"] == 0.0
+    assert scoring["tokens"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arg_key", ["command", "cmd"])
+async def test_finalize_opt_in_trace_fallback_records_inspected_ids(arg_key):
+    # Opt-in debug path may synthesize from inspected hf datasets info ids, but
+    # must remain non-production (finalized=0) so it cannot pass success gates.
+    curator = await _make(max_turns=4, allow_trace_id_manifest_fallback=True)
     calls = [
         (
             "hf datasets ls --search math --sort downloads --limit 5",
@@ -3885,48 +3974,55 @@ async def test_finalize_synthesizes_manifest_from_inspected_tool_call_ids():
             "codeparrot/github-code  1.2M downloads\ncodeparrot/codeparrot-clean  300k",
         ),
     ]
-    trace = _trace_with_bash_calls(curator.task, curator.state, calls)
-    # Precondition: no assistant message carries a parseable JSON manifest.
+    trace = _trace_with_bash_calls(curator.task, curator.state, calls, arg_key=arg_key)
     for msg in trace.assistant_messages:
         assert parse_manifest(msg.content or "") is None
 
     await curator.taskset.finalize(curator.task, trace, None)
 
-    assert RolloutStore.is_finalized(curator.state), (
-        "fallback must finalize the rollout"
+    assert not RolloutStore.is_finalized(curator.state), (
+        "trace fallback must not production-finalize"
     )
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_TRACE_FALLBACK
+    )
+    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_TRACE_FALLBACK
     manifest = RolloutStore.manifest(curator.state)
-    assert manifest.sources, "fallback manifest must be non-empty"
+    assert manifest.sources, "fallback manifest must be non-empty for telemetry"
     ids = {s.dataset_id for s in manifest.sources}
-    # Recovery prefers deliberately inspected candidates over raw search hits,
-    # which can include post-cutoff, gated, or incompatible repositories.
     assert ids == {"meta-math/MetaMathQA", "EleutherAI/hendrycks_math"}
-    # Config must be null (no config was observed in tool output).
     assert all(s.config is None for s in manifest.sources)
+    scoring = await curator.prepared()
+    assert scoring["perf"] == 0.0
+    assert scoring["flops"] == 0.0
+    assert scoring["tokens"] == 0
 
 
 @pytest.mark.asyncio
 async def test_finalize_fallback_only_real_ids_no_invented_sources():
-    # The fallback must ONLY use ids that were genuinely observed in the rollout —
-    # never fabricated ids.  A rollout with zero hf tool calls produces no fallback.
-    curator = await _make()
+    # Even with opt-in enabled, the fallback must ONLY use ids that were genuinely
+    # observed — never fabricated ids.
+    curator = await _make(allow_trace_id_manifest_fallback=True)
     calls = [
         ("echo hello", "hello"),  # no hf call at all
     ]
     trace = _trace_with_bash_calls(curator.task, curator.state, calls)
     await curator.taskset.finalize(curator.task, trace, None)
 
-    # No hf ids were observed → fallback has nothing to synthesize → not finalized.
     assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
     manifest = RolloutStore.manifest(curator.state)
     assert not manifest.sources
 
 
 @pytest.mark.asyncio
-async def test_finalize_message_fallback_wins_over_trace_ids():
-    # With no workspace file, a valid assistant-message manifest remains the first
-    # compatibility fallback and must beat trace-ID synthesis.
-    curator = await _make(max_turns=4)
+async def test_finalize_message_probe_wins_over_trace_ids():
+    # With no workspace file, a valid assistant-message mixture is preferred for
+    # telemetry over opt-in trace-ID synthesis, and neither production-finalizes.
+    curator = await _make(max_turns=4, allow_trace_id_manifest_fallback=True)
     calls = [
         (
             "hf datasets info meta-math/MetaMathQA --expand downloads",
@@ -3934,7 +4030,6 @@ async def test_finalize_message_fallback_wins_over_trace_ids():
         ),
     ]
     trace = _trace_with_bash_calls(curator.task, curator.state, calls)
-    # Inject a final text turn with a valid manifest (primary path).
     final_manifest = (
         '```json\n{"sources": [{"id": "good/science", "weight": 3.0}]}\n```'
     )
@@ -3943,7 +4038,6 @@ async def test_finalize_message_fallback_wins_over_trace_ids():
         [
             vf.SystemMessage(content="sys"),
             vf.UserMessage(content="go"),
-            # Replay the tool-call turns so the graph prefix matches.
             *[
                 msg
                 for tc_cmd, tc_result in calls
@@ -3975,9 +4069,12 @@ async def test_finalize_message_fallback_wins_over_trace_ids():
 
     await curator.taskset.finalize(curator.task, trace, None)
 
-    assert RolloutStore.is_finalized(curator.state)
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    )
     manifest = RolloutStore.manifest(curator.state)
-    # Primary-path manifest wins: good/science, not the fallback's MetaMathQA.
     assert [s.dataset_id for s in manifest.sources] == ["good/science"]
     assert manifest.sources[0].weight == 3.0
 
@@ -3986,21 +4083,16 @@ async def test_finalize_message_fallback_wins_over_trace_ids():
 
 
 @pytest.mark.asyncio
-async def test_finalize_grace_period_picks_up_late_final_message():
-    """Reproduces the confirmed upstream race: `verifiers`' interception server
-    commits the agent's real final assistant message to `trace.nodes` AFTER the
-    rollout pool has already unregistered the rollout and `finalize()` has begun.
-    At the moment `finalize()` first checks, only a tool-call turn (fallback
-    fodder) is present; the true manifest lands a beat later, inside the grace
-    window. The grace-period poll (`_await_final_manifest`) must pick up the real
-    manifest instead of prematurely synthesizing one from trace-discovered ids."""
+async def test_finalize_grace_period_picks_up_late_workspace_file():
+    """Workspace-file race: finalize begins before the shell write is visible.
+
+    The bounded grace poll must pick up the late ``manifest.json`` rather than
+    settling for assistant-message / trace probes.
+    """
     curator = await _make()
     trace = vf.Trace(task=curator.task, state=curator.state)
     prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
 
-    # Turn 0: a bash tool call that discovers a real id but carries no manifest --
-    # exactly what the tier-2 fallback would synthesize from if the grace period
-    # were skipped.
     tc = vf.ToolCall(
         id="tc0",
         name="bash",
@@ -4016,53 +4108,33 @@ async def test_finalize_grace_period_picks_up_late_final_message():
             usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
         )
     )
-    conversation = [
-        *prompt,
-        vf.AssistantMessage(content="", tool_calls=[tc]),
-        vf.ToolMessage(tool_call_id="tc0", content="Dataset: good/encyclopedia"),
-    ]
-
-    # Precondition: as of right now, the trace has no usable manifest -- this is
-    # the state finalize() sees on its first (pre-grace) check.
     assert parse_manifest(trace.assistant_messages[-1].content or "") is None
 
-    final_manifest = (
-        '```json\n{"sources": [{"id": "good/science", "weight": 2.0}]}\n```'
-    )
+    runtime = _FakeRuntime()
 
-    async def _commit_late_final_message() -> None:
-        # Yield past the first grace-period poll before the interception server
-        # "finishes" committing the agent's real final message.
+    async def _write_late_manifest() -> None:
         await asyncio.sleep(curator.taskset._FINALIZE_GRACE_INTERVAL_SECONDS * 2)
-        graph.prepare_turn(trace, conversation).commit(
-            vf.Response(
-                id="r1",
-                created=0,
-                model="m",
-                message=vf.AssistantMessage(content=final_manifest),
-                finish_reason="stop",
-                usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
-            )
+        runtime._files[MANIFEST_FILENAME] = (
+            b'{"sources": [{"id": "good/science", "weight": 2.0}]}'
         )
 
-    late_commit = asyncio.create_task(_commit_late_final_message())
-    await curator.taskset.finalize(curator.task, trace, None)
-    await late_commit
+    late_write = asyncio.create_task(_write_late_manifest())
+    await curator.taskset.finalize(curator.task, trace, runtime)
+    await late_write
 
     assert RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    )
     manifest = RolloutStore.manifest(curator.state)
-    # The REAL agent-submitted manifest won, not the trace-discovered-ids
-    # fallback (which would have synthesized good/encyclopedia instead).
     assert [s.dataset_id for s in manifest.sources] == ["good/science"]
     assert manifest.sources[0].weight == 2.0
 
 
 @pytest.mark.asyncio
-async def test_finalize_falls_back_when_final_message_never_arrives():
-    """Companion to the grace-period test above: when the final message truly
-    never arrives (no race, just an agent that never submits a manifest), the
-    grace period must still expire and the existing trace-discovered-ids
-    fallback must still fire exactly as before."""
+async def test_finalize_does_not_trace_fallback_when_file_never_arrives():
+    """When no workspace file arrives, default finalize must not synthesize."""
     curator = await _make()
     calls = [
         (
@@ -4074,10 +4146,181 @@ async def test_finalize_falls_back_when_final_message_never_arrives():
 
     await curator.taskset.finalize(curator.task, trace, None)
 
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
+    assert not RolloutStore.manifest(curator.state).sources
+
+
+def test_shell_command_from_tool_args_supports_cmd_and_command():
+    assert (
+        _shell_command_from_tool_args(json.dumps({"command": "hf datasets ls"}))
+        == "hf datasets ls"
+    )
+    assert (
+        _shell_command_from_tool_args(json.dumps({"cmd": "hf datasets info a/b"}))
+        == "hf datasets info a/b"
+    )
+    assert (
+        _shell_command_from_tool_args(
+            json.dumps({"command": "preferred", "cmd": "other"})
+        )
+        == "preferred"
+    )
+    assert _shell_command_from_tool_args("raw shell text") == "raw shell text"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Dataset: teknium/OpenHermes-2.5/default\n",
+            ["teknium/OpenHermes-2.5"],
+        ),
+        (
+            "garage-bAInd/Open-Platypus/default available\n",
+            ["garage-bAInd/Open-Platypus"],
+        ),
+        (
+            "see open-web-math/open-web-math/default here\n",
+            ["open-web-math/open-web-math"],
+        ),
+        ("building/starting. next sentence\n", []),
+    ],
+)
+def test_ids_from_trace_does_not_backtrack_three_segment_prose(text, expected):
+    task = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0]
+    state = CuratorState()
+    trace = vf.Trace(task=task, state=state)
+    prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
+    tc = vf.ToolCall(
+        id="tc0",
+        name="bash",
+        arguments=json.dumps({"command": "echo probe"}),
+    )
+    graph.prepare_turn(trace, prompt).commit(
+        vf.Response(
+            id="r0",
+            created=0,
+            model="m",
+            message=vf.AssistantMessage(content="", tool_calls=[tc]),
+            finish_reason="tool_calls",
+            usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
+        )
+    )
+    conversation = [
+        *prompt,
+        vf.AssistantMessage(content="", tool_calls=[tc]),
+        vf.ToolMessage(tool_call_id="tc0", content=text),
+    ]
+    graph.prepare_turn(trace, conversation).commit(
+        vf.Response(
+            id="r1",
+            created=0,
+            model="m",
+            message=vf.AssistantMessage(content="ok"),
+            finish_reason="stop",
+            usage=vf.Usage(prompt_tokens=1, completion_tokens=1),
+        )
+    )
+    assert _ids_from_trace(trace) == expected
+    # Explicitly forbid the historical backtrack fragments.
+    forbidden = {
+        "teknium/OpenHermes-2",
+        "5/default",
+        "garage-bAInd/Open",
+        "Platypus/default",
+        "open-web-math/open-web",
+        "math/default",
+        "building/starting",
+        "building/starting.",
+    }
+    assert forbidden.isdisjoint(_ids_from_trace(trace))
+
+
+@pytest.mark.asyncio
+async def test_missing_workspace_manifest_skips_materialize_and_training():
+    client = FakeClient()
+    builder = _CountingBuilder(client=client)
+    trainer = _CountingTrainer()
+    curator = await _make(client=client, corpus_builder=builder, trainer=trainer)
+    trace = _trace_with_final(
+        curator.task,
+        curator.state,
+        '```json\n{"sources": [{"id": "good/encyclopedia"}]}\n```',
+    )
+    await curator.taskset.finalize(curator.task, trace, _FakeRuntime())
+    await curator.taskset.score(trace, None)
+
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    )
+    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_ASSISTANT_MESSAGE
+    assert builder.materialize_calls == 0
+    assert trainer.calls == 0
+    assert trace.metrics["finalized"] == 0.0
+    assert trace.metrics["manifest_missing"] == 0.0
+    assert trace.metrics["train_flops"] == 0.0
+    assert trace.metrics["corpus_tokens"] == 0.0
+    assert trace.reward == 0.0
+
+
+@pytest.mark.asyncio
+async def test_explicit_workspace_manifest_still_trains_and_scores():
+    client = FakeClient()
+    builder = _CountingBuilder(client=client)
+    trainer = _CountingTrainer()
+    curator = await _make(client=client, corpus_builder=builder, trainer=trainer)
+    trace = _trace_with_final(curator.task, curator.state, "Done.")
+    runtime = _FakeRuntime(
+        files={
+            MANIFEST_FILENAME: (
+                b'{"sources": [{"id": "good/encyclopedia", "weight": 1.0},'
+                b' {"id": "good/science", "weight": 1.0}]}'
+            )
+        }
+    )
+    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.taskset.score(trace, None)
+
     assert RolloutStore.is_finalized(curator.state)
-    manifest = RolloutStore.manifest(curator.state)
-    assert [s.dataset_id for s in manifest.sources] == ["meta-math/MetaMathQA"]
-    assert manifest.sources[0].config is None
+    assert (
+        RolloutStore.manifest_provenance(curator.state)
+        == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    )
+    assert trace.info["manifest_provenance"] == MANIFEST_PROVENANCE_WORKSPACE_FILE
+    assert builder.materialize_calls == 1
+    assert trainer.calls == 1
+    assert client.sample_calls == ["good/encyclopedia", "good/science"]
+    assert trace.metrics["finalized"] == 1.0
+    assert trace.metrics["manifest_missing"] == 0.0
+    assert trace.metrics["train_flops"] > 0.0
+    assert trace.metrics["corpus_tokens"] > 0.0
+    assert trace.reward != 0.0
+
+
+@pytest.mark.asyncio
+async def test_finalize_ignores_draft_json_workspace_file():
+    curator = await _make()
+    trace = _trace_with_final(curator.task, curator.state, "Done.")
+    runtime = _FakeRuntime(
+        files={
+            "draft.json": (b'{"sources": [{"id": "good/encyclopedia", "weight": 1.0}]}')
+        }
+    )
+    await curator.taskset.finalize(curator.task, trace, runtime)
+
+    assert not RolloutStore.is_finalized(curator.state)
+    assert (
+        RolloutStore.manifest_provenance(curator.state) == MANIFEST_PROVENANCE_MISSING
+    )
+    assert not RolloutStore.manifest(curator.state).sources
+    scoring = await curator.prepared()
+    assert scoring["flops"] == 0.0
+    assert scoring["tokens"] == 0
 
 
 def test_safety_turn_cap_does_not_change_agent_prompt():

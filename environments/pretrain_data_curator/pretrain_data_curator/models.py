@@ -17,6 +17,19 @@ from .val_set import ValidationSetConfig
 
 MANIFEST_FILENAME = "manifest.json"
 
+# Where finalize() obtained the scored/recorded mixture. Production benchmarks
+# only accept ``workspace_file`` as a successful finalization (`finalized=1`).
+ManifestProvenance = Literal[
+    "workspace_file",
+    "assistant_message",
+    "trace_fallback",
+    "missing",
+]
+MANIFEST_PROVENANCE_WORKSPACE_FILE: ManifestProvenance = "workspace_file"
+MANIFEST_PROVENANCE_ASSISTANT_MESSAGE: ManifestProvenance = "assistant_message"
+MANIFEST_PROVENANCE_TRACE_FALLBACK: ManifestProvenance = "trace_fallback"
+MANIFEST_PROVENANCE_MISSING: ManifestProvenance = "missing"
+
 _RESERVED_WORKSPACE_FILES = frozenset(
     {
         MANIFEST_FILENAME,
@@ -568,6 +581,11 @@ class CuratorConfig(BaseModel):
             "Maximum dataset IDs used by trace-based manifest recovery/fallback only."
         ),
     )
+    # Opt-in debug/compat path. When False (default), production finalize never
+    # synthesizes a manifest from regex-scraped trace IDs. Even when True, that
+    # path records provenance ``trace_fallback`` with ``finalized=0`` so it cannot
+    # pass production success gates or trigger materialize/train.
+    allow_trace_id_manifest_fallback: bool = False
     allow_local_sources: bool = True
     max_local_source_bytes: int = Field(default=33_554_432, ge=1, le=1_073_741_824)
 

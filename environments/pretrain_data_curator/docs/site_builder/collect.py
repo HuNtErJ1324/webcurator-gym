@@ -25,7 +25,7 @@ class RunRecord:
     token_budget: int | None
     use_real_trainer: bool | None
     reward: float | None
-    metrics: dict[str, float | int | bool | None]
+    metrics: dict[str, float | int | bool | str | None]
     timing: dict[str, Any]
     is_completed: bool
     stop_condition: str | None
@@ -73,12 +73,15 @@ def _reward_from_row(row: dict[str, Any]) -> float | None:
     return None
 
 
-def _metrics_from_row(row: dict[str, Any]) -> dict[str, float | int | bool | None]:
+def _metrics_from_row(
+    row: dict[str, Any],
+) -> dict[str, float | int | bool | str | None]:
     metrics = dict(row.get("metrics") or {})
     for key in (
         "corpus_tokens",
         "external_failure",
         "finalized",
+        "manifest_missing",
         "leakage_score",
         "num_sources",
         "perf_accuracy",
@@ -90,6 +93,9 @@ def _metrics_from_row(row: dict[str, Any]) -> dict[str, float | int | bool | Non
     ):
         if key in row and key not in metrics:
             metrics[key] = row[key]
+    info = row.get("info") or {}
+    if isinstance(info, dict) and "manifest_provenance" in info:
+        metrics.setdefault("manifest_provenance", info["manifest_provenance"])
     return metrics
 
 
@@ -126,11 +132,15 @@ def _infer_harness(config: dict[str, Any], parent_name: str) -> str:
     return harness_from_name
 
 
-def discover_runs(outputs_dir: Path, *, full_400m_only: bool = False) -> list[RunRecord]:
+def discover_runs(
+    outputs_dir: Path, *, full_400m_only: bool = False
+) -> list[RunRecord]:
     runs: list[RunRecord] = []
     for results_path in sorted(outputs_dir.rglob("results.jsonl")):
         rel_parent = results_path.parent.relative_to(outputs_dir)
-        parent_name = rel_parent.parts[0] if rel_parent.parts else results_path.parent.name
+        parent_name = (
+            rel_parent.parts[0] if rel_parent.parts else results_path.parent.name
+        )
         run_group = str(rel_parent)
         meta_path = results_path.parent / "metadata.json"
         config_path = results_path.parent / "config.toml"
@@ -140,10 +150,14 @@ def discover_runs(outputs_dir: Path, *, full_400m_only: bool = False) -> list[Ru
         model = _infer_model(meta, config, parent_name)
         harness = _infer_harness(config, parent_name)
         token_budget = args.get("token_budget") if isinstance(args, dict) else None
-        use_real_trainer = args.get("use_real_trainer") if isinstance(args, dict) else None
+        use_real_trainer = (
+            args.get("use_real_trainer") if isinstance(args, dict) else None
+        )
         if full_400m_only and not is_full_400m_eval(
             token_budget=int(token_budget) if token_budget is not None else None,
-            use_real_trainer=bool(use_real_trainer) if use_real_trainer is not None else None,
+            use_real_trainer=bool(use_real_trainer)
+            if use_real_trainer is not None
+            else None,
             config=config,
         ):
             continue
@@ -161,7 +175,9 @@ def discover_runs(outputs_dir: Path, *, full_400m_only: bool = False) -> list[Ru
                     rel_path=str(results_path.relative_to(outputs_dir)),
                     model=model,
                     harness=harness,
-                    token_budget=int(token_budget) if token_budget is not None else None,
+                    token_budget=int(token_budget)
+                    if token_budget is not None
+                    else None,
                     use_real_trainer=bool(use_real_trainer)
                     if use_real_trainer is not None
                     else None,
@@ -180,7 +196,9 @@ def discover_runs(outputs_dir: Path, *, full_400m_only: bool = False) -> list[Ru
                         "harness": harness,
                         "token_budget": token_budget,
                         "use_real_trainer": use_real_trainer,
-                        "max_turns": args.get("max_turns") if isinstance(args, dict) else config.get("max_turns"),
+                        "max_turns": args.get("max_turns")
+                        if isinstance(args, dict)
+                        else config.get("max_turns"),
                     },
                 )
             )
