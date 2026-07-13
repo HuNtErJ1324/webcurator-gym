@@ -321,11 +321,40 @@ def _clear_fd_cloexec(fd):
     fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
 
 
+def _pgid_starttime(pgid):
+    """Return /proc/<pid>/stat starttime, or None if unavailable."""
+    if pgid is None:
+        return None
+    try:
+        with open("/proc/%s/stat" % int(pgid), "r", encoding="utf-8") as fh:
+            stat = fh.read()
+    except OSError:
+        return None
+    close = stat.rfind(")")
+    if close < 0:
+        return None
+    fields = stat[close + 2 :].split()
+    if len(fields) < 20:
+        return None
+    return fields[19]
+
+
+def _pgid_identity(pgid):
+    starttime = _pgid_starttime(pgid)
+    if starttime is None:
+        return None
+    return "%s:%s" % (int(pgid), starttime)
+
+
 def _write_lock_pgid(fh, pgid):
     fh.seek(0)
     fh.truncate()
     if pgid is not None:
-        fh.write("%s\n" % int(pgid))
+        identity = _pgid_identity(pgid)
+        if identity is not None:
+            fh.write("%s\n" % identity)
+        else:
+            fh.write("%s\n" % int(pgid))
     fh.flush()
     try:
         os.fsync(fh.fileno())
@@ -333,15 +362,28 @@ def _write_lock_pgid(fh, pgid):
         pass
 
 
-def _read_lock_pgid(fh):
+def _read_lock_holder(fh):
+    """Return (pgid, starttime_or_None) recorded in the lock file."""
     fh.seek(0)
     text = (fh.read() or "").strip()
     if not text:
-        return None
+        return None, None
+    raw = text.splitlines()[0].strip()
+    if ":" in raw:
+        left, right = raw.split(":", 1)
+        try:
+            return int(left), right
+        except ValueError:
+            return None, None
     try:
-        return int(text.splitlines()[0].strip())
+        return int(raw), None
     except ValueError:
-        return None
+        return None, None
+
+
+def _read_lock_pgid(fh):
+    pgid, _start = _read_lock_holder(fh)
+    return pgid
 
 
 def _pgid_alive(pgid):
@@ -356,7 +398,31 @@ def _pgid_alive(pgid):
         return True
 
 
-def _terminate_pgid(pgid, *, grace_seconds=5.0):
+def _identity_matches(pgid, expected_starttime):
+    if pgid is None:
+        return False
+    if expected_starttime is None:
+        return _pgid_alive(pgid)
+    current = _pgid_identity(pgid)
+    return current == "%s:%s" % (int(pgid), expected_starttime)
+
+
+def _poll_reap_child(proc, timeout):
+    """Reap a direct child if possible; return True when wait completed."""
+    if proc is None:
+        return False
+    if proc.poll() is not None:
+        return True
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return proc.poll() is not None
+
+
+def _terminate_pgid(pgid, *, grace_seconds=5.0, child_proc=None):
     details = {
         "pgid": pgid,
         "terminated": False,
@@ -367,23 +433,46 @@ def _terminate_pgid(pgid, *, grace_seconds=5.0):
     if pgid is None:
         details["reaped"] = True
         return details
-    if not _pgid_alive(pgid):
+    if child_proc is not None and child_proc.poll() is not None and not _pgid_alive(pgid):
+        details["reaped"] = True
+        return details
+    if child_proc is None and not _pgid_alive(pgid):
         details["reaped"] = True
         return details
     try:
         os.killpg(pgid, signal.SIGTERM)
         details["terminated"] = True
     except ProcessLookupError:
-        details["reaped"] = True
+        if child_proc is not None:
+            _poll_reap_child(child_proc, 0.05)
+        details["reaped"] = not _pgid_alive(pgid) and (
+            child_proc is None or child_proc.poll() is not None
+        )
         return details
     except Exception as exc:
         details["error"] = "term:%s" % exc
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not _pgid_alive(pgid):
-            details["reaped"] = True
-            return details
-        time.sleep(0.05)
+
+    def _grace_wait():
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            child_done = _poll_reap_child(child_proc, 0.05) if child_proc is not None else False
+            alive = _pgid_alive(pgid)
+            if child_proc is not None:
+                if child_done and not alive:
+                    details["reaped"] = True
+                    return True
+                # Leader reaped but other members remain, or leader still running:
+                # keep polling until grace expires.
+                time.sleep(0.05)
+                continue
+            if not alive:
+                details["reaped"] = True
+                return True
+            time.sleep(0.05)
+        return False
+
+    if _grace_wait():
+        return details
     try:
         os.killpg(pgid, signal.SIGKILL)
         details["killed"] = True
@@ -391,31 +480,68 @@ def _terminate_pgid(pgid, *, grace_seconds=5.0):
         pass
     except Exception as exc:
         details["error"] = "kill:%s" % exc
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not _pgid_alive(pgid):
-            details["reaped"] = True
-            return details
-        time.sleep(0.05)
-    details["reaped"] = not _pgid_alive(pgid)
+    if _grace_wait():
+        return details
+    if child_proc is not None:
+        _poll_reap_child(child_proc, 0.05)
+    details["reaped"] = (child_proc is None or child_proc.poll() is not None) and (
+        not _pgid_alive(pgid)
+    )
     return details
 
 
 def _reap_stale_lock_holder(fh):
     """After acquiring the exclusive lock, terminate any recorded stale trainer pgid."""
-    stale = _read_lock_pgid(fh)
+    stale, expected_start = _read_lock_holder(fh)
     if stale is None:
         return None
+    if not _identity_matches(stale, expected_start):
+        # Process gone or PID reused — never kill on identity mismatch.
+        _write_lock_pgid(fh, None)
+        return {
+            "pgid": stale,
+            "skipped": True,
+            "reason": "identity_mismatch_or_gone",
+            "expected_starttime": expected_start,
+            "current_identity": _pgid_identity(stale),
+            "terminated": False,
+            "killed": False,
+            "reaped": True,
+            "error": None,
+        }
     details = _terminate_pgid(stale)
     _write_lock_pgid(fh, None)
     return details
 
 
-def _train_lock(lock_path=None):
-    """Exclusive file lock so only one self_score trainer runs at a time."""
+def _train_lock(lock_path=None, timeout=None):
+    """Exclusive file lock so only one self_score trainer runs at a time.
+
+    Acquisition uses LOCK_NB with a deadline so a wedged holder cannot block
+    forever. Raises RuntimeError when another trainer still holds the GPU lock.
+    """
     path = lock_path or _TRAIN_LOCK_PATH
+    if timeout is None:
+        raw = os.environ.get("PDC_SELF_SCORE_LOCK_TIMEOUT", "120")
+        try:
+            timeout = float(raw)
+        except ValueError:
+            timeout = 120.0
+    timeout = max(0.05, float(timeout))
     fh = open(path, "a+", encoding="utf-8")
-    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                raise RuntimeError(
+                    "another trainer holds the GPU lock at %s (waited %.1ss)"
+                    % (path, timeout)
+                )
+            time.sleep(0.05)
     _reap_stale_lock_holder(fh)
     return fh
 
@@ -449,12 +575,12 @@ def _terminate_process_group(proc, *, grace_seconds=5.0):
         details["reaped"] = True
         details["returncode"] = proc.returncode
         return details
-    pg = _terminate_pgid(proc.pid, grace_seconds=grace_seconds)
-    details.update({k: pg[k] for k in ("terminated", "killed", "reaped", "error") if k in pg})
-    try:
-        proc.wait(timeout=grace_seconds)
-    except Exception:
-        pass
+    pg = _terminate_pgid(proc.pid, grace_seconds=grace_seconds, child_proc=proc)
+    details.update(
+        {k: pg[k] for k in ("terminated", "killed", "reaped", "error") if k in pg}
+    )
+    if proc.poll() is None:
+        _poll_reap_child(proc, min(grace_seconds, 1.0))
     details["returncode"] = proc.poll()
     details["reaped"] = details["returncode"] is not None and not _pgid_alive(proc.pid)
     return details
@@ -466,7 +592,8 @@ def _cleanup_active_train_proc():
     lock_fh = _ACTIVE_LOCK_FH
     _ACTIVE_TRAIN_PROC = None
     if proc is not None and proc.poll() is None:
-        _terminate_process_group(proc)
+        details = _terminate_process_group(proc)
+        details["cleanup_reason"] = "signal"
     if lock_fh is not None:
         try:
             _write_lock_pgid(lock_fh, None)
@@ -523,6 +650,7 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         "pgid": proc.pid,
         "returncode": None,
         "timed_out": False,
+        "cleanup_reason": None,
         "grandchild_pids": [],
     }
     try:
@@ -531,7 +659,9 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr), pg_details
     except subprocess.TimeoutExpired:
         pg_details["timed_out"] = True
-        pg_details.update(_terminate_process_group(proc))
+        term = _terminate_process_group(proc)
+        term["cleanup_reason"] = "timeout"
+        pg_details.update(term)
         stdout = stderr = ""
         try:
             out, err = proc.communicate(timeout=1)
@@ -542,12 +672,17 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         exc.process_group = pg_details  # type: ignore[attr-defined]
         raise exc
     except Exception:
-        pg_details.update(_terminate_process_group(proc))
+        term = _terminate_process_group(proc)
+        term["cleanup_reason"] = "error"
+        pg_details.update(term)
         raise
     finally:
         # Hold the flock until group cleanup is complete, then clear pgid.
         if proc.poll() is None:
-            pg_details.update(_terminate_process_group(proc))
+            term = _terminate_process_group(proc)
+            if pg_details.get("cleanup_reason") is None:
+                term["cleanup_reason"] = "error"
+            pg_details.update(term)
         if lock_fh is not None:
             try:
                 _write_lock_pgid(lock_fh, None)
@@ -557,6 +692,95 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
             _ACTIVE_TRAIN_PROC = None
         if _ACTIVE_LOCK_FH is lock_fh:
             _ACTIVE_LOCK_FH = None
+
+
+def _snapshot_cgroup_memory():
+    """Read cgroup v2 memory.events / memory.max; never raise."""
+    events = {}
+    memory_max = None
+    events_error = None
+    max_error = None
+    try:
+        with open("/sys/fs/cgroup/memory.events", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                try:
+                    events[parts[0]] = int(parts[1])
+                except ValueError:
+                    continue
+    except OSError as exc:
+        events_error = str(exc)
+    try:
+        with open("/sys/fs/cgroup/memory.max", "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+        if raw and raw != "max":
+            memory_max = int(raw)
+    except (OSError, ValueError) as exc:
+        max_error = str(exc)
+    return {
+        "events": events,
+        "memory_max": memory_max,
+        "events_error": events_error,
+        "max_error": max_error,
+    }
+
+
+def _classify_trainer_kill(
+    *,
+    returncode=None,
+    stderr=None,
+    timed_out=False,
+    events_before=None,
+    events_after=None,
+    docker_oom_killed=None,
+    process_group=None,
+):
+    """Deterministic kill classification from cgroup/Docker/stderr/timeout evidence.
+
+    Priority: timeout → cgroup/container OOM → CUDA OOM → external SIGKILL → unknown.
+    Local timeout/error/signal cleanup is never labeled external_sigkill.
+    """
+    pg = process_group or {}
+    if timed_out or pg.get("timed_out"):
+        return "timeout"
+
+    before = (events_before or {}).get("events") or events_before or {}
+    after = (events_after or {}).get("events") or events_after or {}
+    oom_delta = 0
+    for key in ("oom", "oom_kill", "oom_group"):
+        try:
+            oom_delta += max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
+        except (TypeError, ValueError):
+            continue
+    if oom_delta > 0:
+        return "cgroup_oom"
+    if docker_oom_killed:
+        # Docker State.OOMKilled is the container cgroup OOM killer.
+        return "cgroup_oom"
+
+    text = stderr or ""
+    if "CUDA out of memory" in text or (
+        re.search(r"cuda\s+out\s+of\s+memory", text, re.I)
+        and re.search(r"cuda", text, re.I)
+    ):
+        return "cuda_oom"
+    if re.search(r"cuda\s+out\s+of\s+memory", text, re.I):
+        return "cuda_oom"
+
+    if pg.get("cleanup_reason") in ("timeout", "error", "signal"):
+        return "unknown"
+
+    sig = None
+    if returncode is not None:
+        if returncode < 0:
+            sig = -returncode
+        elif returncode >= 128:
+            sig = returncode - 128
+    if sig == 9:
+        return "external_sigkill"
+    return "unknown"
 
 
 def decon_score(docs):

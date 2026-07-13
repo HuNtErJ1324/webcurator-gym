@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -192,6 +193,16 @@ def test_classify_trainer_failure_from_cgroup_events_and_signals():
         )
         == "cuda_oom"
     )
+    # cgroup oom_kill delta takes precedence over CUDA text.
+    assert (
+        classify_trainer_failure(
+            returncode=1,
+            stderr="RuntimeError: CUDA out of memory",
+            events_before={"events": {"oom_kill": 0}},
+            events_after={"events": {"oom_kill": 1}},
+        )
+        == "cgroup_oom"
+    )
     assert (
         classify_trainer_failure(
             returncode=-9,
@@ -209,7 +220,7 @@ def test_classify_trainer_failure_from_cgroup_events_and_signals():
             events_after={"events": {"oom_kill": 0}},
             docker_oom_killed=True,
         )
-        == "host_oom"
+        == "cgroup_oom"
     )
     assert (
         classify_trainer_failure(
@@ -220,6 +231,24 @@ def test_classify_trainer_failure_from_cgroup_events_and_signals():
             docker_oom_killed=False,
         )
         == "external_sigkill"
+    )
+    assert (
+        classify_trainer_failure(
+            returncode=-9,
+            process_group={"killed": True, "cleanup_reason": "error"},
+        )
+        == "unknown"
+    )
+    assert (
+        classify_trainer_failure(
+            returncode=-9,
+            process_group={
+                "killed": True,
+                "cleanup_reason": "timeout",
+                "timed_out": True,
+            },
+        )
+        == "timeout"
     )
     assert parse_cgroup_memory_events("oom 1\noom_kill 2\n") == {
         "oom": 1,
@@ -267,6 +296,7 @@ def _load_self_score_helpers():
         "time": time,
         "atexit": __import__("atexit"),
         "json": json,
+        "re": re,
     }
     exec(compile(script[start:end], "<self_score_helpers>", "exec"), ns)
     return ns
@@ -285,11 +315,18 @@ def test_self_score_script_embeds_single_flight_and_process_group_controls():
     assert "_terminate_process_group" in script
     assert "_run_in_process_group" in script
     assert "killpg" in script
+    assert "LOCK_NB" in script
+    assert "def _snapshot_cgroup_memory" in script
+    assert "def _classify_trainer_kill" in script
+    assert "_pgid_starttime" in script
     rendered = render_self_score_script(CuratorConfig(use_real_trainer=True))
     text = rendered.decode()
     assert "start_new_session=True" in text
     assert "pass_fds=" in text
     assert "_train_lock" in text
+    assert "def _snapshot_cgroup_memory" in text
+    assert "def _classify_trainer_kill" in text
+    compile(text, "<rendered_self_score>", "exec")
 
 
 def test_process_group_timeout_kills_and_reaps_grandchild(tmp_path):
@@ -385,19 +422,33 @@ def test_train_lock_serializes_overlapping_holders(tmp_path):
 def test_cross_process_single_flight_lock(tmp_path):
     helpers = _load_self_score_helpers()
     lock_path = str(tmp_path / "cross.lock")
-    marker = tmp_path / "overlap.flag"
+    events_path = tmp_path / "events.log"
+    # Avoid nested f-strings; %% escapes feed the outer % path interpolation.
     script = textwrap.dedent(
-        f"""
-        import fcntl, os, sys, time
-        path = {lock_path!r}
+        """
+        import fcntl, time
+        path = %r
+        events = %r
+        started = time.monotonic()
         fh = open(path, "a+", encoding="utf-8")
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        # Hold briefly; peer should not also observe the hold window.
-        time.sleep(0.4)
+        contended = False
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                contended = True
+                if time.monotonic() - started > 2.0:
+                    fh.close()
+                    raise SystemExit("lock wait timed out")
+                time.sleep(0.02)
+        held_at = time.monotonic()
+        with open(events, "a", encoding="utf-8") as ev:
+            ev.write('acquired contended=%%s t=%%.6f\\n' %% (contended, held_at))
+        time.sleep(0.2)
         fh.close()
         """
-    )
-    # Parent holds lock via helpers while a child process tries to acquire.
+    ) % (lock_path, str(events_path))
     fh = helpers["_train_lock"](lock_path)
     child = subprocess.Popen(
         [sys.executable, "-c", script],
@@ -405,11 +456,19 @@ def test_cross_process_single_flight_lock(tmp_path):
         stderr=subprocess.PIPE,
         text=True,
     )
-    time.sleep(0.15)
-    assert child.poll() is None, "child acquired/finished while parent still held lock"
+    time.sleep(0.2)
+    assert child.poll() is None, (
+        "child acquired/finished while parent still held lock: "
+        f"rc={child.poll()} stderr={child.stderr.read() if child.stderr else ''}"
+    )
+    parent_release = time.monotonic()
     helpers["_release_train_lock"](fh)
-    assert child.wait(timeout=2) == 0
-    assert not marker.exists()
+    assert child.wait(timeout=2) == 0, child.stderr.read()
+    lines = events_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines, "child never recorded lock acquisition"
+    assert "contended=True" in lines[0], lines
+    child_t = float(lines[0].split("t=")[1])
+    assert child_t + 1e-3 >= parent_release, (child_t, parent_release)
 
 
 def test_stale_pgid_recovery_terminates_orphan_group(tmp_path):
@@ -422,8 +481,8 @@ def test_stale_pgid_recovery_terminates_orphan_group(tmp_path):
         stderr=subprocess.DEVNULL,
     )
     try:
-        with open(lock_path, "w", encoding="utf-8") as fh:
-            fh.write(f"{orphan.pid}\n")
+        with open(lock_path, "a+", encoding="utf-8") as fh:
+            helpers["_write_lock_pgid"](fh, orphan.pid)
         # New holder must reap the recorded stale pgid after acquiring the lock.
         fh = helpers["_train_lock"](lock_path)
         helpers["_release_train_lock"](fh)
@@ -437,6 +496,70 @@ def test_stale_pgid_recovery_terminates_orphan_group(tmp_path):
         if orphan.poll() is None:
             os.killpg(orphan.pid, signal.SIGKILL)
             orphan.wait(timeout=2)
+
+
+def test_stale_pgid_recovery_skips_pid_reuse(tmp_path):
+    helpers = _load_self_score_helpers()
+    lock_path = str(tmp_path / "reuse.lock")
+    victim = subprocess.Popen(
+        [sys.executable, "-c", "import time\nwhile True:\n    time.sleep(0.2)\n"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        # Record a matching pgid with a fake starttime so identity mismatches.
+        with open(lock_path, "w", encoding="utf-8") as fh:
+            fh.write(f"{victim.pid}:0\n")
+        fh = helpers["_train_lock"](lock_path)
+        helpers["_release_train_lock"](fh)
+        time.sleep(0.1)
+        assert victim.poll() is None, "PID-reuse mismatch must not kill live process"
+    finally:
+        os.killpg(victim.pid, signal.SIGKILL)
+        victim.wait(timeout=2)
+
+
+def test_train_lock_times_out_instead_of_blocking_forever(tmp_path):
+    helpers = _load_self_score_helpers()
+    lock_path = str(tmp_path / "busy.lock")
+    holder = open(lock_path, "a+", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="another trainer holds the GPU"):
+            helpers["_train_lock"](lock_path, timeout=0.25)
+        assert time.monotonic() - t0 < 1.5
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+
+
+def test_terminate_process_group_reaps_zombie_quickly():
+    helpers = _load_self_score_helpers()
+    # Child ignores SIGTERM briefly then exits; parent must reap without ~10s stall.
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal,time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "time.sleep(0.2)\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+                "time.sleep(0.05)\n"
+            ),
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    t0 = time.monotonic()
+    details = helpers["_terminate_process_group"](child, grace_seconds=0.5)
+    elapsed = time.monotonic() - t0
+    assert details["reaped"] is True
+    assert child.poll() is not None
+    assert elapsed < 3.0, elapsed
 
 
 def test_signal_handler_cleans_active_process_group(tmp_path):
@@ -462,6 +585,137 @@ def test_signal_handler_cleans_active_process_group(tmp_path):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+def test_signal_delivery_terminates_trainer_group_and_exits(tmp_path):
+    """Real subprocess: helper installs handlers, gets SIGTERM, trainer PGID dies."""
+    from pretrain_data_curator import self_score as mod
+
+    script = mod._SCRIPT
+    hs = script.index("# Single-flight GPU trainer lock")
+    he = script.index("\ndef decon_score")
+    helper_src = script[hs:he]
+    ready = tmp_path / "ready.txt"
+    helper_path = tmp_path / "signal_helper.py"
+    helper_path.write_text(
+        "import atexit, fcntl, json, os, re, signal, subprocess, sys, time\n"
+        + helper_src
+        + "\n"
+        + textwrap.dedent(
+            f"""
+            def main():
+                _install_train_signal_handlers()
+                trainer = subprocess.Popen(
+                    [sys.executable, "-c", "import time\\nwhile True:\\n    time.sleep(0.2)\\n"],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                global _ACTIVE_TRAIN_PROC
+                _ACTIVE_TRAIN_PROC = trainer
+                Path = __import__("pathlib").Path
+                Path({str(ready)!r}).write_text(str(trainer.pid), encoding="utf-8")
+                while True:
+                    time.sleep(0.2)
+
+            if __name__ == "__main__":
+                main()
+            """
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(helper_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    trainer_pid = None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if ready.exists():
+            raw = ready.read_text(encoding="utf-8").strip()
+            if raw.isdigit():
+                trainer_pid = int(raw)
+                break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    assert trainer_pid is not None, (
+        proc.poll(),
+        proc.stderr.read() if proc.stderr else None,
+    )
+    os.kill(proc.pid, signal.SIGTERM)
+    rc = proc.wait(timeout=5)
+    # Default disposition after re-raise yields 128+signum or -SIGTERM depending on platform.
+    assert rc in (128 + signal.SIGTERM, -signal.SIGTERM, signal.SIGTERM), rc
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(trainer_pid, 0)
+            time.sleep(0.05)
+        except ProcessLookupError:
+            break
+    with pytest.raises(ProcessLookupError):
+        os.kill(trainer_pid, 0)
+    # Wiring covers SIGINT/SIGHUP as well as SIGTERM.
+    assert "signal.SIGINT" in helper_src and "signal.SIGHUP" in helper_src
+
+
+def test_rendered_self_score_script_compiles_and_train_perf_smoke(tmp_path):
+    """Compile the full rendered script and exercise train_perf with a stub trainer."""
+    cfg = CuratorConfig(use_real_trainer=True)
+    rendered = render_self_score_script(cfg).decode()
+    compile(rendered, "<rendered_self_score_full>", "exec")
+    assert "def _snapshot_cgroup_memory" in rendered
+    assert "def _classify_trainer_kill" in rendered
+
+    ss_path = tmp_path / "self_score.py"
+    train_path = tmp_path / "self_score_train.py"
+    ss_path.write_text(rendered, encoding="utf-8")
+    train_path.write_text(
+        textwrap.dedent(
+            """
+            #!/usr/bin/env python3
+            import json, pathlib, sys
+            workdir = sys.argv[1]
+            pathlib.Path(workdir, "result.json").write_text(
+                json.dumps({"loss": 2.5, "val_source": "stub"}),
+                encoding="utf-8",
+            )
+            print("RESULT_JSON " + json.dumps({"loss": 2.5, "val_source": "stub"}))
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ns: dict[str, object] = {
+        "__name__": "self_score_under_test",
+        "__file__": str(ss_path),
+    }
+    exec(compile(rendered, str(ss_path), "exec"), ns)
+    train_perf = ns["train_perf"]
+    loss, perf, backend = train_perf(
+        ["hello world document for stub training"],
+        max_corpus_chars=1000,
+        max_steps=1,
+        train_timeout=30,
+    )
+    assert loss == 2.5
+    assert perf is not None and backend == "stub"
+    # Undefined helper regression: calling classify/snapshot must work.
+    snap = ns["_snapshot_cgroup_memory"]()
+    assert isinstance(snap, dict) and "events" in snap
+    assert (
+        ns["_classify_trainer_kill"](
+            returncode=-9,
+            stderr="",
+            events_before={"events": {"oom_kill": 0}},
+            events_after={"events": {"oom_kill": 1}},
+        )
+        == "cgroup_oom"
+    )
 
 
 @pytest.mark.asyncio
@@ -552,19 +806,9 @@ def test_on_pod_eval_toml_quoting_and_missing_memory_gb(tmp_path):
     end = script.index("\nPY\n", start)
     body = script[start:end]
 
+    # The on-pod script reads top-level args.proxy_student; mirror that shape,
+    # including metacharacters in the path to prove EVAL_TOML quoting.
     good = tmp_path / 'cfg with spaces & "quotes".toml'
-    good.write_text(
-        textwrap.dedent(
-            """
-            [[eval]]
-            [eval.args.proxy_student]
-            memory_gb = 96
-            """
-        ).strip()
-        + "\n",
-        encoding="utf-8",
-    )
-    # The on-pod script reads top-level args.proxy_student; mirror that shape.
     good.write_text(
         textwrap.dedent(
             """

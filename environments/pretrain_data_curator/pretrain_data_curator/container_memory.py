@@ -46,9 +46,7 @@ ENV_SKIP_MEMORY_PREFLIGHT = "PDC_SKIP_MEMORY_PREFLIGHT"
 CGROUP_MEMORY_EVENTS_PATH = "/sys/fs/cgroup/memory.events"
 CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
 
-KillClass = (
-    str  # cgroup_oom | host_oom | cuda_oom | timeout | external_sigkill | unknown
-)
+KillClass = str  # cgroup_oom | cuda_oom | timeout | external_sigkill | unknown (host_oom unused)
 
 
 class ContainerMemoryError(RuntimeError):
@@ -341,17 +339,14 @@ def classify_trainer_failure(
 ) -> KillClass:
     """Classify a trainer failure using cgroup/Docker/stderr/timeout evidence.
 
-    Priority: timeout → CUDA OOM → cgroup/host OOM → external SIGKILL → unknown.
+    Priority: timeout → cgroup/container OOM → CUDA OOM → external SIGKILL → unknown.
+
+    Docker ``State.OOMKilled`` is container/cgroup OOM (not host OOM). Local
+    timeout/error/signal cleanup must not be labeled ``external_sigkill``.
     """
-    if timed_out or (process_group or {}).get("timed_out"):
+    pg = process_group or {}
+    if timed_out or pg.get("timed_out"):
         return "timeout"
-    text = stderr or ""
-    if re.search(r"cuda\s+out\s+of\s+memory|out of memory", text, re.I) and re.search(
-        r"cuda", text, re.I
-    ):
-        return "cuda_oom"
-    if re.search(r"CUDA out of memory", text):
-        return "cuda_oom"
 
     before = (events_before or {}).get("events") or events_before or {}
     after = (events_after or {}).get("events") or events_after or {}
@@ -364,10 +359,20 @@ def classify_trainer_failure(
     if oom_delta > 0:
         return "cgroup_oom"
     if docker_oom_killed:
-        return "host_oom"
+        return "cgroup_oom"
+
+    text = stderr or ""
+    if re.search(r"CUDA out of memory", text) or (
+        re.search(r"cuda\s+out\s+of\s+memory", text, re.I)
+        and re.search(r"cuda", text, re.I)
+    ):
+        return "cuda_oom"
+
+    if pg.get("cleanup_reason") in ("timeout", "error", "signal"):
+        return "unknown"
 
     sig = _signal_number(returncode)
-    if sig == 9 or (process_group or {}).get("killed"):
+    if sig == 9:
         return "external_sigkill"
     return "unknown"
 
