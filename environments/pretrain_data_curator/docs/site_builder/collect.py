@@ -82,6 +82,7 @@ def _metrics_from_row(
         "external_failure",
         "finalized",
         "manifest_missing",
+        "manifest_invalid",
         "leakage_score",
         "num_sources",
         "perf_accuracy",
@@ -94,8 +95,11 @@ def _metrics_from_row(
         if key in row and key not in metrics:
             metrics[key] = row[key]
     info = row.get("info") or {}
-    if isinstance(info, dict) and "manifest_provenance" in info:
-        metrics.setdefault("manifest_provenance", info["manifest_provenance"])
+    if isinstance(info, dict):
+        if "manifest_provenance" in info:
+            metrics.setdefault("manifest_provenance", info["manifest_provenance"])
+        if "manifest_candidate" in info:
+            metrics.setdefault("manifest_candidate", info["manifest_candidate"])
     return metrics
 
 

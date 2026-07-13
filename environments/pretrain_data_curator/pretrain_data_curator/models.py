@@ -17,18 +17,28 @@ from .val_set import ValidationSetConfig
 
 MANIFEST_FILENAME = "manifest.json"
 
-# Where finalize() obtained the scored/recorded mixture. Production benchmarks
-# only accept ``workspace_file`` as a successful finalization (`finalized=1`).
+# Where finalize() obtained the production workspace outcome. Only
+# ``workspace_file`` sets ``finalized=1``. Absent vs present-but-invalid are
+# distinct failure reasons; assistant/trace candidates never override them.
 ManifestProvenance = Literal[
     "workspace_file",
+    "invalid_workspace_file",
     "assistant_message",
     "trace_fallback",
     "missing",
 ]
 MANIFEST_PROVENANCE_WORKSPACE_FILE: ManifestProvenance = "workspace_file"
+MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE: ManifestProvenance = (
+    "invalid_workspace_file"
+)
 MANIFEST_PROVENANCE_ASSISTANT_MESSAGE: ManifestProvenance = "assistant_message"
 MANIFEST_PROVENANCE_TRACE_FALLBACK: ManifestProvenance = "trace_fallback"
 MANIFEST_PROVENANCE_MISSING: ManifestProvenance = "missing"
+
+# Non-production telemetry candidate when the workspace file did not finalize.
+ManifestCandidate = Literal["assistant_message", "trace_fallback"]
+MANIFEST_CANDIDATE_ASSISTANT_MESSAGE: ManifestCandidate = "assistant_message"
+MANIFEST_CANDIDATE_TRACE_FALLBACK: ManifestCandidate = "trace_fallback"
 
 _RESERVED_WORKSPACE_FILES = frozenset(
     {
