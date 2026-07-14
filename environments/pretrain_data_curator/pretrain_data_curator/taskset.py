@@ -50,7 +50,6 @@ from pydantic import ValidationError, field_validator, model_validator
 
 from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder, CuratedCorpus
 from .leakage import DeconLeakageDetector
-from .docker_network import DockerHostReachability
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_cli_parse import content_text, extract_hf_commands
 from .leakage import DEFAULT_DECON_BINARY, DEFAULT_EVAL_SETS_DIR
@@ -706,7 +705,6 @@ class CuratorTaskset(_TasksetBase):
                 "no longer supported"
             )
         if runtime.type == "docker":
-            DockerHostReachability.configure()
             # Real Docker trainers pin --memory; verify the live cgroup matches.
             # Heuristic / non-real-trainer Docker harness runs skip this pin.
             if (
