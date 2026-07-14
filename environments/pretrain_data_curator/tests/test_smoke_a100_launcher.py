@@ -138,7 +138,7 @@ def test_smoke_script_site_rebuild_only_after_valid_gate():
     assert "--outputs" in rebuild_fn
     assert "--include-all" in rebuild_fn
     assert "--no-debug" in rebuild_fn
-    assert "docs/build_site.py" in rebuild_fn
+    assert '"$ROOT/docs/build_site.py"' in rebuild_fn
 
 
 def _write_valid_results(tmp_path: Path, *, budget: int = 10_000_000) -> Path:

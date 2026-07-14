@@ -9,7 +9,7 @@
 #   ./scripts/run_25m_smoke_a100.sh --model z-ai/glm-5.2
 #
 # Artifacts land in outputs/evals/<run-name>/ (smaller-budget runs stay out of
-# the curated outputs/evals-400m/ bench site; see docs/README.md).
+# the curated outputs/evals-400m/ bench site; see <repo root>/docs/README.md).
 
 id = "pretrain-data-curator"
 model = "z-ai/glm-5.2"  # overridden by -m / --model when set
