@@ -25,7 +25,9 @@ rich = true
 [sampling]
 temperature = 0.6
 top_p = 0.9
-top_k = 0.9
+# Do not set top_k: Prime Inference /v1/responses rejects non-standard top_k
+# (observed 400 invalid_request for deepseek/deepseek-v4-pro and v4-flash).
+# Chat completions may accept it, but the Codex harness intercepts /v1/responses.
 
 [args]
 cutoff_date = "2024-12-31"

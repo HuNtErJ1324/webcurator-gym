@@ -9,6 +9,18 @@ from pathlib import Path
 TRACEBACK_MARKER = "Traceback (most recent call last)"
 
 
+def _config_use_real_trainer(out: Path) -> bool:
+    """Return True when config.toml requests the real GPU trainer."""
+    config_path = out / "config.toml"
+    if not config_path.is_file():
+        return False
+    cfg = config_path.read_text(errors="ignore")
+    m = re.search(r"(?m)^use_real_trainer\s*=\s*(true|false)\s*$", cfg)
+    if not m:
+        return False
+    return m.group(1) == "true"
+
+
 def validate_smoke_results(
     out_dir: Path | str,
     *,
@@ -17,9 +29,11 @@ def validate_smoke_results(
 ) -> str:
     """Validate a downloaded smoke results directory.
 
-    Requires a nonempty ``results.jsonl`` with at least one ``is_completed``
-    record, no hard failure markers, no record-level traceback payloads, and
-    (when ``config.toml`` is present) matching token budgets.
+    ``is_completed=true`` alone is insufficient: reject ``stop_condition=error``,
+    any error/failure payload, empty metrics, hard failure markers, record-level
+    traceback payloads, and (when ``config.toml`` is present) mismatched token
+    budgets. At least one completed record must carry real metrics (including
+    numeric ``corpus_tokens``).
     """
     out = Path(out_dir)
     results = out / "results.jsonl"
@@ -58,14 +72,56 @@ def validate_smoke_results(
         raise ValueError("results.jsonl has no is_completed=true records")
 
     for idx, row in enumerate(completed):
+        stop = row.get("stop_condition")
+        if isinstance(stop, str) and stop.strip().lower() == "error":
+            raise ValueError(f"completed record {idx} has stop_condition=error")
+
         err = row.get("error")
         if err:
             raise ValueError(f"completed record {idx} has error={err!r}")
+
         errors = row.get("errors")
         if errors:
-            blob = errors if isinstance(errors, str) else json.dumps(errors)
-            if TRACEBACK_MARKER in blob:
-                raise ValueError(f"completed record {idx} errors contain traceback")
+            if isinstance(errors, list) and len(errors) == 0:
+                pass
+            else:
+                blob = errors if isinstance(errors, str) else json.dumps(errors)
+                raise ValueError(f"completed record {idx} has error/failure payload: {blob}")
+
+        failure = row.get("failure")
+        if failure:
+            raise ValueError(f"completed record {idx} has failure={failure!r}")
+
+        metrics = row.get("metrics")
+        if not isinstance(metrics, dict) or not metrics:
+            raise ValueError(f"completed record {idx} missing nonempty metrics")
+        corpus_tokens = metrics.get("corpus_tokens")
+        if not isinstance(corpus_tokens, (int, float)):
+            raise ValueError(
+                f"completed record {idx} metrics missing numeric corpus_tokens"
+            )
+
+        # Real-trainer smokes must actually train — is_completed + corpus fill is
+        # not enough when use_real_trainer=true (trainer_error_msg=1 / flops=0).
+        if _config_use_real_trainer(out):
+            trainer_err = metrics.get("trainer_error_msg", 0.0)
+            if isinstance(trainer_err, (int, float)) and float(trainer_err) != 0.0:
+                raise ValueError(
+                    f"completed record {idx} trainer_error_msg={trainer_err} "
+                    "(real trainer failed)"
+                )
+            train_flops = metrics.get("train_flops")
+            if not isinstance(train_flops, (int, float)) or float(train_flops) <= 0.0:
+                raise ValueError(
+                    f"completed record {idx} missing positive train_flops "
+                    f"(got {train_flops!r})"
+                )
+            perf_loss = metrics.get("perf_loss")
+            if not isinstance(perf_loss, (int, float)) or not (float(perf_loss) > 0.0):
+                raise ValueError(
+                    f"completed record {idx} missing positive perf_loss "
+                    f"(got {perf_loss!r})"
+                )
 
     log_path = out / "eval-stream.log"
     if log_path.is_file():

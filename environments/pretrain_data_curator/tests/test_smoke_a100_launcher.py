@@ -73,6 +73,14 @@ def test_smoke_script_default_remains_25m():
     assert "allow_gpu_fallback=1" in out
 
 
+def test_smoke_script_existing_pod_id_dry_run():
+    out = _dry_run(
+        ["--existing-pod-id", "e79f3b6967ba49f08cbbf958c13dc303", "--profile", "10M"]
+    )
+    assert "existing_pod_id=e79f3b6967ba49f08cbbf958c13dc303" in out
+    assert "profile=10M" in out
+
+
 def test_smoke_script_config_flag_selects_10m():
     out = _dry_run(["--config", "configs/eval/10M-60turn-codex-smoke.toml"])
     assert "profile=10M" in out
@@ -93,13 +101,24 @@ def test_smoke_script_preserves_cleanup_trap_and_runtime_gates():
     assert "webcurator-runtime:latest" in gpu
     assert "Dockerfile.runtime" in gpu
 
+    # Prime Inference rejects Codex multi_agent namespace tools; launcher must
+    # disable that feature before eval on the pod.
+    patch = _extract_bash_function(text, "remote_patch_codex_for_prime_inference")
+    assert "multi_agent" in patch
+    assert "PRIME_INFERENCE_DISABLE_MULTI_AGENT" in patch
+    assert "remote_patch_codex_for_prime_inference" in text
+
     fallback = _extract_bash_function(text, "pick_cloud_id_with_fallback")
     assert 'ALLOW_GPU_FALLBACK" -eq 1' in fallback or "ALLOW_GPU_FALLBACK" in fallback
     assert "A100_40GB" in fallback
 
-    # select_cloud_id_or_die must be invoked directly so die hits the main shell.
-    assert re.search(r"(?m)^select_cloud_id_or_die$", text)
+    # select_cloud_id_or_die must be invoked directly (not via command
+    # substitution) so die hits the main shell. It may be nested under the
+    # create-new branch when --existing-pod-id is set.
+    assert re.search(r"(?m)^\s*select_cloud_id_or_die$", text)
     assert 'CLOUD_ID="$(select_cloud_id_or_die)"' not in text
+    assert "--existing-pod-id" in text
+    assert 'EXISTING_POD_ID=' in text
 
 
 def test_smoke_script_site_rebuild_only_after_valid_gate():
@@ -138,6 +157,7 @@ def _write_valid_results(tmp_path: Path, *, budget: int = 10_000_000) -> Path:
                 'model = "deepseek/deepseek-v4-pro"',
                 "[args]",
                 f"token_budget = {budget}",
+                "use_real_trainer = false",
                 "[args.proxy_student]",
                 f"train_token_budget = {budget}",
                 "",
@@ -194,6 +214,149 @@ def test_validate_smoke_results_rejects_traceback_without_results(tmp_path: Path
         validate_smoke_results(out, expected_token_budget=10_000_000)
 
 
+def test_validate_smoke_results_rejects_stop_condition_error_despite_completed(
+    tmp_path: Path,
+):
+    """Regression: is_completed=true + stop_condition=error must not pass."""
+    out = _write_valid_results(tmp_path)
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "upstream-400",
+                "is_completed": True,
+                "stop_condition": "error",
+                "rewards": {"reward": 0.0},
+                "metrics": {},
+                "errors": [
+                    {
+                        "type": "Error",
+                        "message": 'upstream 400: {"error":{"message":"Invalid request."}}',
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="stop_condition=error"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+
+def test_validate_smoke_results_rejects_error_payload_and_empty_metrics(tmp_path: Path):
+    out = _write_valid_results(tmp_path)
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "payload",
+                "is_completed": True,
+                "stop_condition": "max_turns",
+                "rewards": {"reward": 0.0},
+                "metrics": {"corpus_tokens": 100},
+                "errors": [{"type": "Error", "message": "boom"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="error/failure payload"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "empty-metrics",
+                "is_completed": True,
+                "stop_condition": "max_turns",
+                "rewards": {"reward": 0.1},
+                "metrics": {},
+                "errors": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="nonempty metrics"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "no-corpus",
+                "is_completed": True,
+                "stop_condition": "max_turns",
+                "rewards": {"reward": 0.1},
+                "metrics": {"perf_loss": 3.0},
+                "errors": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="corpus_tokens"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+
+def test_validate_smoke_results_rejects_failed_real_trainer(tmp_path: Path):
+    out = _write_valid_results(tmp_path)
+    (out / "config.toml").write_text(
+        "\n".join(
+            [
+                'model = "deepseek/deepseek-v4-pro"',
+                "[args]",
+                "token_budget = 10000000",
+                "use_real_trainer = true",
+                "[args.proxy_student]",
+                "train_token_budget = 10000000",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "trainer-fail",
+                "is_completed": True,
+                "stop_condition": "agent_completed",
+                "rewards": {"reward": 0.0},
+                "metrics": {
+                    "corpus_tokens": 10_000_000,
+                    "trainer_error_msg": 1.0,
+                    "train_flops": 0.0,
+                    "perf_loss": 0.0,
+                },
+                "errors": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="trainer_error_msg"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "trainer-ok",
+                "is_completed": True,
+                "stop_condition": "agent_completed",
+                "rewards": {"reward": 0.5},
+                "metrics": {
+                    "corpus_tokens": 10_000_000,
+                    "trainer_error_msg": 0.0,
+                    "train_flops": 1.0e16,
+                    "perf_loss": 5.0,
+                },
+                "errors": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    msg = validate_smoke_results(out, expected_token_budget=10_000_000)
+    assert "valid_records=1" in msg
+
+
 def test_smoke_script_validate_only_gate(tmp_path: Path):
     out = _write_valid_results(tmp_path)
     ok = subprocess.run(
@@ -241,6 +404,8 @@ def test_10m_smoke_config_uses_webcurator_runtime_and_10m_budget():
     assert proxy["train_token_budget"] == 10_000_000
     assert proxy["runtime_backend"] == "docker"
     assert proxy["docker_image"] == "webcurator-runtime:latest"
+    # /v1/responses rejects non-standard top_k (400 invalid_request).
+    assert "top_k" not in cfg.get("sampling", {})
 
 
 def test_25m_smoke_config_uses_webcurator_runtime_and_25m_budget():

@@ -36,6 +36,7 @@
 #   --curation-only     Heuristic trainer only (outputs/debug/, full trace)
 #   --skip-site         Skip docs/site rebuild after a valid download
 #   --validate-only DIR Validate an existing local results dir and exit (no pod)
+#   --existing-pod-id ID Reuse an already-provisioned ACTIVE pod (skip create)
 #   --keep-pod          Do not terminate the pod on exit (debugging)
 #   --dry-run           Print planned actions without creating a pod
 set -euo pipefail
@@ -58,6 +59,7 @@ DRY_RUN=0
 CURATION_ONLY=0
 SKIP_SITE=0
 VALIDATE_ONLY=""
+EXISTING_POD_ID=""
 MODEL=""
 MODEL_SLUG=""
 POD_NAME=""
@@ -218,6 +220,7 @@ while [[ $# -gt 0 ]]; do
     --curation-only) CURATION_ONLY=1; shift ;;
     --skip-site) SKIP_SITE=1; shift ;;
     --validate-only) VALIDATE_ONLY="${2:-}"; shift 2 ;;
+    --existing-pod-id) EXISTING_POD_ID="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage ;;
     *) die "Unknown argument: $1 (try --help)" ;;
@@ -255,6 +258,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   log "allow_gpu_fallback=$ALLOW_GPU_FALLBACK"
   log "run_name=$RUN_NAME"
   log "compute_type=$GPU_TYPE pod_image=$POD_IMAGE disk_gb=$DISK_GB pod_name=$POD_NAME curation_only=$CURATION_ONLY skip_site=$SKIP_SITE"
+  log "existing_pod_id=${EXISTING_POD_ID:-<create-new>}"
   log "local_out=$LOCAL_OUT_DIR"
   exit 0
 fi
@@ -773,6 +777,55 @@ echo "=== PROVISION DONE ==="
 REMOTE
 }
 
+remote_patch_codex_for_prime_inference() {
+  # Codex 0.137.0 enables the stable `multi_agent` feature by default, which
+  # emits a Responses-API `type=namespace` tool (`multi_agent_v1`). Prime
+  # Inference returns HTTP 400 invalid_request for that tool on DeepSeek v4
+  # (Pro and Flash). Disable the feature at the Codex harness boundary before
+  # eval so the shipped codex smoke can complete on Prime Inference.
+  log "Patching remote Codex harness to --disable multi_agent (Prime Inference compat)"
+  remote bash -s <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+cd /root/webcurator-gym/environments/pretrain_data_curator
+uv run python <<'PY'
+from pathlib import Path
+import verifiers
+
+path = Path(verifiers.__file__).parent / "v1/harnesses/codex/harness.py"
+text = path.read_text()
+marker = "PRIME_INFERENCE_DISABLE_MULTI_AGENT"
+if marker in text:
+    print(f"already patched: {path}")
+else:
+    needle = (
+        "        tool_config = [\n"
+        "            arg\n"
+        "            for tool in self.config.disabled_tools or []\n"
+        "            for arg in (\"--disable\", tool)\n"
+        "        ]"
+    )
+    if needle not in text:
+        raise SystemExit(f"codex harness patch needle missing in {path}")
+    repl = (
+        "        # "
+        + marker
+        + "\n"
+        "        _disabled = list(self.config.disabled_tools or [])\n"
+        "        if \"multi_agent\" not in _disabled:\n"
+        "            _disabled.append(\"multi_agent\")\n"
+        "        tool_config = [\n"
+        "            arg\n"
+        "            for tool in _disabled\n"
+        "            for arg in (\"--disable\", tool)\n"
+        "        ]"
+    )
+    path.write_text(text.replace(needle, repl, 1))
+    print(f"patched: {path}")
+PY
+REMOTE
+}
+
 run_remote_eval() {
   local remote_log="/root/wcg-eval-${RUN_NAME}.log"
   if [[ "$CURATION_ONLY" -eq 1 ]]; then
@@ -780,6 +833,7 @@ run_remote_eval() {
   else
     log "Launching ${BUDGET_LABEL} smoke eval on pod (real GPU trainer, expect well under 1h)"
   fi
+  remote_patch_codex_for_prime_inference
   remote bash -s <<REMOTE
 set -euo pipefail
 export PATH="/root/webcurator-gym/environments/pretrain_data_curator/decon/bin:\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
@@ -837,6 +891,13 @@ REMOTE
 download_results() {
   local rel_dir="$1"
   log "Downloading results from outputs/$rel_dir"
+  if [[ -d "$LOCAL_OUT_DIR" && -s "$LOCAL_OUT_DIR/results.jsonl" ]]; then
+    local stamp preserve
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    preserve="${LOCAL_OUT_DIR}.attempt-${stamp}"
+    log "Preserving prior local artifacts at $preserve"
+    mv "$LOCAL_OUT_DIR" "$preserve"
+  fi
   mkdir -p "$LOCAL_OUT_DIR"
   rsync -az \
     -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -p $SSH_PORT" \
@@ -868,8 +929,11 @@ validate_downloaded_results() {
 }
 
 rebuild_site() {
-  log "Rebuilding docs bench site"
-  python3 "$ENV_DIR/docs/build_site.py"
+  log "Rebuilding docs bench site (include smoke outputs/evals)"
+  python3 "$ENV_DIR/docs/build_site.py" \
+    --outputs "$ENV_DIR/outputs/evals" \
+    --include-all \
+    --no-debug
   python3 - <<'PY' "$ENV_DIR/docs/site/data/manifest.json"
 import json, sys
 from pathlib import Path
@@ -897,42 +961,47 @@ for k in ("perf_loss", "perf_vs_baseline", "corpus_tokens", "num_sources", "leak
 PY
 }
 
-select_cloud_id_or_die
-log "Selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
-
-# Shared A100 inventory (e.g. the 22V pool) can flicker between
-# `availability list` and `pods create` under contention; retry a few times
-# with a re-pick before giving up (observed 2026-07-08: "No valid GPU
-# configuration found" on a cloud_id that `availability list` just reported
-# as Available, succeeded on immediate retry).
-CREATE_LOG="$(mktemp)"
-POD_ID=""
-EXCLUDED_CLOUD_IDS=""
-for attempt in 1 2 3 4 5; do
-  if prime pods create \
-    --cloud-id "$CLOUD_ID" \
-    --name "$POD_NAME" \
-    --disk-size "$DISK_GB" \
-    --image "$POD_IMAGE" \
-    --yes --plain 2>&1 | tee "$CREATE_LOG"; then
-    POD_ID="$(sed -n 's/.*Successfully created pod //p' "$CREATE_LOG" | awk '{print $1}')"
-    [[ -n "$POD_ID" ]] && break
-  fi
-  # Exclude the cloud_id that just failed so a single consistently-broken
-  # offer (observed 2026-07-08: "1A100.40S.22V" repeatedly returned "No valid
-  # GPU configuration found" from `pods create` despite `availability list`
-  # reporting it Available, and kept getting re-picked as the cheapest
-  # remaining option) can't eat the whole retry budget.
-  log "prime pods create attempt $attempt failed on cloud_id=$CLOUD_ID; excluding it and retrying in 15s"
-  EXCLUDED_CLOUD_IDS="$EXCLUDED_CLOUD_IDS $CLOUD_ID"
-  sleep 15
+if [[ -n "$EXISTING_POD_ID" ]]; then
+  POD_ID="$EXISTING_POD_ID"
+  log "Reusing existing pod $POD_ID (skip create)"
+else
   select_cloud_id_or_die
-  log "Re-selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
-done
-rm -f "$CREATE_LOG"
-[[ -n "$POD_ID" ]] || die "prime pods create failed after 5 attempts"
+  log "Selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
 
-log "Created pod $POD_ID ($POD_NAME)"
+  # Shared A100 inventory (e.g. the 22V pool) can flicker between
+  # `availability list` and `pods create` under contention; retry a few times
+  # with a re-pick before giving up (observed 2026-07-08: "No valid GPU
+  # configuration found" on a cloud_id that `availability list` just reported
+  # as Available, succeeded on immediate retry).
+  CREATE_LOG="$(mktemp)"
+  POD_ID=""
+  EXCLUDED_CLOUD_IDS=""
+  for attempt in 1 2 3 4 5; do
+    if prime pods create \
+      --cloud-id "$CLOUD_ID" \
+      --name "$POD_NAME" \
+      --disk-size "$DISK_GB" \
+      --image "$POD_IMAGE" \
+      --yes --plain 2>&1 | tee "$CREATE_LOG"; then
+      POD_ID="$(sed -n 's/.*Successfully created pod //p' "$CREATE_LOG" | awk '{print $1}')"
+      [[ -n "$POD_ID" ]] && break
+    fi
+    # Exclude the cloud_id that just failed so a single consistently-broken
+    # offer (observed 2026-07-08: "1A100.40S.22V" repeatedly returned "No valid
+    # GPU configuration found" from `pods create` despite `availability list`
+    # reporting it Available, and kept getting re-picked as the cheapest
+    # remaining option) can't eat the whole retry budget.
+    log "prime pods create attempt $attempt failed on cloud_id=$CLOUD_ID; excluding it and retrying in 15s"
+    EXCLUDED_CLOUD_IDS="$EXCLUDED_CLOUD_IDS $CLOUD_ID"
+    sleep 15
+    select_cloud_id_or_die
+    log "Re-selected cloud_id=$CLOUD_ID ($GPU_TYPE)"
+  done
+  rm -f "$CREATE_LOG"
+  [[ -n "$POD_ID" ]] || die "prime pods create failed after 5 attempts"
+
+  log "Created pod $POD_ID ($POD_NAME)"
+fi
 wait_for_pod "$POD_ID"
 wait_for_ssh_auth
 
