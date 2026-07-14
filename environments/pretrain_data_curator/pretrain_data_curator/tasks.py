@@ -17,6 +17,12 @@ Research and iterate autonomously while maintaining the authoritative manifest J
 When using commands, execute them through the harness tool or shell interface; writing a command as prose does not run it.
 Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md`. Environment overrides win over conflicting skill text: the preinstalled `hf` is the only allowed HF CLI — never install, upgrade, replace, shadow, or bypass it; never run `hf skills add`; never print, echo, log, or reveal tokens (including via `hf auth token`). Treat install/regenerate/auth-token skill guidance as inapplicable here.
 
+## Setup
+- Sole curation budget: {token_budget} tokens.
+- Data cutoff: on or before {cutoff_date}. Local sources are {local_source_status}.
+- Scoring: `{alpha_perf} * performance - {lambda_leakage} * leakage` on the fixed student.
+- Performance scales from a neutral baseline: validation loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
+
 ## Research
 Explore broadly before locking a mixture: search the web, read papers/writeups, and study modern pretraining practice — no prescribed recipe. Use the installed `hf papers` CLI to discover or access papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
 
@@ -55,12 +61,6 @@ Flags: `--limit N` docs/source (default 8); `--max-steps N` proxy steps (default
 Samples sources, trains the proxy student (corpus-split CE), runs decon, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (no held-out validation). `ok: false` + `reward: null` is a diagnostic, not a score: a source sampled zero documents (see `reason`). A scored mixture is `ok: true` with a numeric reward, even 0.0.
 Long silent runs with idle GPU are normal; `[self-score] phase=` heartbeats go to stderr. Never kill or signal any process/group/shell: it can kill your harness. Wait for it to return or time out.
 Before further experiments or voluntary completion, keep `{manifest_path}` a valid non-empty manifest; temporary experimental variants are fine, but the best-known scoreable mixture must stay at the authoritative path.
-
-## Setup
-- Sole curation budget: {token_budget} tokens.
-- Data cutoff: on or before {cutoff_date}. Local sources are {local_source_status}.
-- Scoring: `{alpha_perf} * performance - {lambda_leakage} * leakage` on the fixed student.
-- Performance scales from a neutral baseline: validation loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
 
 ## Rules
 1. Use exact dataset IDs/configs observed this rollout. Invented or incompatible sources materialize no data and yield no performance.

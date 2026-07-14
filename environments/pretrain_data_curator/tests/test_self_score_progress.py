@@ -488,6 +488,22 @@ def test_prompt_preserves_existing_guidance():
     assert "does not end the episode" in prompt
 
 
+def test_prompt_section_order_is_objective_setup_research_deliverable_self_score_rules():
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    section_headers = [
+        "## Objective",
+        "## Setup",
+        "## Research",
+        "## Deliverable",
+        "## Self-score (you run it)",
+        "## Rules",
+    ]
+    positions = [prompt.index(header) for header in section_headers]
+    assert positions == sorted(positions)
+    for header in section_headers:
+        assert TASK_PROMPT.count(header) == 1
+
+
 def test_prompt_stays_within_its_length_contract():
     prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
     assert len(TASK_PROMPT) <= TASK_PROMPT_MAX_CHARS, len(TASK_PROMPT)

@@ -4748,6 +4748,16 @@ def test_build_tasks_renders_single_structured_task_prompt():
     assert "## Deliverable" in prompt
     assert "## Setup" in prompt
     assert "## Rules" in prompt
+    section_headers = [
+        "## Objective",
+        "## Setup",
+        "## Research",
+        "## Deliverable",
+        "## Self-score (you run it)",
+        "## Rules",
+    ]
+    positions = [prompt.index(header) for header in section_headers]
+    assert positions == sorted(positions)
     assert "complete freedom" in prompt
     assert "Research and iterate autonomously" in prompt
     assert "Hugging Face `hf` CLI" in prompt
