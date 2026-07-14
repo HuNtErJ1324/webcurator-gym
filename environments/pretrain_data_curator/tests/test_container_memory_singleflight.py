@@ -739,10 +739,6 @@ async def test_heuristic_docker_setup_skips_memory_pin(monkeypatch):
         "pretrain_data_curator.container_memory.verify_runtime_memory_limit",
         boom,
     )
-    monkeypatch.setattr(
-        "pretrain_data_curator.taskset.DockerHostReachability.configure",
-        lambda: None,
-    )
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="pretrain-data-curator",
@@ -775,10 +771,6 @@ async def test_real_docker_setup_verifies_memory_pin(monkeypatch):
     monkeypatch.setattr(
         "pretrain_data_curator.container_memory.verify_runtime_memory_limit",
         fake_verify,
-    )
-    monkeypatch.setattr(
-        "pretrain_data_curator.taskset.DockerHostReachability.configure",
-        lambda: None,
     )
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
@@ -852,3 +844,5 @@ def test_on_pod_eval_toml_quoting_and_missing_memory_gb(tmp_path):
     )
     assert proc.returncode != 0
     assert "memory_gb is required" in (proc.stderr + proc.stdout)
+
+

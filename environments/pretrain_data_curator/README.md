@@ -163,9 +163,6 @@ single-runtime path; `load_environment` rejects a configured `docker_host`.
 Leave it unset and do not set an ambient remote `DOCKER_HOST`. A local Unix
 socket is valid; Docker Desktop under WSL may require
 `export DOCKER_HOST=unix:///mnt/wsl/docker-desktop/shared-sockets/guest-services/docker.proxy.sock`.
-On Docker Desktop under WSL2, the environment automatically advertises the
-interception server on the WSL interface; `PDC_DOCKER_HOST_IP` can override the
-detected address if necessary.
 
 The Docker and Modal proxy-student commands retain their budget-derived
 deadline and structured exit/`RESULT_JSON` validation. Timeout or cancellation
@@ -320,7 +317,6 @@ with provenance metrics.
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
 - `trainer.py` — `ProxyStudentTrainer` interface, the heuristic backend, and `RuntimeSelectedTrainer` (dispatches to the docker/modal backend matching the live harness runtime's type).
 - `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
-- `docker_network.py` — `DockerHostReachability`: binds the host interception server to the WSL interface (instead of localhost) so containers started by Docker Desktop's WSL2 VM can reach it; a no-op outside WSL.
 - `modal_backend.py` — proxy-student execution on the rollout-owned v1 Modal runtime, including GPU mapping, training limits, timeout/cancellation teardown, and structured result parsing.
 - `student_model.py` — modern modded-nanogpt proxy-student architecture embedded into the sandbox script.
 - `student_train.py` — AdamW schedule, contiguous batching, and multi-run averaging, also embedded into the sandbox script.
@@ -347,3 +343,4 @@ with provenance metrics.
 - Token counts use `max(word_count, character_count // 4)` on the env side; the
   real trainer tokenizes inside the sandbox.
 - Filtering is expressed via the structured `filters` argument.
+
