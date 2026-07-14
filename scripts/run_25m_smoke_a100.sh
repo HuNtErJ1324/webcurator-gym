@@ -43,6 +43,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_DIR="$ROOT/environments/pretrain_data_curator"
+ENV_PYTHON="$ENV_DIR/.venv/bin/python"
 SMOKE_PROFILE="25M"
 BASE_EVAL_CONFIG="configs/eval/25M-60turn-codex-smoke.toml"
 BASE_EVAL_CONFIG_PATH="$ENV_DIR/$BASE_EVAL_CONFIG"
@@ -1048,4 +1049,3 @@ else
 fi
 
 log "Done. Artifacts: $LOCAL_OUT_DIR"
-

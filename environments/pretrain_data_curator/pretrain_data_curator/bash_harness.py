@@ -131,7 +131,7 @@ def get_truncating_bash_harness_class() -> type[Any]:
         """Default harness that caps tool results in its builtin bash program."""
 
         async def setup(self, runtime: Runtime) -> None:
-            await runtime.prepare_uv_script(program_source, self.config.env)
+            await runtime.prepare_uv_script(program_source, self.config.resolved_env)
 
         async def launch(
             self,
