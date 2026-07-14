@@ -97,17 +97,16 @@ Training FLOPs are reported as the zero-weight ``train_flops`` metric.
 When `use_real_trainer=true`, proxy training uses one of two **selectable**
 backends, chosen by `proxy_student.runtime_backend` (required — no default).
 This field is a static, pre-runtime hint only: it shapes the harness runtime and
-task declarations built before any rollout exists. Which trainer actually runs
-is decided entirely by the live harness runtime's type at score time, via a
-`RuntimeSelectedTrainer` dispatcher — so `runtime_backend` and the harness
-runtime you actually configure must agree.
+task declarations built before any rollout exists. The single runtime trainer
+then validates the live runtime type at score time, so `runtime_backend` and the
+harness runtime you actually configure must agree.
 
-- **`docker`**: declares a GPU-capable v1 `DockerConfig` on the bash harness.
+- **`docker`**: declares a GPU-capable v1 `DockerConfig` on the default harness.
   Dataset discovery, the agent loop, finalization, and proxy-student scoring all
   use the same rollout-owned container on a Docker daemon co-located with the
   eval worker. Scoring receives that live runtime and writes/runs training
   directly through `runtime.write()` and `runtime.run()`.
-- **`modal`**: declares a GPU-capable v1 `ModalConfig` on the bash harness.
+- **`modal`**: declares a GPU-capable v1 `ModalConfig` on the default harness.
   Dataset discovery, the agent loop, finalization, and proxy-student scoring all
   use the same rollout-owned Modal sandbox. The CPU-only env-server needs no
   Docker daemon or GPU; it uses outbound HTTPS and the Modal SDK. Requires
@@ -137,7 +136,7 @@ docker build -t pretrain-data-curator:gpu \
 ```bash
 cd environments/pretrain_data_curator
 uv run eval pretrain-data-curator \
-  --harness.id bash \
+  --harness.id default \
   --harness.runtime.type docker \
   --harness.runtime.image pretrain-data-curator:gpu \
   --harness.runtime.workdir /workspace \
@@ -274,7 +273,7 @@ but every rollout does.
 | `allow_local_sources` | bool | `true` | Allow capped pulls of text/JSONL files created in the live bash workspace. |
 | `max_local_source_bytes` | int | `33554432` | Maximum bytes transferred per local source before parsing. |
 | `max_turns` | int | `64` | Generous harness safety cap; absent from the prompt, reward, and metrics. |
-| `harness_id` | str | `"bash"` | Bundled Verifiers harness (`bash`, `codex`, `mini_swe_agent`, etc.). |
+| `harness_id` | str | `"default"` | Bundled Verifiers harness (`default`, `codex`, `mini_swe_agent`, etc.). |
 | `alpha_perf` | float | `1.0` | Cross-entropy performance weight. |
 | `lambda_leakage` | float | `1.0` | Leakage penalty weight. |
 | `perf_baseline_loss` | float | `log(50304)` | Neutral CE reference for relative performance. |
@@ -314,9 +313,7 @@ with provenance metrics.
 - `corpus.py` — `CorpusBuilder` + `DocumentFilter` (materialize manifest into documents).
 - `leakage.py` — `DeconLeakageDetector` (decon n-gram contamination vs bundled benchmarks + optional ephemeral held-out val screen), `LeakageScores`, `DeconError`, and the token-weighted `_reduce_report`.
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
-- `trainer.py` — `ProxyStudentTrainer` interface, the heuristic backend, and `RuntimeSelectedTrainer` (dispatches to the docker/modal backend matching the live harness runtime's type).
-- `docker_backend.py` — proxy-student execution on the rollout-owned v1 Docker runtime, including training limits, timeout/cancellation teardown, and structured result parsing.
-- `modal_backend.py` — proxy-student execution on the rollout-owned v1 Modal runtime, including GPU mapping, training limits, timeout/cancellation teardown, and structured result parsing.
+- `trainer.py` — `ProxyStudentTrainer` interface, the heuristic backend, and one `RuntimeProxyTrainer` using the builtin v1 `Runtime` interface; Docker adds cgroup/OOM diagnostics as an optional layer.
 - `train_gpt.py` — single-file modded-nanogpt proxy student: architecture, Muon/AdamW optimizers, batch/LR schedule, validation, and training loop. Backends copy this file directly into the sandbox.
 - `rewards.py` — `CuratorScorer`, the framework-agnostic heavy scoring pass.
 - `rollout_state.py` — typed `CuratorState` plus `RolloutStore` accessors.

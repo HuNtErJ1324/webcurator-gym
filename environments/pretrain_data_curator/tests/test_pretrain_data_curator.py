@@ -69,6 +69,7 @@ from pretrain_data_curator.taskset import (
     HF_CLI_SKILL_UPSTREAM_PATH,
     HF_CLI_SKILL_UPSTREAM_REVISION,
     CuratorTaskset,
+    CuratorTask,
     CuratorTasksetConfig,
     _ids_from_trace,
     _shell_command_from_tool_args,
@@ -80,7 +81,7 @@ from tests.conftest import NoOpLeakageDetector, bind_fast_scorer
 from verifiers.v1.taskset import Taskset
 from pretrain_data_curator.trainer import (
     HeuristicProxyTrainer,
-    RuntimeSelectedTrainer,
+    RuntimeProxyTrainer,
     TrainResult,
     estimate_param_count,
 )
@@ -131,7 +132,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def _fast_finalize_grace_period(monkeypatch):
     """Shrink workspace-manifest polling while preserving race coverage."""
-    monkeypatch.setattr(CuratorTaskset, "_FINALIZE_GRACE_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(CuratorTask, "_FINALIZE_GRACE_INTERVAL_SECONDS", 0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +172,12 @@ class _Curator:
         **cfg,
     ) -> None:
         self.client = client or FakeClient()
-        self.taskset = CuratorTaskset(
+        taskset = CuratorTaskset(
             CuratorTasksetConfig(id="test", screen_val_set=False, **cfg)
         )
+        self.taskset = taskset.load()[0]
         # The validated CuratorConfig the reward/tools derive from (== v0 env.config).
-        self.config = self.taskset.curator
+        self.config = self.taskset.config.curator
         # One shared corpus builder so a tool preview and final scoring share the
         # per-rollout document cache + cost ledger (they also share `state`).
         self.corpus_builder = corpus_builder or CorpusBuilder(
@@ -200,7 +202,7 @@ class _Curator:
         )
         # This rollout's task (no per-task tool server is built — the taskset
         # exposes no MCP tools; the agent curates via the `hf` CLI in its shell).
-        self.task = build_tasks(self.config.cutoff_date, self.config.token_budget)[0]
+        self.task = self.taskset
         self.state = CuratorState()
 
     async def setup(self) -> "_Curator":
@@ -232,7 +234,10 @@ class _Curator:
         return self.taskset._ensure()
 
     def trace(self, state=None) -> vf.Trace:
-        return vf.Trace(task=self.task, state=self.state if state is None else state)
+        return vf.Trace(
+            task=vf.TraceTask(type=type(self.task).__name__, data=self.task.data),
+            state=self.state if state is None else state,
+        )
 
     async def prepared(self, state=None) -> dict:
         return await self.taskset._prepared(self.trace(state))
@@ -273,7 +278,7 @@ def test_hf_token_is_validated_lazily_at_first_api_use(monkeypatch):
     env = load_environment()
 
     with pytest.raises(RuntimeError, match="HF_TOKEN.*required for rollouts"):
-        env.taskset._ensure()
+        env.taskset.load()[0]._ensure()
 
 
 def test_hf_client_accepts_explicit_token_without_environment(monkeypatch):
@@ -466,15 +471,15 @@ def test_load_environment_returns_v1_environment(monkeypatch):
 
     assert isinstance(env, vf.Environment)
     assert isinstance(env.taskset, CuratorTaskset)
-    assert env.taskset.config.candidate_limit == 3
+    assert env.taskset.load()[0].config.curator.candidate_limit == 3
     assert env.taskset.config.manifest_filename == MANIFEST_FILENAME
-    assert env.harness.config.id == "bash"
+    assert env.harness.config.id == "default"
     assert env.harness.config.env == {
         "MAX_TOOL_OUTPUT_CHARS": "20000",
         "HF_TOKEN": "test-token",
     }
-    assert env.env_args["harness_id"] == "bash"
-    assert env.taskset.load_tasks()
+    assert env.env_args["harness_id"] == "default"
+    assert env.taskset.load()
 
 
 def test_single_smoke_config_exhaustively_matches_source_options():
@@ -794,7 +799,7 @@ def test_zstandard_codec_installed_and_decompresses():
     assert out == data
 
 
-@pytest.mark.parametrize("harness_id", ["bash", "codex", "mini_swe_agent"])
+@pytest.mark.parametrize("harness_id", ["default", "codex", "mini_swe_agent"])
 def test_load_environment_uses_one_initial_prompt_for_all_harnesses(
     monkeypatch, harness_id
 ):
@@ -806,11 +811,11 @@ def test_load_environment_uses_one_initial_prompt_for_all_harnesses(
     assert env.harness.config.env.get("HF_TOKEN") == "test-token"
     assert env.env_args["harness_id"] == harness_id
 
-    task = env.taskset.load_tasks()[0]
-    system_prompt, prompt = env.harness.resolve_prompt(task)
+    task = env.taskset.load()[0]
+    system_prompt, prompt = env.harness.resolve_prompt(task.data)
     assert system_prompt is None
-    assert task.system_prompt is None
-    assert prompt == task.prompt
+    assert task.data.system_prompt is None
+    assert prompt == task.data.prompt
     assert prompt.count("## Rules") == 1
     assert "self_score.py" in prompt
 
@@ -820,7 +825,7 @@ def test_load_environment_rejects_unknown_harness():
         ValueError,
         match=(
             "unknown harness_id 'unknown'; valid harness ids: "
-            "bash, codex, default, kimi_code, mini_swe_agent, rlm, terminus_2"
+            "codex, default, kimi_code, mini_swe_agent, null, rlm, terminus_2"
         ),
     ):
         load_environment(harness_id="unknown")
@@ -900,10 +905,12 @@ async def test_taskset_setup_fails_fast_when_hf_token_is_not_exported(monkeypatc
         RuntimeError,
         match=r"source secrets\.env.*without `export` or `set -a`",
     ):
-        await taskset.setup(
-            taskset.load_tasks()[0],
-            SimpleNamespace(type="subprocess"),
+        task = taskset.load()[0]
+        trace = vf.Trace(
+            task=vf.TraceTask(type=type(task).__name__, data=task.data),
+            state=CuratorState(),
         )
+        await task.setup(trace, SimpleNamespace(type="subprocess"))
 
 
 @pytest.mark.asyncio
@@ -2191,8 +2198,8 @@ def test_agent_token_budget_overrides_task_default():
 def test_build_tasks_carry_typed_token_budget():
     # The typed per-task field that replaced the v0 `info` override.
     tasks = build_tasks("2024-12-31", 777)
-    assert tasks and all(t.token_budget == 777 for t in tasks)
-    assert all(t.cutoff_date == "2024-12-31" for t in tasks)
+    assert tasks and all(t.data.token_budget == 777 for t in tasks)
+    assert all(t.data.cutoff_date == "2024-12-31" for t in tasks)
 
 
 # --- Tier E: deterministic same-key cache; preview == score; cost once ------
@@ -2235,7 +2242,10 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     # is parsed by `finalize`, written to the single per-rollout CuratorState, then
     # `score` materializes that manifest's sources and trains over the SAME state.
     client = FakeClient()
-    taskset = CuratorTaskset(CuratorTasksetConfig(id="test", cutoff_date="2024-12-31"))
+    taskset_loader = CuratorTaskset(
+        CuratorTasksetConfig(id="test", cutoff_date="2024-12-31")
+    )
+    taskset = taskset_loader.load()[0]
     builder = CorpusBuilder(
         client=client,
     )
@@ -2253,9 +2263,11 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     # The taskset exposes NO tools (the non-MCP gate passes).
     assert type(taskset).tools is Taskset.tools
 
-    task = taskset.load_tasks()[0]
+    task = taskset
     state = CuratorState()
-    trace = vf.Trace(task=task, state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     manifest_bytes = (
         '{"sources": [{"id": "good/encyclopedia", "weight": 1.0},'
@@ -2273,7 +2285,7 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     )
 
     runtime = _FakeRuntime(files={MANIFEST_FILENAME: manifest_bytes})
-    await taskset.finalize(task, trace, runtime)
+    await task.finalize(trace, runtime)
     assert RolloutStore.is_finalized(state)
     manifest = RolloutStore.manifest(state)
     assert {s.dataset_id for s in manifest.sources} == {
@@ -2282,7 +2294,7 @@ async def test_real_taskset_finalize_and_scoring_share_one_rollout_state():
     }
 
     # score materializes the parsed manifest's sources (once each) and trains.
-    await taskset.score(trace, None)
+    await task.score(trace, None)
     assert client.sample_calls == ["good/encyclopedia", "good/science"]
     assert trace.reward != 0.0  # scoring actually ran over the shared state
 
@@ -2759,10 +2771,10 @@ async def test_reward_has_no_cost_total_metric():
 
 
 def test_task_prompt_contract():
-    task = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load_tasks()[0]
-    prompt = task.prompt
+    task = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load()[0]
+    prompt = task.data.prompt
 
-    assert task.system_prompt is None
+    assert task.data.system_prompt is None
     assert len(prompt) <= 6_000
     assert "complete freedom" in prompt
     assert '"token_budget": 1000000' in prompt
@@ -2820,8 +2832,8 @@ def test_task_prompt_recurring_finalization_contract():
     """Early manifest.json is authoritative/live, not episode completion; research kept."""
     prompt = (
         CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7))
-        .load_tasks()[0]
-        .prompt
+        .load()[0]
+        .data.prompt
     )
 
     # Self-score targets the authoritative path (no separate draft.json workflow).
@@ -2865,13 +2877,13 @@ def test_task_prompt_recurring_finalization_contract():
 
 def test_discovery_has_no_call_or_output_stop():
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
-    stops = discover_decorated(taskset, "stop")
+    stops = discover_decorated(taskset.load()[0], "stop")
 
     assert [stop.__name__ for stop in stops] == ["max_turns_reached"]
 
 
 def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
-    prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0].prompt
+    prompt = CuratorTaskset(CuratorTasksetConfig(id="test")).load()[0].data.prompt
 
     assert (
         '"sample_docs_per_source": <optional integer >= 1; omit for no per-source fetch cap — fetches are sized from weights and token_budget>'
@@ -3239,14 +3251,15 @@ async def test_default_taskset_path_builds_decon_detector():
             screen_val_set=False,
         )
     )
-    taskset._client = FakeClient()
-    taskset._corpus_builder = CorpusBuilder(client=taskset._client)
-    taskset._trainer = HeuristicProxyTrainer()
+    task = taskset.load()[0]
+    task._client = FakeClient()
+    task._corpus_builder = CorpusBuilder(client=task._client)
+    task._trainer = HeuristicProxyTrainer()
 
-    scorer = taskset._ensure()
-    assert taskset._decon_detector is not None
-    assert taskset._scorer is scorer
-    assert taskset._decon_detector._binary == "/nonexistent/decon"
+    scorer = task._ensure()
+    assert task._decon_detector is not None
+    assert task._scorer is scorer
+    assert task._decon_detector._binary == "/nonexistent/decon"
 
 
 # === Decon reducer unit tests ==============================================
@@ -3435,8 +3448,9 @@ def test_load_environment_accepts_validation_set_override(monkeypatch):
         validation_set={"dataset_id": "custom/val", "val_tokens": 1024},
     )
     # The override flows through the compat shim into the taskset's CuratorConfig.
-    assert env.taskset.curator.validation_set.dataset_id == "custom/val"
-    assert env.taskset.curator.validation_set.val_tokens == 1024
+    config = env.taskset.load()[0].config.curator
+    assert config.validation_set.dataset_id == "custom/val"
+    assert config.validation_set.val_tokens == 1024
 
 
 # --- Tier Q: held-out CE windowing/reduction (CPU-testable; guards the GPU loop)
@@ -3708,7 +3722,9 @@ class _FakeRuntime:
 
 def _trace_with_final(task, state, final_text):
     """A trace whose single sampled assistant message is ``final_text``."""
-    trace = vf.Trace(task=task, state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     graph.prepare_turn(trace, prompt).commit(
         vf.Response(
@@ -3737,7 +3753,7 @@ async def test_finalize_warns_when_fetch_cap_cannot_reach_token_budget(caplog):
     )
 
     with caplog.at_level("WARNING"):
-        await curator.taskset.finalize(curator.task, trace, runtime)
+        await curator.task.finalize(trace, runtime)
 
     assert "TOKEN BUDGET IS NOT REACHABLE" in caplog.text
     assert RolloutStore.is_finalized(curator.state)
@@ -3759,7 +3775,7 @@ async def test_finalize_populates_manifest_without_cost_ledger():
             )
         }
     )
-    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.task.finalize(trace, runtime)
     assert RolloutStore.is_finalized(curator.state)
     assert (
         RolloutStore.manifest_provenance(curator.state)
@@ -3793,7 +3809,7 @@ async def test_finalize_prefers_valid_workspace_manifest_file():
         }
     )
 
-    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.task.finalize(trace, runtime)
 
     manifest = RolloutStore.manifest(curator.state)
     assert RolloutStore.is_finalized(curator.state)
@@ -3820,7 +3836,7 @@ async def test_finalize_polls_for_late_workspace_manifest_file():
         runtime._files[MANIFEST_FILENAME] = b'{"sources": [{"id": "file/late"}]}'
 
     write = asyncio.create_task(write_manifest())
-    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.task.finalize(trace, runtime)
     await write
 
     assert RolloutStore.is_finalized(curator.state)
@@ -3842,7 +3858,7 @@ async def test_finalize_absent_workspace_manifest_reports_missing_with_assistant
         '```json\n{"sources": [{"id": "message/fallback"}]}\n```',
     )
 
-    await curator.taskset.finalize(curator.task, trace, _FakeRuntime())
+    await curator.task.finalize(trace, _FakeRuntime())
 
     # Workspace file absent → provenance missing even when assistant JSON exists.
     assert not RolloutStore.is_finalized(curator.state)
@@ -3875,7 +3891,7 @@ async def test_finalize_malformed_workspace_manifest_reports_invalid(
     runtime = _FakeRuntime(files={MANIFEST_FILENAME: b'{"sources": ['})
 
     with caplog.at_level("WARNING"):
-        await curator.taskset.finalize(curator.task, trace, runtime)
+        await curator.task.finalize(trace, runtime)
 
     assert "does not contain a valid non-empty manifest" in caplog.text
     assert not RolloutStore.is_finalized(curator.state)
@@ -3907,7 +3923,7 @@ async def test_finalize_empty_sources_workspace_manifest_reports_invalid():
     )
     runtime = _FakeRuntime(files={MANIFEST_FILENAME: b'{"sources": []}'})
 
-    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.task.finalize(trace, runtime)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -3931,7 +3947,7 @@ async def test_finalize_graceful_zero_when_no_manifest():
     trace = _trace_with_final(
         curator.task, curator.state, "I could not find suitable datasets, sorry."
     )
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -3956,7 +3972,9 @@ def _trace_with_turns(task, state, assistant_texts):
     """A linear multi-turn trace: one sampled assistant message per text, with a
     synthetic `hf`-output user message interleaved between turns so the graph stays
     linear and ``num_turns == len(assistant_texts)``."""
-    trace = vf.Trace(task=task, state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     conversation = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     for i, text in enumerate(assistant_texts):
         graph.prepare_turn(trace, conversation).commit(
@@ -3998,7 +4016,7 @@ async def test_finalize_records_mid_rollout_assistant_manifest_without_finalizin
     # old last-message-only finalize would have scored zero.
     assert parse_manifest(trace.assistant_messages[-1].content or "") is None
 
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4030,7 +4048,7 @@ async def test_finalize_message_probe_prefers_latest_manifest():
         '{"sources": [{"id": "good/science", "weight": 2.0}]}\n```'
     )
     trace = _trace_with_turns(curator.task, curator.state, [draft, final])
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4054,7 +4072,9 @@ def _trace_with_bash_calls(task, state, calls, *, arg_key: str = "command"):
     Returns a trace with NO final text manifest (all turns are tool calls).
     ``arg_key`` selects ``command`` (bash) or ``cmd`` (Codex-style) tool args.
     """
-    trace = vf.Trace(task=task, state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     conversation = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     for i, (cmd, result) in enumerate(calls):
         tc = vf.ToolCall(id=f"tc{i}", name="bash", arguments=json.dumps({arg_key: cmd}))
@@ -4083,7 +4103,7 @@ async def test_finalize_trace_fallback_disabled_by_default():
         ),
     ]
     trace = _trace_with_bash_calls(curator.task, curator.state, calls)
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4123,7 +4143,7 @@ async def test_finalize_opt_in_trace_fallback_records_inspected_ids(arg_key):
     for msg in trace.assistant_messages:
         assert parse_manifest(msg.content or "") is None
 
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state), (
         "trace fallback must not production-finalize"
@@ -4153,7 +4173,7 @@ async def test_finalize_fallback_only_real_ids_no_invented_sources():
         ("echo hello", "hello"),  # no hf call at all
     ]
     trace = _trace_with_bash_calls(curator.task, curator.state, calls)
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4212,7 +4232,7 @@ async def test_finalize_message_probe_wins_over_trace_ids():
         )
     )
 
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4235,7 +4255,12 @@ async def test_finalize_grace_period_picks_up_late_workspace_file():
     settling for assistant-message / trace probes.
     """
     curator = await _make()
-    trace = vf.Trace(task=curator.task, state=curator.state)
+    trace = vf.Trace(
+        task=vf.TraceTask(
+            type=type(curator.task).__name__, data=curator.task.data
+        ),
+        state=curator.state,
+    )
     prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
 
     tc = vf.ToolCall(
@@ -4264,7 +4289,7 @@ async def test_finalize_grace_period_picks_up_late_workspace_file():
         )
 
     late_write = asyncio.create_task(_write_late_manifest())
-    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.task.finalize(trace, runtime)
     await late_write
 
     assert RolloutStore.is_finalized(curator.state)
@@ -4289,7 +4314,7 @@ async def test_finalize_does_not_trace_fallback_when_file_never_arrives():
     ]
     trace = _trace_with_bash_calls(curator.task, curator.state, calls)
 
-    await curator.taskset.finalize(curator.task, trace, None)
+    await curator.task.finalize(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4335,9 +4360,11 @@ def test_shell_command_from_tool_args_supports_cmd_and_command():
     ],
 )
 def test_ids_from_trace_does_not_backtrack_three_segment_prose(text, expected):
-    task = CuratorTaskset(CuratorTasksetConfig(id="test")).load_tasks()[0]
+    task = CuratorTaskset(CuratorTasksetConfig(id="test")).load()[0]
     state = CuratorState()
-    trace = vf.Trace(task=task, state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     prompt = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     tc = vf.ToolCall(
         id="tc0",
@@ -4395,8 +4422,8 @@ async def test_missing_workspace_manifest_skips_materialize_and_training():
         curator.state,
         '```json\n{"sources": [{"id": "good/encyclopedia"}]}\n```',
     )
-    await curator.taskset.finalize(curator.task, trace, _FakeRuntime())
-    await curator.taskset.score(trace, None)
+    await curator.task.finalize(trace, _FakeRuntime())
+    await curator.task.score(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4426,8 +4453,8 @@ async def test_invalid_workspace_manifest_skips_materialize_and_training():
         '```json\n{"sources": [{"id": "good/encyclopedia"}]}\n```',
     )
     runtime = _FakeRuntime(files={MANIFEST_FILENAME: b'{"sources": ['})
-    await curator.taskset.finalize(curator.task, trace, runtime)
-    await curator.taskset.score(trace, None)
+    await curator.task.finalize(trace, runtime)
+    await curator.task.score(trace, None)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4463,8 +4490,8 @@ async def test_explicit_workspace_manifest_still_trains_and_scores():
             )
         }
     )
-    await curator.taskset.finalize(curator.task, trace, runtime)
-    await curator.taskset.score(trace, None)
+    await curator.task.finalize(trace, runtime)
+    await curator.task.score(trace, None)
 
     assert RolloutStore.is_finalized(curator.state)
     assert (
@@ -4492,7 +4519,7 @@ async def test_finalize_ignores_draft_json_workspace_file():
             "draft.json": (b'{"sources": [{"id": "good/encyclopedia", "weight": 1.0}]}')
         }
     )
-    await curator.taskset.finalize(curator.task, trace, runtime)
+    await curator.task.finalize(trace, runtime)
 
     assert not RolloutStore.is_finalized(curator.state)
     assert (
@@ -4505,11 +4532,11 @@ async def test_finalize_ignores_draft_json_workspace_file():
 
 
 def test_safety_turn_cap_does_not_change_agent_prompt():
-    short = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load_tasks()
-    long = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=200)).load_tasks()
-    assert short[0].prompt == long[0].prompt
-    assert short[0].system_prompt is None
-    assert long[0].system_prompt is None
+    short = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load()
+    long = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=200)).load()
+    assert short[0].data.prompt == long[0].data.prompt
+    assert short[0].data.system_prompt is None
+    assert long[0].data.system_prompt is None
 
 
 def test_task_prompt_renders_scoring_parameters_and_local_policy():
@@ -4520,36 +4547,36 @@ def test_task_prompt_renders_scoring_parameters_and_local_policy():
             alpha_perf=2.0,
             lambda_leakage=3.0,
         )
-    ).load_tasks()[0]
+    ).load()[0]
 
-    assert "Local sources are disabled; use only Hugging Face sources" in task.prompt
-    assert "`2.0 * performance - 3.0 * leakage`" in task.prompt
-    assert f"/workspace/{MANIFEST_FILENAME}" in task.prompt
-    assert "read `/workspace/.agents/skills/hf-cli/SKILL.md`" in task.prompt
-    assert "Environment overrides win over conflicting skill text" in task.prompt
-    assert "preinstalled `hf` is the only allowed HF CLI" in task.prompt
-    assert "metered" not in task.prompt.lower()
-    assert "unmetered" not in task.prompt.lower()
-    assert "never install, upgrade, replace, shadow, or bypass it" in task.prompt
-    assert "never run `hf skills add`" in task.prompt
+    assert "Local sources are disabled; use only Hugging Face sources" in task.data.prompt
+    assert "`2.0 * performance - 3.0 * leakage`" in task.data.prompt
+    assert f"/workspace/{MANIFEST_FILENAME}" in task.data.prompt
+    assert "read `/workspace/.agents/skills/hf-cli/SKILL.md`" in task.data.prompt
+    assert "Environment overrides win over conflicting skill text" in task.data.prompt
+    assert "preinstalled `hf` is the only allowed HF CLI" in task.data.prompt
+    assert "metered" not in task.data.prompt.lower()
+    assert "unmetered" not in task.data.prompt.lower()
+    assert "never install, upgrade, replace, shadow, or bypass it" in task.data.prompt
+    assert "never run `hf skills add`" in task.data.prompt
     assert (
         "never print, echo, log, or reveal tokens (including via `hf auth token`)"
-        in task.prompt
+        in task.data.prompt
     )
     assert (
         "Treat install/regenerate/auth-token skill guidance as inapplicable here."
-        in task.prompt
+        in task.data.prompt
     )
-    assert "final response must contain" not in task.prompt
+    assert "final response must contain" not in task.data.prompt
 
 
 def test_manifest_filename_is_configurable_and_rendered():
     env = load_environment(manifest_filename="curation-output.json")
-    task = env.taskset.load_tasks()[0]
+    task = env.taskset.load()[0]
 
     assert env.taskset.config.manifest_filename == "curation-output.json"
     assert env.env_args["manifest_filename"] == "curation-output.json"
-    assert "/workspace/curation-output.json" in task.prompt
+    assert "/workspace/curation-output.json" in task.data.prompt
 
 
 @pytest.mark.parametrize(
@@ -4593,7 +4620,12 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
 
     runtime = Runtime()
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
-    await taskset.setup(taskset.load_tasks()[0], runtime)
+    task = taskset.load()[0]
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data),
+        state=CuratorState(),
+    )
+    await task.setup(trace, runtime)
 
     assert SELF_SCORE_FILENAME in runtime.files
     assert HF_CLI_SKILL_RUNTIME_PATH == HF_CLI_SKILL_FILENAME
@@ -4609,7 +4641,7 @@ async def test_setup_installs_self_score_in_rollout_workspace(monkeypatch):
     # Canonical skill may mention install/auth-token flows; env overrides live in prompt.
     assert "hf skills add" in skill_text or "Install:" in skill_text
     assert (
-        taskset.curator.validation_set.dataset_id.encode()
+        task.config.curator.validation_set.dataset_id.encode()
         not in runtime.files[SELF_SCORE_FILENAME]
     )
     assert SELF_SCORE_TRAIN_FILENAME not in runtime.files
@@ -4739,7 +4771,7 @@ def test_parse_manifest_finds_manifest_after_leading_note_block():
 
 
 def test_build_tasks_renders_single_structured_task_prompt():
-    prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
+    prompt = build_tasks("2024-12-31", 1_000_000)[0].data.prompt
     assert prompt.startswith("We want to train")
     assert "## Objective" in TASK_PROMPT
     assert "## Deliverable" in prompt
@@ -4801,21 +4833,20 @@ def _real_trainer_taskset(**proxy_student):
     )
     # Inject the non-trainer collaborators so `_ensure` builds only the trainer
     # (no HF token / network needed); the trainer slot stays None for selection.
-    ts._client = FakeClient()
-    ts._corpus_builder = CorpusBuilder(client=ts._client)
-    ts._decon_detector = NoOpLeakageDetector()
-    return ts
+    task = ts.load()[0]
+    task._client = FakeClient()
+    task._corpus_builder = CorpusBuilder(client=task._client)
+    task._decon_detector = NoOpLeakageDetector()
+    return task
 
 
 def test_backend_selection_builds_runtime_selected_dispatcher():
-    # _build_real_trainer() always returns a RuntimeSelectedTrainer covering both
-    # concrete backends; which one trains is decided at score time from the live
-    # harness runtime's type, never from runtime_backend.
+    # _build_real_trainer() returns one runtime-backed trainer; the live runtime
+    # selects Docker diagnostics versus the common Modal path.
     ts = _real_trainer_taskset()
     ts._ensure()
     trainer = ts._trainer
-    assert isinstance(trainer, RuntimeSelectedTrainer)
-    assert set(trainer._trainers_by_runtime_type) == {"docker", "modal"}
+    assert isinstance(trainer, RuntimeProxyTrainer)
 
 
 def test_docker_real_trainer_construction_does_not_import_modal():
@@ -4823,9 +4854,8 @@ def test_docker_real_trainer_construction_does_not_import_modal():
 import sys
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
 
-assert "pretrain_data_curator.modal_backend" not in sys.modules
 taskset = CuratorTaskset(CuratorTasksetConfig(id="test", use_real_trainer=True))
-taskset._build_real_trainer()
+taskset.load()[0]._build_real_trainer()
 assert "pretrain_data_curator.modal_backend" not in sys.modules
 """
     subprocess.run(
@@ -5005,9 +5035,10 @@ def test_load_environment_accepts_baseline_relative_overrides(monkeypatch):
     env = load_environment(
         baseline_relative_perf=True, perf_baseline_loss=7.5, perf_target_loss=2.5
     )
-    assert env.taskset.curator.baseline_relative_perf is True
-    assert env.taskset.curator.perf_baseline_loss == 7.5
-    assert env.taskset.curator.perf_target_loss == 2.5
+    config = env.taskset.load()[0].config.curator
+    assert config.baseline_relative_perf is True
+    assert config.perf_baseline_loss == 7.5
+    assert config.perf_target_loss == 2.5
     assert env.env_args["perf_target_loss"] == 2.5
 
 
@@ -5600,7 +5631,7 @@ def test_prompt_documents_default_squared_performance_curve():
     """Rendered Setup must match the live default squared/linear reward contract."""
     cfg = CuratorConfig()
     assert cfg.perf_scaling_exponent == 2.0
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     setup = prompt[prompt.index("## Setup") : prompt.index("## Research")]
     assert "normalized loss progress is squared in the performance term" in setup
     assert f"default exponent {cfg.perf_scaling_exponent:g}" in setup
@@ -5640,7 +5671,7 @@ def test_load_environment_accepts_perf_scaling_exponent(monkeypatch):
     env = load_environment(
         perf_scaling_exponent=1.5, perf_baseline_loss=10.0, perf_target_loss=2.0
     )
-    assert env.taskset.curator.perf_scaling_exponent == pytest.approx(1.5)
+    assert env.taskset.load()[0].config.curator.perf_scaling_exponent == pytest.approx(1.5)
     assert env.env_args["perf_scaling_exponent"] == 1.5
 
 

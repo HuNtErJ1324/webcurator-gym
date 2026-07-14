@@ -44,12 +44,12 @@ def test_load_environment_wires_cap_into_bash_harness(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "test-token")
     env = load_environment()
     assert env.harness.config.env.get("MAX_TOOL_OUTPUT_CHARS") == "20000"
-    assert env.taskset.curator.max_tool_output_chars == 20_000
+    assert env.taskset.load()[0].config.curator.max_tool_output_chars == 20_000
     assert type(env.harness).__name__ == "TruncatingBashHarness"
 
     env2 = load_environment(max_tool_output_chars=5_000)
     assert env2.harness.config.env.get("MAX_TOOL_OUTPUT_CHARS") == "5000"
-    assert env2.taskset.curator.max_tool_output_chars == 5_000
+    assert env2.taskset.load()[0].config.curator.max_tool_output_chars == 5_000
 
 
 def test_truncating_program_source_patches_stock_run_bash():
@@ -76,14 +76,15 @@ def test_program_run_bash_caps_over_20k_agent_visible_output():
 
 def test_wrap_bash_harness_preserves_config_id_and_runtime(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "tok")
-    env = load_environment(harness_id="bash")
+    env = load_environment(harness_id="default")
     wrapped = wrap_bash_harness(env.harness.config)
-    assert wrapped.config.id == "bash"
+    assert wrapped.config.id == "default"
     assert wrapped.config.env["MAX_TOOL_OUTPUT_CHARS"] == "20000"
 
 
 def test_taskset_config_roundtrip():
     tsc = CuratorTasksetConfig(id="t", max_tool_output_chars=12345)
     ts = CuratorTaskset(tsc)
-    assert isinstance(ts.curator, CuratorConfig)
-    assert ts.curator.max_tool_output_chars == 12345
+    task = ts.load()[0]
+    assert isinstance(task.config.curator, CuratorConfig)
+    assert task.config.curator.max_tool_output_chars == 12345

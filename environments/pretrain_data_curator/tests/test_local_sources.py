@@ -390,7 +390,9 @@ async def test_materialize_runtime_none_keeps_hf_source_unchanged():
 def _trace_with_command_and_manifest(
     task, state, command: str, final_manifest: str
 ) -> vf.Trace:
-    trace = vf.Trace(task=task, state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     conversation = [vf.SystemMessage(content="sys"), vf.UserMessage(content="go")]
     tool_call = vf.ToolCall(
         id="tc0", name="bash", arguments=json.dumps({"command": command})
@@ -436,7 +438,7 @@ async def test_finalize_detects_validation_repository_access():
         '```json\n{"sources":[{"id":"good/science"}]}\n```',
     )
 
-    await taskset.finalize(task, trace, FakeRuntime({}))
+    await task.finalize(trace, FakeRuntime({}))
 
     assert RolloutStore.val_set_access(state)
 
@@ -448,13 +450,15 @@ async def test_local_provenance_metrics_read_rollout_state():
     state = CuratorState()
     RolloutStore.add_local_source(state, bytes_pulled=123, truncated=True)
     RolloutStore.set_val_set_access(state, True)
-    trace = vf.Trace(task=task, state=state)
-    taskset._scoring_cache[trace.id] = {}
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
+    task._scoring_cache[trace.id] = {}
 
-    assert await taskset.local_source_count(trace) == 1.0
-    assert await taskset.local_source_bytes(trace) == 123.0
-    assert await taskset.local_source_truncated(trace) == 1.0
-    assert await taskset.val_set_access(trace) == 1.0
+    assert await task.local_source_count(trace) == 1.0
+    assert await task.local_source_bytes(trace) == 123.0
+    assert await task.local_source_truncated(trace) == 1.0
+    assert await task.val_set_access(trace) == 1.0
 
 
 def test_local_configuration_is_validated_and_plumbed():
@@ -469,14 +473,15 @@ def test_local_configuration_is_validated_and_plumbed():
         max_local_source_bytes=4096,
     )
     assert env.taskset.config.allow_local_sources is False
-    assert env.taskset.curator.allow_local_sources is False
-    assert env.taskset.curator.max_local_source_bytes == 4096
+    config = env.taskset.load()[0].config.curator
+    assert config.allow_local_sources is False
+    assert config.max_local_source_bytes == 4096
     assert env.env_args["allow_local_sources"] is False
     assert env.env_args["max_local_source_bytes"] == 4096
 
 
 def test_initial_prompt_discloses_local_source_safety_and_token_budget():
-    prompt = build_tasks("2024-12-31", 1_000_000)[0].prompt
+    prompt = build_tasks("2024-12-31", 1_000_000)[0].data.prompt
     assert '"kind": "hf"' in prompt
     assert '"kind": "local"' in prompt
     assert "workspace-relative" in prompt

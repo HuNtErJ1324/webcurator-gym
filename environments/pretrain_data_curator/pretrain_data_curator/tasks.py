@@ -68,8 +68,8 @@ Before further experiments or voluntary completion, keep `{manifest_path}` a val
 There will be no user interaction. Never ask the user for feedback or clarification; operate autonomously and execute the actions that make the most sense."""
 
 
-class CuratorTask(vf.Task):
-    """One curation episode with typed budget and cutoff provenance."""
+class CuratorTaskData(vf.TaskData):
+    """Wire data for one curation task."""
 
     answer: str
     token_budget: int
@@ -85,8 +85,14 @@ def build_tasks(
     alpha_perf: float = 1.0,
     lambda_leakage: float = 1.0,
     perf_target_loss: float = 3.28,
+    config: vf.TaskConfig | None = None,
 ) -> list[CuratorTask]:
     """Build one curation task with the prompt parameters substituted."""
+    # CuratorTask lives with the taskset's behavior so it can own the v1
+    # lifecycle and scoring hooks. Import it lazily to keep this prompt/data
+    # module independent of the taskset loader during package discovery.
+    from .taskset import CuratorTask
+
     local_source_status = (
         "enabled for workspace-relative plain-text or JSONL files"
         if allow_local_sources
@@ -94,19 +100,25 @@ def build_tasks(
     )
     return [
         CuratorTask(
-            idx=0,
-            prompt=TASK_PROMPT.format(
-                cutoff_date=cutoff_date,
+            CuratorTaskData(
+                idx=0,
+                prompt=TASK_PROMPT.format(
+                    cutoff_date=cutoff_date,
+                    token_budget=token_budget,
+                    manifest_path=f"/workspace/{manifest_filename}",
+                    local_source_status=local_source_status,
+                    alpha_perf=alpha_perf,
+                    lambda_leakage=lambda_leakage,
+                    perf_target_loss=perf_target_loss,
+                ),
+                system_prompt=None,
+                answer=cutoff_date,
                 token_budget=token_budget,
-                manifest_path=f"/workspace/{manifest_filename}",
-                local_source_status=local_source_status,
-                alpha_perf=alpha_perf,
-                lambda_leakage=lambda_leakage,
-                perf_target_loss=perf_target_loss,
+                cutoff_date=cutoff_date,
             ),
-            system_prompt=None,
-            answer=cutoff_date,
-            token_budget=token_budget,
-            cutoff_date=cutoff_date,
+            config=config,
         )
     ]
+
+
+__all__ = ["TASK_PROMPT", "CuratorTaskData", "build_tasks"]

@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import verifiers.v1 as vf
 
 from pretrain_data_curator.container_memory import (
     DEFAULT_HOST_HEADROOM_GIB,
@@ -40,6 +41,7 @@ from pretrain_data_curator.container_memory import (
 from pretrain_data_curator.models import CuratorConfig, ProxyStudentConfig
 from pretrain_data_curator.runtime_config import derive_trainer_resources
 from pretrain_data_curator.self_score import render_self_score_script
+from pretrain_data_curator.rollout_state import CuratorState
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
 
 
@@ -746,7 +748,12 @@ async def test_heuristic_docker_setup_skips_memory_pin(monkeypatch):
             proxy_student={"runtime_backend": "docker"},
         )
     )
-    await taskset.setup(taskset.load_tasks()[0], FakeRuntime())
+    task = taskset.load()[0]
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data),
+        state=CuratorState(),
+    )
+    await task.setup(trace, FakeRuntime())
     assert called["verify"] is False
 
 
@@ -779,7 +786,12 @@ async def test_real_docker_setup_verifies_memory_pin(monkeypatch):
             proxy_student={"runtime_backend": "docker", "memory_gb": 96},
         )
     )
-    await taskset.setup(taskset.load_tasks()[0], FakeRuntime())
+    task = taskset.load()[0]
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data),
+        state=CuratorState(),
+    )
+    await task.setup(trace, FakeRuntime())
     assert seen["container"] == "pdc-real"
     assert seen["configured_gb"] == 96.0
 

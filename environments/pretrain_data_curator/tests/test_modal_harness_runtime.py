@@ -7,15 +7,17 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import verifiers.v1 as vf
 from pydantic import ValidationError
 from verifiers.v1.runtimes.modal import ModalConfig
 
 from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
-from pretrain_data_curator.modal_backend import ModalProxyTrainer, _modal_gpu_for
+from pretrain_data_curator.runtime_config import _modal_gpu_for
 from pretrain_data_curator.models import ProxyStudentConfig
 from pretrain_data_curator.pretrain_data_curator import load_environment
+from pretrain_data_curator.rollout_state import CuratorState
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
-from pretrain_data_curator.trainer import TrainerError
+from pretrain_data_curator.trainer import RuntimeProxyTrainer, TrainerError
 
 
 def _corpus() -> CuratedCorpus:
@@ -66,13 +68,13 @@ async def test_swallowed_wait_for_cancellation_is_reraised(monkeypatch):
         return result
 
     monkeypatch.setattr(
-        "pretrain_data_curator.modal_backend.asyncio.wait_for",
+        "pretrain_data_curator.trainer.asyncio.wait_for",
         swallow_at_completion,
     )
     runtime = FakeRuntime()
 
     with pytest.raises(asyncio.CancelledError):
-        await ModalProxyTrainer().train_and_eval(
+        await RuntimeProxyTrainer().train_and_eval(
             _corpus(),
             ProxyStudentConfig(runtime_backend="modal"),
             runtime=runtime,
@@ -137,14 +139,14 @@ def test_native_modal_tasks_declare_runtime_requirements_and_deadline():
         )
     )
 
-    task = taskset.load_tasks()[0]
+    task = taskset.load()[0]
 
-    assert task.image == "registry.example/curator:gpu"
-    assert task.workdir == "/workspace"
-    assert task.resources.gpu == "H200"
-    assert task.resources.cpu == 4.0
-    assert task.resources.memory == 16.0
-    assert task.timeout.scoring == 45 * 60 + 540
+    assert task.data.image == "registry.example/curator:gpu"
+    assert task.data.workdir == "/workspace"
+    assert task.data.resources.gpu == "H200"
+    assert task.data.resources.cpu == 4.0
+    assert task.data.resources.memory == 16.0
+    assert task.data.timeout.scoring == 45 * 60 + 540
 
 
 def test_modal_timeout_cannot_exceed_runtime_lifetime():
@@ -163,8 +165,10 @@ async def test_taskset_setup_rejects_modal_trainer_on_other_runtime(monkeypatch)
         )
     )
 
+    task = taskset.load()[0]
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data),
+        state=CuratorState(),
+    )
     with pytest.raises(TrainerError, match="Docker or Modal harness runtime"):
-        await taskset.setup(
-            taskset.load_tasks()[0],
-            FakeRuntime(runtime_type="subprocess"),
-        )
+        await task.setup(trace, FakeRuntime(runtime_type="subprocess"))

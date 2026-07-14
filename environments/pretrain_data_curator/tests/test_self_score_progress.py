@@ -457,7 +457,7 @@ def test_decon_timeout_still_produces_the_single_json_result(tmp_path: Path):
 
 
 def test_prompt_warns_that_self_score_is_slow_and_must_not_be_killed():
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     lowered = prompt.lower()
     assert "long silent runs" in lowered
     assert "idle gpu" in lowered
@@ -469,7 +469,7 @@ def test_prompt_warns_that_self_score_is_slow_and_must_not_be_killed():
 
 
 def test_prompt_distinguishes_zero_doc_diagnostic_from_a_trained_zero():
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     assert "`ok: false` + `reward: null`" in prompt
     assert "not a score" in prompt
     assert "sampled zero documents" in prompt
@@ -478,7 +478,7 @@ def test_prompt_distinguishes_zero_doc_diagnostic_from_a_trained_zero():
 
 
 def test_prompt_preserves_existing_guidance():
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     # existing guidance is preserved
     assert "hf papers" in prompt
     assert "/workspace/.agents/skills/hf-cli/SKILL.md" in prompt
@@ -488,7 +488,7 @@ def test_prompt_preserves_existing_guidance():
 
 
 def test_prompt_section_order_is_objective_setup_research_deliverable_self_score_rules():
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     section_headers = [
         "## Objective",
         "## Setup",
@@ -504,14 +504,14 @@ def test_prompt_section_order_is_objective_setup_research_deliverable_self_score
 
 
 def test_prompt_stays_within_its_length_contract():
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     assert len(TASK_PROMPT) <= TASK_PROMPT_MAX_CHARS, len(TASK_PROMPT)
     assert len(prompt) <= TASK_PROMPT_MAX_CHARS, len(prompt)
 
 
 def test_prompt_explains_squared_performance_matching_reward_default():
     """Setup must document squared nonnegative progress; reward default is 2.0."""
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     setup = prompt[prompt.index("## Setup") : prompt.index("## Research")]
     assert "normalized loss progress is squared in the performance term" in setup
     assert "default exponent 2.0" in setup
