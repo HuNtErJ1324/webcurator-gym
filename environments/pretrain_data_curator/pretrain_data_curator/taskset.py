@@ -48,7 +48,7 @@ from typing import Any, Literal
 import verifiers.v1 as vf
 from pydantic import ValidationError, field_validator, model_validator
 
-from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder, CuratedCorpus
+from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .leakage import DeconLeakageDetector
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
 from .hf_cli_parse import content_text, extract_hf_commands
@@ -78,12 +78,11 @@ from .self_score import (
     render_self_score_script,
     render_self_score_train_script,
 )
-from .tasks import CuratorTask, build_tasks
+from .tasks import CuratorTaskData, TASK_PROMPT, build_tasks
 from .trainer import (
     HeuristicProxyTrainer,
     ProxyStudentTrainer,
-    RuntimeSelectedTrainer,
-    TrainResult,
+    RuntimeProxyTrainer,
     TrainerError,
 )
 from .val_set import ValidationSetConfig, ValTokenLoader
@@ -112,31 +111,6 @@ def hf_cli_skill_package_file():
 
 
 _HF_CLI_SKILL = hf_cli_skill_package_file().read_bytes()
-
-
-class _LazyModalProxyTrainer:
-    """Delay importing Modal until a live Modal runtime actually trains."""
-
-    def __init__(self, *, concurrency_limit: int, val_loader: ValTokenLoader | None):
-        self._concurrency_limit = concurrency_limit
-        self._val_loader = val_loader
-        self._trainer: ProxyStudentTrainer | None = None
-
-    async def train_and_eval(
-        self,
-        corpus: CuratedCorpus,
-        config: ProxyStudentConfig,
-        *,
-        runtime: Any = None,
-    ) -> TrainResult:
-        if self._trainer is None:
-            from .modal_backend import ModalProxyTrainer
-
-            self._trainer = ModalProxyTrainer(
-                concurrency_limit=self._concurrency_limit,
-                val_loader=self._val_loader,
-            )
-        return await self._trainer.train_and_eval(corpus, config, runtime=runtime)
 
 
 # --------------------------------------------------------------------------- #
@@ -553,16 +527,26 @@ class CuratorTasksetConfig(vf.TasksetConfig):
         return self
 
 
-try:
-    _TasksetBase = vf.Taskset[CuratorTask, CuratorTasksetConfig, CuratorState]
-except TypeError:
-    _TasksetBase = vf.Taskset
+class CuratorTaskConfig(vf.TaskConfig):
+    """Task-facing configuration consumed by one curation task."""
+
+    curator: CuratorConfig = CuratorConfig()
+    hf_token_env: str = "HF_TOKEN"
+    manifest_filename: str = MANIFEST_FILENAME
+    decon_binary: str = DEFAULT_DECON_BINARY
+    decon_evals_dir: str | None = None
+    decon_threshold: float = 0.2
+    screen_val_set: bool = True
 
 
-class CuratorTaskset(_TasksetBase):
-    def __init__(self, config: CuratorTasksetConfig) -> None:
-        super().__init__(config)
-        self.curator = self._build_curator_config(config)
+class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
+    """One curation task, including its v1 lifecycle and scoring behavior."""
+
+    def __init__(
+        self, data: CuratorTaskData, config: CuratorTaskConfig | None = None
+    ) -> None:
+        super().__init__(data, config)
+        self.curator = self.config.curator
         self._client: HuggingFaceDatasetClient | None = None
         self._corpus_builder: CorpusBuilder | None = None
         self._trainer: ProxyStudentTrainer | None = None
@@ -597,6 +581,18 @@ class CuratorTaskset(_TasksetBase):
             proxy_student=ProxyStudentConfig(**(config.proxy_student or {})),
             validation_set=ValidationSetConfig(**(config.validation_set or {})),
             max_tool_output_chars=config.max_tool_output_chars,
+        )
+
+    @classmethod
+    def task_config(cls, config: CuratorTasksetConfig) -> CuratorTaskConfig:
+        return CuratorTaskConfig(
+            curator=cls._build_curator_config(config),
+            hf_token_env=config.hf_token_env,
+            manifest_filename=config.manifest_filename,
+            decon_binary=config.decon_binary,
+            decon_evals_dir=config.decon_evals_dir,
+            decon_threshold=config.decon_threshold,
+            screen_val_set=config.screen_val_set,
         )
 
     # -- collaborators ---------------------------------------------------------
@@ -654,40 +650,14 @@ class CuratorTaskset(_TasksetBase):
         return self._scorer
 
     def _build_real_trainer(self) -> ProxyStudentTrainer:
-        from .docker_backend import HarnessRuntimeProxyTrainer
-
-        return RuntimeSelectedTrainer(
-            {
-                "docker": HarnessRuntimeProxyTrainer(
-                    concurrency_limit=self.curator.max_concurrent_training,
-                    val_loader=self._val_loader,
-                ),
-                "modal": _LazyModalProxyTrainer(
-                    concurrency_limit=self.curator.max_concurrent_training,
-                    val_loader=self._val_loader,
-                ),
-            }
+        return RuntimeProxyTrainer(
+            concurrency_limit=self.curator.max_concurrent_training,
+            val_loader=self._val_loader,
         )
 
-    # -- taskset surface -------------------------------------------------------
+    # -- task lifecycle --------------------------------------------------------
 
-    def load_tasks(self) -> list[CuratorTask]:
-        tasks = build_tasks(
-            self.curator.cutoff_date,
-            self.curator.token_budget,
-            manifest_filename=self.config.manifest_filename,
-            allow_local_sources=self.curator.allow_local_sources,
-            alpha_perf=self.curator.alpha_perf,
-            lambda_leakage=self.curator.lambda_leakage,
-            perf_target_loss=self.curator.perf_target_loss,
-        )
-        updates = derive_task_runtime_updates(
-            self.curator.proxy_student,
-            use_real_trainer=self.curator.use_real_trainer,
-        )
-        return [task.model_copy(update=updates) for task in tasks]
-
-    async def setup(self, task: CuratorTask, runtime: vf.Runtime) -> None:
+    async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         token_env = self.config.hf_token_env
         if not os.environ.get(token_env):
             raise RuntimeError(
@@ -755,11 +725,7 @@ class CuratorTaskset(_TasksetBase):
         return msgs[-1].content or ""
 
     async def _manifest_from_workspace_file(
-        self,
-        task: CuratorTask,
-        runtime: Any,
-        *,
-        warn_invalid: bool = False,
+        self, runtime: Any, *, warn_invalid: bool = False
     ) -> tuple[Literal["absent", "invalid", "valid"], Manifest | None]:
         """Read the agent-written manifest from the runtime workspace.
 
@@ -794,7 +760,7 @@ class CuratorTaskset(_TasksetBase):
             data = None
         manifest = parse_manifest(
             json.dumps(data) if isinstance(data, dict) else "",
-            default_token_budget=task.token_budget,
+            default_token_budget=self.data.token_budget,
             reserved_local_filename=self.config.manifest_filename,
         )
         if manifest is None or not manifest.sources:
@@ -807,13 +773,11 @@ class CuratorTaskset(_TasksetBase):
             return "invalid", None
         return "valid", manifest
 
-    def _manifest_from_messages(
-        self, task: CuratorTask, trace: vf.Trace
-    ) -> Manifest | None:
+    def _manifest_from_messages(self, trace: vf.Trace) -> Manifest | None:
         """Compatibility fallback: parse assistant text messages newest first."""
         manifest = parse_manifest(
             self._final_message_text(trace),
-            default_token_budget=task.token_budget,
+            default_token_budget=self.data.token_budget,
             reserved_local_filename=self.config.manifest_filename,
         )
         if manifest is not None and manifest.sources:
@@ -821,16 +785,14 @@ class CuratorTaskset(_TasksetBase):
         for message in reversed(trace.assistant_messages[:-1]):
             manifest = parse_manifest(
                 message.content or "",
-                default_token_budget=task.token_budget,
+                default_token_budget=self.data.token_budget,
                 reserved_local_filename=self.config.manifest_filename,
             )
             if manifest is not None and manifest.sources:
                 return manifest
         return None
 
-    def _manifest_from_trace_ids(
-        self, task: CuratorTask, trace: vf.Trace
-    ) -> Manifest | None:
+    def _manifest_from_trace_ids(self, trace: vf.Trace) -> Manifest | None:
         observed = _ids_from_trace(trace)
         if not observed:
             return None
@@ -838,7 +800,7 @@ class CuratorTaskset(_TasksetBase):
         sources = [
             Source(dataset_id=did, config=None, weight=1.0) for did in observed[:limit]
         ]
-        return Manifest(token_budget=task.token_budget, sources=sources)
+        return Manifest(token_budget=self.data.token_budget, sources=sources)
 
     # Grace-period bound for `_await_final_manifest` (see its docstring): total
     # worst-case wait is attempts * interval seconds, and it only runs when the
@@ -847,7 +809,7 @@ class CuratorTaskset(_TasksetBase):
     _FINALIZE_GRACE_INTERVAL_SECONDS = 0.5
 
     async def _await_final_manifest(
-        self, task: CuratorTask, trace: vf.Trace, runtime: Any
+        self, trace: vf.Trace, runtime: Any
     ) -> tuple[Literal["absent", "invalid", "valid"], Manifest | None]:
         """Poll briefly for the agent's workspace manifest before fallbacks.
 
@@ -861,7 +823,6 @@ class CuratorTaskset(_TasksetBase):
         for attempt in range(self._FINALIZE_GRACE_ATTEMPTS):
             await asyncio.sleep(self._FINALIZE_GRACE_INTERVAL_SECONDS)
             status, manifest = await self._manifest_from_workspace_file(
-                task,
                 runtime,
                 warn_invalid=attempt == self._FINALIZE_GRACE_ATTEMPTS - 1,
             )
@@ -869,7 +830,7 @@ class CuratorTaskset(_TasksetBase):
                 return status, manifest
         return status, manifest
 
-    async def finalize(self, task: CuratorTask, trace: vf.Trace, runtime: Any) -> None:
+    async def finalize(self, trace: vf.Trace, runtime: Any) -> None:
         """Read the agent's manifest from the runtime workspace.
 
         Positional signature as invoked at ``verifiers/v1/rollout.py:241``; runs
@@ -889,9 +850,9 @@ class CuratorTaskset(_TasksetBase):
         sentinel (no materialize/train).
         """
         state = trace.state
-        status, manifest = await self._manifest_from_workspace_file(task, runtime)
+        status, manifest = await self._manifest_from_workspace_file(runtime)
         if status != "valid":
-            status, manifest = await self._await_final_manifest(task, trace, runtime)
+            status, manifest = await self._await_final_manifest(trace, runtime)
 
         candidate: ManifestCandidate | None = None
         telemetry_manifest: Manifest | None = None
@@ -901,12 +862,12 @@ class CuratorTaskset(_TasksetBase):
             provenance = MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
         else:
             provenance = MANIFEST_PROVENANCE_MISSING
-            message_manifest = self._manifest_from_messages(task, trace)
+            message_manifest = self._manifest_from_messages(trace)
             if message_manifest is not None:
                 telemetry_manifest = message_manifest
                 candidate = MANIFEST_CANDIDATE_ASSISTANT_MESSAGE
             elif self.curator.allow_trace_id_manifest_fallback:
-                trace_manifest = self._manifest_from_trace_ids(task, trace)
+                trace_manifest = self._manifest_from_trace_ids(trace)
                 if trace_manifest is not None:
                     telemetry_manifest = trace_manifest
                     candidate = MANIFEST_CANDIDATE_TRACE_FALLBACK
@@ -991,7 +952,7 @@ class CuratorTaskset(_TasksetBase):
         self._scoring_locks.pop(trace.id, None)
         return scoring
 
-    async def score(self, trace: vf.Trace, runtime: vf.Runtime | None) -> None:
+    async def score(self, trace: vf.Trace, runtime: vf.Runtime | None = None) -> None:
         try:
             await super().score(trace, runtime)
         finally:
@@ -1174,7 +1135,36 @@ class CuratorTaskset(_TasksetBase):
         return 1.0 if await self.trainer_error_str(trace, runtime) else 0.0
 
 
+class CuratorTaskset(vf.Taskset[CuratorTask, CuratorTasksetConfig]):
+    """Thin v1 loader; lifecycle and scoring belong to :class:`CuratorTask`."""
+
+    def load(self) -> list[CuratorTask]:
+        task_config = CuratorTask.task_config(self.config)
+        tasks = build_tasks(
+            self.config.cutoff_date,
+            self.config.token_budget,
+            manifest_filename=self.config.manifest_filename,
+            allow_local_sources=self.config.allow_local_sources,
+            alpha_perf=self.config.alpha_perf,
+            lambda_leakage=self.config.lambda_leakage,
+            perf_target_loss=self.config.perf_target_loss,
+            config=task_config,
+        )
+        updates = derive_task_runtime_updates(
+            task_config.curator.proxy_student,
+            use_real_trainer=task_config.curator.use_real_trainer,
+        )
+        return [
+            CuratorTask(task.data.model_copy(update=updates), task_config)
+            for task in tasks
+        ]
+
+
 __all__ = [
+    "TASK_PROMPT",
+    "CuratorTask",
+    "CuratorTaskConfig",
+    "CuratorTaskData",
     "CuratorTaskset",
     "_ids_from_trace",
     "_shell_command_from_tool_args",

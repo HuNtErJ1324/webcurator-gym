@@ -360,7 +360,10 @@ async def test_taskset_score_removes_rollout_scratch_directory():
         def sample_documents(self, dataset_id, config, split, text_field, n):
             return ["some document text about the sample topic."] * n
 
-    taskset = CuratorTaskset(CuratorTasksetConfig(id="test", screen_val_set=False))
+    taskset_loader = CuratorTaskset(
+        CuratorTasksetConfig(id="test", screen_val_set=False)
+    )
+    taskset = taskset_loader.load()[0]
     taskset._client = _FakeClient()
     taskset._corpus_builder = CorpusBuilder(
         client=taskset._client,
@@ -380,10 +383,12 @@ async def test_taskset_score_removes_rollout_scratch_directory():
         Manifest(token_budget=1_000, sources=[Source(dataset_id="a/b")]),
     )
     RolloutStore.set_finalized(state, True)
-    task = build_tasks("2024-12-31", 1_000_000)[0]
-    trace = vf.Trace(task=task, state=state)
+    task = taskset
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
 
-    await taskset.score(trace, None)
+    await task.score(trace, None)
 
     assert state.scratch_dir is None
     assert not state.doc_cache

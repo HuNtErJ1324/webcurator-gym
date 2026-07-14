@@ -18,6 +18,17 @@ import verifiers.v1 as vf
 from .container_memory import resolve_container_memory_gb
 from .models import ProxyStudentConfig
 
+_MODAL_GPU_MAP: dict[str, str] = {
+    "H100": "H100",
+    "H200": "H200",
+    "A100": "A100-80GB",
+}
+
+
+def _modal_gpu_for(modal_gpu: str) -> str:
+    """Translate the package-level GPU name to Modal's runtime spelling."""
+    return _MODAL_GPU_MAP.get(modal_gpu, "L4")
+
 
 def derive_trainer_resources(
     ps: ProxyStudentConfig,
@@ -28,15 +39,13 @@ def derive_trainer_resources(
 
     ``backend`` is ``"docker"`` or ``"modal"``. The only backend-specific field
     is the GPU specifier: Docker passes ``gpu_count`` (``None`` when zero), while
-    Modal maps ``modal_gpu`` through ``_modal_gpu_for`` (lazy import).
+    Modal maps ``modal_gpu`` through ``_modal_gpu_for``.
 
     Docker container memory honors ``PDC_DOCKER_CONTAINER_MEMORY_GB`` (legacy
     ``PDC_CONTAINER_MEMORY_GB``) when set so production pods can raise the Docker
     ``--memory`` pin without editing eval TOMLs. Modal ignores those overrides.
     """
     if backend == "modal":
-        from .modal_backend import _modal_gpu_for
-
         gpu = _modal_gpu_for(ps.modal_gpu)
     else:
         gpu = str(ps.gpu_count) if ps.gpu_count > 0 else None
@@ -101,10 +110,9 @@ def derive_task_runtime_updates(
 ) -> dict[str, Any]:
     """Build the per-task runtime/resources/timeout updates for the taskset.
 
-    Returns ``{}`` when no real trainer backend is selected, matching the
-    historical behavior of ``CuratorTaskset.load_tasks`` (which leaves the base
-    tasks untouched). For a real ``docker``/``modal`` backend it returns the
-    shared image/workdir plus a ``vf.TaskResources``/``vf.TaskTimeout`` pair.
+    Returns ``{}`` when no real trainer backend is selected. For a real
+    ``docker``/``modal`` backend it returns the shared image/workdir plus a
+    ``vf.TaskResources``/``vf.TaskTimeout`` pair for the task data.
     """
     if not (use_real_trainer and ps.runtime_backend in ("docker", "modal")):
         return {}

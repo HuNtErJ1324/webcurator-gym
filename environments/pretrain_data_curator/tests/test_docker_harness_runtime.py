@@ -8,7 +8,7 @@ import pytest
 import verifiers.v1 as vf
 
 from pretrain_data_curator.corpus import CuratedCorpus, SourceCorpus
-from pretrain_data_curator.docker_backend import HarnessRuntimeProxyTrainer
+from pretrain_data_curator.trainer import RuntimeProxyTrainer
 from pretrain_data_curator.models import (
     CuratorConfig,
     Manifest,
@@ -17,14 +17,8 @@ from pretrain_data_curator.models import (
 )
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
-from pretrain_data_curator.tasks import build_tasks
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
-from pretrain_data_curator.trainer import (
-    HeuristicProxyTrainer,
-    RuntimeSelectedTrainer,
-    TrainerError,
-    TrainResult,
-)
+from pretrain_data_curator.trainer import HeuristicProxyTrainer, TrainerError, TrainResult
 
 
 def _corpus() -> CuratedCorpus:
@@ -113,7 +107,7 @@ class FakeRuntime:
 @pytest.mark.asyncio
 async def test_harness_runtime_trainer_writes_and_runs_on_supplied_runtime():
     runtime = FakeRuntime()
-    trainer = HarnessRuntimeProxyTrainer()
+    trainer = RuntimeProxyTrainer()
 
     result = await trainer.train_and_eval(
         _corpus(), ProxyStudentConfig(runtime_backend="docker"), runtime=runtime
@@ -189,16 +183,19 @@ async def test_reward_threads_injected_runtime_through_scoring_chain():
             proxy_student={"runtime_backend": "docker"},
         )
     )
-    taskset._scorer = CuratorScorer(config, _CorpusBuilder(), trainer, _Leakage())
+    task = taskset.load()[0]
+    task._scorer = CuratorScorer(config, _CorpusBuilder(), trainer, _Leakage())
     state = CuratorState()
     RolloutStore.set_manifest(
         state, Manifest(sources=[Source(dataset_id="owner/data")])
     )
     RolloutStore.set_finalized(state, True)
-    trace = vf.Trace(task=build_tasks("2024-12-31", 1_000_000)[0], state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     runtime = FakeRuntime()
 
-    await taskset.score(trace, runtime)
+    await task.score(trace, runtime)
 
     assert trace.rewards["perf_reward"] > 0.0
     assert trainer.runtime is runtime
@@ -215,7 +212,7 @@ async def test_training_timeout_stops_runtime_without_hanging(monkeypatch):
 
     with pytest.raises(TrainerError, match="timed out"):
         await asyncio.wait_for(
-            HarnessRuntimeProxyTrainer().train_and_eval(
+            RuntimeProxyTrainer().train_and_eval(
                 _corpus(),
                 ProxyStudentConfig(runtime_backend="docker"),
                 runtime=runtime,
@@ -234,7 +231,7 @@ async def test_cancelled_training_stops_runtime():
 
     runtime = BlockingRuntime()
     task = asyncio.create_task(
-        HarnessRuntimeProxyTrainer().train_and_eval(
+        RuntimeProxyTrainer().train_and_eval(
             _corpus(),
             ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
@@ -266,10 +263,10 @@ async def test_training_semaphore_bounds_runtime_commands():
 
     config = ProxyStudentConfig(runtime_backend="docker")
     await asyncio.gather(
-        HarnessRuntimeProxyTrainer(concurrency_limit=1).train_and_eval(
+        RuntimeProxyTrainer(concurrency_limit=1).train_and_eval(
             _corpus(), config, runtime=ConcurrentRuntime()
         ),
-        HarnessRuntimeProxyTrainer(concurrency_limit=1).train_and_eval(
+        RuntimeProxyTrainer(concurrency_limit=1).train_and_eval(
             _corpus(), config, runtime=ConcurrentRuntime()
         ),
     )
@@ -301,7 +298,7 @@ async def test_runtime_failures_raise_clear_trainer_errors(result, message):
     runtime = FakeRuntime(result)
 
     with pytest.raises(TrainerError, match=message) as excinfo:
-        await HarnessRuntimeProxyTrainer().train_and_eval(
+        await RuntimeProxyTrainer().train_and_eval(
             _corpus(),
             ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
@@ -326,7 +323,7 @@ async def test_training_crash_surfaces_stdout_traceback_and_persists_full_logs()
     runtime = FakeRuntime(result)
 
     with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
-        await HarnessRuntimeProxyTrainer().train_and_eval(
+        await RuntimeProxyTrainer().train_and_eval(
             _corpus(),
             ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
@@ -355,7 +352,7 @@ async def test_training_crash_surfaces_redirected_stderr_file():
     )
 
     with pytest.raises(TrainerError, match="exited with code 1") as excinfo:
-        await HarnessRuntimeProxyTrainer().train_and_eval(
+        await RuntimeProxyTrainer().train_and_eval(
             _corpus(),
             ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
@@ -378,7 +375,7 @@ async def test_no_result_json_surfaces_stdout_tail():
     runtime = FakeRuntime(result)
 
     with pytest.raises(TrainerError, match="no RESULT_JSON marker") as excinfo:
-        await HarnessRuntimeProxyTrainer().train_and_eval(
+        await RuntimeProxyTrainer().train_and_eval(
             _corpus(),
             ProxyStudentConfig(runtime_backend="docker"),
             runtime=runtime,
@@ -402,15 +399,18 @@ async def test_trainer_error_str_preserves_training_traceback():
             proxy_student={"runtime_backend": "docker"},
         )
     )
-    taskset._scorer = CuratorScorer(
-        config, _CorpusBuilder(), HarnessRuntimeProxyTrainer(), _Leakage()
+    task = taskset.load()[0]
+    task._scorer = CuratorScorer(
+        config, _CorpusBuilder(), RuntimeProxyTrainer(), _Leakage()
     )
     state = CuratorState()
     RolloutStore.set_manifest(
         state, Manifest(sources=[Source(dataset_id="owner/data")])
     )
     RolloutStore.set_finalized(state, True)
-    trace = vf.Trace(task=build_tasks("2024-12-31", 1_000_000)[0], state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     runtime = FakeRuntime(
         SimpleNamespace(
             stdout=TRACEBACK_STDOUT,
@@ -419,21 +419,20 @@ async def test_trainer_error_str_preserves_training_traceback():
         )
     )
 
-    err = await taskset.trainer_error_str(trace, runtime)
+    err = await task.trainer_error_str(trace, runtime)
 
     assert 'File "/workspace/train.py", line 217, in <module>' in err
     assert "RuntimeError: loss is non-finite" in err
-    assert await taskset.trainer_error_msg(trace, runtime) == 1.0
+    assert await task.trainer_error_msg(trace, runtime) == 1.0
 
 
 @pytest.mark.asyncio
-async def test_build_real_trainer_dispatches_by_runtime_type():
-    # _build_real_trainer() always builds ONE RuntimeSelectedTrainer regardless
-    # of runtime_backend; which concrete trainer actually runs is decided
-    # ENTIRELY by the live runtime.type passed to train_and_eval at score time.
+async def test_build_real_trainer_uses_one_runtime_implementation():
+    # One RuntimeProxyTrainer handles both live runtime types; Docker adds its
+    # cgroup diagnostics while Modal uses the common write/run/read path.
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test", use_real_trainer=True))
-    trainer = taskset._build_real_trainer()
-    assert isinstance(trainer, RuntimeSelectedTrainer)
+    trainer = taskset.load()[0]._build_real_trainer()
+    assert isinstance(trainer, RuntimeProxyTrainer)
 
     docker_result = await trainer.train_and_eval(
         _corpus(), ProxyStudentConfig(), runtime=FakeRuntime(runtime_type="docker")
@@ -445,7 +444,7 @@ async def test_build_real_trainer_dispatches_by_runtime_type():
     )
     assert modal_result.backend == "modal"
 
-    with pytest.raises(TrainerError, match="docker or modal harness runtime"):
+    with pytest.raises(TrainerError, match="Docker or Modal harness runtime"):
         await trainer.train_and_eval(
             _corpus(),
             ProxyStudentConfig(),
@@ -467,14 +466,14 @@ def test_native_docker_tasks_declare_runtime_requirements_and_deadline():
         )
     )
 
-    task = taskset.load_tasks()[0]
+    task = taskset.load()[0]
 
-    assert task.image == "pretrain-data-curator:gpu"
-    assert task.workdir == "/workspace"
-    assert task.resources.gpu == "1"
-    assert task.resources.cpu == 4.0
-    assert task.resources.memory == 16.0
-    assert task.timeout.scoring == 45 * 60 + 540
+    assert task.data.image == "pretrain-data-curator:gpu"
+    assert task.data.workdir == "/workspace"
+    assert task.data.resources.gpu == "1"
+    assert task.data.resources.cpu == 4.0
+    assert task.data.resources.memory == 16.0
+    assert task.data.timeout.scoring == 45 * 60 + 540
 
 
 def test_package_is_discoverable_as_a_native_v1_taskset():
@@ -494,11 +493,13 @@ async def test_taskset_setup_rejects_docker_trainer_on_subprocess_runtime(monkey
         )
     )
 
+    task = taskset.load()[0]
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data),
+        state=CuratorState(),
+    )
     with pytest.raises(TrainerError, match="Docker or Modal harness runtime"):
-        await taskset.setup(
-            taskset.load_tasks()[0],
-            FakeRuntime(runtime_type="subprocess"),
-        )
+        await task.setup(trace, FakeRuntime(runtime_type="subprocess"))
 
 
 class _FailingCorpusBuilder:
@@ -512,7 +513,8 @@ class _FailingCorpusBuilder:
 async def test_external_failure_metrics_wait_for_materialization():
     config = CuratorConfig()
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
-    taskset._scorer = CuratorScorer(
+    task = taskset.load()[0]
+    task._scorer = CuratorScorer(
         config,
         _FailingCorpusBuilder(),
         HeuristicProxyTrainer(),
@@ -523,9 +525,11 @@ async def test_external_failure_metrics_wait_for_materialization():
         state, Manifest(sources=[Source(dataset_id="owner/data")])
     )
     RolloutStore.set_finalized(state, True)
-    trace = vf.Trace(task=build_tasks("2024-12-31", 1_000_000)[0], state=state)
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
 
-    await taskset.score(trace, None)
+    await task.score(trace, None)
 
     assert trace.metrics["external_failure"] == 1.0
     assert trace.metrics["tool_error_count"] == 1.0

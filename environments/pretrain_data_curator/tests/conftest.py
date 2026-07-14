@@ -23,7 +23,7 @@ class NoOpLeakageDetector:
 
 
 def bind_fast_scorer(
-    taskset: CuratorTaskset,
+    taskset,
     *,
     corpus_builder,
     trainer,
@@ -35,7 +35,7 @@ def bind_fast_scorer(
     taskset._decon_detector = leakage_detector
     taskset._val_loader = None
     scorer = CuratorScorer(
-        taskset.curator,
+        taskset.config.curator,
         corpus_builder,
         trainer,
         leakage_detector,

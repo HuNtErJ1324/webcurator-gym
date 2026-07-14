@@ -79,6 +79,7 @@ class FakeTrace:
     def __init__(
         self, *, num_turns: int = 4, stop_condition: str | None = None
     ) -> None:
+        self.id = "trace-id"
         self.num_turns = num_turns
         self.stop_condition = stop_condition
         self.is_completed = False
@@ -97,8 +98,11 @@ class FakeTrace:
 
 
 class _FakeTask:
-    prompt = "Curate a pretraining corpus."
-    system_prompt = None
+    data = type(
+        "_TaskData",
+        (),
+        {"prompt": "Curate a pretraining corpus.", "system_prompt": None},
+    )()
 
 
 class FakeCtx:
@@ -406,10 +410,10 @@ def test_codex_max_continuations_is_configurable():
 
 
 def test_other_harnesses_are_not_wrapped_by_the_codex_guard():
-    """The guard is codex-specific; bash keeps its own wrapper."""
+    """The guard is codex-specific; the default harness is untouched."""
     from pretrain_data_curator.pretrain_data_curator import load_environment
 
-    harness = load_environment(harness_id="bash").harness
+    harness = load_environment(harness_id="default").harness
     assert not isinstance(harness, get_manifest_continuation_codex_harness_class())
 
 

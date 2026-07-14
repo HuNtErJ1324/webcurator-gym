@@ -5,26 +5,31 @@
   - `HeuristicProxyTrainer`: deterministic, CPU-only stand-in that predicts
     loss/accuracy from corpus statistics. Used in tests and as the default so the
     environment is usable without GPU.
-  - `HarnessRuntimeProxyTrainer` / `ModalProxyTrainer` (see `docker_backend.py` /
-    `modal_backend.py`): actually train a fixed small GPT-2-scale model on the
-    curated corpus, inside the live Docker or Modal harness runtime that hosts
-    the rollout, and report measured val loss, next-token accuracy, and FLOPs.
-  - `RuntimeSelectedTrainer`: dispatches to whichever of the above matches the
-    live harness runtime's ``type`` at score time -- trainer selection is driven
-    entirely by the runtime actually provisioned, never by a config field.
+  - `RuntimeProxyTrainer`: trains a fixed small GPT-2-scale model through the
+    live v1 Runtime, with Docker-only OOM diagnostics layered around the common
+    launch path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import weakref
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
+import verifiers.v1 as vf
 from pydantic import BaseModel
 
+from .container_memory import (
+    collect_oom_diagnostics,
+    format_oom_diagnostics,
+    inspect_container_memory,
+    resolve_container_memory_gb,
+)
 from .corpus import CuratedCorpus
 from .hf_access import loop_local_semaphore
 from .models import ProxyStudentConfig
@@ -181,41 +186,6 @@ def _source_diversity(corpus: CuratedCorpus) -> float:
     return entropy / math.log(len(non_empty))
 
 
-class RuntimeSelectedTrainer:
-    """Dispatches ``train_and_eval`` to the real trainer matching the live
-    harness runtime's ``type``.
-
-    There is no separate backend-selector config consulted here: the harness
-    runtime actually provisioned for the rollout is the ONLY signal used to
-    pick a concrete trainer, so a rollout always trains with whichever trainer
-    matches the runtime it is really running on. Prime GPU sandboxes are not
-    supported -- only Docker and Modal harness runtimes have a real trainer.
-    """
-
-    def __init__(
-        self, trainers_by_runtime_type: dict[str, "ProxyStudentTrainer"]
-    ) -> None:
-        self._trainers_by_runtime_type = trainers_by_runtime_type
-
-    async def train_and_eval(
-        self,
-        corpus: CuratedCorpus,
-        config: ProxyStudentConfig,
-        *,
-        runtime: Any = None,
-    ) -> TrainResult:
-        runtime_type = getattr(runtime, "type", None)
-        trainer = self._trainers_by_runtime_type.get(runtime_type)
-        if trainer is None:
-            supported = " or ".join(sorted(self._trainers_by_runtime_type))
-            raise TrainerError(
-                f"use_real_trainer requires a {supported} harness runtime; got "
-                f"{runtime_type!r}. Pass --harness.runtime.type {supported} (or the "
-                "matching load_environment runtime args)."
-            )
-        return await trainer.train_and_eval(corpus, config, runtime=runtime)
-
-
 TRAIN_GPT_PATH = Path(__file__).with_name("train_gpt.py")
 
 
@@ -228,3 +198,406 @@ def __getattr__(name: str) -> Any:
     if name == "NANOGPT_TRAIN_SCRIPT":
         return _nanogpt_train_script()
     raise AttributeError(name)
+
+
+class RuntimeProxyTrainer:
+    """Train through the live v1 runtime selected by the harness config.
+
+    Docker and Modal share one write/run/read implementation. Docker-only
+    cgroup and daemon inspection is an optional diagnostic layer around that
+    common launch path.
+    """
+
+    STREAM_TAIL = 8000
+    TRACEBACK_MARKER = "Traceback (most recent call last)"
+
+    def __init__(
+        self,
+        max_corpus_chars: int | None = None,
+        concurrency_limit: int = 1,
+        val_loader: Any = None,
+    ) -> None:
+        self._max_corpus_chars = max_corpus_chars
+        self._concurrency_limit = concurrency_limit
+        self._val_loader = val_loader
+
+    async def train_and_eval(
+        self,
+        corpus: CuratedCorpus,
+        config: ProxyStudentConfig,
+        *,
+        runtime: vf.Runtime | None = None,
+    ) -> TrainResult:
+        runtime_type = getattr(runtime, "type", None)
+        if runtime is None or runtime_type not in {"docker", "modal"}:
+            raise TrainerError(
+                "real proxy-student training requires a live Docker or Modal "
+                f"harness runtime, got {runtime_type!r}"
+            )
+
+        cap = (
+            self._max_corpus_chars
+            if self._max_corpus_chars is not None
+            else config.effective_max_corpus_chars
+        )
+        text = corpus.joined_text(cap)
+        if not text.strip():
+            return TrainResult(
+                loss=float("inf"),
+                accuracy=0.0,
+                flops=0.0,
+                tokens_trained=0,
+                backend=runtime_type,
+            )
+
+        val_set = await self._resolve_val_set()
+        payload = config.training_payload(
+            tokenizer=val_set.tokenizer if val_set else "gpt2"
+        )
+        async with training_semaphore(self._concurrency_limit):
+            try:
+                await self._write_inputs(runtime, text, payload, config, val_set)
+                self._raise_if_cancelling()
+                result = await self._run_training(runtime, config)
+                self._raise_if_cancelling()
+                return self._parse_result(
+                    result.stdout, result.stderr, backend=runtime_type
+                )
+            except BaseException:
+                await self._stop_cancel_safe(runtime)
+                raise
+
+    @staticmethod
+    def _raise_if_cancelling() -> None:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError()
+
+    async def _resolve_val_set(self) -> Any:
+        if self._val_loader is None:
+            return None
+        return await self._val_loader.load()
+
+    async def _write_inputs(
+        self,
+        runtime: vf.Runtime,
+        text: str,
+        payload: dict[str, Any],
+        config: ProxyStudentConfig,
+        val_set: Any,
+    ) -> None:
+        files = [
+            ("/workspace/corpus.txt", text.encode("utf-8")),
+            ("/workspace/config.json", json.dumps(payload).encode("utf-8")),
+            ("/workspace/train.py", _nanogpt_train_script().encode("utf-8")),
+        ]
+        if val_set is not None:
+            files.append(("/workspace/val.bin", val_set.to_uint16_bytes()))
+        for path, data in files:
+            try:
+                await asyncio.wait_for(
+                    runtime.write(path, data), timeout=config.upload_timeout_seconds
+                )
+                self._raise_if_cancelling()
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TrainerError(
+                    f"timed out writing proxy-student input {path!r}"
+                ) from exc
+
+    async def _run_training(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> Any:
+        docker = runtime.type == "docker"
+        before = await self._read_cgroup(runtime, config) if docker else None
+        timeout = config.effective_timeout_minutes * 60
+        try:
+            result = await asyncio.wait_for(
+                runtime.run(["python", "/workspace/train.py"], {}), timeout=timeout
+            )
+            self._raise_if_cancelling()
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            after = await self._read_cgroup(runtime, config) if docker else None
+            raise TrainerError(
+                f"proxy-student training timed out after {timeout}s",
+                stderr_tail=await self._training_diagnostic_async(
+                    "",
+                    "",
+                    runtime=runtime,
+                    config=config,
+                    events_before=before,
+                    events_after=after,
+                    timed_out=True,
+                ),
+            ) from exc
+
+        redirected = await self._read_redirected_stderr(runtime, config) if docker else ""
+        stderr = self._merge_stderr(getattr(result, "stderr", None), redirected)
+        after = await self._read_cgroup(runtime, config) if docker else None
+        await self._persist_logs(
+            runtime,
+            result,
+            config,
+            redirected=redirected,
+            stderr=stderr,
+            events_before=before,
+            events_after=after,
+        )
+        if result.exit_code not in (0, None):
+            raise TrainerError(
+                f"proxy-student training exited with code {result.exit_code}",
+                stderr_tail=await self._training_diagnostic_async(
+                    getattr(result, "stdout", ""),
+                    stderr,
+                    runtime=runtime,
+                    config=config,
+                    events_before=before,
+                    events_after=after,
+                    returncode=result.exit_code,
+                ),
+            )
+        return SimpleNamespace(
+            stdout=getattr(result, "stdout", "") or "",
+            stderr=stderr,
+            exit_code=getattr(result, "exit_code", None),
+        )
+
+    async def _read_cgroup(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> dict[str, Any]:
+        script = (
+            "from pathlib import Path\n"
+            "import json\n"
+            "events=Path('/sys/fs/cgroup/memory.events')\n"
+            "mmax=Path('/sys/fs/cgroup/memory.max')\n"
+            "payload={'events':{}, 'memory_max': None, 'error': None}\n"
+            "try:\n"
+            "    if events.is_file():\n"
+            "        for line in events.read_text().splitlines():\n"
+            "            parts=line.split()\n"
+            "            if len(parts)==2 and parts[1].lstrip('-').isdigit():\n"
+            "                payload['events'][parts[0]]=int(parts[1])\n"
+            "    if mmax.is_file():\n"
+            "        raw=mmax.read_text().strip()\n"
+            "        payload['memory_max']=None if raw=='max' else int(raw)\n"
+            "except Exception as exc:\n"
+            "    payload['error']=str(exc)\n"
+            "print('CGROUP_JSON '+json.dumps(payload, sort_keys=True))\n"
+        )
+        try:
+            result = await asyncio.wait_for(
+                runtime.run(["python", "-c", script], {}),
+                timeout=min(30.0, config.upload_timeout_seconds),
+            )
+        except Exception as exc:  # diagnostics must not raise
+            return {"events": {}, "memory_max": None, "error": str(exc)}
+        for line in reversed((getattr(result, "stdout", "") or "").splitlines()):
+            if line.startswith("CGROUP_JSON "):
+                try:
+                    return json.loads(line[len("CGROUP_JSON ") :])
+                except json.JSONDecodeError:
+                    break
+        return {"events": {}, "memory_max": None, "error": "missing CGROUP_JSON"}
+
+    async def _read_redirected_stderr(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig
+    ) -> str:
+        try:
+            data = await asyncio.wait_for(
+                runtime.read("/workspace/stderr.txt"),
+                timeout=config.upload_timeout_seconds,
+            )
+        except Exception:
+            return ""
+        return (data or b"").decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _merge_stderr(captured: str | None, redirected: str | None) -> str:
+        captured = (captured or "").strip()
+        redirected = (redirected or "").strip()
+        if captured and redirected and captured not in redirected and redirected not in captured:
+            return f"{captured}\n--- redirected stderr.txt ---\n{redirected}"
+        return redirected or captured
+
+    async def _persist_logs(
+        self,
+        runtime: vf.Runtime,
+        result: Any,
+        config: ProxyStudentConfig,
+        *,
+        redirected: str,
+        stderr: str,
+        events_before: dict[str, Any] | None,
+        events_after: dict[str, Any] | None,
+    ) -> None:
+        logs = {
+            "/workspace/train_stdout.log": getattr(result, "stdout", "") or "",
+            "/workspace/train_stderr.log": stderr,
+        }
+        if runtime.type == "docker":
+            logs["/workspace/train_stderr_redirect.log"] = redirected
+            diagnostics = await self._oom_diagnostics_async(
+                runtime,
+                config,
+                events_before=events_before,
+                events_after=events_after,
+                returncode=getattr(result, "exit_code", None),
+                stderr=stderr,
+            )
+            logs["/workspace/train_oom_diagnostics.json"] = json.dumps(
+                diagnostics, sort_keys=True, default=str
+            )
+        try:
+            for path, text in logs.items():
+                await asyncio.wait_for(
+                    runtime.write(path, text.encode("utf-8", errors="replace")),
+                    timeout=config.upload_timeout_seconds,
+                )
+        except Exception:
+            logger.warning("failed to persist %s training logs", runtime.type, exc_info=True)
+
+    def _parse_result(self, stdout: str, stderr: str, *, backend: str) -> TrainResult:
+        marker = next(
+            (
+                line[len("RESULT_JSON ") :]
+                for line in reversed((stdout or "").splitlines())
+                if line.startswith("RESULT_JSON ")
+            ),
+            None,
+        )
+        if marker is None:
+            raise TrainerError(
+                "proxy-student training produced no RESULT_JSON marker",
+                stderr_tail=self._training_diagnostic(stdout, stderr),
+            )
+        try:
+            data = json.loads(marker)
+            return TrainResult(
+                loss=float(data["loss"]),
+                accuracy=float(data.get("accuracy", 0.0)),
+                flops=float(data.get("flops", 0.0)),
+                tokens_trained=int(data.get("tokens_trained", 0)),
+                backend=backend,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TrainerError(
+                f"proxy-student training produced malformed RESULT_JSON: {exc}",
+                stderr_tail=self._training_diagnostic(stdout, stderr),
+            ) from exc
+
+    def _training_diagnostic(self, stdout: str, stderr: str, **kwargs: Any) -> str:
+        parts = [
+            "--- stdout tail ---",
+            self._diagnostic_stream(stdout or ""),
+            "--- stderr tail ---",
+            self._diagnostic_stream(stderr or ""),
+        ]
+        runtime = kwargs.get("runtime")
+        if runtime is not None and runtime.type == "docker":
+            parts.append(kwargs.get("memory_diagnostic") or self._memory_diagnostic(
+                runtime,
+                kwargs.get("config"),
+                events_before=kwargs.get("events_before"),
+                events_after=kwargs.get("events_after"),
+                returncode=kwargs.get("returncode"),
+                stderr=stderr,
+                timed_out=bool(kwargs.get("timed_out")),
+            ))
+        return "\n".join(parts)
+
+    async def _training_diagnostic_async(
+        self, stdout: str, stderr: str, **kwargs: Any
+    ) -> str:
+        runtime = kwargs.get("runtime")
+        if runtime is not None and runtime.type == "docker":
+            kwargs["memory_diagnostic"] = await self._memory_diagnostic_async(
+                runtime,
+                kwargs.get("config"),
+                events_before=kwargs.get("events_before"),
+                events_after=kwargs.get("events_after"),
+                returncode=kwargs.get("returncode"),
+                stderr=stderr,
+                timed_out=bool(kwargs.get("timed_out")),
+            )
+        return self._training_diagnostic(stdout, stderr, **kwargs)
+
+    def _diagnostic_stream(self, text: str) -> str:
+        marker_at = text.find(self.TRACEBACK_MARKER)
+        return text[marker_at:] if marker_at >= 0 else text[-self.STREAM_TAIL :]
+
+    def _oom_diagnostics(
+        self,
+        runtime: vf.Runtime,
+        config: ProxyStudentConfig | None,
+        *,
+        events_before: dict[str, Any] | None = None,
+        events_after: dict[str, Any] | None = None,
+        returncode: int | None = None,
+        stderr: str | None = None,
+        timed_out: bool = False,
+        inspect_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        container = getattr(runtime, "_container", None) or getattr(runtime, "name", None)
+        if container and inspect_info is None:
+            try:
+                inspect_info = inspect_container_memory(str(container))
+            except Exception as exc:
+                logger.debug("oom inspect failed: %s", exc)
+        return collect_oom_diagnostics(
+            configured_gb=(
+                resolve_container_memory_gb(config.memory_gb, backend="docker")
+                if config is not None
+                else None
+            ),
+            effective_memory_bytes=(inspect_info or {}).get("memory_bytes"),
+            oom_killed=(inspect_info or {}).get("oom_killed"),
+            container=str(container) if container else None,
+            events_before=events_before,
+            events_after=events_after,
+            returncode=returncode,
+            stderr=stderr,
+            timed_out=timed_out,
+        )
+
+    async def _oom_diagnostics_async(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig, **kwargs: Any
+    ) -> dict[str, Any]:
+        container = getattr(runtime, "_container", None) or getattr(runtime, "name", "")
+        try:
+            inspect_info = await asyncio.to_thread(inspect_container_memory, str(container))
+        except Exception:
+            inspect_info = None
+        return self._oom_diagnostics(runtime, config, inspect_info=inspect_info, **kwargs)
+
+    def _memory_diagnostic(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig | None, **kwargs: Any
+    ) -> str:
+        return format_oom_diagnostics(self._oom_diagnostics(runtime, config, **kwargs))
+
+    async def _memory_diagnostic_async(
+        self, runtime: vf.Runtime, config: ProxyStudentConfig | None, **kwargs: Any
+    ) -> str:
+        return format_oom_diagnostics(
+            await self._oom_diagnostics_async(runtime, config, **kwargs)
+        )
+
+    @staticmethod
+    async def _stop_cancel_safe(runtime: vf.Runtime) -> None:
+        teardown = asyncio.create_task(runtime.stop())
+        try:
+            await asyncio.shield(teardown)
+        except asyncio.CancelledError:
+            await asyncio.shield(teardown)
+            raise
+        except Exception:
+            logger.warning("runtime teardown failed", exc_info=True)
+
+
+__all__ = [
+    "HeuristicProxyTrainer",
+    "ProxyStudentTrainer",
+    "RuntimeProxyTrainer",
+    "TrainResult",
+    "TrainerError",
+    "estimate_param_count",
+    "estimate_train_flops",
+]

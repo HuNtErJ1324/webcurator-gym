@@ -304,10 +304,10 @@ class ProxyStudentConfig(BaseModel):
     polar_express: bool = False
     # --- real-trainer backend selection (only used when use_real_trainer) -----
     # Static, pre-runtime hint only: shapes ``load_environment``'s harness.runtime
-    # and ``load_tasks()``'s task image/resources/timeout declarations, and gates
-    # the Modal timeout ceiling check below. It is NEVER read when selecting which
+    # and the task data's image/resources/timeout declarations, and gates the
+    # Modal timeout ceiling check below. It is NEVER read when selecting which
     # trainer actually runs at score time -- that is driven purely by the live
-    # harness runtime's ``type`` via ``trainer.RuntimeSelectedTrainer``. No default:
+    # harness runtime's ``type``. No default:
     # a real-trainer run must explicitly pick ``'docker'`` or ``'modal'``.
     runtime_backend: Literal["docker", "modal"] | None = None
     # Retained for config compatibility, but remote Docker is not supported by

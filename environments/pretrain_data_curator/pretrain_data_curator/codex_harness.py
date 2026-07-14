@@ -165,7 +165,7 @@ def get_manifest_continuation_codex_harness_class() -> type[Any]:
     if _ManifestContinuationCodexHarness is not None:
         return _ManifestContinuationCodexHarness
 
-    from verifiers.v1.clients import RolloutContext
+    from verifiers.v1.clients import ModelContext
     from verifiers.v1.errors import HarnessError, boundary
     from verifiers.v1.harnesses.codex.harness import CodexHarness
     from verifiers.v1.runtimes import Runtime
@@ -195,7 +195,7 @@ def get_manifest_continuation_codex_harness_class() -> type[Any]:
 
         async def run(
             self,
-            ctx: RolloutContext,
+            ctx: ModelContext,
             trace: Trace,
             runtime: Runtime,
             endpoint: str,

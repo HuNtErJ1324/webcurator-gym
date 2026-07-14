@@ -66,7 +66,7 @@ def load_environment(
     proxy_student: dict[str, Any] | None = None,
     validation_set: dict[str, Any] | None = None,
     fetch_timeout_per_doc_seconds: float = 0.25,
-    harness_id: str = "bash",
+    harness_id: str = "default",
     decon_binary: str = DEFAULT_DECON_BINARY,
     decon_evals_dir: str | None = None,
     decon_threshold: float = 0.2,
@@ -229,7 +229,7 @@ def load_environment(
     # bash harness caps agent-visible tool results in-runtime by patching the uv
     # program (MAX_TOOL_OUTPUT_CHARS flows in via harness_env above); the codex
     # harness relies on the external runner for any wire-level capping.
-    if harness_id == "bash":
+    if harness_id == "default":
         from .bash_harness import wrap_bash_harness
 
         env.harness = wrap_bash_harness(env.harness.config)

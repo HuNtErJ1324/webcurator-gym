@@ -43,6 +43,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_DIR="$ROOT/environments/pretrain_data_curator"
+ENV_PYTHON="$ENV_DIR/.venv/bin/python"
 SMOKE_PROFILE="25M"
 BASE_EVAL_CONFIG="configs/eval/25M-60turn-codex-smoke.toml"
 BASE_EVAL_CONFIG_PATH="$ENV_DIR/$BASE_EVAL_CONFIG"
@@ -239,9 +240,10 @@ if [[ -n "$VALIDATE_ONLY" ]]; then
   LOCAL_OUT_DIR="$VALIDATE_ONLY"
   [[ -d "$LOCAL_OUT_DIR" ]] || die "validate-only dir missing: $LOCAL_OUT_DIR"
   log "Validating existing results in $LOCAL_OUT_DIR (profile=$SMOKE_PROFILE suffix=$RUN_SUFFIX budget=$EXPECTED_TOKEN_BUDGET)"
+  [[ -x "$ENV_PYTHON" ]] || die "env python missing: $ENV_PYTHON (cd $ENV_DIR && uv sync)"
   (
     cd "$ENV_DIR"
-    python3 -m pretrain_data_curator.smoke_result_gate \
+    "$ENV_PYTHON" -m pretrain_data_curator.smoke_result_gate \
       "$LOCAL_OUT_DIR" "$EXPECTED_TOKEN_BUDGET" "$RUN_SUFFIX"
   ) || die "Downloaded results failed validation"
   log "Validation OK"
@@ -921,9 +923,10 @@ EOF
 
 validate_downloaded_results() {
   # Gate success + site rebuild via shared Python helper (importable in tests).
+  [[ -x "$ENV_PYTHON" ]] || die "env python missing: $ENV_PYTHON (cd $ENV_DIR && uv sync)"
   (
     cd "$ENV_DIR"
-    python3 -m pretrain_data_curator.smoke_result_gate \
+    "$ENV_PYTHON" -m pretrain_data_curator.smoke_result_gate \
       "$LOCAL_OUT_DIR" "$EXPECTED_TOKEN_BUDGET" "$RUN_SUFFIX"
   )
 }

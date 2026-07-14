@@ -5,7 +5,7 @@ tags = ["huggingface", "datasets", "data-curation", "pretraining", "tool-use", "
 version = "0.8.8"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "verifiers==0.1.15.dev376",
+    "verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@f68cac097de14d5a129e8944292c1b4247b69cc1",
     "renderers==0.1.8.dev49",
     "datasets>=2.18.0",
     "huggingface-hub>=0.24.0",
