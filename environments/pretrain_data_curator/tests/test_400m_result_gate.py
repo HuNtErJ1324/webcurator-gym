@@ -146,8 +146,14 @@ def test_launcher_gates_remote_and_downloaded_results_before_site_work():
     assert "SEMANTIC_INVALID=" in script
     assert "STATUS=semantic_invalid" in script
     assert "REMOTE_SEMANTIC_INVALID=1" in script
+    assert 'PROJECT_ROOT="$REPO_ROOT/environments/pretrain_data_curator"' in script
+    assert 'PROJECT_PYTHON="$REPO_ROOT/.venv/bin/python"' in script
+    assert "python3 pretrain_data_curator/result_gate.py" not in script
+    assert "provisioned project Python is unavailable or not executable" in script
 
-    remote_gate = script.index("python3 pretrain_data_curator/result_gate.py")
+    remote_gate = script.index(
+        '"$PROJECT_PYTHON" "$PROJECT_ROOT/pretrain_data_curator/result_gate.py"'
+    )
     remote_status = script.index("SEMANTIC_INVALID=", remote_gate)
     assert remote_gate < remote_status
 

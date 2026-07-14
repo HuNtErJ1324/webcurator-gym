@@ -525,6 +525,9 @@ def _eval_wrapper_repo(
         "[args.proxy_student]\n"
         "train_token_budget = 400000000\n"
     )
+    project_bin = repo / ".venv" / "bin"
+    project_bin.mkdir(parents=True)
+    (project_bin / "python").symlink_to(sys.executable)
     (repo / "secrets.env").write_text("HF_TOKEN=dummy\nPRIME_API_KEY=dummy\n")
     if row is not None:
         (run_dir / "results.jsonl").write_text(json.dumps(row) + "\n")
@@ -591,6 +594,23 @@ def test_status_is_exit_zero_only_for_a_finalized_successful_rollout(tmp_path: P
     status, log = _run_eval_wrapper(tmp_path, _HEALTHY_ROW)
     assert status == "EXIT=0", log
     assert "valid_rows=1 mode=production" in log
+
+
+@pytest.mark.parametrize("mode", ["missing", "not_executable"])
+def test_result_gate_missing_project_python_fails_closed_with_diagnostic(
+    tmp_path: Path, mode: str
+):
+    repo, home, script = _eval_wrapper_repo(tmp_path, _HEALTHY_ROW)
+    project_python = repo / ".venv" / "bin" / "python"
+    project_python.unlink()
+    if mode == "not_executable":
+        project_python.write_text("not an executable\n")
+        project_python.chmod(0o644)
+
+    status, log = _run_eval_wrapper_repo(repo, home, script)
+    assert status == "SEMANTIC_INVALID=65", log
+    assert "provisioned project Python is unavailable or not executable" in log
+    assert str(project_python) in log
 
 
 @pytest.mark.parametrize(

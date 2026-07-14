@@ -757,6 +757,8 @@ cat > "$RD/eval.sh" <<'EVAL'
 set -uo pipefail
 REPO_ROOT="${WCG_REPO_ROOT:-/root/webcurator-gym}"
 export PATH="$REPO_ROOT/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+PROJECT_ROOT="$REPO_ROOT/environments/pretrain_data_curator"
+PROJECT_PYTHON="$REPO_ROOT/.venv/bin/python"
 MODEL="$1"
 EVAL_CONFIG="$2"
 ST="$3"
@@ -773,7 +775,20 @@ validate_run_results() {
     echo "[validate] FAIL: no usable results path logged by this run" >&2
     return 1
   fi
-  python3 pretrain_data_curator/result_gate.py \
+  if [[ ! -x "$PROJECT_PYTHON" ]]; then
+    echo "[validate] FAIL: provisioned project Python is unavailable or not executable: $PROJECT_PYTHON (expected Python 3.12)" >&2
+    return 1
+  fi
+  local python_version
+  if ! python_version="$("$PROJECT_PYTHON" -c 'import sys, tomllib; print(".".join(map(str, sys.version_info[:3])))' 2>&1)"; then
+    echo "[validate] FAIL: provisioned project Python cannot import tomllib: $PROJECT_PYTHON ($python_version)" >&2
+    return 1
+  fi
+  if [[ "$python_version" != 3.12.* ]]; then
+    echo "[validate] FAIL: provisioned project Python must be 3.12 (got $python_version at $PROJECT_PYTHON)" >&2
+    return 1
+  fi
+  "$PROJECT_PYTHON" "$PROJECT_ROOT/pretrain_data_curator/result_gate.py" \
     "$PWD/$rel/results.jsonl" "$PWD/$EVAL_CONFIG"
 }
 
