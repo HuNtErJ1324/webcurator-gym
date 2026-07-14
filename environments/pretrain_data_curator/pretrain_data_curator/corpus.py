@@ -570,6 +570,44 @@ class CorpusBuilder:
         if locks is not None:
             locks.pop(lock_key, None)
 
+    @staticmethod
+    async def _offloaded_to_completion(fn, *args, **kwargs):
+        """Await ``asyncio.to_thread(fn, *args, **kwargs)`` for a blocking write.
+
+        If *this* coroutine is cancelled while the worker thread is still running,
+        we do **not** release the surrounding critical-section guard (an asyncio
+        lock or the pipeline semaphore) until the worker has actually finished:
+        the underlying task is created explicitly, shielded from the cancellation,
+        and awaited to completion inside the guard before the ``CancelledError`` is
+        re-raised. Callers must therefore hold the relevant guard around this call
+        (the store-lock for ``store_docs``, the pipeline semaphore for
+        ``from_docs``) so a follower can never observe a half-written state or
+        transiently exceed ``fetch_limit``.
+
+        Exactly-once / error semantics:
+        - Normal completion: the result is returned and the guard releases.
+        - Worker error, no cancellation: the worker's exception propagates
+          unchanged (it is not wrapped in ``CancelledError``).
+        - Cancellation while the worker is still running: we wait for the worker;
+          if the worker then succeeds we re-raise ``CancelledError``, and if the
+          worker itself fails we re-raise the worker's exception (the cancellation
+          does not mask the real error).
+        """
+        worker = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        shielded = asyncio.shield(worker)
+        try:
+            return await shielded
+        except asyncio.CancelledError:
+            # The caller was cancelled, but the worker thread is still running
+            # (shield keeps it alive). Stay inside the guard and wait for the
+            # worker to finish so the write completes before any follower enters.
+            try:
+                await worker
+            except BaseException as exc:
+                # The worker failed: surface its error, not the cancellation.
+                raise exc
+            raise
+
     async def fetch_source_docs(
         self, state: CuratorState, key: FetchKey
     ) -> tuple[list[str], dict[str, Any] | None]:
