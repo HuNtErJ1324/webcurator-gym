@@ -48,7 +48,7 @@ from typing import Any, Literal
 import verifiers.v1 as vf
 from pydantic import ValidationError, field_validator, model_validator
 
-from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
+from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder, CuratedCorpus
 from .leakage import DeconLeakageDetector
 from .docker_network import DockerHostReachability
 from .hf_access import HuggingFaceDatasetClient, RetryPolicy
@@ -84,6 +84,7 @@ from .trainer import (
     HeuristicProxyTrainer,
     ProxyStudentTrainer,
     RuntimeSelectedTrainer,
+    TrainResult,
     TrainerError,
 )
 from .val_set import ValidationSetConfig, ValTokenLoader
@@ -112,6 +113,32 @@ def hf_cli_skill_package_file():
 
 
 _HF_CLI_SKILL = hf_cli_skill_package_file().read_bytes()
+
+
+class _LazyModalProxyTrainer:
+    """Delay importing Modal until a live Modal runtime actually trains."""
+
+    def __init__(self, *, concurrency_limit: int, val_loader: ValTokenLoader | None):
+        self._concurrency_limit = concurrency_limit
+        self._val_loader = val_loader
+        self._trainer: ProxyStudentTrainer | None = None
+
+    async def train_and_eval(
+        self,
+        corpus: CuratedCorpus,
+        config: ProxyStudentConfig,
+        *,
+        runtime: Any = None,
+    ) -> TrainResult:
+        if self._trainer is None:
+            from .modal_backend import ModalProxyTrainer
+
+            self._trainer = ModalProxyTrainer(
+                concurrency_limit=self._concurrency_limit,
+                val_loader=self._val_loader,
+            )
+        return await self._trainer.train_and_eval(corpus, config, runtime=runtime)
+
 
 # --------------------------------------------------------------------------- #
 # manifest parsing (workspace file primary; assistant messages remain fallback)
@@ -629,7 +656,6 @@ class CuratorTaskset(_TasksetBase):
 
     def _build_real_trainer(self) -> ProxyStudentTrainer:
         from .docker_backend import HarnessRuntimeProxyTrainer
-        from .modal_backend import ModalProxyTrainer
 
         return RuntimeSelectedTrainer(
             {
@@ -637,7 +663,7 @@ class CuratorTaskset(_TasksetBase):
                     concurrency_limit=self.curator.max_concurrent_training,
                     val_loader=self._val_loader,
                 ),
-                "modal": ModalProxyTrainer(
+                "modal": _LazyModalProxyTrainer(
                     concurrency_limit=self.curator.max_concurrent_training,
                     val_loader=self._val_loader,
                 ),

@@ -84,7 +84,7 @@ from pretrain_data_curator.trainer import (
     TrainResult,
     estimate_param_count,
 )
-from pretrain_data_curator.student_model import GPT2_SMALL_PARAM_COUNT
+from pretrain_data_curator.train_gpt import GPT2_SMALL_PARAM_COUNT
 from pretrain_data_curator.val_set import (
     NANOGPT_VAL_DATASET_ID,
     NANOGPT_VAL_FILENAME,
@@ -395,7 +395,15 @@ for name in list(sys.modules):
 
 import pretrain_data_curator  # noqa: F401
 
-assert "pretrain_data_curator.student_model" not in sys.modules
+from pretrain_data_curator.train_gpt import steps_for_token_budget
+
+assert steps_for_token_budget(
+    32,
+    batch_size=1,
+    block_size=8,
+    batch_stage_muls=(1, 2, 3),
+    batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
+) >= 1
 assert "torch" not in sys.modules
 """
     subprocess.run(
@@ -1941,7 +1949,7 @@ def test_train_token_budget_constant_batch_derives_steps(
 
 def test_train_token_budget_equal_stages_400m_is_schedule_aware():
     """400M / 16 / 1024 under [1,2,3] equal stages ≈ 12,208 steps (not 24,415)."""
-    from pretrain_data_curator.batch_schedule import scheduled_presentation_tokens
+    from pretrain_data_curator.train_gpt import scheduled_presentation_tokens
 
     cfg = ProxyStudentConfig(
         train_token_budget=400_000_000,
@@ -1980,7 +1988,7 @@ def test_train_token_budget_equal_stages_400m_is_schedule_aware():
 
 
 def test_train_token_budget_irregular_stage_fractions():
-    from pretrain_data_curator.batch_schedule import scheduled_presentation_tokens
+    from pretrain_data_curator.train_gpt import scheduled_presentation_tokens
 
     fracs = (0.1, 0.2, 0.7)
     muls = (1, 2, 4)
@@ -2019,7 +2027,7 @@ def test_train_token_budget_irregular_stage_fractions():
 
 
 def test_train_token_budget_small_budget_rounds_deterministically():
-    from pretrain_data_curator.batch_schedule import scheduled_presentation_tokens
+    from pretrain_data_curator.train_gpt import scheduled_presentation_tokens
 
     cfg = ProxyStudentConfig(
         train_token_budget=10,
@@ -2044,7 +2052,7 @@ def test_train_token_budget_small_budget_rounds_deterministically():
 
 def test_train_token_budget_accounting_parity_with_schedule_sum():
     """effective_train_tokens equals the explicit sum of staged presentations."""
-    from pretrain_data_curator.batch_schedule import (
+    from pretrain_data_curator.train_gpt import (
         batch_stage_boundaries,
         scheduled_presentation_tokens,
     )
@@ -3484,25 +3492,14 @@ def test_mean_held_out_ce_empty_raises_not_zero():
         mean_held_out_ce(1, 256, lambda start, length: 0.0)
 
 
-def test_sandbox_script_embeds_tested_windowing_helper():
-    # The GPU-only script must run the SAME plan_val_windows this tier tests, and
-    # must no longer contain the old, buggy non-overlapping-full-block windowing.
+def test_sandbox_script_is_the_written_train_gpt_source():
     import ast
-    import inspect
 
-    from pretrain_data_curator.trainer import NANOGPT_TRAIN_SCRIPT
+    from pretrain_data_curator.trainer import TRAIN_GPT_PATH, _nanogpt_train_script
 
-    ast.parse(NANOGPT_TRAIN_SCRIPT)  # the injected script is valid Python
-    # Exact single-source identity: the literal helper source the unit tests
-    # exercise must appear verbatim in the script, proving the GPU loop runs
-    # byte-identical code to the tested helper (a refactor can't silently diverge
-    # the sandbox copy).
-    helper_src = inspect.getsource(plan_val_windows).rstrip()
-    assert helper_src in NANOGPT_TRAIN_SCRIPT
-    assert "val_data) - 1) // block" not in NANOGPT_TRAIN_SCRIPT  # old logic gone
-    assert "loss_sum / max(total, 1)" not in NANOGPT_TRAIN_SCRIPT  # no bogus 0.0
-    assert "averaged_train_and_eval(" in NANOGPT_TRAIN_SCRIPT
-    assert '"loss": val_loss' in NANOGPT_TRAIN_SCRIPT
+    source = _nanogpt_train_script()
+    assert source == TRAIN_GPT_PATH.read_text(encoding="utf-8")
+    ast.parse(source)
 
 
 def test_parse_token_shard_rejects_odd_body():
@@ -4651,7 +4648,7 @@ def test_self_score_train_script_renders_and_compiles():
     assert b"WORKDIR" in script
     assert b"/workspace" not in script
     assert b"buffering=1" in script
-    assert b"atexit.register(_stderr_fh.flush)" in script
+    assert b"atexit.register(stderr_fh.flush)" in script
     compile(script.decode("utf-8"), SELF_SCORE_TRAIN_FILENAME, "exec")
 
 
@@ -4819,6 +4816,26 @@ def test_backend_selection_builds_runtime_selected_dispatcher():
     trainer = ts._trainer
     assert isinstance(trainer, RuntimeSelectedTrainer)
     assert set(trainer._trainers_by_runtime_type) == {"docker", "modal"}
+
+
+def test_docker_real_trainer_construction_does_not_import_modal():
+    code = """
+import sys
+from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
+
+assert "pretrain_data_curator.modal_backend" not in sys.modules
+taskset = CuratorTaskset(CuratorTasksetConfig(id="test", use_real_trainer=True))
+taskset._build_real_trainer()
+assert "pretrain_data_curator.modal_backend" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_backend_default_is_heuristic_and_no_runtime_backend_selector():

@@ -4,7 +4,7 @@ Covers (1) the non-monotonicity of ``scheduled_presentation_tokens`` and the
 provably-sufficient bounded search ``steps_for_token_budget`` uses instead of
 a (unsound) binary search, via an exact counterexample plus brute-force
 property tests, and (2) exact stage-boundary parity between the accounting
-helper and the runtime scheduler (``student_optimizer.build_batch_schedule``),
+helper and the runtime scheduler (``train_gpt.build_batch_schedule``),
 which now share one canonical implementation.
 """
 
@@ -15,12 +15,12 @@ from collections.abc import Sequence
 
 import pytest
 
-from pretrain_data_curator.batch_schedule import (
+from pretrain_data_curator.train_gpt import (
     batch_stage_boundaries,
     scheduled_presentation_tokens,
     steps_for_token_budget,
 )
-from pretrain_data_curator.student_optimizer import build_batch_schedule
+from pretrain_data_curator.train_gpt import build_batch_schedule
 
 
 def _tokens(

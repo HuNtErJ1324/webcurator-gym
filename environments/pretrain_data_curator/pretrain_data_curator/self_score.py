@@ -1526,21 +1526,7 @@ def _student_train_payload(config: CuratorConfig) -> dict[str, object]:
 def render_self_score_train_script() -> bytes:
     """Return the workspace-local proxy-student trainer used by ``self_score.py``."""
     body = _nanogpt_train_script()
-    replacements = {
-        '_stderr_path = "/workspace/stderr.txt"': (
-            '_stderr_path = os.path.join(WORKDIR, "stderr.txt")'
-        ),
-        'open("/workspace/config.json")': 'open(os.path.join(WORKDIR, "config.json"))',
-        'open("/workspace/corpus.txt", encoding="utf-8")': (
-            'open(os.path.join(WORKDIR, "corpus.txt"), encoding="utf-8")'
-        ),
-        'val_path = "/workspace/val.bin"': 'val_path = os.path.join(WORKDIR, "val.bin")',
-        'pathlib.Path("/workspace/result.json").write_text(json.dumps(result))': (
-            'pathlib.Path(os.path.join(WORKDIR, "result.json")).write_text(json.dumps(result))'
-        ),
-    }
-    for old, new in replacements.items():
-        body = body.replace(old, new)
+    body = body.replace('TRAIN_WORKDIR = "/workspace"', "TRAIN_WORKDIR = WORKDIR")
     wrapper = (
         "#!/usr/bin/env python3\n"
         '"""Workspace-local proxy-student trainer for self_score.py."""\n'

@@ -52,7 +52,7 @@ rebuild.
 `proxy_student.train_token_budget` limits actual scheduled token presentations,
 not merely `steps × base_batch × block_size`. This matters because the
 NanoGPT-style batch schedule increases the effective batch during training. The
-shared `batch_schedule.py` helper computes the minimal number of optimizer steps
+the pure schedule helpers in `train_gpt.py` compute the minimal number of optimizer steps
 whose staged presentations meet the configured budget, and the runtime optimizer
 uses the same stage-boundary implementation as accounting.
 

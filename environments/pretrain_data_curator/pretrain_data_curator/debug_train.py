@@ -16,7 +16,7 @@ reproducible local debug loop:
    stale bundle is never silently reused.
 3. **Hand the corpus to the real trainer.** ``train_debug`` GPT-2-BPE tokenizes
    the bundle's ``corpus.txt`` and runs the project's *actual* proxy-student
-   recipe (``student_train.averaged_train_and_eval`` — byte-identical to the
+   recipe (``train_gpt.averaged_train_and_eval`` — identical to the
    sandbox script) on CPU with a small bounded budget, writing a clear result
    dir. The handoff is exact: the trainer sees the tokens of ``corpus.txt``.
 
@@ -54,8 +54,13 @@ import torch
 from .corpus import CorpusBuilder, CuratedCorpus
 from .models import Manifest, ProxyStudentConfig
 from .rollout_state import CuratorState
-from .student_model import GPT
-from .student_train import averaged_train_and_eval, encode_document_tokens
+from .train_gpt import (
+    GPT,
+    averaged_train_and_eval,
+    encode_document_tokens,
+    model_kwargs_from_config,
+    training_kwargs_from_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -544,61 +549,11 @@ def prepare_training_data(
     return train_data, val_data, document_ranges
 
 
-def _training_kwargs(config: ProxyStudentConfig, vocab_size: int) -> dict[str, Any]:
-    """Build the kwargs for the real training recipe, mirroring the sandbox call.
-
-    The recipe's ``train_and_eval_student`` names (``base_lr``/``beta1``/``beta2``/
-    ``eps``) map from the config's ``learning_rate``/``adam_beta1``/``adam_beta2``/
-    ``adam_eps`` — the same remap the embedded sandbox script performs, so this
-    debug path drives byte-identical training code with identical hyperparameters.
-    """
-    return {
-        "block_size": config.block_size,
-        "batch_size": config.batch_size,
-        "steps": config.effective_steps,
-        "vocab_size": vocab_size,
-        "training_recipe": config.training_recipe,
-        "base_lr": config.learning_rate,
-        "warmup_steps": config.effective_warmup_steps,
-        "weight_decay": config.weight_decay,
-        "grad_clip": config.grad_clip,
-        "beta1": config.adam_beta1,
-        "beta2": config.adam_beta2,
-        "eps": config.record_adam_eps,
-        "lr_min_ratio": config.lr_min_ratio,
-        "muon_lr": config.muon_lr,
-        "muon_weight_decay": config.muon_weight_decay,
-        "muon_momentum_min": config.muon_momentum_min,
-        "muon_momentum_max": config.muon_momentum_max,
-        "muon_warmup_steps": config.muon_warmup_steps,
-        "muon_cooldown_steps": config.muon_cooldown_steps,
-        "adam_lr": config.adam_lr,
-        "adam_eps": config.adam_eps,
-        "adam_weight_decay": config.adam_weight_decay,
-        "embed_lr_mul": config.embed_lr_mul,
-        "lm_head_lr_mul": config.lm_head_lr_mul,
-        "value_embed_lr_mul": config.value_embed_lr_mul,
-        "scalar_lr_mul": config.scalar_lr_mul,
-        "embed_wd_mul": config.embed_wd_mul,
-        "lm_head_wd_mul": config.lm_head_wd_mul,
-        "value_embed_wd_mul": config.value_embed_wd_mul,
-        "scalar_wd_mul": config.scalar_wd_mul,
-        "adam_on_odd_steps": config.adam_on_odd_steps,
-        "batch_schedule_enabled": config.batch_schedule_enabled,
-        "batch_stage_fracs": config.batch_stage_fracs,
-        "batch_stage_muls": config.batch_stage_muls,
-        "lr_stage_muls": config.lr_stage_muls,
-        "lr_cooldown_frac": config.lr_cooldown_frac,
-        "lr_cooldown_floor": config.lr_cooldown_floor,
-        # portable feature flags (all default-off)
-        "grad_accum_embed_head_steps": config.grad_accum_embed_head_steps,
-        "seq_len_schedule": config.seq_len_schedule,
-        "multi_token_pred": config.multi_token_pred,
-        "untie_at_frac": config.untie_at_frac,
-        "cautious_wd": config.cautious_wd,
-        "nor_muon": config.nor_muon,
-        "polar_express": config.polar_express,
-    }
+def _training_kwargs(
+    config: ProxyStudentConfig, vocab_size: int
+) -> dict[str, Any]:
+    """Use the same serialized-config remap as the sandbox training entrypoint."""
+    return training_kwargs_from_config(config.training_payload(), vocab_size)
 
 
 def train_debug(
@@ -637,29 +592,10 @@ def train_debug(
         max_document_tokens=config.max_document_tokens,
     )
     vocab_size = tiktoken.get_encoding(tokenizer).n_vocab
+    training_payload = config.training_payload(tokenizer=tokenizer)
 
     def build_model() -> GPT:
-        return GPT(
-            vocab_size=vocab_size,
-            num_layers=config.n_layer,
-            model_dim=config.n_embd,
-            num_heads=config.n_head,
-            mlp_ratio=config.mlp_ratio,
-            softcap=config.lm_head_softcap,
-            num_value_embeds=config.num_value_embeds,
-            attn_scale=config.attn_scale,
-            sliding_window_size=config.sliding_window_size,
-            bigram_hash_embed=config.bigram_hash_embed,
-            smear_embed=config.smear_embed,
-            partial_key_offset=config.partial_key_offset,
-            paired_head=config.paired_head,
-            mudd_pairs=config.mudd_pairs,
-            xsa_enabled=config.xsa_enabled,
-            xsa_pairs=config.xsa_pairs,
-            single_act_last_k=config.single_act_last_k,
-            exp_residual_decay=config.exp_residual_decay,
-            multi_token_pred=config.multi_token_pred,
-        ).to(device)
+        return GPT(**model_kwargs_from_config(training_payload, vocab_size)).to(device)
 
     kwargs = _training_kwargs(config, vocab_size)
     kwargs["document_ranges"] = document_ranges
