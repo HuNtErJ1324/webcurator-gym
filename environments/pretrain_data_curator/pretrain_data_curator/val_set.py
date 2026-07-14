@@ -41,6 +41,7 @@ from .hf_access import (
     hf_fetch_semaphore,
     run_blocking_with_retry,
 )
+from .train_gpt import plan_val_windows
 
 # --- NanoGPT speedrun validation-set spec (verified against modded-nanogpt) ---
 # Source dataset (GPT-2-BPE-tokenized FineWeb sample-10BT) and the val shard.
@@ -169,39 +170,6 @@ def parse_token_shard(
         tokens=tokens,
         n_tokens=n,
     )
-
-
-def plan_val_windows(n_tokens, block):
-    """Non-overlapping windows covering EVERY held-out next-token target.
-
-    Returns a list of ``(start, length)`` windows whose lengths sum to exactly the
-    number of predictable next-token targets (``n_tokens - 1``) -- including the
-    final partial window -- where window ``(start, length)`` scores the targets at
-    token indices ``start+1 .. start+length`` from an input of ``val[start:start+
-    length]``. Raises ``ValueError`` when there are no predictable positions, so an
-    empty or single-token val set can NEVER be silently scored as a perfect ``0.0``
-    cross-entropy (which would game the reward).
-
-    Kept deliberately annotation-free and dependency-free (builtins only): its
-    exact source is embedded into the GPU-only sandbox training script
-    (``trainer.py``), so the CPU unit tests of this function guard the real
-    validation loop that no test can otherwise reach.
-    """
-    block = int(block)
-    if block < 1:
-        raise ValueError(f"block must be >= 1, got {block}")
-    n_targets = int(n_tokens) - 1
-    if n_targets < 1:
-        raise ValueError(
-            f"held-out val set has no predictable positions (n_tokens={n_tokens})"
-        )
-    windows = []
-    start = 0
-    while start < n_targets:
-        length = min(block, n_targets - start)
-        windows.append((start, length))
-        start += length
-    return windows
 
 
 def mean_held_out_ce(n_tokens, block, window_loss_sum):

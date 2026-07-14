@@ -1,23 +1,14 @@
-"""CPU unit tests for the modern proxy-student model (``student_model.py``).
-
-These guard the single source of truth for the architecture: every component is
-exercised on CPU here, the GPT-2-small param count is pinned, and the verbatim
-model source is asserted to be embedded byte-identically in the sandbox training
-script in ``trainer.py`` (so the GPU run executes this exact code).
-"""
+"""CPU unit tests for the model in the single-file ``train_gpt.py`` trainer."""
 
 from __future__ import annotations
 
-import ast
-import inspect
 import math
 
 import pytest
 import torch
 import torch.nn as nn
 
-from pretrain_data_curator.student_model import (
-    _MODEL_COMPONENTS,
+from pretrain_data_curator.train_gpt import (
     _causal_attn_mask,
     _combine_attn_masks,
     _sliding_window_mask,
@@ -37,10 +28,8 @@ from pretrain_data_curator.student_model import (
     MUDD,
     XSA,
     MultiTokenHeads,
-    model_source,
 )
-from pretrain_data_curator.student_train import build_document_attn_mask
-from pretrain_data_curator.trainer import NANOGPT_TRAIN_SCRIPT
+from pretrain_data_curator.train_gpt import build_document_attn_mask
 
 
 def _randomize(model: torch.nn.Module) -> None:
@@ -728,30 +717,6 @@ def test_gpt_with_portable_features_default_off_matches_baseline():
         out_base = model_base(idx)
         out_feat = model_feat(idx)
     assert torch.allclose(out_base, out_feat, atol=1e-6)
-
-
-# --- single source of truth: verbatim model embedded in the sandbox script --
-
-
-def test_trainer_embeds_student_model_verbatim():
-    # The GPU-only training script must run the SAME model these CPU tests
-    # exercise: the exact model source appears byte-identically in the script
-    # (a refactor of the model can't silently diverge the sandbox copy).
-    ast.parse(NANOGPT_TRAIN_SCRIPT)  # assembled script is valid Python
-    src = model_source()
-    assert src in NANOGPT_TRAIN_SCRIPT
-    # Every model component (including Block and ValueEmbedding) is present
-    # verbatim — iterate the actual source-of-truth tuple so none is omitted.
-    for component in _MODEL_COMPONENTS:
-        assert inspect.getsource(component).rstrip() in NANOGPT_TRAIN_SCRIPT
-    # Modern components are wired; the old LayerNorm/MHA/GELU model is gone, and
-    # no GPU-only FlexAttention dependency leaked into the script.
-    assert "F.scaled_dot_product_attention" in NANOGPT_TRAIN_SCRIPT
-    assert "F.rms_norm" in NANOGPT_TRAIN_SCRIPT
-    assert "torch.tanh" in NANOGPT_TRAIN_SCRIPT
-    assert "nn.LayerNorm" not in NANOGPT_TRAIN_SCRIPT
-    assert "MultiheadAttention" not in NANOGPT_TRAIN_SCRIPT
-    assert "flex_attention" not in NANOGPT_TRAIN_SCRIPT
 
 
 def test_forward_hidden_and_apply_lm_head_match_forward():

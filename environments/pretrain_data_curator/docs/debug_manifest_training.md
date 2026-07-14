@@ -11,7 +11,7 @@ It reuses two pieces of the project's *real* code paths unchanged:
   filters/sampling. Local sources are read from disk through a tiny
   `LocalProcessRuntime` that emulates the `wc -c` / `head -c` shell contract the
   curation path expects, so no Docker/Modal sandbox (and no GPU) is needed.
-- **Training** — `student_train.averaged_train_and_eval` (the modded-nanogpt
+- **Training** — `train_gpt.averaged_train_and_eval` (the modded-nanogpt
   speedrun recipe, byte-identical to the GPU sandbox script) trains the fixed
   GPT-2-scale proxy-student on the bundle's `corpus.txt` on CPU with a small
   bounded budget.
@@ -23,7 +23,7 @@ pods, Hub benchmarks, or any external state.
 
 | Dependency | Why | Check |
 | --- | --- | --- |
-| Python ≥ 3.11, `torch` | CPU training recipe (`student_train`) | `python -c "import torch"` |
+| Python ≥ 3.11, `torch` | CPU training recipe (`train_gpt`) | `python -c "import torch"` |
 | `tiktoken` | GPT-2-BPE tokenization of `corpus.txt` | `python -c "import tiktoken"` |
 | `huggingface_hub` / `hf` | **Not required** — the debug workflow is local-only and rejects any `kind: "hf"` source. | n/a |
 | `decon` | **Not used** — leakage screening is out of scope for this debug path. | n/a |

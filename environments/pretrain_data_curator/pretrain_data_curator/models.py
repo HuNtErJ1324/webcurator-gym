@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_serializer, model_validator
 
-from .batch_schedule import scheduled_presentation_tokens, steps_for_token_budget
+from .train_gpt import scheduled_presentation_tokens, steps_for_token_budget
 from .val_set import ValidationSetConfig
 
 MANIFEST_FILENAME = "manifest.json"
@@ -55,7 +55,7 @@ _RESERVED_WORKSPACE_FILES = frozenset(
 # all derive from ``train_token_budget`` so a single token knob scales the whole
 # run from a cheap default up to an H100/H200-scale few-hundred-million-token run.
 # When set, steps are chosen so *scheduled* presentations under ``batch_stage_muls``
-# meet the budget (not base-batch alone); see ``batch_schedule.py``.
+# meet the budget (not base-batch alone); see ``train_gpt.py``.
 _MAX_TRAIN_TOKEN_BUDGET = 1_000_000_000  # generous H100/H200 upper bound
 _CHARS_PER_TOKEN = 4  # matches hf_access.estimate_tokens (chars // 4)
 _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
@@ -153,7 +153,7 @@ class ProxyStudentConfig(BaseModel):
     sandbox training job.
     """
 
-    # Defaults mirror ``student_model.GPT2_SMALL`` (modded-nanogpt / speedrun record_01
+    # Defaults mirror ``train_gpt.GPT2_SMALL`` (modded-nanogpt / speedrun record_01
     # architecture): 12 layers, 768-wide, 6 heads, ~278M instantiated params.
     n_layer: int = Field(default=12, ge=2, le=64)
     n_head: int = Field(default=6, ge=1, le=64)
@@ -161,7 +161,7 @@ class ProxyStudentConfig(BaseModel):
     # Modern (modded-nanogpt) student knobs: ReLU**2 MLP width ratio, the tanh
     # logit-softcap constant, and the number of distinct sparse value-embedding
     # tables (SparsifyEmbeds; clamped to n_layer//2 by the model). The model itself
-    # lives in ``student_model.py``.
+    # lives in ``train_gpt.py``.
     mlp_ratio: int = Field(default=4, ge=1, le=16)
     lm_head_softcap: float = Field(default=30.0, gt=0.0, le=1000.0)
     num_value_embeds: int = Field(default=3, ge=1, le=32)
@@ -192,7 +192,7 @@ class ProxyStudentConfig(BaseModel):
     # training length becomes the minimal ``effective_steps`` whose *scheduled*
     # token presentations (base batch × ``batch_stage_muls`` over stage fracs)
     # meet the budget — not ``ceil(budget / (batch*block))``. See
-    # ``batch_schedule.steps_for_token_budget`` for the single-step overshoot
+    # ``train_gpt.steps_for_token_budget`` for the single-step overshoot
     # boundary rule. ``train_microbatch_size`` does not affect this (memory-only).
     # ``None`` (default) keeps the historical ``steps``-driven behavior exactly —
     # so default/CPU/heuristic runs stay cheap and unchanged.
@@ -342,7 +342,7 @@ class ProxyStudentConfig(BaseModel):
         """Training steps actually run.
 
         With ``train_token_budget`` set: minimal N whose staged presentations
-        meet the budget (see ``batch_schedule.steps_for_token_budget``).
+        meet the budget (see ``train_gpt.steps_for_token_budget``).
         Otherwise: the explicit ``steps`` field (unchanged historical path).
         """
         if self.train_token_budget is None:
@@ -539,7 +539,7 @@ class ProxyStudentConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_student_dims(self) -> "ProxyStudentConfig":
-        # The modern student (student_model.GPT) requires: n_embd divisible by
+        # The modern student (train_gpt.GPT) requires: n_embd divisible by
         # n_head, a head_dim that is a multiple of 4 (half-truncate RoPE), and an
         # even depth >= 2 (symmetric U-net encoder/decoder skips). Reject anything
         # unbuildable here so it fails fast instead of inside the GPU sandbox.
