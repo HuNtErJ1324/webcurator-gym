@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -495,9 +496,65 @@ def test_prompt_stays_within_its_length_contract():
 
 # --- detached A100 status propagation ---------------------------------------
 
+# The wrapper runs the result gate with the pod's project Python and refuses any
+# interpreter that is not 3.12 (the pod provisions `uv venv -p 3.12`). This project
+# supports 3.11 too, so the test session's own interpreter cannot stand in for the
+# pod's -- it would be rejected at the preflight and no wrapper test would ever
+# reach semantic validation.
+#
+# The fixture therefore provisions a shim interpreter that models the pod's 3.12
+# exactly where it matters and nowhere else: it answers the wrapper's *exact*
+# version probe with a 3.12 version, and delegates every other invocation --
+# notably running result_gate.py -- transparently to the real test interpreter.
+# Nothing depends on which interpreters happen to be installed on the machine.
+#
+# Kept byte-identical to the probe in scripts/run_400m_eval_a100.sh; the pairing is
+# pinned by test_project_python_shim_answers_the_wrappers_exact_probe.
+_VERSION_PROBE_CODE = (
+    'import sys, tomllib; print(".".join(map(str, sys.version_info[:3])))'
+)
+
+
+def _python_calls(tmp_path: Path) -> Path:
+    """Every invocation the wrapper makes of the provisioned project Python."""
+    return tmp_path / "project-python-calls.txt"
+
+
+def _write_project_python_shim(
+    python: Path, *, version: str, calls: Path, delegate: str | None
+) -> None:
+    """Write a project-Python shim that spoofs *only* the wrapper's version probe.
+
+    ``delegate`` is the real interpreter every other invocation is handed to; when
+    it is None (the rejected-interpreter case), any second invocation fails loudly,
+    so a run that slipped past the preflight is visible as a recorded gate call.
+    """
+    if delegate is None:
+        fallthrough = (
+            'echo "rejected project Python was asked to run: $*" >&2\nexit 1\n'
+        )
+    else:
+        fallthrough = f'exec {shlex.quote(delegate)} "$@"\n'
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n"
+        f'if [[ $# -eq 2 && "$1" == "-c" && "$2" == {shlex.quote(_VERSION_PROBE_CODE)} ]]; then\n'
+        f"  printf '%s\\n' {shlex.quote(version)}\n"
+        "  exit 0\n"
+        "fi\n" + fallthrough,
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
 
 def _eval_wrapper_repo(
-    tmp_path: Path, row: dict | None, *, uv_exit: int = 0, log_results=True
+    tmp_path: Path,
+    row: dict | None,
+    *,
+    uv_exit: int = 0,
+    log_results=True,
+    python_version: str = "3.12.13",
+    delegate: bool = True,
 ):
     """Temp repo + fake `uv` so the real eval.sh wrapper can run end to end.
 
@@ -527,7 +584,12 @@ def _eval_wrapper_repo(
     )
     project_bin = repo / ".venv" / "bin"
     project_bin.mkdir(parents=True)
-    (project_bin / "python").symlink_to(sys.executable)
+    _write_project_python_shim(
+        project_bin / "python",
+        version=python_version,
+        calls=_python_calls(tmp_path),
+        delegate=sys.executable if delegate else None,
+    )
     (repo / "secrets.env").write_text("HF_TOKEN=dummy\nPRIME_API_KEY=dummy\n")
     if row is not None:
         (run_dir / "results.jsonl").write_text(json.dumps(row) + "\n")
@@ -590,10 +652,66 @@ _HEALTHY_ROW = {
 }
 
 
+def test_project_python_shim_spoofs_only_the_wrappers_exact_probe(tmp_path: Path):
+    """The shim models 3.12 for one exact command and is transparent otherwise.
+
+    Pins the shim to the probe production actually runs: if the wrapper's probe
+    changes, the shim stops matching it (and delegates, reporting the session's
+    real 3.11) rather than silently spoofing a command production no longer uses.
+    """
+    script = EVAL_SCRIPT.read_text(encoding="utf-8")
+    assert f"\"$PROJECT_PYTHON\" -c '{_VERSION_PROBE_CODE}'" in script
+
+    shim = tmp_path / "python"
+    _write_project_python_shim(
+        shim,
+        version="3.12.13",
+        calls=_python_calls(tmp_path),
+        delegate=sys.executable,
+    )
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(shim), *args], capture_output=True, text=True, timeout=60
+        )
+
+    assert run("-c", _VERSION_PROBE_CODE).stdout.strip() == "3.12.13"
+    # Any other invocation is the real interpreter, unspoofed: same code with an
+    # extra argument, a different snippet, and real script execution all pass
+    # straight through.
+    assert run("-c", _VERSION_PROBE_CODE, "extra").stdout.strip() == (
+        ".".join(map(str, sys.version_info[:3]))
+    )
+    assert run("-c", "print('delegated')").stdout.strip() == "delegated"
+    assert run("-c", "import sys; print(sys.executable)").stdout.strip() == (
+        sys.executable
+    )
+
+
 def test_status_is_exit_zero_only_for_a_finalized_successful_rollout(tmp_path: Path):
     status, log = _run_eval_wrapper(tmp_path, _HEALTHY_ROW)
     assert status == "EXIT=0", log
     assert "valid_rows=1 mode=production" in log
+    # Non-vacuous: the shim answered the version probe, then handed the *real*
+    # interpreter the result gate, which is what produced that verdict.
+    recorded = _python_calls(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert len(recorded) == 2, recorded
+    assert recorded[0] == f"-c {_VERSION_PROBE_CODE}"
+    assert "pretrain_data_curator/result_gate.py" in recorded[1]
+    assert "results.jsonl" in recorded[1]
+
+
+def test_non_3_12_project_python_fails_before_semantic_validation(tmp_path: Path):
+    """A provisioned interpreter that is not 3.12 never reaches the result gate."""
+    status, log = _run_eval_wrapper(
+        tmp_path, _HEALTHY_ROW, python_version="3.11.14", delegate=False
+    )
+    assert status == "SEMANTIC_INVALID=65", log
+    assert "provisioned project Python must be 3.12 (got 3.11.14" in log
+    # ... and it stopped there: the gate never ran, so nothing was validated.
+    assert "valid_rows=" not in log
+    recorded = _python_calls(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert recorded == [f"-c {_VERSION_PROBE_CODE}"], recorded
 
 
 @pytest.mark.parametrize("mode", ["missing", "not_executable"])
@@ -663,6 +781,10 @@ def test_failed_rollout_never_reports_exit_zero(tmp_path: Path, row, expected):
     status, log = _run_eval_wrapper(tmp_path, row)
     assert status == "SEMANTIC_INVALID=65", log
     assert expected in log
+    # the verdict came from the real result gate, not from the interpreter preflight
+    recorded = _python_calls(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert len(recorded) == 2, recorded
+    assert "pretrain_data_curator/result_gate.py" in recorded[1]
 
 
 def test_finalized_rollout_with_genuine_zero_reward_exits_zero(tmp_path: Path):
@@ -672,6 +794,8 @@ def test_finalized_rollout_with_genuine_zero_reward_exits_zero(tmp_path: Path):
     )
     assert status == "EXIT=0", log
     assert "valid_rows=1 mode=production" in log
+    recorded = _python_calls(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert "pretrain_data_curator/result_gate.py" in recorded[1], recorded
 
 
 def test_validation_uses_this_runs_logged_dir_not_a_repo_scan(tmp_path: Path):
