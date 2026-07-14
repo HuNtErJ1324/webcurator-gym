@@ -6,11 +6,7 @@ import verifiers.v1 as vf
 
 from .models import MANIFEST_FILENAME
 
-_GOALS = [
-    "curate the strongest general-purpose pretraining mixture for the fixed student.",
-]
-
-TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to {goal}
+TASK_PROMPT = """We want to train a fixed small language model on the strongest possible pretraining mixture. You are the data-curation agent, and your goal is to curate the strongest general-purpose pretraining mixture for the fixed student.
 
 ## Objective
 Research and iterate autonomously while maintaining the authoritative manifest JSON for the mixture. You have complete freedom in source choice, weights, filters, local processing, and use of the shell, internet, Hugging Face `hf` CLI, and other harness tools.
@@ -21,7 +17,7 @@ Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md`. E
 - Sole curation budget: {token_budget} tokens.
 - Data cutoff: on or before {cutoff_date}. Local sources are {local_source_status}.
 - Scoring: `{alpha_perf} * performance - {lambda_leakage} * leakage` on the fixed student.
-- Performance: normalized loss progress is squared in the performance term (default exponent 2.0), so equal loss improvements earn more reward later than earlier; negative progress stays linear. Target loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
+- Performance: normalized loss progress is squared in the performance term, so equal loss improvements earn more reward later than earlier; negative progress stays linear. Target loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
 
 ## Research
 Explore broadly before locking a mixture: search the web, read papers/writeups, and study modern pretraining practice — no prescribed recipe. Use the installed `hf papers` CLI to discover or access papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
@@ -90,7 +86,7 @@ def build_tasks(
     lambda_leakage: float = 1.0,
     perf_target_loss: float = 3.28,
 ) -> list[CuratorTask]:
-    """Build one curation task with the single goal substituted into the prompt."""
+    """Build one curation task with the prompt parameters substituted."""
     local_source_status = (
         "enabled for workspace-relative plain-text or JSONL files"
         if allow_local_sources
@@ -98,9 +94,8 @@ def build_tasks(
     )
     return [
         CuratorTask(
-            idx=i,
+            idx=0,
             prompt=TASK_PROMPT.format(
-                goal=goal,
                 cutoff_date=cutoff_date,
                 token_budget=token_budget,
                 manifest_path=f"/workspace/{manifest_filename}",
@@ -114,5 +109,4 @@ def build_tasks(
             token_budget=token_budget,
             cutoff_date=cutoff_date,
         )
-        for i, goal in enumerate(_GOALS)
     ]
