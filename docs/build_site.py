@@ -8,8 +8,11 @@ from pathlib import Path
 
 from site_builder.render import build_site
 
-FULL_400M_OUTPUTS = Path(__file__).resolve().parent.parent / "outputs" / "evals-400m"
-DEBUG_OUTPUTS = Path(__file__).resolve().parent.parent / "outputs" / "debug"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ENV_DIR = REPO_ROOT / "environments" / "pretrain_data_curator"
+
+FULL_400M_OUTPUTS = ENV_DIR / "outputs" / "evals-400m"
+DEBUG_OUTPUTS = ENV_DIR / "outputs" / "debug"
 
 
 def main() -> None:
@@ -18,18 +21,24 @@ def main() -> None:
         "--outputs",
         type=Path,
         default=FULL_400M_OUTPUTS,
-        help="Directory containing full 400M eval artifacts (default: outputs/evals-400m)",
+        help=(
+            "Directory containing full 400M eval artifacts "
+            "(default: environments/pretrain_data_curator/outputs/evals-400m)"
+        ),
     )
     parser.add_argument(
         "--debug-dir",
         type=Path,
         default=DEBUG_OUTPUTS,
-        help="Directory containing curation debug snapshots (default: outputs/debug)",
+        help=(
+            "Directory containing curation debug snapshots "
+            "(default: environments/pretrain_data_curator/outputs/debug)"
+        ),
     )
     parser.add_argument(
         "--no-debug",
         action="store_true",
-        help="Exclude outputs/debug snapshots from the site",
+        help="Exclude the debug snapshots directory from the site",
     )
     parser.add_argument(
         "--site-dir",

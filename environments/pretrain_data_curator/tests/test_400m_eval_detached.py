@@ -91,11 +91,23 @@ def _make_temp_repo(tmp_path: Path) -> Path:
     )
     package_dst.mkdir(parents=True)
     shutil.copy(package_src, package_dst / package_src.name)
-    docs = repo / "environments" / "pretrain_data_curator" / "docs"
+    docs = repo / "docs"
     docs.mkdir(parents=True)
     (docs / "build_site.py").write_text(
         "import os, pathlib\n"
         "pathlib.Path(os.environ['WCG_RECORD_DIR'], 'site_rebuilt.log').write_text('yes\\n')\n"
+    )
+    site_data = docs / "site" / "data"
+    site_data.mkdir(parents=True)
+    (site_data / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_count": 1,
+                "runs": [
+                    {"model": "z-ai/glm-5.2", "reward": 0.42},
+                ],
+            }
+        )
     )
     (repo / "secrets.env").write_text("HF_TOKEN=dummy\nPRIME_API_KEY=dummy\n")
     return repo
@@ -806,4 +818,44 @@ def test_invalid_download_preserves_artifacts_skips_site_and_cleans_pod(
     assert json.loads((local_dir / "results.jsonl").read_text()) == invalid
     assert (local_dir / "downloaded-artifact.txt").read_text() == "preserve me\n"
     assert not (record / "site_rebuilt.log").exists()
+    assert (record / "terminated.log").exists()
+
+
+def test_valid_download_rebuilds_site_via_repo_root_builder(tmp_path: Path):
+    """A results row that PASSES semantic validation must reach the site rebuild,
+    exercising the fake builder at the new repo-root docs/ location (proving the
+    launcher's "$ROOT/docs/build_site.py" resolves correctly end-to-end)."""
+    repo = _make_temp_repo(tmp_path)
+    valid = {
+        "is_completed": True,
+        "stop_condition": "agent_completed",
+        "errors": [],
+        "rewards": {"reward": 0.42},
+        "metrics": {
+            "finalized": 1.0,
+            "manifest_missing": 0.0,
+            "manifest_invalid": 0.0,
+            "corpus_tokens": 400000000.0,
+            "num_sources": 3.0,
+            "train_flops": 1.2e18,
+            "perf_loss": 3.1,
+            "trainer_error_msg": 0.0,
+        },
+    }
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        skip_site=False,
+        modes={
+            "WCG_EVAL_TIMEOUT_SECONDS": 30,
+            "WCG_EVAL_POLL_INTERVAL": 1,
+            "WCG_EVAL_MON_RETRIES": 2,
+            "WCG_EVAL_MON_BACKOFF": 1,
+            "WCG_DONE_AFTER_PROBES": 1,
+            "WCG_RESULTS_JSON": json.dumps(valid),
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    # validation passed AND the repo-root builder was actually invoked
+    assert (record / "site_rebuilt.log").read_text().strip() == "yes"
     assert (record / "terminated.log").exists()

@@ -930,11 +930,11 @@ validate_downloaded_results() {
 
 rebuild_site() {
   log "Rebuilding docs bench site (include smoke outputs/evals)"
-  python3 "$ENV_DIR/docs/build_site.py" \
+  python3 "$ROOT/docs/build_site.py" \
     --outputs "$ENV_DIR/outputs/evals" \
     --include-all \
     --no-debug
-  python3 - <<'PY' "$ENV_DIR/docs/site/data/manifest.json"
+  python3 - <<'PY' "$ROOT/docs/site/data/manifest.json"
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -1040,7 +1040,7 @@ summarize_results
 
 if [[ "$SKIP_SITE" -eq 0 ]]; then
   rebuild_site
-  log "Site: file://$ENV_DIR/docs/site/index.html"
+  log "Site: file://$ROOT/docs/site/index.html"
 else
   log "Skipping docs/site rebuild (--skip-site)"
 fi

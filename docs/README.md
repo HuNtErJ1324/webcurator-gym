@@ -4,24 +4,28 @@ PostTrainBench-style static site for **full 400M-token** curation evaluations.
 
 ## Layout
 
-Full 400M eval artifacts live under:
+This site lives at the repository root (`docs/`); the eval artifacts it reads
+live in the environment package. Full 400M eval artifacts live under:
 
 ```text
-outputs/evals-400m/<run-name>/
+environments/pretrain_data_curator/outputs/evals-400m/<run-name>/
   config.toml
   results.jsonl
 ```
 
-Smoke tests and smaller budgets stay in `outputs/evals/`.
+Smoke tests and smaller budgets stay in
+`environments/pretrain_data_curator/outputs/evals/`.
 
 ## Build
 
 ```bash
-cd environments/pretrain_data_curator
+cd <repo-root>
 python docs/build_site.py
 ```
 
-By default the builder scans `outputs/evals-400m/` and keeps only runs with:
+By default the builder scans
+`environments/pretrain_data_curator/outputs/evals-400m/` and keeps only runs
+with:
 
 - `token_budget = 400_000_000`
 - `use_real_trainer = true`
@@ -62,8 +66,10 @@ The previous base-batch calculation used 24,415 steps and presented about 800M
 tokens despite reporting a 400M budget. `train_microbatch_size` remains a
 memory-only control and does not change budget accounting.
 
-Debug curation snapshots under `outputs/debug/<run-name>/` are included automatically.
-Rebuild with `python docs/build_site.py` (omit them with `--no-debug`).
+Debug curation snapshots under
+`environments/pretrain_data_curator/outputs/debug/<run-name>/` are included
+automatically. Rebuild with `python docs/build_site.py` (omit them with
+`--no-debug`).
 
 ## Trace rendering
 
@@ -75,7 +81,9 @@ Traces are rendered with:
 
 ## Regenerate after new evals
 
-Save new full 400M runs under `outputs/evals-400m/<descriptive-name>/`, then:
+Save new full 400M runs under
+`environments/pretrain_data_curator/outputs/evals-400m/<descriptive-name>/`,
+then, from the repository root:
 
 ```bash
 python docs/build_site.py
