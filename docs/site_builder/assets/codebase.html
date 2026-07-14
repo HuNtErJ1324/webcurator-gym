@@ -188,8 +188,8 @@ environments/pretrain_data_curator/
       <h3>Proxy-student training</h3>
       <p>
         Training budgets are measured in actual token presentations across the staged batch schedule.
-        <code>batch_schedule.py</code> finds the minimal optimizer-step count whose scheduled batches meet
-        <code>train_token_budget</code>, and <code>student_optimizer.py</code> uses the same boundary helper at
+        <code>train_gpt.py</code> finds the minimal optimizer-step count whose scheduled batches meet
+        <code>train_token_budget</code>, and the merged optimizer recipe uses the same boundary helper at
         runtime. For the standard 400M profile (batch 16, block 1024, equal <code>1×/2×/3×</code> stages),
         this yields 12,208 steps. The older base-batch-only calculation used 24,415 steps and presented
         roughly 800M tokens. Microbatch size remains a memory control and does not affect this accounting.

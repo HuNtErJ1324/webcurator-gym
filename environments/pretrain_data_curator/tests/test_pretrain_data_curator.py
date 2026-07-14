@@ -2947,6 +2947,16 @@ def test_parse_token_shard_rejects_malformed(shard, kind_match):
     assert kind_match in str(excinfo.value)
 
 
+def test_parse_token_shard_rejects_odd_body():
+    # A corrupt shard with a dangling odd body byte must raise a typed
+    # DatasetAccessError(bad_field), not a bare NumPy ValueError.
+    shard = _make_shard([], declared=3) + b"\x01\x02\x03"  # 3 body bytes (odd)
+    with pytest.raises(DatasetAccessError) as excinfo:
+        parse_token_shard(shard, limit=4)
+    assert excinfo.value.kind == "bad_field"
+    assert "not a multiple of" in str(excinfo.value)
+
+
 def _shard_download_fn(tmp_path, token_ids, counter=None):
     """A ValTokenLoader download_fn that writes a synthetic shard to disk."""
     path = tmp_path / "fineweb_val_000000.bin"
@@ -5292,6 +5302,37 @@ def test_gamma_default_is_two():
     assert cfg.perf_scaling_exponent == 2.0
     tscfg = CuratorTasksetConfig(id="test")
     assert tscfg.perf_scaling_exponent == 2.0
+
+
+def test_gamma_anchors_are_invariant():
+    """p=0 → 0.0 and p=1 → 1.0 for any valid gamma (indep of exponent)."""
+    for gamma in [1.0, 2.0, 3.0, 0.5]:
+        cfg = CuratorConfig(
+            perf_scaling_exponent=gamma, perf_baseline_loss=10.0, perf_target_loss=2.0
+        )
+        scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+        # at target: loss=2.0 → p=(10-2)/(10-2)=1.0
+        at_target = TrainResult(
+            loss=2.0, accuracy=0.4, flops=0.0, tokens_trained=0, backend="x"
+        )
+        assert scorer._perf(at_target) == pytest.approx(1.0)
+        # at baseline: loss=10.0 → p=0.0
+        at_baseline = TrainResult(
+            loss=10.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+        )
+        assert scorer._perf(at_baseline) == pytest.approx(0.0)
+
+
+def test_gamma_sentinel_still_zero():
+    """Nonfinite loss → 0.0 regardless of gamma."""
+    cfg = CuratorConfig(
+        perf_scaling_exponent=2.0, perf_baseline_loss=10.0, perf_target_loss=2.0
+    )
+    scorer = _scorer(HeuristicProxyTrainer(), config=cfg)
+    sentinel = TrainResult(
+        loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
+    )
+    assert scorer._perf(sentinel) == 0.0
 
 
 def test_prompt_documents_default_squared_performance_curve():

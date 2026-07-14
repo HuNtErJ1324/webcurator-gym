@@ -117,6 +117,17 @@ def test_rmsnorm_normalizes_to_unit_rms():
     assert torch.allclose(rms, torch.ones(5), atol=1e-3)
 
 
+def test_rotary_shape_and_rotation():
+    rot = Rotary(8)
+    x = torch.randn(2, 4, 3, 8)  # (B, T, H, D)
+    y = rot(x)
+    assert y.shape == x.shape
+    # theta=0 at position 0 -> RoPE is the identity there...
+    assert torch.allclose(y[:, 0], x[:, 0], atol=1e-5)
+    # ...but later positions are rotated (non-trivial change).
+    assert not torch.allclose(y[:, 1], x[:, 1], atol=1e-3)
+
+
 def test_rotary_requires_head_dim_multiple_of_four():
     with pytest.raises(ValueError, match="divisible by 4"):
         Rotary(6)
@@ -226,6 +237,28 @@ def test_value_embedding_residual_path_is_used():
     assert model.post_lambdas.shape == (6, 2)
     assert model.resid_lambdas_attn.shape == (6,)
     assert model.x0_lambdas.shape == (6,)
+
+
+def test_sparse_value_layers_get_no_residual():
+    # On a layer whose value embedding is None, attention must use only lambdas[0]*v
+    # (no value-residual term); so a fresh model's middle layers carry no value
+    # contribution. We verify the None branch runs and yields finite output for a
+    # config with genuine None layers (L=8, k=2 -> layers 2..5 are None).
+    model = GPT(64, num_layers=8, model_dim=32, num_heads=2, num_value_embeds=2).eval()
+    ve = model.value_embeds(torch.randint(0, 64, (1, 5)))
+    assert [t is None for t in ve] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+    _randomize(model)
+    out = model(torch.randint(0, 64, (1, 6)))
+    assert torch.isfinite(out).all()
 
 
 def test_gpt_rejects_odd_or_too_few_layers():

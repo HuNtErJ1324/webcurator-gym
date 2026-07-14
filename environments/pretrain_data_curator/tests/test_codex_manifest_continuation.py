@@ -417,6 +417,22 @@ async def test_manifest_is_present_maps_read_failure_to_absent():
     assert await manifest_is_present(present, MANIFEST) is True
 
 
+def test_build_continuation_argv_swaps_only_the_prompt():
+    base = ["/tmp/vf-codex/bin/codex", "exec", "-m", "gpt", "-c", "k=v", "do the task"]
+    argv = build_continuation_argv(base, "nudge")
+    assert argv == [
+        "/tmp/vf-codex/bin/codex",
+        "exec",
+        "-m",
+        "gpt",
+        "-c",
+        "k=v",
+        "resume",
+        "--last",
+        "nudge",
+    ]
+
+
 def test_build_continuation_argv_without_resume_is_context_free():
     base = ["codex", "exec", "-m", "gpt", "do the task"]
     assert build_continuation_argv(base, "nudge", resume=False) == [

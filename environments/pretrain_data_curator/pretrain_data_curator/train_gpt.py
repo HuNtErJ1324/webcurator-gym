@@ -708,7 +708,15 @@ else:
 
 
     class GPT(nn.Module):
-        """Decoder-only transformer with U-net skips, sparse value embeddings, and speedrun lambdas."""
+        """Proxy-student transformer read verbatim by ``trainer.py`` for the GPU sandbox.
+
+        ``train_gpt.py`` is the written source of truth: ``trainer.py`` loads this
+        file's text (``NANOGPT_TRAIN_SCRIPT``) and copies it into the Docker/Modal
+        workspace, so this class is the model actually instantiated and trained
+        there. Architecture: decoder-only with U-net skips, sparse value
+        embeddings, multi-token prediction heads, and opt-in portable features
+        (bigram-hash / paired-head / MUDD / XSA).
+        """
 
         def __init__(
             self,
