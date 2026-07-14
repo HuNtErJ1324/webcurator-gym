@@ -51,38 +51,3 @@ def _wire_output_text(output: Any) -> str:
                 parts.append(str(part))
         return "".join(parts)
     return str(output)
-
-
-def truncate_wire_tool_outputs(body: dict[str, Any], cap: int) -> dict[str, Any]:
-    """Cap agent-visible tool results on a Chat/Responses interception body.
-
-    Codex posts Responses ``function_call_output`` items; chat harnesses post
-    ``role=tool`` messages. Mutates ``body`` in place and returns it. ``cap <= 0``
-    is a no-op.
-    """
-    if cap is None or cap <= 0 or not isinstance(body, dict):
-        return body
-
-    raw_input = body.get("input")
-    if isinstance(raw_input, list):
-        for item in raw_input:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "function_call_output":
-                continue
-            text = _wire_output_text(item.get("output"))
-            capped, _ = truncate_tool_output(text, cap)
-            item["output"] = capped
-
-    messages = body.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            if message.get("role") != "tool":
-                continue
-            text = _wire_output_text(message.get("content"))
-            capped, _ = truncate_tool_output(text, cap)
-            message["content"] = capped
-
-    return body

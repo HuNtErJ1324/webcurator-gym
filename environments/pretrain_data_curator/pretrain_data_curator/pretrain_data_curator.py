@@ -10,9 +10,8 @@ from typing import Any
 import verifiers.v1 as vf
 import verifiers.v1.harnesses as vf_harnesses
 
-from .leakage import DEFAULT_DECON_BINARY
-from .truncating_environment import Environment
 from .codex_harness import DEFAULT_MAX_CONTINUATIONS
+from .leakage import DEFAULT_DECON_BINARY
 from .models import MANIFEST_FILENAME, ProxyStudentConfig
 from .runtime_config import derive_env_harness_runtime
 from .taskset import CuratorTasksetConfig
@@ -20,7 +19,27 @@ from .tasks import TASK_PROMPT
 
 TASKSET_ID = "pretrain-data-curator"
 
-__all__ = ["TASK_PROMPT", "load_environment"]
+
+class Environment(vf.Environment):
+    """Native verifiers v1 environment that also exposes the loader's ``env_args``.
+
+    The v0/hosted compatibility façade (and its tool-output capping wrapper) is
+    gone; the native v1 runners build the stock ``vf.Environment`` from the
+    taskset id directly. This subclass exists only so ``load_environment`` callers
+    (and their tests) can still read back the kwargs it was built with.
+    """
+
+    def __init__(
+        self,
+        config: vf.EnvConfig,
+        *,
+        env_args: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(config)
+        self.env_args: dict[str, object] = dict(env_args or {})
+
+
+__all__ = ["TASK_PROMPT", "load_environment", "Environment"]
 
 
 def load_environment(
@@ -137,7 +156,6 @@ def load_environment(
         "decon_evals_dir": decon_evals_dir,
         "decon_threshold": decon_threshold,
         "screen_val_set": screen_val_set,
-        "max_tool_output_chars": max_tool_output_chars,
         "codex_max_continuations": codex_max_continuations,
     }
     harness_env: dict[str, str] = {
@@ -206,14 +224,11 @@ def load_environment(
             ),
             timeout=timeout,
         ),
-        max_tool_output_chars=max_tool_output_chars,
         env_args=env_args,
     )
-    # Cap agent-visible tool results:
-    # - bash: patch the uv program so run_bash/tool appends are capped in-runtime
-    # - codex: TruncatingClient on Environment.episode caps Responses
-    #   function_call_output items at the interception→provider boundary
-    # Lazy imports keep package import safe when a stub Verifiers install is present.
+    # bash harness caps agent-visible tool results in-runtime by patching the uv
+    # program (MAX_TOOL_OUTPUT_CHARS flows in via harness_env above); the codex
+    # harness relies on the external runner for any wire-level capping.
     if harness_id == "bash":
         from .bash_harness import wrap_bash_harness
 
