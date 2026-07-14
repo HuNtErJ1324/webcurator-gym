@@ -2755,7 +2755,7 @@ def test_task_prompt_contract():
     prompt = task.prompt
 
     assert task.system_prompt is None
-    assert len(prompt) <= 5_850
+    assert len(prompt) <= 6_000
     assert "complete freedom" in prompt
     assert '"token_budget": 1000000' in prompt
     assert '"sources"' in prompt
@@ -2852,7 +2852,7 @@ def test_task_prompt_recurring_finalization_contract():
     assert "mixture-weighting heuristics" in prompt
     assert "installed `hf papers` CLI" in prompt
 
-    assert len(prompt) <= 5_850
+    assert len(prompt) <= 6_000
 
 
 def test_discovery_has_no_call_or_output_stop():
@@ -5577,6 +5577,44 @@ def test_gamma_default_is_two():
     assert cfg.perf_scaling_exponent == 2.0
     tscfg = CuratorTasksetConfig(id="test")
     assert tscfg.perf_scaling_exponent == 2.0
+
+
+def test_prompt_documents_default_squared_performance_curve():
+    """Rendered Setup must match the live default squared/linear reward contract."""
+    cfg = CuratorConfig()
+    assert cfg.perf_scaling_exponent == 2.0
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    setup = prompt[prompt.index("## Setup") : prompt.index("## Research")]
+    assert "normalized loss progress is squared in the performance term" in setup
+    assert f"default exponent {cfg.perf_scaling_exponent:g}" in setup
+    assert "equal loss improvements earn more reward later than earlier" in setup
+    assert "negative progress stays linear" in setup
+
+    # Equal normalized-progress steps: later step earns more under γ=2.
+    scorer = _scorer(
+        HeuristicProxyTrainer(),
+        config=CuratorConfig(
+            perf_scaling_exponent=cfg.perf_scaling_exponent,
+            perf_baseline_loss=10.0,
+            perf_target_loss=2.0,
+        ),
+    )
+    early = TrainResult(
+        loss=8.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+    )
+    mid = TrainResult(loss=6.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    late = TrainResult(loss=4.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
+    # p: 0.25 → 0.50 → 0.75; squared: 0.0625 → 0.25 → 0.5625
+    assert scorer._perf(mid) - scorer._perf(early) == pytest.approx(0.1875)
+    assert scorer._perf(late) - scorer._perf(mid) == pytest.approx(0.3125)
+    assert (scorer._perf(late) - scorer._perf(mid)) > (
+        scorer._perf(mid) - scorer._perf(early)
+    )
+    # Negative branch stays linear (not squared).
+    worse = TrainResult(
+        loss=14.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
+    )
+    assert scorer._perf(worse) == pytest.approx(-0.5)
 
 
 def test_load_environment_accepts_perf_scaling_exponent(monkeypatch):

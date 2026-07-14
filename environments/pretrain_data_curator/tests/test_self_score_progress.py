@@ -41,9 +41,8 @@ from test_400m_eval_detached import _extract_bash_heredoc
 REPO_ROOT = Path(__file__).resolve().parents[3]
 EVAL_SCRIPT = REPO_ROOT / "scripts" / "run_400m_eval_a100.sh"
 
-# Same budget the existing prompt contract enforces (test_task_prompt_contract):
-# the new hang/kill guidance has to fit inside it, not extend it.
-TASK_PROMPT_MAX_CHARS = 5_850
+# Same budget the existing prompt contract enforces (test_task_prompt_contract).
+TASK_PROMPT_MAX_CHARS = 6_000
 
 
 def _self_score_helpers() -> dict[str, Any]:
@@ -508,6 +507,19 @@ def test_prompt_stays_within_its_length_contract():
     prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
     assert len(TASK_PROMPT) <= TASK_PROMPT_MAX_CHARS, len(TASK_PROMPT)
     assert len(prompt) <= TASK_PROMPT_MAX_CHARS, len(prompt)
+
+
+def test_prompt_explains_squared_performance_matching_reward_default():
+    """Setup must document squared nonnegative progress; reward default is 2.0."""
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    setup = prompt[prompt.index("## Setup") : prompt.index("## Research")]
+    assert "normalized loss progress is squared in the performance term" in setup
+    assert "default exponent 2.0" in setup
+    assert "equal loss improvements earn more reward later than earlier" in setup
+    assert "negative progress stays linear" in setup
+    # Live default must match the documented exponent (do not hard-code drift).
+    assert CuratorConfig().perf_scaling_exponent == 2.0
+    assert "default exponent 2.0" in TASK_PROMPT
 
 
 # --- detached A100 status propagation ---------------------------------------
