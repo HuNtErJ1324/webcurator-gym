@@ -14,8 +14,8 @@ from pretrain_data_curator.bash_harness import (
     truncating_program_source,
     wrap_bash_harness,
 )
-from pretrain_data_curator.hosted_compat import Environment
 from pretrain_data_curator.models import CuratorConfig
+from pretrain_data_curator.truncating_environment import Environment
 from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
 from pretrain_data_curator.truncating_client import TruncatingClient, wrap_client

@@ -7,12 +7,11 @@ import os
 import pkgutil
 from typing import Any
 
-import verifiers as legacy_vf
 import verifiers.v1 as vf
 import verifiers.v1.harnesses as vf_harnesses
 
-from .hosted_compat import Environment
 from .leakage import DEFAULT_DECON_BINARY
+from .truncating_environment import Environment
 from .codex_harness import DEFAULT_MAX_CONTINUATIONS
 from .models import MANIFEST_FILENAME, ProxyStudentConfig
 from .runtime_config import derive_env_harness_runtime
@@ -171,7 +170,16 @@ def load_environment(
         # package on this path; hosted/Prime/default paths keep the normal cache.
         harness_env["UV_REINSTALL_PACKAGE"] = "pydantic-core"
     elif use_real_trainer and ps.runtime_backend == "modal":
-        legacy_vf.ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
+        missing_modal_keys = [
+            key
+            for key in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
+            if not os.environ.get(key)
+        ]
+        if missing_modal_keys:
+            raise ValueError(
+                "Missing required environment variable(s): "
+                f"{', '.join(missing_modal_keys)}"
+            )
         # Intentionally do not set UV_REINSTALL_PACKAGE here. That workaround
         # originated when the Docker trainer's bash harness ran on the env-server
         # and could reuse its host-cached PEP 723 environment. ModalRuntime creates
@@ -198,6 +206,7 @@ def load_environment(
             ),
             timeout=timeout,
         ),
+        max_tool_output_chars=max_tool_output_chars,
         env_args=env_args,
     )
     # Cap agent-visible tool results:
