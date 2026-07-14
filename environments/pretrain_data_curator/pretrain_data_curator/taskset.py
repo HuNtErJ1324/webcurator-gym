@@ -1155,4 +1155,3 @@ __all__ = [
     "parse_manifest",
     "extract_json_object",
 ]
-

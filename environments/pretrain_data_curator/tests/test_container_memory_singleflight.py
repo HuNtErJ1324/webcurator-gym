@@ -844,5 +844,3 @@ def test_on_pod_eval_toml_quoting_and_missing_memory_gb(tmp_path):
     )
     assert proc.returncode != 0
     assert "memory_gb is required" in (proc.stderr + proc.stdout)
-
-

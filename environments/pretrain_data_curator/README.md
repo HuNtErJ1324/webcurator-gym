@@ -343,4 +343,3 @@ with provenance metrics.
 - Token counts use `max(word_count, character_count // 4)` on the env side; the
   real trainer tokenizes inside the sandbox.
 - Filtering is expressed via the structured `filters` argument.
-
