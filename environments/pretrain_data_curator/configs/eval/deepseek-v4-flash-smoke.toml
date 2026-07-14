@@ -43,6 +43,8 @@ decon_evals_dir = ""
 decon_threshold = 0.2
 screen_val_set = true
 max_tool_output_chars = 20_000
+# Codex-only: bounded relaunches when codex exits cleanly with no manifest.
+codex_max_continuations = 2
 
 [eval.args.proxy_student]
 n_layer = 12

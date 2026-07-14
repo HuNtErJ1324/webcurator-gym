@@ -13,6 +13,7 @@ import verifiers.v1.harnesses as vf_harnesses
 
 from .hosted_compat import Environment
 from .leakage import DEFAULT_DECON_BINARY
+from .codex_harness import DEFAULT_MAX_CONTINUATIONS
 from .models import MANIFEST_FILENAME, ProxyStudentConfig
 from .runtime_config import derive_env_harness_runtime
 from .taskset import CuratorTasksetConfig
@@ -53,6 +54,7 @@ def load_environment(
     decon_threshold: float = 0.2,
     screen_val_set: bool = True,
     max_tool_output_chars: int = 20_000,
+    codex_max_continuations: int = DEFAULT_MAX_CONTINUATIONS,
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -137,6 +139,7 @@ def load_environment(
         "decon_threshold": decon_threshold,
         "screen_val_set": screen_val_set,
         "max_tool_output_chars": max_tool_output_chars,
+        "codex_max_continuations": codex_max_continuations,
     }
     harness_env: dict[str, str] = {
         "MAX_TOOL_OUTPUT_CHARS": str(max_tool_output_chars),
@@ -206,4 +209,18 @@ def load_environment(
         from .bash_harness import wrap_bash_harness
 
         env.harness = wrap_bash_harness(env.harness.config)
+    elif harness_id == "codex":
+        # The stock codex harness calls any clean exit `agent_completed`, so an
+        # empty model turn at turn 4/300 ends the rollout with no manifest and
+        # the turn budget unspent. Guard it: on a clean exit with no manifest
+        # and turns to spare, continue codex with a nudge (bounded, strict
+        # scoring untouched).
+        from .codex_harness import wrap_codex_harness
+
+        env.harness = wrap_codex_harness(
+            env.harness.config,
+            manifest_filename=manifest_filename,
+            max_turns=max_turns,
+            max_continuations=codex_max_continuations,
+        )
     return env
