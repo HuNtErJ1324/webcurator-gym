@@ -79,6 +79,27 @@ def _make_temp_repo(tmp_path: Path) -> Path:
     cfg_dst.mkdir(parents=True)
     for toml in cfg_src.glob("*.toml"):
         shutil.copy(toml, cfg_dst / toml.name)
+    package_src = (
+        REPO_ROOT
+        / "environments"
+        / "pretrain_data_curator"
+        / "pretrain_data_curator"
+        / "result_gate.py"
+    )
+    package_dst = (
+        repo
+        / "environments"
+        / "pretrain_data_curator"
+        / "pretrain_data_curator"
+    )
+    package_dst.mkdir(parents=True)
+    shutil.copy(package_src, package_dst / package_src.name)
+    docs = repo / "environments" / "pretrain_data_curator" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "build_site.py").write_text(
+        "import os, pathlib\n"
+        "pathlib.Path(os.environ['WCG_RECORD_DIR'], 'site_rebuilt.log').write_text('yes\\n')\n"
+    )
     (repo / "secrets.env").write_text("HF_TOKEN=dummy\nPRIME_API_KEY=dummy\n")
     return repo
 
@@ -214,9 +235,14 @@ fi
 last="${@: -1}"
 if [[ "$last" != *"@"* ]]; then
   mkdir -p "$last"
-  cat > "$last/results.jsonl" <<'JSON'
-{"is_completed": true, "rewards": {"reward": 0.42}, "metrics": {"perf_loss": 3.1, "leakage_score": 0.0}}
+  if [ -n "${WCG_RESULTS_JSON:-}" ]; then
+    printf '%s\n' "$WCG_RESULTS_JSON" > "$last/results.jsonl"
+  else
+    cat > "$last/results.jsonl" <<'JSON'
+{"is_completed":true,"stop_condition":"agent_completed","errors":[],"rewards":{"reward":0.42},"metrics":{"finalized":1.0,"manifest_missing":0.0,"manifest_invalid":0.0,"corpus_tokens":400000000.0,"num_sources":3.0,"train_flops":1.2e18,"perf_loss":3.1,"trainer_error_msg":0.0}}
 JSON
+  fi
+  printf 'preserve me\n' > "$last/downloaded-artifact.txt"
 fi
 exit 0
 '''
@@ -278,7 +304,14 @@ exit 0
     return bin_dir
 
 
-def _run_script(tmp_path: Path, repo: Path, *, modes: dict | None = None, model="z-ai/glm-5.2"):
+def _run_script(
+    tmp_path: Path,
+    repo: Path,
+    *,
+    modes: dict | None = None,
+    model="z-ai/glm-5.2",
+    skip_site: bool = True,
+):
     record_dir = tmp_path / "record"
     record_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = _build_fakes(record_dir)
@@ -299,8 +332,11 @@ def _run_script(tmp_path: Path, repo: Path, *, modes: dict | None = None, model=
     for k, v in (modes or {}).items():
         env[k] = str(v)
     script = repo / "scripts" / EVAL_SCRIPT.name
+    argv = [str(script), "--model", model]
+    if skip_site:
+        argv.append("--skip-site")
     result = subprocess.run(
-        [str(script), "--model", model, "--skip-site"],
+        argv,
         env=env,
         cwd=str(repo),
         capture_output=True,
@@ -407,13 +443,19 @@ def test_remote_eval_probe_heredoc_runs_against_real_files(tmp_path: Path):
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=done EXIT=3" in out.stdout, out.stdout + out.stderr
 
-    # 4) dead PID with missing status -> nostatus_deadpid (fails safe)
+    # 4) semantic failure is distinct from an eval process exit of 65, allowing
+    # artifact download without accidentally accepting an unrelated exit code.
+    st.write_text("SEMANTIC_INVALID=65\n")
+    out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
+    assert "STATUS=semantic_invalid EXIT=65" in out.stdout, out.stdout + out.stderr
+
+    # 5) dead PID with missing status -> nostatus_deadpid (fails safe)
     st.unlink()
     pid.write_text("999999\n")  # not a live pid on the test host
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=nostatus_deadpid" in out.stdout, out.stdout + out.stderr
 
-    # 5) missing status AND missing pid -> nostatus_nopid
+    # 6) missing status AND missing pid -> nostatus_nopid
     pid.unlink()
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=nostatus_nopid" in out.stdout, out.stdout + out.stderr
@@ -701,3 +743,54 @@ def test_download_constructs_single_outputs_and_lands_local(tmp_path: Path):
     assert src in args
     assert src.count("/outputs/") == 1
     assert "/outputs/outputs/" not in args
+
+
+def test_invalid_download_preserves_artifacts_skips_site_and_cleans_pod(
+    tmp_path: Path,
+):
+    """The original bad row must fail only after its artifacts are retained."""
+    repo = _make_temp_repo(tmp_path)
+    invalid = {
+        "is_completed": True,
+        "stop_condition": "agent_completed",
+        "errors": [],
+        "rewards": {"reward": 0.0},
+        "metrics": {
+            "finalized": 0.0,
+            "manifest_missing": 1.0,
+            "manifest_invalid": 0.0,
+            "corpus_tokens": 0.0,
+            "num_sources": 0.0,
+            "train_flops": 0.0,
+            "perf_loss": None,
+            "trainer_error_msg": 0.0,
+        },
+    }
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        skip_site=False,
+        modes={
+            "WCG_EVAL_TIMEOUT_SECONDS": 30,
+            "WCG_EVAL_POLL_INTERVAL": 1,
+            "WCG_EVAL_MON_RETRIES": 2,
+            "WCG_EVAL_MON_BACKOFF": 1,
+            "WCG_DONE_AFTER_PROBES": 1,
+            "WCG_RESULTS_JSON": json.dumps(invalid),
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "semantic validation" in result.stderr
+
+    local_dir = (
+        repo
+        / "environments"
+        / "pretrain_data_curator"
+        / "outputs"
+        / "evals-400m"
+        / "z-ai-glm-5.2-400M-300turn-codex"
+    )
+    assert json.loads((local_dir / "results.jsonl").read_text()) == invalid
+    assert (local_dir / "downloaded-artifact.txt").read_text() == "preserve me\n"
+    assert not (record / "site_rebuilt.log").exists()
+    assert (record / "terminated.log").exists()
