@@ -524,6 +524,7 @@ def test_single_smoke_config_exhaustively_matches_source_options():
         "polar_express",
     }
     assert set(args["proxy_student"]) == expected_proxy_fields
+    assert args["proxy_student"]["adam_eps"] == ProxyStudentConfig().adam_eps == 1e-10
     assert ProxyStudentConfig.model_validate(args["proxy_student"])
     assert ValidationSetConfig.model_validate(args["validation_set"])
 
