@@ -508,6 +508,26 @@ def _eval_wrapper_repo(
     env_dir = repo / "environments" / "pretrain_data_curator"
     run_dir = env_dir / "outputs" / "run-abc"
     run_dir.mkdir(parents=True)
+    gate_src = (
+        REPO_ROOT
+        / "environments"
+        / "pretrain_data_curator"
+        / "pretrain_data_curator"
+        / "result_gate.py"
+    )
+    gate_dst = env_dir / "pretrain_data_curator"
+    gate_dst.mkdir()
+    (gate_dst / gate_src.name).write_bytes(gate_src.read_bytes())
+    (env_dir / "config.toml").write_text(
+        "[args]\n"
+        "token_budget = 400000000\n"
+        "use_real_trainer = true\n"
+        "[args.proxy_student]\n"
+        "train_token_budget = 400000000\n"
+    )
+    project_bin = repo / ".venv" / "bin"
+    project_bin.mkdir(parents=True)
+    (project_bin / "python").symlink_to(sys.executable)
     (repo / "secrets.env").write_text("HF_TOKEN=dummy\nPRIME_API_KEY=dummy\n")
     if row is not None:
         (run_dir / "results.jsonl").write_text(json.dumps(row) + "\n")
@@ -557,14 +577,40 @@ _HEALTHY_ROW = {
     "stop_condition": "completed",
     "errors": [],
     "rewards": {"reward": 0.42},
-    "metrics": {"perf_loss": 3.1, "corpus_tokens": 12_000},
+    "metrics": {
+        "finalized": 1.0,
+        "manifest_missing": 0.0,
+        "manifest_invalid": 0.0,
+        "corpus_tokens": 400_000_000.0,
+        "num_sources": 3.0,
+        "train_flops": 1.2e18,
+        "perf_loss": 3.1,
+        "trainer_error_msg": 0.0,
+    },
 }
 
 
 def test_status_is_exit_zero_only_for_a_finalized_successful_rollout(tmp_path: Path):
     status, log = _run_eval_wrapper(tmp_path, _HEALTHY_ROW)
     assert status == "EXIT=0", log
-    assert "[validate] OK" in log
+    assert "valid_rows=1 mode=production" in log
+
+
+@pytest.mark.parametrize("mode", ["missing", "not_executable"])
+def test_result_gate_missing_project_python_fails_closed_with_diagnostic(
+    tmp_path: Path, mode: str
+):
+    repo, home, script = _eval_wrapper_repo(tmp_path, _HEALTHY_ROW)
+    project_python = repo / ".venv" / "bin" / "python"
+    project_python.unlink()
+    if mode == "not_executable":
+        project_python.write_text("not an executable\n")
+        project_python.chmod(0o644)
+
+    status, log = _run_eval_wrapper_repo(repo, home, script)
+    assert status == "SEMANTIC_INVALID=65", log
+    assert "provisioned project Python is unavailable or not executable" in log
+    assert str(project_python) in log
 
 
 @pytest.mark.parametrize(
@@ -587,31 +633,35 @@ def test_status_is_exit_zero_only_for_a_finalized_successful_rollout(tmp_path: P
                     {"type": "HarnessError", "message": "harness 'codex' exited 143"}
                 ],
             },
-            "rollout error",
+            "has errors=",
             id="harness_error",
         ),
         pytest.param(
-            {**_HEALTHY_ROW, "metrics": {}}, "empty metrics", id="empty_metrics"
+            {**_HEALTHY_ROW, "metrics": {}},
+            "empty or missing metrics",
+            id="empty_metrics",
         ),
         pytest.param(
-            {**_HEALTHY_ROW, "is_completed": False}, "not finalized", id="not_finalized"
+            {**_HEALTHY_ROW, "is_completed": False},
+            "not completed",
+            id="not_finalized",
         ),
         pytest.param(
             {**_HEALTHY_ROW, "rewards": {"reward": None}},
-            "no numeric reward",
+            "missing numeric reward",
             id="nested_null_reward",
         ),
         pytest.param(
             {**_HEALTHY_ROW, "rewards": {}, "reward": None},
-            "no numeric reward",
+            "missing numeric reward",
             id="flat_null_reward",
         ),
-        pytest.param(None, "missing or empty", id="no_results_file"),
+        pytest.param(None, "missing or empty results file", id="no_results_file"),
     ],
 )
 def test_failed_rollout_never_reports_exit_zero(tmp_path: Path, row, expected):
     status, log = _run_eval_wrapper(tmp_path, row)
-    assert status == "EXIT=65", log
+    assert status == "SEMANTIC_INVALID=65", log
     assert expected in log
 
 
@@ -621,7 +671,7 @@ def test_finalized_rollout_with_genuine_zero_reward_exits_zero(tmp_path: Path):
         tmp_path, {**_HEALTHY_ROW, "rewards": {"reward": 0.0}}
     )
     assert status == "EXIT=0", log
-    assert "[validate] OK" in log
+    assert "valid_rows=1 mode=production" in log
 
 
 def test_validation_uses_this_runs_logged_dir_not_a_repo_scan(tmp_path: Path):
@@ -636,7 +686,7 @@ def test_validation_uses_this_runs_logged_dir_not_a_repo_scan(tmp_path: Path):
     (stale / "results.jsonl").write_text(json.dumps(_HEALTHY_ROW) + "\n")
 
     status, log = _run_eval_wrapper_repo(repo, home, script)
-    assert status == "EXIT=65", log
+    assert status == "SEMANTIC_INVALID=65", log
 
 
 def test_nonzero_eval_exit_is_preserved(tmp_path: Path):
@@ -646,7 +696,7 @@ def test_nonzero_eval_exit_is_preserved(tmp_path: Path):
 
 def test_missing_results_line_in_log_fails_closed(tmp_path: Path):
     status, log = _run_eval_wrapper(tmp_path, _HEALTHY_ROW, log_results=False)
-    assert status == "EXIT=65", log
+    assert status == "SEMANTIC_INVALID=65", log
     assert "no usable results path" in log
 
 

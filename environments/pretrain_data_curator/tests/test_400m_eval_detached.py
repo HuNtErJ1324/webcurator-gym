@@ -79,11 +79,29 @@ def _make_temp_repo(tmp_path: Path) -> Path:
     cfg_dst.mkdir(parents=True)
     for toml in cfg_src.glob("*.toml"):
         shutil.copy(toml, cfg_dst / toml.name)
+    package_src = (
+        REPO_ROOT
+        / "environments"
+        / "pretrain_data_curator"
+        / "pretrain_data_curator"
+        / "result_gate.py"
+    )
+    package_dst = (
+        repo / "environments" / "pretrain_data_curator" / "pretrain_data_curator"
+    )
+    package_dst.mkdir(parents=True)
+    shutil.copy(package_src, package_dst / package_src.name)
+    docs = repo / "environments" / "pretrain_data_curator" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "build_site.py").write_text(
+        "import os, pathlib\n"
+        "pathlib.Path(os.environ['WCG_RECORD_DIR'], 'site_rebuilt.log').write_text('yes\\n')\n"
+    )
     (repo / "secrets.env").write_text("HF_TOKEN=dummy\nPRIME_API_KEY=dummy\n")
     return repo
 
 
-_SSH_FAKE = r'''#!/usr/bin/env bash
+_SSH_FAKE = r"""#!/usr/bin/env bash
 set +e
 stdin="$(cat)"
 REC="${WCG_RECORD_DIR:?}"
@@ -195,10 +213,10 @@ fi
 
 # default: provisioning / other heredocs -> success
 exit 0
-'''
+"""
 
 
-_RSYNC_FAKE = r'''#!/usr/bin/env bash
+_RSYNC_FAKE = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "${WCG_RECORD_DIR:?}/rsync_args.log"
 printf 'rsync\n' >> "${WCG_RECORD_DIR:?}/rsync_count.txt"
 mode="${WCG_RSYNC_MODE:-ok}"
@@ -214,12 +232,17 @@ fi
 last="${@: -1}"
 if [[ "$last" != *"@"* ]]; then
   mkdir -p "$last"
-  cat > "$last/results.jsonl" <<'JSON'
-{"is_completed": true, "rewards": {"reward": 0.42}, "metrics": {"perf_loss": 3.1, "leakage_score": 0.0}}
+  if [ -n "${WCG_RESULTS_JSON:-}" ]; then
+    printf '%s\n' "$WCG_RESULTS_JSON" > "$last/results.jsonl"
+  else
+    cat > "$last/results.jsonl" <<'JSON'
+{"is_completed":true,"stop_condition":"agent_completed","errors":[],"rewards":{"reward":0.42},"metrics":{"finalized":1.0,"manifest_missing":0.0,"manifest_invalid":0.0,"corpus_tokens":400000000.0,"num_sources":3.0,"train_flops":1.2e18,"perf_loss":3.1,"trainer_error_msg":0.0}}
 JSON
+  fi
+  printf 'preserve me\n' > "$last/downloaded-artifact.txt"
 fi
 exit 0
-'''
+"""
 
 
 def _build_fakes(record_dir: Path) -> Path:
@@ -227,7 +250,7 @@ def _build_fakes(record_dir: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     _write_script(
         bin_dir / "prime",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 set +e
 case "$1" in
   whoami) exit 0 ;;
@@ -258,27 +281,40 @@ case "$1" in
     ;;
 esac
 exit 0
-''',
+""",
     )
     _write_script(bin_dir / "ssh", _SSH_FAKE)
     _write_script(
         bin_dir / "scp",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 printf 'scp %s\n' "$*" >> "${WCG_RECORD_DIR:?}/scp.log"
 exit 0
-''',
+""",
     )
     _write_script(bin_dir / "rsync", _RSYNC_FAKE)
-    _write_script(bin_dir / "ssh-keygen", r'''#!/usr/bin/env bash
+    _write_script(
+        bin_dir / "ssh-keygen",
+        r"""#!/usr/bin/env bash
 exit 0
-''')
-    _write_script(bin_dir / "sleep", r'''#!/usr/bin/env bash
+""",
+    )
+    _write_script(
+        bin_dir / "sleep",
+        r"""#!/usr/bin/env bash
 exit 0
-''')
+""",
+    )
     return bin_dir
 
 
-def _run_script(tmp_path: Path, repo: Path, *, modes: dict | None = None, model="z-ai/glm-5.2"):
+def _run_script(
+    tmp_path: Path,
+    repo: Path,
+    *,
+    modes: dict | None = None,
+    model="z-ai/glm-5.2",
+    skip_site: bool = True,
+):
     record_dir = tmp_path / "record"
     record_dir.mkdir(parents=True, exist_ok=True)
     bin_dir = _build_fakes(record_dir)
@@ -299,8 +335,11 @@ def _run_script(tmp_path: Path, repo: Path, *, modes: dict | None = None, model=
     for k, v in (modes or {}).items():
         env[k] = str(v)
     script = repo / "scripts" / EVAL_SCRIPT.name
+    argv = [str(script), "--model", model]
+    if skip_site:
+        argv.append("--skip-site")
     result = subprocess.run(
-        [str(script), "--model", model, "--skip-site"],
+        argv,
         env=env,
         cwd=str(repo),
         capture_output=True,
@@ -354,7 +393,9 @@ def _run_bash_heredoc(body: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
-def _run_find_results(body: str, remote_root: Path, run_name: str) -> subprocess.CompletedProcess:
+def _run_find_results(
+    body: str, remote_root: Path, run_name: str
+) -> subprocess.CompletedProcess:
     """Execute the find_remote_results_dir heredoc (the remote-side body) with
     remote_log/REMOTE_ROOT set, mirroring what the launcher's `remote` wrapper
     would expand before invoking `bash -s` on the pod.
@@ -382,6 +423,7 @@ def _run_find_results(body: str, remote_root: Path, run_name: str) -> subprocess
 
 # --- actual-probe-herdoc regression (blocker 2) ----------------------------
 
+
 def test_remote_eval_probe_heredoc_runs_against_real_files(tmp_path: Path):
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
     body = _extract_function_heredoc(text, "_remote_eval_probe", "RM")
@@ -407,13 +449,19 @@ def test_remote_eval_probe_heredoc_runs_against_real_files(tmp_path: Path):
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=done EXIT=3" in out.stdout, out.stdout + out.stderr
 
-    # 4) dead PID with missing status -> nostatus_deadpid (fails safe)
+    # 4) semantic failure is distinct from an eval process exit of 65, allowing
+    # artifact download without accidentally accepting an unrelated exit code.
+    st.write_text("SEMANTIC_INVALID=65\n")
+    out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
+    assert "STATUS=semantic_invalid EXIT=65" in out.stdout, out.stdout + out.stderr
+
+    # 5) dead PID with missing status -> nostatus_deadpid (fails safe)
     st.unlink()
     pid.write_text("999999\n")  # not a live pid on the test host
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=nostatus_deadpid" in out.stdout, out.stdout + out.stderr
 
-    # 5) missing status AND missing pid -> nostatus_nopid
+    # 6) missing status AND missing pid -> nostatus_nopid
     pid.unlink()
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=nostatus_nopid" in out.stdout, out.stdout + out.stderr
@@ -428,6 +476,7 @@ def test_remote_eval_probe_argument_mapping_is_correct():
 
 
 # --- source-inspection tests ------------------------------------------------
+
 
 def test_run_remote_eval_launches_detached_with_markers():
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
@@ -445,12 +494,12 @@ def test_run_remote_eval_has_monitor_tolerating_transient_ssh():
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
     mon = _extract_bash_function(text, "monitor_remote_eval")
     # retries + backoff within the probe loop
-    assert "for attempt in $(seq 1 \"$retries\")" in mon
-    assert "sleep \"$backoff\"" in mon
+    assert 'for attempt in $(seq 1 "$retries")' in mon
+    assert 'sleep "$backoff"' in mon
     # transient probe failure must NOT kill the eval; it only logs + retries
     assert "monitor SSH probe failed (transient)" in mon
     # only proceeds after confirmed completion
-    assert 'STATUS=done*)' in mon
+    assert "STATUS=done*)" in mon
     assert "exited non-zero" in mon
     # timeout path preserves remote log/status
     assert "monitor timed out after" in mon
@@ -472,13 +521,14 @@ def test_secrets_sourced_not_echoed():
     assert "source secrets.env" in text
     assert "set -a" in text
     # never print secrets to any log
-    assert "echo \"$PRIME_API_KEY" not in text
-    assert "echo \"$HF_TOKEN" not in text
+    assert 'echo "$PRIME_API_KEY' not in text
+    assert 'echo "$HF_TOKEN' not in text
     assert "echo $PRIME_API_KEY" not in text
     assert "echo $HF_TOKEN" not in text
 
 
 # --- behavioral tests (stateful fake SSH) ------------------------------------
+
 
 def test_detached_eval_survives_transient_disconnect_and_completes(tmp_path: Path):
     repo = _make_temp_repo(tmp_path)
@@ -607,6 +657,7 @@ def test_hostile_model_value_cannot_break_out(tmp_path: Path):
 
 # --- find_remote_results_dir / download path logic (artifact-path blocker) ---
 
+
 def test_find_remote_results_strips_outputs_prefix(tmp_path: Path):
     """The real function must return the results dir RELATIVE to the outputs
     root (strip exactly one leading `outputs/`), not `outputs/...`."""
@@ -652,7 +703,11 @@ def test_find_remote_results_fallback_returns_relative(tmp_path: Path):
     run_dir.mkdir()
     (run_dir / "eval.log").write_text("no results line here\n")
     outputs_root = (
-        tmp_path / "webcurator-gym" / "environments" / "pretrain_data_curator" / "outputs"
+        tmp_path
+        / "webcurator-gym"
+        / "environments"
+        / "pretrain_data_curator"
+        / "outputs"
     )
     run = outputs_root / "pretrain-data-curator--abc" / "run-uuid"
     run.mkdir(parents=True)
@@ -701,3 +756,54 @@ def test_download_constructs_single_outputs_and_lands_local(tmp_path: Path):
     assert src in args
     assert src.count("/outputs/") == 1
     assert "/outputs/outputs/" not in args
+
+
+def test_invalid_download_preserves_artifacts_skips_site_and_cleans_pod(
+    tmp_path: Path,
+):
+    """The original bad row must fail only after its artifacts are retained."""
+    repo = _make_temp_repo(tmp_path)
+    invalid = {
+        "is_completed": True,
+        "stop_condition": "agent_completed",
+        "errors": [],
+        "rewards": {"reward": 0.0},
+        "metrics": {
+            "finalized": 0.0,
+            "manifest_missing": 1.0,
+            "manifest_invalid": 0.0,
+            "corpus_tokens": 0.0,
+            "num_sources": 0.0,
+            "train_flops": 0.0,
+            "perf_loss": None,
+            "trainer_error_msg": 0.0,
+        },
+    }
+    result, record = _run_script(
+        tmp_path,
+        repo,
+        skip_site=False,
+        modes={
+            "WCG_EVAL_TIMEOUT_SECONDS": 30,
+            "WCG_EVAL_POLL_INTERVAL": 1,
+            "WCG_EVAL_MON_RETRIES": 2,
+            "WCG_EVAL_MON_BACKOFF": 1,
+            "WCG_DONE_AFTER_PROBES": 1,
+            "WCG_RESULTS_JSON": json.dumps(invalid),
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "semantic validation" in result.stderr
+
+    local_dir = (
+        repo
+        / "environments"
+        / "pretrain_data_curator"
+        / "outputs"
+        / "evals-400m"
+        / "z-ai-glm-5.2-400M-300turn-codex"
+    )
+    assert json.loads((local_dir / "results.jsonl").read_text()) == invalid
+    assert (local_dir / "downloaded-artifact.txt").read_text() == "preserve me\n"
+    assert not (record / "site_rebuilt.log").exists()
+    assert (record / "terminated.log").exists()

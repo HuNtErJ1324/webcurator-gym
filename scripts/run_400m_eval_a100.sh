@@ -45,6 +45,7 @@ POD_NAME=""
 EVAL_CONFIG=""
 EVAL_CONFIG_PATH=""
 RUN_NAME=""
+REMOTE_SEMANTIC_INVALID=0
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
@@ -756,6 +757,8 @@ cat > "$RD/eval.sh" <<'EVAL'
 set -uo pipefail
 REPO_ROOT="${WCG_REPO_ROOT:-/root/webcurator-gym}"
 export PATH="$REPO_ROOT/environments/pretrain_data_curator/decon/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+PROJECT_ROOT="$REPO_ROOT/environments/pretrain_data_curator"
+PROJECT_PYTHON="$REPO_ROOT/.venv/bin/python"
 MODEL="$1"
 EVAL_CONFIG="$2"
 ST="$3"
@@ -772,46 +775,21 @@ validate_run_results() {
     echo "[validate] FAIL: no usable results path logged by this run" >&2
     return 1
   fi
-  python3 - "$PWD/$rel/results.jsonl" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-
-
-def bad(message):
-    print("[validate] FAIL: %s (%s)" % (message, path), file=sys.stderr)
-    raise SystemExit(1)
-
-
-if not path.is_file() or path.stat().st_size == 0:
-    bad("results.jsonl is missing or empty")
-rows = [line for line in path.read_text().splitlines() if line.strip()]
-if not rows:
-    bad("results.jsonl has no rows")
-for index, line in enumerate(rows):
-    try:
-        row = json.loads(line)
-    except json.JSONDecodeError as exc:
-        bad("row %d is not valid JSON: %s" % (index, exc))
-    if not row.get("is_completed"):
-        bad("row %d is not finalized (is_completed is false)" % index)
-    stop = row.get("stop_condition")
-    if stop in ("error", "truncation"):
-        bad("row %d stop_condition=%s" % (index, stop))
-    errors = row.get("errors") or []
-    if errors:
-        bad("row %d has %d rollout error(s): %s" % (index, len(errors), str(errors[0])[:300]))
-    if not (row.get("metrics") or {}):
-        bad("row %d has empty metrics" % index)
-    rewards = row.get("rewards") or {}
-    reward = rewards["reward"] if "reward" in rewards else row.get("reward")
-    # A genuine 0.0 is a real score and must pass; null (nested or flat) is not.
-    if reward is None or isinstance(reward, bool) or not isinstance(reward, (int, float)):
-        bad("row %d has no numeric reward (got %r)" % (index, reward))
-print("[validate] OK: %d finalized row(s) with metrics in %s" % (len(rows), path))
-PY
+  if [[ ! -x "$PROJECT_PYTHON" ]]; then
+    echo "[validate] FAIL: provisioned project Python is unavailable or not executable: $PROJECT_PYTHON (expected Python 3.12)" >&2
+    return 1
+  fi
+  local python_version
+  if ! python_version="$("$PROJECT_PYTHON" -c 'import sys, tomllib; print(".".join(map(str, sys.version_info[:3])))' 2>&1)"; then
+    echo "[validate] FAIL: provisioned project Python cannot import tomllib: $PROJECT_PYTHON ($python_version)" >&2
+    return 1
+  fi
+  if [[ "$python_version" != 3.12.* ]]; then
+    echo "[validate] FAIL: provisioned project Python must be 3.12 (got $python_version at $PROJECT_PYTHON)" >&2
+    return 1
+  fi
+  "$PROJECT_PYTHON" "$PROJECT_ROOT/pretrain_data_curator/result_gate.py" \
+    "$PWD/$rel/results.jsonl" "$PWD/$EVAL_CONFIG"
 }
 
 cd "$REPO_ROOT"
@@ -823,11 +801,19 @@ set +a
 cd environments/pretrain_data_curator
 uv run eval -m "$MODEL" @ "$EVAL_CONFIG"
 rc=$?
+semantic_invalid=0
 if [[ $rc -eq 0 ]]; then
-  validate_run_results "$LOG" || rc=65
+  if ! validate_run_results "$LOG"; then
+    rc=65
+    semantic_invalid=1
+  fi
 fi
 # Atomic status completion: write to a temp file, then rename into place.
-echo "EXIT=$rc" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+if [[ $semantic_invalid -eq 1 ]]; then
+  echo "SEMANTIC_INVALID=$rc" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+else
+  echo "EXIT=$rc" > "$ST.tmp" && mv "$ST.tmp" "$ST"
+fi
 exit $rc
 EVAL
 chmod +x "$RD/eval.sh"
@@ -857,6 +843,10 @@ RD="$1"; LOG="$2"; PID="$3"; ST="$4"
 if [[ -f "$ST" ]]; then
   s=$(cat "$ST")
   if [[ "$s" == EXIT=* ]]; then echo "STATUS=done EXIT=${s#EXIT=}"; exit 0; fi
+  if [[ "$s" == SEMANTIC_INVALID=* ]]; then
+    echo "STATUS=semantic_invalid EXIT=${s#SEMANTIC_INVALID=}"
+    exit 0
+  fi
   echo "STATUS=running"; exit 0
 fi
 if [[ -f "$PID" ]]; then
@@ -904,6 +894,14 @@ monitor_remote_eval() {
     if (( ok )); then
       local st; st=$(printf '%s\n' "$probe" | grep -E '^STATUS=' | tail -1)
       case "$st" in
+        STATUS=semantic_invalid*)
+          # Continue only far enough to preserve the result artifacts locally;
+          # the post-download gate remains authoritative and prevents summary
+          # or site work before the EXIT trap terminates the pod.
+          log "remote semantic validation failed; downloading artifacts for local validation"
+          REMOTE_SEMANTIC_INVALID=1
+          return 0
+          ;;
         STATUS=done*)
           local code="${st#STATUS=done EXIT=}"
           if [[ "$code" == "0" ]]; then
@@ -1002,16 +1000,35 @@ EOF
   fi
 }
 
+validate_downloaded_results() {
+  log "Validating downloaded 400M result semantics"
+  if ! python3 "$ENV_DIR/pretrain_data_curator/result_gate.py" \
+    "$LOCAL_OUT_DIR/results.jsonl" "$LOCAL_OUT_DIR/config.toml"; then
+    die "Downloaded result failed semantic validation; artifacts preserved at $LOCAL_OUT_DIR"
+  fi
+  if [[ "$REMOTE_SEMANTIC_INVALID" -eq 1 ]]; then
+    die "Remote semantic validation failed; artifacts preserved at $LOCAL_OUT_DIR"
+  fi
+}
+
 rebuild_site() {
   log "Rebuilding docs bench site"
   python3 "$ENV_DIR/docs/build_site.py"
   python3 - <<'PY' "$ENV_DIR/docs/site/data/manifest.json"
-import json, sys
+import json, math, sys
 from pathlib import Path
 m = json.loads(Path(sys.argv[1]).read_text())
 print(f"site runs={m['run_count']}")
 for r in m["runs"]:
-    print(f"  {r['model']:28} reward={r['reward']:.4f}")
+    reward = r.get("reward")
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        display = "n/a"
+    elif not math.isfinite(float(reward)):
+        display = "n/a"
+    else:
+        display = f"{float(reward):.4f}"
+    model = str(r.get("model") or "<unknown>")
+    print(f"  {model:28} reward={display}")
 PY
 }
 
@@ -1114,6 +1131,7 @@ run_remote_eval
 
 RESULTS_REL="$(find_remote_results_dir)" || die "Could not locate remote results directory"
 download_results "$RESULTS_REL"
+validate_downloaded_results
 
 log "Eval summary:"
 summarize_results
