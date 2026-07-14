@@ -1013,8 +1013,8 @@ validate_downloaded_results() {
 
 rebuild_site() {
   log "Rebuilding docs bench site"
-  python3 "$ENV_DIR/docs/build_site.py"
-  python3 - <<'PY' "$ENV_DIR/docs/site/data/manifest.json"
+  python3 "$ROOT/docs/build_site.py"
+  python3 - <<'PY' "$ROOT/docs/site/data/manifest.json"
 import json, math, sys
 from pathlib import Path
 m = json.loads(Path(sys.argv[1]).read_text())
@@ -1138,7 +1138,7 @@ summarize_results
 
 if [[ "$SKIP_SITE" -eq 0 ]]; then
   rebuild_site
-  log "Site: file://$ENV_DIR/docs/site/index.html"
+  log "Site: file://$ROOT/docs/site/index.html"
 fi
 
 log "Done. Artifacts: $LOCAL_OUT_DIR"

@@ -35,11 +35,9 @@ htmlcov/
 **/.venv/
 **/.prime/
 /environments/*/docs/
-!/environments/pretrain_data_curator/docs/
-!/environments/pretrain_data_curator/docs/**
-/environments/pretrain_data_curator/docs/**/__pycache__/
-/environments/pretrain_data_curator/docs/**/*.py[cod]
-/environments/pretrain_data_curator/docs/site/
+/docs/**/__pycache__/
+/docs/**/*.py[cod]
+/docs/site/
 /environments/pretrain_data_curator/scripts/
 /environments/nanogpt_speedrun/
 secrets.env
