@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -10,15 +11,61 @@ TRACEBACK_MARKER = "Traceback (most recent call last)"
 
 
 def _config_use_real_trainer(out: Path) -> bool:
-    """Return True when config.toml requests the real GPU trainer."""
+    """Return whether config.toml requests the real GPU trainer.
+
+    Fail closed: a present ``config.toml`` must declare
+    ``use_real_trainer = true|false``. Missing or malformed values raise so
+    trainer metrics cannot be silently skipped.
+    """
     config_path = out / "config.toml"
     if not config_path.is_file():
         return False
     cfg = config_path.read_text(errors="ignore")
     m = re.search(r"(?m)^use_real_trainer\s*=\s*(true|false)\s*$", cfg)
     if not m:
-        return False
+        raise ValueError(
+            "config.toml missing or malformed use_real_trainer=true|false "
+            "(fail closed: cannot skip real-trainer metrics)"
+        )
     return m.group(1) == "true"
+
+
+def _require_finite_number(
+    value: object,
+    *,
+    name: str,
+    idx: int,
+    positive: bool = False,
+    non_negative: bool = False,
+) -> float:
+    """Require a real finite number; optionally enforce sign/range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"completed record {idx} missing numeric {name} (got {value!r})"
+        )
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(
+            f"completed record {idx} {name} must be finite (got {value!r})"
+        )
+    if positive and not (number > 0.0):
+        raise ValueError(
+            f"completed record {idx} missing positive {name} (got {value!r})"
+        )
+    if non_negative and number < 0.0:
+        raise ValueError(
+            f"completed record {idx} {name} must be >= 0 (got {value!r})"
+        )
+    return number
+
+
+def _record_reward(row: dict) -> object:
+    rewards = row.get("rewards")
+    if isinstance(rewards, dict) and "reward" in rewards:
+        return rewards.get("reward")
+    if isinstance(rewards, (int, float)) and not isinstance(rewards, bool):
+        return rewards
+    return row.get("reward")
 
 
 def validate_smoke_results(
@@ -30,10 +77,12 @@ def validate_smoke_results(
     """Validate a downloaded smoke results directory.
 
     ``is_completed=true`` alone is insufficient: reject ``stop_condition=error``,
-    any error/failure payload, empty metrics, hard failure markers, record-level
-    traceback payloads, and (when ``config.toml`` is present) mismatched token
-    budgets. At least one completed record must carry real metrics (including
-    numeric ``corpus_tokens``).
+    any error/failure payload, empty metrics, non-finite required aggregates,
+    hard failure markers, record-level traceback payloads, and (when
+    ``config.toml`` is present) mismatched token budgets. At least one completed
+    record must carry real metrics (including finite ``corpus_tokens`` and
+    ``reward``). When ``use_real_trainer=true``, also require finite positive
+    ``train_flops`` / ``perf_loss`` and ``trainer_error_msg == 0``.
     """
     out = Path(out_dir)
     results = out / "results.jsonl"
@@ -71,6 +120,8 @@ def validate_smoke_results(
     if not completed:
         raise ValueError("results.jsonl has no is_completed=true records")
 
+    use_real_trainer = _config_use_real_trainer(out)
+
     for idx, row in enumerate(completed):
         stop = row.get("stop_condition")
         if isinstance(stop, str) and stop.strip().lower() == "error":
@@ -82,11 +133,8 @@ def validate_smoke_results(
 
         errors = row.get("errors")
         if errors:
-            if isinstance(errors, list) and len(errors) == 0:
-                pass
-            else:
-                blob = errors if isinstance(errors, str) else json.dumps(errors)
-                raise ValueError(f"completed record {idx} has error/failure payload: {blob}")
+            blob = errors if isinstance(errors, str) else json.dumps(errors)
+            raise ValueError(f"completed record {idx} has error/failure payload: {blob}")
 
         failure = row.get("failure")
         if failure:
@@ -95,33 +143,41 @@ def validate_smoke_results(
         metrics = row.get("metrics")
         if not isinstance(metrics, dict) or not metrics:
             raise ValueError(f"completed record {idx} missing nonempty metrics")
-        corpus_tokens = metrics.get("corpus_tokens")
-        if not isinstance(corpus_tokens, (int, float)):
-            raise ValueError(
-                f"completed record {idx} metrics missing numeric corpus_tokens"
-            )
+
+        _require_finite_number(
+            metrics.get("corpus_tokens"),
+            name="corpus_tokens",
+            idx=idx,
+            non_negative=True,
+        )
+        _require_finite_number(_record_reward(row), name="reward", idx=idx)
 
         # Real-trainer smokes must actually train — is_completed + corpus fill is
         # not enough when use_real_trainer=true (trainer_error_msg=1 / flops=0).
-        if _config_use_real_trainer(out):
-            trainer_err = metrics.get("trainer_error_msg", 0.0)
-            if isinstance(trainer_err, (int, float)) and float(trainer_err) != 0.0:
+        if use_real_trainer:
+            trainer_err = _require_finite_number(
+                metrics.get("trainer_error_msg", 0.0),
+                name="trainer_error_msg",
+                idx=idx,
+                non_negative=True,
+            )
+            if trainer_err != 0.0:
                 raise ValueError(
                     f"completed record {idx} trainer_error_msg={trainer_err} "
                     "(real trainer failed)"
                 )
-            train_flops = metrics.get("train_flops")
-            if not isinstance(train_flops, (int, float)) or float(train_flops) <= 0.0:
-                raise ValueError(
-                    f"completed record {idx} missing positive train_flops "
-                    f"(got {train_flops!r})"
-                )
-            perf_loss = metrics.get("perf_loss")
-            if not isinstance(perf_loss, (int, float)) or not (float(perf_loss) > 0.0):
-                raise ValueError(
-                    f"completed record {idx} missing positive perf_loss "
-                    f"(got {perf_loss!r})"
-                )
+            _require_finite_number(
+                metrics.get("train_flops"),
+                name="train_flops",
+                idx=idx,
+                positive=True,
+            )
+            _require_finite_number(
+                metrics.get("perf_loss"),
+                name="perf_loss",
+                idx=idx,
+                positive=True,
+            )
 
     log_path = out / "eval-stream.log"
     if log_path.is_file():

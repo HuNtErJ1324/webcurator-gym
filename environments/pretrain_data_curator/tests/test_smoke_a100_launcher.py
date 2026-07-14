@@ -133,6 +133,12 @@ def test_smoke_script_site_rebuild_only_after_valid_gate():
     # Failure path must retain artifacts and skip site rebuild.
     assert "site rebuild skipped" in text
     assert "retaining artifacts" in text
+    # Site builder already supports these flags; launcher must pass them.
+    rebuild_fn = text[text.index("rebuild_site()") : text.index("summarize_results()")]
+    assert "--outputs" in rebuild_fn
+    assert "--include-all" in rebuild_fn
+    assert "--no-debug" in rebuild_fn
+    assert "docs/build_site.py" in rebuild_fn
 
 
 def _write_valid_results(tmp_path: Path, *, budget: int = 10_000_000) -> Path:
@@ -355,6 +361,134 @@ def test_validate_smoke_results_rejects_failed_real_trainer(tmp_path: Path):
     )
     msg = validate_smoke_results(out, expected_token_budget=10_000_000)
     assert "valid_records=1" in msg
+
+
+@pytest.mark.parametrize(
+    "metric,bad",
+    [
+        ("corpus_tokens", float("nan")),
+        ("corpus_tokens", float("inf")),
+        ("corpus_tokens", float("-inf")),
+        ("reward", float("nan")),
+        ("reward", float("inf")),
+        ("reward", float("-inf")),
+    ],
+)
+def test_validate_smoke_results_rejects_nonfinite_common_metrics(
+    tmp_path: Path, metric: str, bad: float
+):
+    out = _write_valid_results(tmp_path)
+    row = {
+        "id": "nonfinite",
+        "is_completed": True,
+        "stop_condition": "agent_completed",
+        "rewards": {"reward": 0.1},
+        "metrics": {"corpus_tokens": 1000},
+        "errors": [],
+    }
+    if metric == "reward":
+        row["rewards"] = {"reward": bad}
+    else:
+        row["metrics"][metric] = bad
+    (out / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="finite|missing numeric"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+
+@pytest.mark.parametrize(
+    "metric,bad",
+    [
+        ("train_flops", float("nan")),
+        ("train_flops", float("inf")),
+        ("train_flops", float("-inf")),
+        ("train_flops", 0.0),
+        ("perf_loss", float("nan")),
+        ("perf_loss", float("inf")),
+        ("perf_loss", float("-inf")),
+        ("perf_loss", 0.0),
+        ("trainer_error_msg", float("nan")),
+        ("trainer_error_msg", float("inf")),
+        ("trainer_error_msg", float("-inf")),
+    ],
+)
+def test_validate_smoke_results_rejects_nonfinite_real_trainer_metrics(
+    tmp_path: Path, metric: str, bad: float
+):
+    out = _write_valid_results(tmp_path)
+    (out / "config.toml").write_text(
+        "\n".join(
+            [
+                'model = "deepseek/deepseek-v4-pro"',
+                "[args]",
+                "token_budget = 10000000",
+                "use_real_trainer = true",
+                "[args.proxy_student]",
+                "train_token_budget = 10000000",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    metrics = {
+        "corpus_tokens": 10_000_000,
+        "trainer_error_msg": 0.0,
+        "train_flops": 1.0e16,
+        "perf_loss": 5.0,
+    }
+    metrics[metric] = bad
+    (out / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "trainer-nonfinite",
+                "is_completed": True,
+                "stop_condition": "agent_completed",
+                "rewards": {"reward": 0.5},
+                "metrics": metrics,
+                "errors": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="finite|positive|trainer_error_msg"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+
+def test_validate_smoke_results_use_real_trainer_fail_closed(tmp_path: Path):
+    """Missing/malformed use_real_trainer must not silently skip trainer metrics."""
+    out = _write_valid_results(tmp_path)
+    (out / "config.toml").write_text(
+        "\n".join(
+            [
+                'model = "deepseek/deepseek-v4-pro"',
+                "[args]",
+                "token_budget = 10000000",
+                "[args.proxy_student]",
+                "train_token_budget = 10000000",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="use_real_trainer"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
+
+    (out / "config.toml").write_text(
+        "\n".join(
+            [
+                'model = "deepseek/deepseek-v4-pro"',
+                "[args]",
+                "token_budget = 10000000",
+                'use_real_trainer = "yes"',
+                "[args.proxy_student]",
+                "train_token_budget = 10000000",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="use_real_trainer"):
+        validate_smoke_results(out, expected_token_budget=10_000_000)
 
 
 def test_smoke_script_validate_only_gate(tmp_path: Path):
