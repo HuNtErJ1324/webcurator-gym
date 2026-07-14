@@ -310,8 +310,7 @@ with provenance metrics.
 ## Module Layout
 
 - `__init__.py` — `_bootstrap_verifiers_v1()`: patches `verifiers.__path__` at import time so the real v1 is importable inside Prime's Hosted Training orchestrator (which pre-loads a `verifiers==0.0.0` stub).
-- `pretrain_data_curator.py` — `load_environment` entry point; builds `CuratorTasksetConfig` and returns a `hosted_compat.Environment`.
-- `hosted_compat.py` — `Environment`: multiple-inheritance v0/v1 bridge. Derives from both `vf.Environment` and `legacy_vf.Environment`; delegates rollout work to the v1 episode engine and translates `vf.Trace` to the v0 `State` / `RolloutTiming` / trajectory format consumed by `prime eval` and Hosted Training.
+- `pretrain_data_curator.py` — `load_environment` entry point; builds `CuratorTasksetConfig` and returns a native v1 `Environment` (plus a thin `Environment` subclass that only stashes the loader's `env_args` for callers/tests).
 - `models.py` — Pydantic contracts (`Manifest`, `Source`, `FilterSpec`, `CuratorConfig`, `ProxyStudentConfig`, ...).
 - `hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers. Setup checks credentials before rollout; the client checks again at first Hub use.
 - `hf_cli_parse.py` — parse `hf` CLI argv from shell/command text for manifest recovery and val-set access detection.
