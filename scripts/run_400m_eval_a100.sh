@@ -805,8 +805,11 @@ for index, line in enumerate(rows):
         bad("row %d has %d rollout error(s): %s" % (index, len(errors), str(errors[0])[:300]))
     if not (row.get("metrics") or {}):
         bad("row %d has empty metrics" % index)
-    if "reward" not in (row.get("rewards") or {}) and row.get("reward") is None:
-        bad("row %d has no reward" % index)
+    rewards = row.get("rewards") or {}
+    reward = rewards["reward"] if "reward" in rewards else row.get("reward")
+    # A genuine 0.0 is a real score and must pass; null (nested or flat) is not.
+    if reward is None or isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        bad("row %d has no numeric reward (got %r)" % (index, reward))
 print("[validate] OK: %d finalized row(s) with metrics in %s" % (len(rows), path))
 PY
 }

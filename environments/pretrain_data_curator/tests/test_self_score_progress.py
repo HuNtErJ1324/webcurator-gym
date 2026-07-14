@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -158,6 +159,43 @@ def test_progress_lines_are_flushed_immediately(tmp_path: Path):
         timeout=120,
     )
     assert "[self-score] phase=train_running" in result.stderr, result.stderr
+
+
+def test_heartbeats_reach_stderr_while_a_child_is_still_running(tmp_path: Path):
+    """Heartbeat lines must be readable *during* the wait, before any timeout kill.
+
+    Reads the driver's stderr live: a heartbeat has to arrive while the child is
+    still alive, which is the only thing that distinguishes a slow run from a hang.
+    """
+    rendered = tmp_path / SELF_SCORE_FILENAME
+    rendered.write_bytes(_render_script(tmp_path))
+    driver = (
+        "import subprocess, sys\n"
+        f"ns = {{'__name__': 'self_score_live_test'}}\n"
+        f"exec(compile(open({str(rendered)!r}).read(), 'self_score.py', 'exec'), ns)\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],\n"
+        "                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n"
+        "try:\n"
+        "    ns['_communicate_with_heartbeat'](child, 20, 'train_running')\n"
+        "finally:\n"
+        "    child.kill()\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", driver],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PDC_SELF_SCORE_HEARTBEAT_SECONDS": "1"},
+    )
+    try:
+        assert proc.stderr is not None
+        line = proc.stderr.readline()  # blocks only until the first heartbeat
+        assert "[self-score] phase=train_running" in line, line
+        # ... and it arrived while both the driver and its child were still running
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.communicate()
 
 
 def test_communicate_with_heartbeat_reports_liveness_and_still_times_out():
@@ -313,12 +351,20 @@ def test_one_dead_source_among_live_ones_is_surfaced(tmp_path: Path):
     by_source = {s["source"]: s for s in payload["sources"]}
     assert by_source["good.jsonl"]["ok"] is True
     assert by_source["empty.jsonl"]["ok"] is False
-    # the live source still trained/scored: real reward semantics are preserved.
     assert payload["sampled_documents"] == 4
-    assert isinstance(payload["reward"], float)
+    # A partially sampled candidate was never scored as written: no number at all,
+    # so it can never be misread as a score (least of all a 0.0 one).
+    assert payload["reward"] is None
+    assert payload["perf_reward"] is None
+    assert payload["leakage_penalty"] is None
 
 
-def test_valid_candidate_keeps_genuine_numeric_reward(tmp_path: Path):
+def test_valid_candidate_keeps_genuine_numeric_zero_reward(tmp_path: Path):
+    """The heuristic (no-trainer) path scores exactly 0.0 -- and stays ok=true.
+
+    This is the case the zero-document contract must never swallow: a real,
+    fully sampled candidate whose reward genuinely is 0.0.
+    """
     (tmp_path / "good.jsonl").write_text(
         "\n".join(
             json.dumps({"text": "Clean development sample " * 30}) for _ in range(4)
@@ -341,9 +387,70 @@ def test_valid_candidate_keeps_genuine_numeric_reward(tmp_path: Path):
     assert payload["ok"] is True
     assert payload["error"] is None
     assert payload["sources"][0]["reason"] is None
-    # A trained (or heuristic) candidate keeps a numeric reward -- including 0.0.
-    assert isinstance(payload["reward"], float)
-    assert isinstance(payload["perf_reward"], float)
+    assert payload["sources"][0]["ok"] is True
+    # no trainer and no decon here: perf term 0.0, leakage term 0.0 -> reward 0.0
+    assert payload["perf"] is None
+    assert payload["perf_reward"] == 0.0
+    assert payload["leakage_penalty"] == 0.0
+    assert payload["reward"] == 0.0
+
+
+def test_decon_timeout_still_produces_the_single_json_result(tmp_path: Path):
+    """A decon that never finishes must not cost the run its result."""
+    evals = tmp_path / "evals"
+    evals.mkdir()
+    (evals / "eval.jsonl").write_text(json.dumps({"text": "eval"}) + "\n")
+    slow_decon = tmp_path / "slow-decon"
+    slow_decon.write_text("#!/usr/bin/env bash\nsleep 120\n")
+    slow_decon.chmod(0o755)
+
+    (tmp_path / SELF_SCORE_FILENAME).write_bytes(
+        render_self_score_script(
+            CuratorConfig(token_budget=1_000),
+            decon_binary=str(slow_decon),
+            decon_evals_dir=str(evals),
+        )
+    )
+    (tmp_path / "good.jsonl").write_text(
+        "\n".join(
+            json.dumps({"text": "Clean development sample " * 30}) for _ in range(4)
+        ),
+        encoding="utf-8",
+    )
+    manifest = _write_manifest(
+        tmp_path,
+        [
+            {
+                "kind": "local",
+                "local_path": "good.jsonl",
+                "local_format": "jsonl",
+                "weight": 1.0,
+            }
+        ],
+    )
+    result = subprocess.run(
+        [sys.executable, SELF_SCORE_FILENAME, manifest.name],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            **os.environ,
+            "PDC_SELF_SCORE_DECON_TIMEOUT": "2",
+            "PDC_SELF_SCORE_HEARTBEAT_SECONDS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)  # stdout is still exactly one JSON object
+    assert payload["ok"] is True
+    assert payload["leakage_score"] is None
+    assert payload["leakage_penalty"] == 0.0
+    assert payload["reward"] == 0.0
+    assert "decon timed out after 2s" in result.stderr
+    assert "phase=decon_timeout" in result.stderr
+    # the detector was reaped, not left hanging around the workspace
+    assert "phase=complete" in result.stderr
 
 
 # --- task prompt ------------------------------------------------------------
@@ -352,11 +459,26 @@ def test_valid_candidate_keeps_genuine_numeric_reward(tmp_path: Path):
 def test_prompt_warns_that_self_score_is_slow_and_must_not_be_killed():
     prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
     lowered = prompt.lower()
-    assert "many minutes" in lowered
+    assert "long silent runs" in lowered
+    assert "idle gpu" in lowered
     assert "heartbeat" in lowered
-    assert "kill" in lowered
+    assert "never kill or signal" in lowered
     assert "harness" in lowered
+    assert "wait for it to return or time out" in lowered
     assert "--train-timeout" in prompt
+
+
+def test_prompt_distinguishes_zero_doc_diagnostic_from_a_trained_zero():
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
+    assert "`ok: false` + `reward: null`" in prompt
+    assert "not a score" in prompt
+    assert "sampled zero documents" in prompt
+    # ... and that a real scored mixture may legitimately report exactly 0.0
+    assert "`ok: true` with a numeric reward, even 0.0" in prompt
+
+
+def test_prompt_preserves_existing_guidance():
+    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].prompt)
     # existing guidance is preserved
     assert "hf papers" in prompt
     assert "/workspace/.agents/skills/hf-cli/SKILL.md" in prompt
@@ -474,6 +596,16 @@ def test_status_is_exit_zero_only_for_a_finalized_successful_rollout(tmp_path: P
         pytest.param(
             {**_HEALTHY_ROW, "is_completed": False}, "not finalized", id="not_finalized"
         ),
+        pytest.param(
+            {**_HEALTHY_ROW, "rewards": {"reward": None}},
+            "no numeric reward",
+            id="nested_null_reward",
+        ),
+        pytest.param(
+            {**_HEALTHY_ROW, "rewards": {}, "reward": None},
+            "no numeric reward",
+            id="flat_null_reward",
+        ),
         pytest.param(None, "missing or empty", id="no_results_file"),
     ],
 )
@@ -481,6 +613,15 @@ def test_failed_rollout_never_reports_exit_zero(tmp_path: Path, row, expected):
     status, log = _run_eval_wrapper(tmp_path, row)
     assert status == "EXIT=65", log
     assert expected in log
+
+
+def test_finalized_rollout_with_genuine_zero_reward_exits_zero(tmp_path: Path):
+    """reward 0.0 is a real score, not a missing one: it must not fail the run."""
+    status, log = _run_eval_wrapper(
+        tmp_path, {**_HEALTHY_ROW, "rewards": {"reward": 0.0}}
+    )
+    assert status == "EXIT=0", log
+    assert "[validate] OK" in log
 
 
 def test_validation_uses_this_runs_logged_dir_not_a_repo_scan(tmp_path: Path):
@@ -512,36 +653,28 @@ def test_missing_results_line_in_log_fails_closed(tmp_path: Path):
 # --- process-group safety ---------------------------------------------------
 
 
-def test_guard_refuses_to_signal_a_pid_that_is_not_its_group_leader():
-    """A recorded pid that is no longer its own group leader must never be killed:
-    killpg would hit whatever group now owns that id -- possibly the harness's."""
-    helpers = _self_score_helpers()
-    guard = helpers["_group_signal_guard"]
-    # No start_new_session -> the child lives in THIS process's group, so its pid
-    # is not a pgid (exactly the PID-reuse shape the guard exists to reject).
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        assert helpers["_process_pgid"](child.pid) == os.getpgid(child.pid) != child.pid
-        assert guard(child.pid) == "not_session_leader"
+class _KillpgRecorder:
+    """Stand-in for the script's ``os`` that records every real signal sent.
 
-        details = helpers["_terminate_pgid"](child.pid, grace_seconds=0.2)
-        assert details["skipped"] is True
-        assert details["reason"] == "not_session_leader"
-        assert details["terminated"] is False and details["killed"] is False
-        time.sleep(0.1)
-        assert child.poll() is None, (
-            "guarded cleanup must not signal an unverified group"
-        )
-    finally:
-        child.kill()
-        child.wait(timeout=5)
+    Signal 0 (liveness probe) is delegated; anything else is recorded and
+    swallowed, so a regression that signals an unverified group is caught as a
+    recorded call instead of by killing the test session's own group.
+    """
+
+    def __init__(self):
+        self.signals: list[tuple[int, int]] = []
+
+    def killpg(self, pgid, sig):
+        if sig == 0:
+            return os.killpg(pgid, 0)
+        self.signals.append((int(pgid), int(sig)))
+
+    def __getattr__(self, name):
+        return getattr(os, name)
 
 
-def test_guard_rejects_mismatched_identity_and_missing_leader():
+def test_guard_fails_closed_without_a_recorded_identity():
+    """No recorded starttime means nothing proves the pid is still ours."""
     helpers = _self_score_helpers()
     guard = helpers["_group_signal_guard"]
     leader = subprocess.Popen(
@@ -551,19 +684,152 @@ def test_guard_rejects_mismatched_identity_and_missing_leader():
         stderr=subprocess.DEVNULL,
     )
     try:
-        starttime = helpers["_pgid_starttime"](leader.pid)
-        # a live leader with the recorded starttime is the one case we may signal
-        assert guard(leader.pid, expected_starttime=starttime) is None
-        assert guard(leader.pid, expected_starttime="0") == "identity_mismatch"
+        # Live, is its own group leader, but no identity was recorded: refuse.
+        assert guard(leader.pid) == "no_recorded_identity"
+        assert guard(leader.pid, allow_missing_leader=True) == "no_recorded_identity"
+        assert guard(None) == "no_pgid"
+
+        recorder = _KillpgRecorder()
+        helpers["os"] = recorder
+        details = helpers["_terminate_pgid"](leader.pid, grace_seconds=0.2)
+        assert details["skipped"] is True
+        assert details["reason"] == "no_recorded_identity"
+        assert recorder.signals == [], "signalled a group with no recorded identity"
+        assert leader.poll() is None
     finally:
+        helpers["os"] = os
         leader.kill()
         leader.wait(timeout=5)
 
-    # a pid with no /proc entry is only signalled for a group we still own
-    dead = leader.pid
-    assert guard(dead, expected_starttime=None) == "leader_gone"
-    assert guard(dead, expected_starttime=None, allow_missing_leader=True) is None
-    assert guard(None) == "no_pgid"
+
+def test_guard_refuses_a_reused_pid_and_a_pid_that_is_not_its_group_leader():
+    """PID reuse: same number, different process -> never signalled."""
+    helpers = _self_score_helpers()
+    guard = helpers["_group_signal_guard"]
+
+    leader = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        starttime = helpers["_pgid_starttime"](leader.pid)
+        # the one signallable case: live leader of its own group, identity matches
+        assert guard(leader.pid, expected_starttime=starttime) is None
+        # same pid, different starttime == a recycled pid: refuse
+        assert guard(leader.pid, expected_starttime="0") == "identity_mismatch"
+
+        recorder = _KillpgRecorder()
+        helpers["os"] = recorder
+        details = helpers["_terminate_pgid"](
+            leader.pid, grace_seconds=0.2, expected_starttime="0"
+        )
+        assert details["skipped"] is True
+        assert details["reason"] == "identity_mismatch"
+        assert recorder.signals == [], "signalled a recycled pid"
+        assert leader.poll() is None
+    finally:
+        helpers["os"] = os
+        leader.kill()
+        leader.wait(timeout=5)
+
+    # a pid living in someone else's group (no start_new_session) is not a pgid
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        starttime = helpers["_pgid_starttime"](child.pid)
+        assert helpers["_process_pgid"](child.pid) == os.getpgid(child.pid) != child.pid
+        assert guard(child.pid, expected_starttime=starttime) == "not_session_leader"
+        recorder = _KillpgRecorder()
+        helpers["os"] = recorder
+        details = helpers["_terminate_pgid"](
+            child.pid, grace_seconds=0.2, expected_starttime=starttime
+        )
+        assert details["skipped"] is True
+        assert details["reason"] == "not_session_leader"
+        assert recorder.signals == [], "signalled a group we do not lead"
+        assert child.poll() is None
+    finally:
+        helpers["os"] = os
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_guard_treats_a_missing_leader_as_signallable_only_for_an_owned_group():
+    helpers = _self_score_helpers()
+    guard = helpers["_group_signal_guard"]
+    dead = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    dead.wait(timeout=5)  # reaped: no /proc entry remains
+
+    # Without a recorded identity we never signal, even for an owned group.
+    assert guard(dead.pid, allow_missing_leader=True) == "no_recorded_identity"
+    # With one: a stale lock holder is not signalled ...
+    assert guard(dead.pid, expected_starttime="123") == "leader_gone"
+    # ... while a group we created may still be swept (killpg can only reach
+    # surviving members or raise ESRCH -- a reused pgid needs a live pid==pgid).
+    assert guard(dead.pid, expected_starttime="123", allow_missing_leader=True) is None
+
+
+def test_pid_reuse_between_sigterm_and_sigkill_blocks_the_second_signal():
+    """TOCTOU: identity is revalidated immediately before *each* signal."""
+    helpers = _self_score_helpers()
+    real_stat = helpers["_proc_stat_fields"]
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(30)\n",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        starttime = helpers["_pgid_starttime"](leader.pid)
+        recorder = _KillpgRecorder()
+        helpers["os"] = recorder
+
+        def flaky_stat(pid):
+            """After the first real signal, /proc reports a *different* process."""
+            fields = real_stat(pid)
+            if fields is not None and recorder.signals:
+                fields = list(fields)
+                fields[19] = "999999999"  # pid recycled between SIGTERM and SIGKILL
+            return fields
+
+        helpers["_proc_stat_fields"] = flaky_stat
+        details = helpers["_terminate_pgid"](
+            leader.pid, grace_seconds=0.3, expected_starttime=starttime
+        )
+        # SIGTERM went out under a matching identity; SIGKILL was refused.
+        assert details["terminated"] is True
+        assert details.get("killed") is not True
+        assert details.get("reason") == "identity_mismatch"
+        assert [sig for _pgid, sig in recorder.signals] == [signal.SIGTERM]
+        assert leader.poll() is None
+    finally:
+        helpers["_proc_stat_fields"] = real_stat
+        helpers["os"] = os
+        leader.kill()
+        leader.wait(timeout=5)
+
+
+def test_fast_exiting_child_is_reaped_without_any_signal():
+    helpers = _self_score_helpers()
+    result, details = helpers["_run_in_process_group"](
+        [sys.executable, "-c", "print('quick')"], timeout=30
+    )
+    assert result.returncode == 0
+    assert "quick" in (result.stdout or "")
+    assert details["timed_out"] is False
+    assert details["returncode"] == 0
+    assert not details.get("skipped")
 
 
 def test_stale_lock_holder_that_is_not_a_leader_is_never_signalled(tmp_path: Path):
@@ -577,11 +843,14 @@ def test_stale_lock_holder_that_is_not_a_leader_is_never_signalled(tmp_path: Pat
     try:
         with open(lock_path, "a+", encoding="utf-8") as fh:
             helpers["_write_lock_pgid"](fh, child.pid)
+        recorder = _KillpgRecorder()
+        helpers["os"] = recorder
         lock = helpers["_train_lock"](lock_path)
         helpers["_release_train_lock"](lock)
-        time.sleep(0.1)
-        assert child.poll() is None, "stale-lock recovery signalled a non-leader pid"
+        assert recorder.signals == [], "stale-lock recovery signalled a non-leader pid"
+        assert child.poll() is None
     finally:
+        helpers["os"] = os
         child.kill()
         child.wait(timeout=5)
 
@@ -608,6 +877,7 @@ def test_owned_process_group_still_sweeps_grandchildren(tmp_path: Path):
     assert not details.get("skipped")
     assert details.get("terminated") or details.get("killed")
 
+    # non-vacuous: the grandchild really existed, and it is really gone
     deadline = time.monotonic() + 5
     grandchild = None
     while time.monotonic() < deadline:
@@ -616,6 +886,13 @@ def test_owned_process_group_still_sweeps_grandchildren(tmp_path: Path):
             grandchild = int(raw)
             break
         time.sleep(0.05)
-    assert grandchild is not None
+    assert grandchild is not None, "grandchild never started; test would be vacuous"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
     with pytest.raises(ProcessLookupError):
         os.kill(grandchild, 0)

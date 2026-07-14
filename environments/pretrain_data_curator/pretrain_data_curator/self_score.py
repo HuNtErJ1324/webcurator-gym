@@ -360,6 +360,34 @@ def progress(phase, **fields):
     sys.stderr.flush()
 
 
+def _decon_timeout_seconds():
+    raw = os.environ.get("PDC_SELF_SCORE_DECON_TIMEOUT", "600")
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        value = 600
+    return max(1, value)
+
+
+def _kill_and_reap(proc, *, grace_seconds=5.0):
+    """SIGKILL a direct child and reap it; never leave a zombie behind."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.wait(timeout=grace_seconds)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _communicate_with_heartbeat(proc, timeout, phase, **fields):
     """``proc.communicate(timeout=...)`` with bounded periodic heartbeats.
 
@@ -414,6 +442,7 @@ _TRAIN_LOCK_PATH = os.environ.get(
     "PDC_SELF_SCORE_LOCK", "/tmp/pdc_self_score_train.lock"
 )
 _ACTIVE_TRAIN_PROC = None
+_ACTIVE_TRAIN_IDENTITY = None
 _ACTIVE_LOCK_FH = None
 _SIGNAL_HANDLERS_INSTALLED = False
 
@@ -517,35 +546,36 @@ def _pgid_alive(pgid):
         return True
 
 
-def _identity_matches(pgid, expected_starttime):
-    if pgid is None:
-        return False
-    if expected_starttime is None:
-        return _pgid_alive(pgid)
-    current = _pgid_identity(pgid)
-    return current == "%s:%s" % (int(pgid), expected_starttime)
-
-
 def _group_signal_guard(pgid, expected_starttime=None, allow_missing_leader=False):
     """Return a skip reason when signalling this group would be unsafe, else None.
 
-    ``killpg`` hits every member of a group, so a recorded pid whose identity no
-    longer holds must never be signalled: after PID reuse the same number can
-    name an unrelated leader (in the eval container, plausibly the harness's own
-    session). We only signal when /proc still shows the pid as its own group
-    leader (pid == pgid) with the expected starttime. ``allow_missing_leader``
-    is for a group we created ourselves and still hold a handle to: once its
-    leader is reaped the pgid cannot be reused while members survive, so
-    signalling remains safe and is required to sweep grandchildren.
+    ``killpg`` hits every member of a group, so this fails closed. Without a
+    recorded starttime there is nothing to prove the pid is still the process we
+    recorded (after PID reuse it can name an unrelated leader -- in the eval
+    container, plausibly the harness's own session), so a missing identity is
+    never signalled. Otherwise /proc must still show the pid as its own group
+    leader (pid == pgid) with exactly the recorded starttime.
+
+    ``allow_missing_leader`` covers a group we created and still own whose leader
+    has already been reaped. A signal there can only reach surviving members of
+    the original group or raise ESRCH: a *reused* pgid requires a live process
+    with pid == pgid, and there is none (no /proc entry) -- the kernel also
+    refuses ``setsid`` for a pid that still names a live process group.
     """
     if pgid is None:
         return "no_pgid"
+    if expected_starttime is None:
+        return "no_recorded_identity"
     fields = _proc_stat_fields(pgid)
     if fields is None:
         return None if allow_missing_leader else "leader_gone"
-    if _process_pgid(pgid) != int(pgid):
+    try:
+        leader_pgid = int(fields[2])
+    except ValueError:
+        return "unreadable_stat"
+    if leader_pgid != int(pgid):
         return "not_session_leader"
-    if expected_starttime is not None and not _identity_matches(pgid, expected_starttime):
+    if fields[19] != str(expected_starttime):
         return "identity_mismatch"
     return None
 
@@ -585,7 +615,11 @@ def _terminate_pgid(
         return details
 
     def _guard():
-        """Skip signalling (never killpg) when the group is not verifiably ours."""
+        """Re-prove ownership immediately before a signal; never killpg blind.
+
+        Called again before every ``killpg`` (not once up front) so a leader that
+        exits and has its PID reused mid-cleanup cannot inherit our signal.
+        """
         reason = _group_signal_guard(
             pgid,
             expected_starttime=expected_starttime,
@@ -609,6 +643,8 @@ def _terminate_pgid(
         return details
     if child_proc is None and not _pgid_alive(pgid):
         details["reaped"] = True
+        return details
+    if _guard():  # revalidate: the checks above are not free of wall-clock time
         return details
     try:
         os.killpg(pgid, signal.SIGTERM)
@@ -741,8 +777,10 @@ def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None
     """SIGTERM then SIGKILL an entire session/process group and reap it.
 
     The group was created here (``start_new_session=True``), so its leader is our
-    own child: signalling is allowed even once the leader is reaped, which is what
-    sweeps surviving grandchildren.
+    own child. While that child is unreaped its PID cannot be reused, so when no
+    starttime was recorded we may still read one from /proc and prove the leader
+    is the same child, in its own group. With the child already reaped and no
+    recorded identity there is nothing left to prove: the guard refuses to signal.
     """
     details = {
         "pid": getattr(proc, "pid", None),
@@ -758,6 +796,9 @@ def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None
         details["reaped"] = True
         details["returncode"] = proc.returncode
         return details
+    if expected_starttime is None:
+        # Unreaped child: /proc still describes exactly this process.
+        expected_starttime = _pgid_starttime(proc.pid)
     pg = _terminate_pgid(
         proc.pid,
         grace_seconds=grace_seconds,
@@ -780,12 +821,14 @@ def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None
 
 
 def _cleanup_active_train_proc():
-    global _ACTIVE_TRAIN_PROC, _ACTIVE_LOCK_FH
+    global _ACTIVE_TRAIN_PROC, _ACTIVE_TRAIN_IDENTITY, _ACTIVE_LOCK_FH
     proc = _ACTIVE_TRAIN_PROC
+    identity = _ACTIVE_TRAIN_IDENTITY
     lock_fh = _ACTIVE_LOCK_FH
     _ACTIVE_TRAIN_PROC = None
+    _ACTIVE_TRAIN_IDENTITY = None
     if proc is not None and proc.poll() is None:
-        details = _terminate_process_group(proc)
+        details = _terminate_process_group(proc, expected_starttime=identity)
         details["cleanup_reason"] = "signal"
     if lock_fh is not None:
         try:
@@ -821,7 +864,7 @@ atexit.register(_cleanup_active_train_proc)
 
 def _run_in_process_group(argv, *, timeout, lock_fh=None):
     """Run argv in a new session; on timeout/error kill the whole process group."""
-    global _ACTIVE_TRAIN_PROC, _ACTIVE_LOCK_FH
+    global _ACTIVE_TRAIN_PROC, _ACTIVE_TRAIN_IDENTITY, _ACTIVE_LOCK_FH
     pass_fds = ()
     if lock_fh is not None:
         _clear_fd_cloexec(lock_fh.fileno())
@@ -834,11 +877,12 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         start_new_session=True,
         pass_fds=pass_fds,
     )
+    starttime = _pgid_starttime(proc.pid)
     _ACTIVE_TRAIN_PROC = proc
+    _ACTIVE_TRAIN_IDENTITY = starttime
     _ACTIVE_LOCK_FH = lock_fh
     if lock_fh is not None:
         _write_lock_pgid(lock_fh, proc.pid)
-    starttime = _pgid_starttime(proc.pid)
     pg_details = {
         "pid": proc.pid,
         "pgid": proc.pid,
@@ -887,6 +931,7 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
                 pass
         if _ACTIVE_TRAIN_PROC is proc:
             _ACTIVE_TRAIN_PROC = None
+            _ACTIVE_TRAIN_IDENTITY = None
         if _ACTIVE_LOCK_FH is lock_fh:
             _ACTIVE_LOCK_FH = None
 
@@ -1033,7 +1078,8 @@ def decon_score(docs):
 
         report_dir = os.path.join(tmp, "report")
         os.makedirs(report_dir, exist_ok=True)
-        progress("decon_started", documents=len(docs), timeout="600s")
+        decon_timeout = _decon_timeout_seconds()
+        progress("decon_started", documents=len(docs), timeout="%ds" % decon_timeout)
         proc = subprocess.Popen(
             [
                 binary, "detect",
@@ -1046,11 +1092,22 @@ def decon_score(docs):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
-            _stdout, decon_stderr = _communicate_with_heartbeat(proc, 600, "decon_running")
+            _stdout, decon_stderr = _communicate_with_heartbeat(
+                proc, decon_timeout, "decon_running"
+            )
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            raise
+            # A slow decon must never cost the run its JSON result: kill and reap
+            # the detector, report it, and score with leakage unavailable.
+            _kill_and_reap(proc)
+            progress("decon_timeout", documents=len(docs), timeout="%ds" % decon_timeout)
+            print(
+                "[self-score] WARNING: decon timed out after %ds on %d sampled "
+                "documents; leakage_score is null for this run (reward omits the "
+                "leakage term). Re-run with fewer docs (--limit) to get a leakage "
+                "reading." % (decon_timeout, len(docs)),
+                file=sys.stderr,
+            )
+            return None, None
         if proc.returncode != 0:
             print("[self-score] WARNING: decon exited %d: %s" % (
                 proc.returncode, (decon_stderr or "")[:200],
@@ -1068,9 +1125,6 @@ def decon_score(docs):
             return 0.0, 0
 
         return _reduce_report(report_lines, total_tok)
-    except subprocess.TimeoutExpired:
-        print("[self-score] WARNING: decon timed out after 600s", file=sys.stderr)
-        return None, None
     except Exception as exc:
         print("[self-score] WARNING: decon failed: %s" % exc, file=sys.stderr)
         return None, None
@@ -1403,23 +1457,25 @@ def main():
     leakage_score, num_matches = decon_score(all_docs) if all_docs else (None, None)
     progress("scoring", perf_loss=perf_loss, leakage_score=leakage_score)
 
-    if sampled_documents == 0 or sampled_tokens == 0:
-        # Nothing was sampled, so nothing was trained: there is no reward to
-        # report. Reporting 0.0 here would be indistinguishable from a trained
-        # candidate that genuinely scored 0.
-        perf_reward = None
-        leakage_penalty = None
-        reward = None
-    else:
+    ok = not failed and sampled_documents > 0 and sampled_tokens > 0
+    if ok:
         perf_reward = ALPHA_PERF * (perf or 0.0)
         leakage_penalty = (
             -LAMBDA_LEAKAGE * leakage_score if leakage_score is not None else 0.0
         )
         reward = perf_reward + leakage_penalty
+    else:
+        # A candidate with a dead source was never scored as written: part of the
+        # mixture contributed nothing. Reporting a number here would be read as a
+        # score, and 0.0 would be indistinguishable from a trained candidate that
+        # genuinely scored 0.0. Only a fully sampled candidate gets a reward.
+        perf_reward = None
+        leakage_penalty = None
+        reward = None
 
     error = None
     if failed:
-        error = "%d of %d sources sampled zero documents -- %s" % (
+        error = "%d of %d sources sampled zero documents (reward not scored) -- %s" % (
             len(failed),
             len(source_stats),
             "; ".join(
@@ -1427,14 +1483,9 @@ def main():
             ),
         )
 
-    progress(
-        "complete",
-        ok=not failed and sampled_documents > 0,
-        reward=reward,
-        documents=sampled_documents,
-    )
+    progress("complete", ok=ok, reward=reward, documents=sampled_documents)
     print(json.dumps({
-        "ok": not failed and sampled_documents > 0 and sampled_tokens > 0,
+        "ok": ok,
         "error": error,
         "sampled_documents": sampled_documents,
         "sampled_tokens": sampled_tokens,
