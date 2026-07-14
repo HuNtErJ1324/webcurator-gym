@@ -19,9 +19,7 @@ def _require_number(
     positive: bool = False,
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(
-            f"row {row_index} missing numeric {name} (got {value!r})"
-        )
+        raise ValueError(f"row {row_index} missing numeric {name} (got {value!r})")
     number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"row {row_index} {name} must be finite (got {value!r})")
@@ -172,11 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         production = production_mode_from_config(args[1])
-        print(
-            validate_400m_results(
-                args[0], require_production_training=production
-            )
-        )
+        print(validate_400m_results(args[0], require_production_training=production))
     except ValueError as exc:
         print(f"semantic result validation failed: {exc}", file=sys.stderr)
         return 1

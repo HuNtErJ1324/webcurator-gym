@@ -43,9 +43,10 @@ def _write_result(tmp_path: Path, row: dict) -> Path:
 
 def test_valid_production_result_passes(tmp_path: Path):
     result = _write_result(tmp_path, _valid_row())
-    assert validate_400m_results(
-        result, require_production_training=True
-    ) == "valid_rows=1 mode=production"
+    assert (
+        validate_400m_results(result, require_production_training=True)
+        == "valid_rows=1 mode=production"
+    )
 
 
 def test_missing_model_manifest_fails_closed(tmp_path: Path):
@@ -146,9 +147,7 @@ def test_launcher_gates_remote_and_downloaded_results_before_site_work():
     assert "STATUS=semantic_invalid" in script
     assert "REMOTE_SEMANTIC_INVALID=1" in script
 
-    remote_gate = script.index(
-        "python3 pretrain_data_curator/result_gate.py"
-    )
+    remote_gate = script.index("python3 pretrain_data_curator/result_gate.py")
     remote_status = script.index("SEMANTIC_INVALID=", remote_gate)
     assert remote_gate < remote_status
 

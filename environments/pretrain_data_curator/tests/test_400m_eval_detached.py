@@ -87,10 +87,7 @@ def _make_temp_repo(tmp_path: Path) -> Path:
         / "result_gate.py"
     )
     package_dst = (
-        repo
-        / "environments"
-        / "pretrain_data_curator"
-        / "pretrain_data_curator"
+        repo / "environments" / "pretrain_data_curator" / "pretrain_data_curator"
     )
     package_dst.mkdir(parents=True)
     shutil.copy(package_src, package_dst / package_src.name)
@@ -104,7 +101,7 @@ def _make_temp_repo(tmp_path: Path) -> Path:
     return repo
 
 
-_SSH_FAKE = r'''#!/usr/bin/env bash
+_SSH_FAKE = r"""#!/usr/bin/env bash
 set +e
 stdin="$(cat)"
 REC="${WCG_RECORD_DIR:?}"
@@ -216,10 +213,10 @@ fi
 
 # default: provisioning / other heredocs -> success
 exit 0
-'''
+"""
 
 
-_RSYNC_FAKE = r'''#!/usr/bin/env bash
+_RSYNC_FAKE = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "${WCG_RECORD_DIR:?}/rsync_args.log"
 printf 'rsync\n' >> "${WCG_RECORD_DIR:?}/rsync_count.txt"
 mode="${WCG_RSYNC_MODE:-ok}"
@@ -245,7 +242,7 @@ JSON
   printf 'preserve me\n' > "$last/downloaded-artifact.txt"
 fi
 exit 0
-'''
+"""
 
 
 def _build_fakes(record_dir: Path) -> Path:
@@ -253,7 +250,7 @@ def _build_fakes(record_dir: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     _write_script(
         bin_dir / "prime",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 set +e
 case "$1" in
   whoami) exit 0 ;;
@@ -284,23 +281,29 @@ case "$1" in
     ;;
 esac
 exit 0
-''',
+""",
     )
     _write_script(bin_dir / "ssh", _SSH_FAKE)
     _write_script(
         bin_dir / "scp",
-        r'''#!/usr/bin/env bash
+        r"""#!/usr/bin/env bash
 printf 'scp %s\n' "$*" >> "${WCG_RECORD_DIR:?}/scp.log"
 exit 0
-''',
+""",
     )
     _write_script(bin_dir / "rsync", _RSYNC_FAKE)
-    _write_script(bin_dir / "ssh-keygen", r'''#!/usr/bin/env bash
+    _write_script(
+        bin_dir / "ssh-keygen",
+        r"""#!/usr/bin/env bash
 exit 0
-''')
-    _write_script(bin_dir / "sleep", r'''#!/usr/bin/env bash
+""",
+    )
+    _write_script(
+        bin_dir / "sleep",
+        r"""#!/usr/bin/env bash
 exit 0
-''')
+""",
+    )
     return bin_dir
 
 
@@ -390,7 +393,9 @@ def _run_bash_heredoc(body: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
-def _run_find_results(body: str, remote_root: Path, run_name: str) -> subprocess.CompletedProcess:
+def _run_find_results(
+    body: str, remote_root: Path, run_name: str
+) -> subprocess.CompletedProcess:
     """Execute the find_remote_results_dir heredoc (the remote-side body) with
     remote_log/REMOTE_ROOT set, mirroring what the launcher's `remote` wrapper
     would expand before invoking `bash -s` on the pod.
@@ -417,6 +422,7 @@ def _run_find_results(body: str, remote_root: Path, run_name: str) -> subprocess
 
 
 # --- actual-probe-herdoc regression (blocker 2) ----------------------------
+
 
 def test_remote_eval_probe_heredoc_runs_against_real_files(tmp_path: Path):
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
@@ -471,6 +477,7 @@ def test_remote_eval_probe_argument_mapping_is_correct():
 
 # --- source-inspection tests ------------------------------------------------
 
+
 def test_run_remote_eval_launches_detached_with_markers():
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
     # Search the whole script: _extract_bash_function truncates on ${...} heredocs.
@@ -487,12 +494,12 @@ def test_run_remote_eval_has_monitor_tolerating_transient_ssh():
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
     mon = _extract_bash_function(text, "monitor_remote_eval")
     # retries + backoff within the probe loop
-    assert "for attempt in $(seq 1 \"$retries\")" in mon
-    assert "sleep \"$backoff\"" in mon
+    assert 'for attempt in $(seq 1 "$retries")' in mon
+    assert 'sleep "$backoff"' in mon
     # transient probe failure must NOT kill the eval; it only logs + retries
     assert "monitor SSH probe failed (transient)" in mon
     # only proceeds after confirmed completion
-    assert 'STATUS=done*)' in mon
+    assert "STATUS=done*)" in mon
     assert "exited non-zero" in mon
     # timeout path preserves remote log/status
     assert "monitor timed out after" in mon
@@ -514,13 +521,14 @@ def test_secrets_sourced_not_echoed():
     assert "source secrets.env" in text
     assert "set -a" in text
     # never print secrets to any log
-    assert "echo \"$PRIME_API_KEY" not in text
-    assert "echo \"$HF_TOKEN" not in text
+    assert 'echo "$PRIME_API_KEY' not in text
+    assert 'echo "$HF_TOKEN' not in text
     assert "echo $PRIME_API_KEY" not in text
     assert "echo $HF_TOKEN" not in text
 
 
 # --- behavioral tests (stateful fake SSH) ------------------------------------
+
 
 def test_detached_eval_survives_transient_disconnect_and_completes(tmp_path: Path):
     repo = _make_temp_repo(tmp_path)
@@ -649,6 +657,7 @@ def test_hostile_model_value_cannot_break_out(tmp_path: Path):
 
 # --- find_remote_results_dir / download path logic (artifact-path blocker) ---
 
+
 def test_find_remote_results_strips_outputs_prefix(tmp_path: Path):
     """The real function must return the results dir RELATIVE to the outputs
     root (strip exactly one leading `outputs/`), not `outputs/...`."""
@@ -694,7 +703,11 @@ def test_find_remote_results_fallback_returns_relative(tmp_path: Path):
     run_dir.mkdir()
     (run_dir / "eval.log").write_text("no results line here\n")
     outputs_root = (
-        tmp_path / "webcurator-gym" / "environments" / "pretrain_data_curator" / "outputs"
+        tmp_path
+        / "webcurator-gym"
+        / "environments"
+        / "pretrain_data_curator"
+        / "outputs"
     )
     run = outputs_root / "pretrain-data-curator--abc" / "run-uuid"
     run.mkdir(parents=True)
