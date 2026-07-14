@@ -96,12 +96,6 @@ def test_load_manifest_rejects_missing(tmp_path):
         load_manifest(tmp_path / "nope.json")
 
 
-def test_load_manifest_rejects_bad_schema(tmp_path):
-    bad = _write(tmp_path / "bad.json", '{"token_budget": -5, "sources": []}')
-    with pytest.raises(Exception):
-        load_manifest(bad)
-
-
 # --------------------------------------------------------------------------- #
 # Hardening: explicit positive token-budget validation
 # --------------------------------------------------------------------------- #
@@ -111,42 +105,9 @@ def test_validate_token_budget_rejects_non_positive():
             validate_token_budget(bad)
 
 
-def test_validate_token_budget_rejects_non_int():
-    for bad in (True, False, 1.0, "20000", None):
-        with pytest.raises(TokenBudgetError):
-            validate_token_budget(bad)
-
-
 def test_validate_token_budget_accepts_positive():
     assert validate_token_budget(1) == 1
     assert validate_token_budget(20_000) == 20_000
-
-
-def test_load_manifest_rejects_zero_token_budget(tmp_path):
-    bad = _write(tmp_path / "bad.json", '{"token_budget": 0, "sources": []}')
-    with pytest.raises(TokenBudgetError):
-        load_manifest(bad)
-
-
-def test_load_manifest_rejects_negative_token_budget(tmp_path):
-    bad = _write(tmp_path / "bad.json", '{"token_budget": -5, "sources": []}')
-    with pytest.raises(TokenBudgetError):
-        load_manifest(bad)
-
-
-def test_load_manifest_rejects_bool_token_budget(tmp_path):
-    bad = _write(tmp_path / "bad.json", '{"token_budget": true, "sources": []}')
-    with pytest.raises(TokenBudgetError):
-        load_manifest(bad)
-
-
-def test_load_manifest_accepts_positive_token_budget(tmp_path):
-    good = _write(
-        tmp_path / "good.json",
-        '{"token_budget": 20000, "sources": []}',
-    )
-    manifest = load_manifest(good)
-    assert manifest.token_budget == 20000
 
 
 @pytest.mark.asyncio

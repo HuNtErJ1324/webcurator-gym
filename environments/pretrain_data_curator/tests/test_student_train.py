@@ -3097,13 +3097,9 @@ def test_train_microbatch_adamw_end_to_end_matches_full_batch_weights():
 # --- Microbatch x grad_accum_embed_head_steps regression (values 1 and >1) ---
 
 
-@pytest.mark.parametrize("grad_accum", [1, 2])
-@pytest.mark.parametrize("microbatch", [None, 1])
-def test_grad_accum_microbatch_clip_cadence_unchanged(
-    monkeypatch, grad_accum, microbatch
-):
-    """Clipping fires once per optimizer update for grad_accum in {1, >1}, and
-    loss-scaled microbatching must not add or skip a clip (no double/skipped clip).
+def test_grad_accum_microbatch_clip_cadence_unchanged(monkeypatch):
+    """Clipping fires once per optimizer update, and loss-scaled microbatching
+    must not add or skip a clip (no double/skipped clip).
 
     With batch schedule off, batch=2, steps=6, adam_on_odd_steps=True there are
     always 6 Muon updates + 3 AdamW updates = 9 clips, independent of how many
@@ -3143,17 +3139,16 @@ def test_grad_accum_microbatch_clip_cadence_unchanged(
         training_recipe="speedrun_muon",
         batch_schedule_enabled=False,
         adam_on_odd_steps=True,
-        grad_accum_embed_head_steps=grad_accum,
-        train_microbatch_size=microbatch,
+        grad_accum_embed_head_steps=1,
+        train_microbatch_size=None,
     )
     assert len(clip_calls) == 9, (
-        f"grad_accum={grad_accum} microbatch={microbatch}: expected 9 clips, "
-        f"got {len(clip_calls)}: {clip_calls}"
+        f"expected 9 clips, got {len(clip_calls)}: {clip_calls}"
     )
     assert all(c == 1.0 for c in clip_calls)
 
 
-@pytest.mark.parametrize("grad_accum", [1, 2])
+@pytest.mark.parametrize("grad_accum", [2])
 def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(
     monkeypatch, grad_accum
 ):

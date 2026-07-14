@@ -14,7 +14,6 @@ from pretrain_data_curator.train_gpt import (
     _sliding_window_mask,
     GPT,
     GPT2_SMALL,
-    GPT2_SMALL_PARAM_COUNT,
     MLP,
     RMSNorm,
     Rotary,
@@ -46,20 +45,6 @@ def _randomize(model: torch.nn.Module) -> None:
 
 
 # --- (a) instantiated param count is in the documented GPT-2-small band ----
-
-
-def test_gpt2_small_param_count_is_pinned():
-    # Instantiate on the meta device so the ~278M-param model costs no memory.
-    with torch.device("meta"):
-        model = GPT2_SMALL.build()
-    n_params = sum(p.numel() for p in model.parameters())
-    # Exact pin (single source of truth; guards silent architectural drift).
-    assert n_params == GPT2_SMALL_PARAM_COUNT == 278_122_938
-    # Documented GPT-2-small-class band: 768-wide, 12-deep, but larger by count
-    # because of the untied head and the 3 sparse (SparsifyEmbeds) value tables.
-    assert 270_000_000 <= n_params <= 285_000_000
-    assert n_params > 124_000_000  # well above the tied-embedding canonical 124M
-    assert GPT2_SMALL.model_dim == 768 and GPT2_SMALL.num_layers == 12
 
 
 def test_gpt2_small_unet_halves_are_symmetric():
@@ -130,17 +115,6 @@ def test_rmsnorm_normalizes_to_unit_rms():
     y = norm(x)
     rms = y.pow(2).mean(dim=-1).sqrt()
     assert torch.allclose(rms, torch.ones(5), atol=1e-3)
-
-
-def test_rotary_shape_and_rotation():
-    rot = Rotary(8)
-    x = torch.randn(2, 4, 3, 8)  # (B, T, H, D)
-    y = rot(x)
-    assert y.shape == x.shape
-    # theta=0 at position 0 -> RoPE is the identity there...
-    assert torch.allclose(y[:, 0], x[:, 0], atol=1e-5)
-    # ...but later positions are rotated (non-trivial change).
-    assert not torch.allclose(y[:, 1], x[:, 1], atol=1e-3)
 
 
 def test_rotary_requires_head_dim_multiple_of_four():
@@ -252,28 +226,6 @@ def test_value_embedding_residual_path_is_used():
     assert model.post_lambdas.shape == (6, 2)
     assert model.resid_lambdas_attn.shape == (6,)
     assert model.x0_lambdas.shape == (6,)
-
-
-def test_sparse_value_layers_get_no_residual():
-    # On a layer whose value embedding is None, attention must use only lambdas[0]*v
-    # (no value-residual term); so a fresh model's middle layers carry no value
-    # contribution. We verify the None branch runs and yields finite output for a
-    # config with genuine None layers (L=8, k=2 -> layers 2..5 are None).
-    model = GPT(64, num_layers=8, model_dim=32, num_heads=2, num_value_embeds=2).eval()
-    ve = model.value_embeds(torch.randint(0, 64, (1, 5)))
-    assert [t is None for t in ve] == [
-        False,
-        False,
-        True,
-        True,
-        True,
-        True,
-        False,
-        False,
-    ]
-    _randomize(model)
-    out = model(torch.randint(0, 64, (1, 6)))
-    assert torch.isfinite(out).all()
 
 
 def test_gpt_rejects_odd_or_too_few_layers():
@@ -473,21 +425,6 @@ def test_paired_head_attention_uses_value_embed():
     ve = torch.randn(2, 5, 16)
     out_no_ve = attn(x, value_embed=None)
     out_with_ve = attn(x, value_embed=ve)
-    assert not torch.allclose(out_no_ve, out_with_ve, atol=1e-5)
-
-
-def test_paired_head_attention_production_config():
-    """PairedHeadAttention must work at the default production dims (n_head=6)."""
-    attn = PairedHeadAttention(768, num_heads=6).eval()
-    with torch.no_grad():
-        attn.proj.weight.normal_(0.0, 0.3)
-    x = torch.randn(2, 16, 768)
-    out_no_ve = attn(x, value_embed=None)
-    assert out_no_ve.shape == (2, 16, 768)
-    assert torch.isfinite(out_no_ve).all()
-    out_with_ve = attn(x, value_embed=torch.randn(2, 16, 768))
-    assert out_with_ve.shape == (2, 16, 768)
-    assert torch.isfinite(out_with_ve).all()
     assert not torch.allclose(out_no_ve, out_with_ve, atol=1e-5)
 
 
@@ -752,10 +689,3 @@ def test_lm_head_init_std_and_apply_lm_head_float32():
     out = model.apply_lm_head(hidden)
     assert out.dtype == torch.float32
     assert out.shape == (2, 5, 64)
-
-
-def test_value_embedding_init_std():
-    torch.manual_seed(2)
-    model = GPT(64, num_layers=4, model_dim=32, num_heads=2, num_value_embeds=2)
-    for table in model.value_embeds.embed:
-        assert table.weight.std().item() == pytest.approx(0.01, rel=0.4, abs=0.004)

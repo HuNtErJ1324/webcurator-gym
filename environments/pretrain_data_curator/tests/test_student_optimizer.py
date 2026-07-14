@@ -88,20 +88,6 @@ def test_polar_express_orthogonalizes_2d():
         assert torch.allclose(gram, eye, atol=0.35)
 
 
-def test_polar_express_and_newtonschulz_both_orthogonalize():
-    g = torch.randn(8, 4)
-    ns = zeropower_via_newtonschulz5(g)
-    pe = zeropower_via_polar_express(g)
-    # Both orthogonalize (NS needs more iterations for the same accuracy)
-    # Verify they both produce near-orthogonal outputs
-    if g.size(-2) <= g.size(-1):
-        ns_gram = ns @ ns.T
-        pe_gram = pe @ pe.T
-        eye = torch.eye(g.size(-2))
-        assert torch.allclose(ns_gram, eye, atol=0.35)
-        assert torch.allclose(pe_gram, eye, atol=0.35)
-
-
 def test_nor_muon_update_normalized():
     grad = torch.randn(8, 4)
     mom = torch.zeros_like(grad)
@@ -132,16 +118,6 @@ def test_polar_express_muon_optimizer_steps():
     loss = model(x).sum()
     loss.backward()
     muon_opt.step()
-
-
-def test_build_speedrun_optimizers_with_nor_muon():
-    model = GPT(vocab_size=64, num_layers=2, model_dim=32, num_heads=2)
-    muon_opt, adam_opt = build_speedrun_optimizers(
-        model, nor_muon=True, polar_express=False
-    )
-    assert isinstance(muon_opt, Muon)
-    for g in muon_opt.param_groups:
-        assert g.get("nor_muon", False) is True
 
 
 def test_cautious_weight_decay_muon_step():

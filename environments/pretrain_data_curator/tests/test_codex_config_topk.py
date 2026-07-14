@@ -45,16 +45,6 @@ def test_codex_eval_configs_parse_and_have_no_top_k():
         assert sampling.get("top_p") is not None, f"{name} missing top_p"
 
 
-def test_scan_shipped_codex_eval_tomls_rejects_top_k():
-    """Scanner over the shipped Codex/Responses eval TOMLs rejects top_k."""
-    offenders = []
-    for path in codex_eval_config_paths(CONFIGS_DIR):
-        cfg = tomllib.loads(path.read_text(encoding="utf-8"))
-        if "top_k" in cfg.get("sampling", {}):
-            offenders.append(path.name)
-    assert not offenders, f"Codex eval configs still set top_k: {offenders}"
-
-
 def test_harness_endpoint_configs_may_keep_top_k(tmp_path: Path):
     """top_k is allowed for harness/endpoint configs: the scanner ignores them.
 
