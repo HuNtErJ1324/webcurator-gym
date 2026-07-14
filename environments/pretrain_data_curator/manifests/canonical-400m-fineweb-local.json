@@ -1,0 +1,18 @@
+{
+  "token_budget": 400000000,
+  "sample_docs_per_source": null,
+  "sources": [
+    {
+      "dataset_id": "local:fineweb10B-gpt2-train",
+      "kind": "local",
+      "local_path": "corpus.jsonl",
+      "local_format": "jsonl",
+      "text_field": "text",
+      "weight": 1.0,
+      "split": "local",
+      "config": null,
+      "filters": [],
+      "sampling": { "max_docs": null, "max_tokens": null }
+    }
+  ]
+}
