@@ -241,7 +241,7 @@ if [[ -n "$VALIDATE_ONLY" ]]; then
   log "Validating existing results in $LOCAL_OUT_DIR (profile=$SMOKE_PROFILE suffix=$RUN_SUFFIX budget=$EXPECTED_TOKEN_BUDGET)"
   (
     cd "$ENV_DIR"
-    python3 -m pretrain_data_curator.smoke_result_gate \
+    python3 "$ENV_DIR/scripts_400m/smoke_result_gate.py" \
       "$LOCAL_OUT_DIR" "$EXPECTED_TOKEN_BUDGET" "$RUN_SUFFIX"
   ) || die "Downloaded results failed validation"
   log "Validation OK"
@@ -923,7 +923,7 @@ validate_downloaded_results() {
   # Gate success + site rebuild via shared Python helper (importable in tests).
   (
     cd "$ENV_DIR"
-    python3 -m pretrain_data_curator.smoke_result_gate \
+    python3 "$ENV_DIR/scripts_400m/smoke_result_gate.py" \
       "$LOCAL_OUT_DIR" "$EXPECTED_TOKEN_BUDGET" "$RUN_SUFFIX"
   )
 }
