@@ -18,7 +18,7 @@ The checked-in smoke config is the single local run configuration. It uses
 DeepSeek V4 Flash for curation and a real Modal H100 proxy trainer, and explicitly
 lists every loader, student, and validation option. `HF_TOKEN`,
 `MODAL_TOKEN_ID`, and `MODAL_TOKEN_SECRET` must be exported. For setup and
-zero-score failures, inspect rollout traces in the generated bench site under `docs/site/`.
+zero-score failures, inspect rollout traces in the generated bench site under `docs/site/` at the repo root.
 
 ## Overview
 
@@ -67,7 +67,7 @@ Each term is also emitted as a metric (`perf_loss`, `perf_accuracy`,
 `val_set_access`. Two further zero-weight **diagnostics**,
 `tool_error_count` and `external_failure`, separate bad curation from
 external/infrastructure failure (a flaky Hub or sandbox). See
-[`docs/README.md`](docs/README.md).
+[`docs/README.md`](../../docs/README.md).
 
 ### Proxy-student backends
 
@@ -231,15 +231,15 @@ When a multi-config dataset has no default and `config` is omitted, the
 materializer chooses a stable English/default config (for example `en` or a
 config ending in `.en`) before falling back to the first advertised config.
 
-See [`docs/README.md`](docs/README.md) for the eval visualization site and builder.
+See [`docs/README.md`](../../docs/README.md) for the eval visualization site and builder.
 
 ## Documentation
 
 | Page | Use it for |
 | --- | --- |
-| [Bench site builder](docs/README.md) | Generate a PostTrainBench-style leaderboard from full 400M runs in `outputs/evals-400m/` |
-| [Codebase explanation](docs/site_builder/assets/codebase.html) | Bench-site page (`codebase.html`) covering the rollout lifecycle, repository layout, and module map |
-| [Manifest-backed training debug workflow](docs/debug_manifest_training.md) | Materialize a curated corpus from an explicit local manifest once, then repeatedly debug the NanoGPT/proxy training path against the same bundle without re-curating. |
+| [Bench site builder](../../docs/README.md) | Generate a PostTrainBench-style leaderboard from full 400M runs in `outputs/evals-400m/` |
+| [Codebase explanation](../../docs/site_builder/assets/codebase.html) | Bench-site page (`codebase.html`) covering the rollout lifecycle, repository layout, and module map |
+| [Manifest-backed training debug workflow](../../docs/debug_manifest_training.md) | Materialize a curated corpus from an explicit local manifest once, then repeatedly debug the NanoGPT/proxy training path against the same bundle without re-curating. |
 
 ## Install And Eval
 
