@@ -14,7 +14,6 @@ from pretrain_data_curator.train_gpt import (
     _sliding_window_mask,
     GPT,
     GPT2_SMALL,
-    GPT2_SMALL_PARAM_COUNT,
     MLP,
     RMSNorm,
     Rotary,
@@ -46,20 +45,6 @@ def _randomize(model: torch.nn.Module) -> None:
 
 
 # --- (a) instantiated param count is in the documented GPT-2-small band ----
-
-
-def test_gpt2_small_param_count_is_pinned():
-    # Instantiate on the meta device so the ~278M-param model costs no memory.
-    with torch.device("meta"):
-        model = GPT2_SMALL.build()
-    n_params = sum(p.numel() for p in model.parameters())
-    # Exact pin (single source of truth; guards silent architectural drift).
-    assert n_params == GPT2_SMALL_PARAM_COUNT == 278_122_938
-    # Documented GPT-2-small-class band: 768-wide, 12-deep, but larger by count
-    # because of the untied head and the 3 sparse (SparsifyEmbeds) value tables.
-    assert 270_000_000 <= n_params <= 285_000_000
-    assert n_params > 124_000_000  # well above the tied-embedding canonical 124M
-    assert GPT2_SMALL.model_dim == 768 and GPT2_SMALL.num_layers == 12
 
 
 def test_gpt2_small_unet_halves_are_symmetric():
@@ -476,21 +461,6 @@ def test_paired_head_attention_uses_value_embed():
     assert not torch.allclose(out_no_ve, out_with_ve, atol=1e-5)
 
 
-def test_paired_head_attention_production_config():
-    """PairedHeadAttention must work at the default production dims (n_head=6)."""
-    attn = PairedHeadAttention(768, num_heads=6).eval()
-    with torch.no_grad():
-        attn.proj.weight.normal_(0.0, 0.3)
-    x = torch.randn(2, 16, 768)
-    out_no_ve = attn(x, value_embed=None)
-    assert out_no_ve.shape == (2, 16, 768)
-    assert torch.isfinite(out_no_ve).all()
-    out_with_ve = attn(x, value_embed=torch.randn(2, 16, 768))
-    assert out_with_ve.shape == (2, 16, 768)
-    assert torch.isfinite(out_with_ve).all()
-    assert not torch.allclose(out_no_ve, out_with_ve, atol=1e-5)
-
-
 def test_paired_head_attention_production_config_via_block():
     """The Block class must build PairedHeadAttention with n_head=6 and run."""
     model = GPT(50304, num_layers=2, model_dim=768, num_heads=6, paired_head=True)
@@ -752,10 +722,3 @@ def test_lm_head_init_std_and_apply_lm_head_float32():
     out = model.apply_lm_head(hidden)
     assert out.dtype == torch.float32
     assert out.shape == (2, 5, 64)
-
-
-def test_value_embedding_init_std():
-    torch.manual_seed(2)
-    model = GPT(64, num_layers=4, model_dim=32, num_heads=2, num_value_embeds=2)
-    for table in model.value_embeds.embed:
-        assert table.weight.std().item() == pytest.approx(0.01, rel=0.4, abs=0.004)

@@ -2908,8 +2908,8 @@ wheels = [
 
 [[package]]
 name = "verifiers"
-version = "0.1.15.dev376"
-source = { git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=78467f079815a1841e70d7b768774bb3f563862c#78467f079815a1841e70d7b768774bb3f563862c" }
+version = "0.2.1.dev22"
+source = { git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=f68cac097de14d5a129e8944292c1b4247b69cc1#f68cac097de14d5a129e8944292c1b4247b69cc1" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiolimiter" },
@@ -2948,7 +2948,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=78467f079815a1841e70d7b768774bb3f563862c" }]
+requires-dist = [{ name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=f68cac097de14d5a129e8944292c1b4247b69cc1" }]
 
 [[package]]
 name = "websockets"

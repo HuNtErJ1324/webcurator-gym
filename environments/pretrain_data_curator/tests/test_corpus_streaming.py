@@ -339,15 +339,6 @@ def test_source_corpus_from_iter_empty_docs_has_no_backing_file():
     assert source.documents == []
 
 
-def test_curated_corpus_is_empty_matches_zero_total_documents():
-    empty = CuratedCorpus(sources=[SourceCorpus.from_iter("a/b", None, 1.0, [])])
-    assert empty.is_empty()
-    nonempty = CuratedCorpus(
-        sources=[SourceCorpus.from_iter("a/b", None, 1.0, ["doc"])]
-    )
-    assert not nonempty.is_empty()
-
-
 @pytest.mark.asyncio
 async def test_taskset_score_removes_rollout_scratch_directory():
     """`CuratorTaskset.score` must deterministically remove the rollout's

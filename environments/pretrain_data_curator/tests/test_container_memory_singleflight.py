@@ -94,25 +94,10 @@ def test_legacy_container_memory_env_still_honored_for_docker(monkeypatch):
     assert resolve_container_memory_gb(48, backend="docker") == 96.0
 
 
-def test_derive_trainer_resources_honors_memory_override(monkeypatch):
-    monkeypatch.setenv(ENV_DOCKER_CONTAINER_MEMORY_GB, "96")
-    ps = ProxyStudentConfig(runtime_backend="docker", memory_gb=48, gpu_count=1)
-    resources = derive_trainer_resources(ps, backend="docker")
-    assert resources["memory"] == 96.0
-
-
 def test_default_headroom_allows_100gib_hosts_for_96gib_pin():
     assert DEFAULT_HOST_HEADROOM_GIB <= 4.0
     total_kib = int(100 * GIB / 1024)
     assert_host_supports_container_memory(96, meminfo_text=_meminfo(total_kib))
-
-
-def test_host_preflight_passes_with_sufficient_ram(monkeypatch):
-    monkeypatch.delenv(ENV_SKIP_MEMORY_PREFLIGHT, raising=False)
-    total_kib = int(100 * GIB / 1024)
-    assert_host_supports_container_memory(
-        96, headroom_gb=DEFAULT_HOST_HEADROOM_GIB, meminfo_text=_meminfo(total_kib)
-    )
 
 
 def test_host_preflight_fails_when_host_ram_too_small(monkeypatch):

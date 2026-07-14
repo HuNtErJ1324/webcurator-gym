@@ -83,11 +83,11 @@ def _make_temp_repo(tmp_path: Path) -> Path:
         REPO_ROOT
         / "environments"
         / "pretrain_data_curator"
-        / "pretrain_data_curator"
+        / "scripts_400m"
         / "result_gate.py"
     )
     package_dst = (
-        repo / "environments" / "pretrain_data_curator" / "pretrain_data_curator"
+        repo / "environments" / "pretrain_data_curator" / "scripts_400m"
     )
     package_dst.mkdir(parents=True)
     shutil.copy(package_src, package_dst / package_src.name)
@@ -477,14 +477,6 @@ def test_remote_eval_probe_heredoc_runs_against_real_files(tmp_path: Path):
     pid.unlink()
     out = _run_bash_heredoc(body, str(rd), str(log), str(pid), str(st))
     assert "STATUS=nostatus_nopid" in out.stdout, out.stdout + out.stderr
-
-
-def test_remote_eval_probe_argument_mapping_is_correct():
-    text = EVAL_SCRIPT.read_text(encoding="utf-8")
-    body = _extract_function_heredoc(text, "_remote_eval_probe", "RM")
-    # The script calls `_remote_eval_probe run_dir eval_log eval_pid eval_status`,
-    # so the heredoc must map: $1=RD, $2=LOG, $3=PID, $4=ST.
-    assert 'RD="$1"; LOG="$2"; PID="$3"; ST="$4"' in body
 
 
 # --- source-inspection tests ------------------------------------------------

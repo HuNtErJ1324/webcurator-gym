@@ -243,7 +243,7 @@ if [[ -n "$VALIDATE_ONLY" ]]; then
   [[ -x "$ENV_PYTHON" ]] || die "env python missing: $ENV_PYTHON (cd $ENV_DIR && uv sync)"
   (
     cd "$ENV_DIR"
-    "$ENV_PYTHON" -m pretrain_data_curator.smoke_result_gate \
+    "$ENV_PYTHON" "$ENV_DIR/scripts_400m/smoke_result_gate.py" \
       "$LOCAL_OUT_DIR" "$EXPECTED_TOKEN_BUDGET" "$RUN_SUFFIX"
   ) || die "Downloaded results failed validation"
   log "Validation OK"
@@ -926,7 +926,7 @@ validate_downloaded_results() {
   [[ -x "$ENV_PYTHON" ]] || die "env python missing: $ENV_PYTHON (cd $ENV_DIR && uv sync)"
   (
     cd "$ENV_DIR"
-    "$ENV_PYTHON" -m pretrain_data_curator.smoke_result_gate \
+    "$ENV_PYTHON" "$ENV_DIR/scripts_400m/smoke_result_gate.py" \
       "$LOCAL_OUT_DIR" "$EXPECTED_TOKEN_BUDGET" "$RUN_SUFFIX"
   )
 }

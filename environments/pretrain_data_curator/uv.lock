@@ -1589,7 +1589,7 @@ requires-dist = [
     { name = "renderers", specifier = "==0.1.8.dev49" },
     { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
-    { name = "verifiers", specifier = "==0.1.15.dev376" },
+    { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=f68cac097de14d5a129e8944292c1b4247b69cc1" },
     { name = "zstandard", specifier = ">=0.23.0" },
 ]
 
@@ -2826,8 +2826,8 @@ wheels = [
 
 [[package]]
 name = "verifiers"
-version = "0.1.15.dev376"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.1.dev22"
+source = { git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=f68cac097de14d5a129e8944292c1b4247b69cc1#f68cac097de14d5a129e8944292c1b4247b69cc1" }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiolimiter" },
@@ -2856,10 +2856,6 @@ dependencies = [
     { name = "tomli-w" },
     { name = "typing-extensions", marker = "python_full_version < '3.12'" },
     { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/58/29/24b7771491348e73649c4181092cfb976e4c33dc88c354cd74774892c8a2/verifiers-0.1.15.dev376.tar.gz", hash = "sha256:194ac89bb040fcc68d050e19f706e0c0ec288c075bc7d3c3b5fd91dd09cbde93", size = 780820, upload-time = "2026-06-23T14:02:02.508Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/22/13/22774ff2515714bb8dd38638e80d26bc2e10fa83188437a9ed8aec3cd5e5/verifiers-0.1.15.dev376-py3-none-any.whl", hash = "sha256:9e5f7e6f8b25e8726e6ec554a55719a456da21449992b12ef9736e33232bdc83", size = 804747, upload-time = "2026-06-23T14:02:00.501Z" },
 ]
 
 [[package]]

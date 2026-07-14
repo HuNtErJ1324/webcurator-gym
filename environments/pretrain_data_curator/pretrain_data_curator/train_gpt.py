@@ -186,9 +186,9 @@ def plan_val_windows(n_tokens, block):
     empty or single-token val set can NEVER be silently scored as a perfect ``0.0``
     cross-entropy (which would game the reward).
 
-    Kept deliberately annotation-free and dependency-free (builtins only): its
-    exact source is embedded into the GPU-only sandbox training script
-    (``trainer.py``), so the CPU unit tests of this function guard the real
+    Kept deliberately annotation-free and dependency-free (builtins only): this
+    function now IS the GPU-only sandbox training script, and ``trainer.py`` reads
+    this file verbatim, so the CPU unit tests of this function guard the real
     validation loop that no test can otherwise reach.
     """
     block = int(block)
@@ -708,7 +708,15 @@ else:
 
 
     class GPT(nn.Module):
-        """Decoder-only transformer with U-net skips, sparse value embeddings, and speedrun lambdas."""
+        """Proxy-student transformer read verbatim by ``trainer.py`` for the GPU sandbox.
+
+        ``train_gpt.py`` is the written source of truth: ``trainer.py`` loads this
+        file's text (``NANOGPT_TRAIN_SCRIPT``) and copies it into the Docker/Modal
+        workspace, so this class is the model actually instantiated and trained
+        there. Architecture: decoder-only with U-net skips, sparse value
+        embeddings, multi-token prediction heads, and opt-in portable features
+        (bigram-hash / paired-head / MUDD / XSA).
+        """
 
         def __init__(
             self,

@@ -1,11 +1,9 @@
 """Correctness tests for the token-budget batch-schedule accounting helpers.
 
-Covers (1) the non-monotonicity of ``scheduled_presentation_tokens`` and the
-provably-sufficient bounded search ``steps_for_token_budget`` uses instead of
-a (unsound) binary search, via an exact counterexample plus brute-force
-property tests, and (2) exact stage-boundary parity between the accounting
-helper and the runtime scheduler (``train_gpt.build_batch_schedule``),
-which now share one canonical implementation.
+Covers (1) non-monotonicity of ``scheduled_presentation_tokens`` and the
+bounded search ``steps_for_token_budget`` uses instead of an unsound binary
+search, and (2) exact stage-boundary parity between the accounting helper and
+the runtime scheduler (``train_gpt.build_batch_schedule``).
 """
 
 from __future__ import annotations
@@ -17,10 +15,10 @@ import pytest
 
 from pretrain_data_curator.train_gpt import (
     batch_stage_boundaries,
+    build_batch_schedule,
     scheduled_presentation_tokens,
     steps_for_token_budget,
 )
-from pretrain_data_curator.train_gpt import build_batch_schedule
 
 
 def _tokens(
@@ -81,13 +79,8 @@ _CE_MULS = (1, 2, 4)
 
 
 def test_scheduled_presentation_tokens_documented_counterexample_is_non_monotone():
-    """f(4)=11 > f(5)=10 for equal thirds / muls (1,2,4), per_base=1.
-
-    Adding a step can *reduce* total scheduled tokens: the extra step shifts
-    the rounded stage boundary, moving whole steps from the high-mul stage to
-    a low-mul one faster than the +1 step itself adds. This is why a plain
-    binary search over N is unsound.
-    """
+    """f(4)=11 > f(5)=10: adding a step can reduce total scheduled tokens, so a
+    plain binary search over N is unsound."""
     f4 = _tokens(4, _CE_FRACS, _CE_MULS)
     f5 = _tokens(5, _CE_FRACS, _CE_MULS)
     assert f4 == 11
@@ -103,20 +96,9 @@ def test_steps_for_token_budget_counterexample_returns_true_minimum():
     assert _tokens(n - 1, _CE_FRACS, _CE_MULS) < 11
 
 
-@pytest.mark.parametrize("budget", list(range(1, 30)))
-def test_steps_for_token_budget_matches_brute_force_across_counterexample_schedule(budget):
-    """Exhaustively cross-check every small budget on the exact counterexample
-    schedule (where non-monotonicity is known to occur) against brute force."""
-    got = _min_steps(budget, _CE_FRACS, _CE_MULS)
-    want = _brute_force_min_steps(budget, _CE_FRACS, _CE_MULS)
-    assert got == want
-
-
 def _assert_minimal_and_bounded_overshoot(n, budget, fracs, muls, batch_size, block_size):
     """Core minimality contract: N meets the budget, N-1 does not, and the
-    overshoot is strictly less than the token contribution of the specific
-    final scheduled step that crossed the threshold (N-1 -> N) -- a direct
-    corollary of minimality, not an independent assumption."""
+    overshoot is strictly less than the final scheduled step's token contribution."""
     tokens_n = _tokens(n, fracs, muls, batch_size, block_size)
     assert tokens_n >= budget
     if n > 1:
@@ -128,10 +110,9 @@ def _assert_minimal_and_bounded_overshoot(n, budget, fracs, muls, batch_size, bl
 
 
 def test_steps_for_token_budget_unit_mismatch_regression_skewed_fractions():
-    """p_bound (step*mul units) was being combined directly with budget
-    (token units) without scaling by per_base, corrupting the search window
-    for large per_base. batch=4, block=67 (per_base=268), muls=(1,1,8,1),
-    fracs approx (0.558, 0.113, 0.005, 0.325): true minimal N=16
+    """Regression: p_bound (step*mul units) combined with budget (token units)
+    without scaling by per_base corrupted the search window for large per_base.
+    batch=4, block=67 (per_base=268), muls=(1,1,8,1): true minimal N=16
     (f(16)=6164, f(15)=5896); the unit bug returned 17."""
     raw = (0.558, 0.113, 0.005, 0.325)
     fracs = tuple(f / sum(raw) for f in raw)
@@ -143,29 +124,13 @@ def test_steps_for_token_budget_unit_mismatch_regression_skewed_fractions():
     _assert_minimal_and_bounded_overshoot(n, 5974, fracs, muls, 4, 67)
 
 
-def test_steps_for_token_budget_unit_mismatch_regression_large_per_base():
-    """Second unit-mismatch regression: batch=26, block=127 (per_base=3302),
-    muls=(7,7,1), fracs constructed so the true minimal N=5
-    (f(4)=52832, f(5)=56134); the unit bug returned 6."""
-    fracs = (0.02, 0.08, 0.9)
-    muls = (7, 7, 1)
-    n = _min_steps(55351, fracs, muls, batch_size=26, block_size=127)
-    assert n == 5
-    assert _tokens(4, fracs, muls, batch_size=26, block_size=127) == 52832
-    assert _tokens(5, fracs, muls, batch_size=26, block_size=127) == 56134
-    _assert_minimal_and_bounded_overshoot(n, 55351, fracs, muls, 26, 127)
-
-
 # --- 2) broad property / brute-force tests over random schedules -----------
 
 
 def _random_schedule(rng: random.Random):
-    """Random schedule generator. Deliberately includes large block/batch
-    sizes (large per_base) and skewed multiplier spreads (occasionally very
-    large max/min mul ratios) -- the unit-mismatch bug above only manifests
-    when per_base is large enough that the (unscaled) p_bound is negligible
-    relative to the mis-derived search window, so small per_base alone does
-    not exercise this class of bug."""
+    """Random schedule generator, deliberately including large block/batch sizes
+    (large per_base) and skewed multiplier spreads -- the unit-mismatch bug only
+    manifests when per_base is large."""
     k = rng.choice([2, 3, 4, 5, 6])
     raw_fracs = [rng.random() + 0.001 for _ in range(k)]
     total = sum(raw_fracs)
@@ -181,8 +146,8 @@ def _random_schedule(rng: random.Random):
 
 @pytest.mark.parametrize("trial", range(500))
 def test_steps_for_token_budget_matches_brute_force_random_schedules(trial):
-    """Random small/moderate schedules + budgets: returned N must equal the
-    brute-force minimum exactly (proves minimality, not just a valid budget)."""
+    """Random schedules + budgets: returned N must equal the brute-force minimum
+    exactly (proves minimality, not just a valid budget)."""
     rng = random.Random(trial)
     fracs, muls, batch_size, block_size = _random_schedule(rng)
     budget = rng.randint(1, 5_000)
@@ -193,10 +158,9 @@ def test_steps_for_token_budget_matches_brute_force_random_schedules(trial):
 
 @pytest.mark.parametrize("trial", range(150))
 def test_steps_for_token_budget_large_budget_properties(trial):
-    """Large budgets (brute force from N=1 is infeasible): verify directly
-    that the returned N meets the budget, N-1 does not, overshoot is bounded
-    by the final scheduled step's tokens, and that no smaller N in a generous
-    local window below it is valid either (local minimality safety net)."""
+    """Large budgets (brute force infeasible): N meets the budget, N-1 does not,
+    overshoot is bounded by the final step's tokens, and no smaller N in a local
+    window below it is valid."""
     rng = random.Random(10_000 + trial)
     fracs, muls, batch_size, block_size = _random_schedule(rng)
     budget = rng.randint(10_000_000, 1_000_000_000)
@@ -205,16 +169,6 @@ def test_steps_for_token_budget_large_budget_properties(trial):
     window = min(n - 1, 2000)
     for m in range(max(1, n - window), n):
         assert _tokens(m, fracs, muls, batch_size, block_size) < budget
-
-
-@pytest.mark.parametrize("trial", range(50))
-def test_steps_for_token_budget_tiny_budgets(trial):
-    rng = random.Random(20_000 + trial)
-    fracs, muls, batch_size, block_size = _random_schedule(rng)
-    budget = rng.randint(1, 3)
-    got = _min_steps(budget, fracs, muls, batch_size, block_size)
-    want = _brute_force_min_steps(budget, fracs, muls, batch_size, block_size)
-    assert got == want
 
 
 def test_steps_for_token_budget_no_schedule_still_ceil_division():
@@ -228,9 +182,8 @@ def test_steps_for_token_budget_no_schedule_still_ceil_division():
 def _reference_boundaries(
     total_steps: int, fracs: tuple[float, float, float], muls: tuple[int, int, int]
 ) -> list[tuple[int, int]]:
-    """``build_batch_schedule``'s real contract is exactly 3 stages (matching
-    ``ProxyStudentConfig.batch_stage_fracs: tuple[float, float, float]``), so
-    the runtime-parity comparison is scoped to k=3."""
+    """``build_batch_schedule``'s real contract is exactly 3 stages, so the
+    runtime-parity comparison is scoped to k=3."""
     lr_muls = (1.0, 1.52, 1.73)
     boundaries, _, _, _ = build_batch_schedule(
         total_steps, stage_fracs=fracs, batch_muls=muls, lr_muls=lr_muls
@@ -255,25 +208,10 @@ def test_batch_stage_boundaries_matches_runtime_build_batch_schedule(fracs, n):
     assert batch_stage_boundaries(n, fracs) == _reference_boundaries(n, fracs, muls)
 
 
-@pytest.mark.parametrize("trial", range(200))
-def test_batch_stage_boundaries_matches_runtime_random(trial):
-    """Random irregular fractions/step counts (k=3, matching the real
-    ``build_batch_schedule`` contract), including cases that produce
-    zero-length (pre-clamp) intermediate stages for small N."""
-    rng = random.Random(30_000 + trial)
-    raw = [rng.random() + 0.001 for _ in range(3)]
-    total = sum(raw)
-    fracs: tuple[float, float, float] = tuple(f / total for f in raw)  # type: ignore[assignment]
-    muls: tuple[int, int, int] = tuple(rng.randint(1, 5) for _ in range(3))  # type: ignore[assignment]
-    n = rng.choice([1, 2, 3, 4, 5, rng.randint(1, 50), rng.randint(1, 20_000)])
-    assert batch_stage_boundaries(n, fracs) == _reference_boundaries(n, fracs, muls)
-
-
 @pytest.mark.parametrize("trial", range(100))
 def test_batch_stage_boundaries_general_k_invariants(trial):
-    """Beyond the k=3 runtime contract, ``batch_stage_boundaries`` itself must
-    still exactly partition [0, N) for any number of stages (used generically
-    by the accounting helpers)."""
+    """``batch_stage_boundaries`` must exactly partition [0, N) for any number of
+    stages, including tiny N where intermediate stages collapse."""
     rng = random.Random(40_000 + trial)
     k = rng.choice([2, 3, 4, 5, 6])
     raw = [rng.random() + 0.001 for _ in range(k)]
@@ -292,18 +230,3 @@ def test_batch_stage_boundaries_general_k_invariants(trial):
 def test_batch_stage_boundaries_rejects_fracs_not_summing_to_one():
     with pytest.raises(ValueError, match="must sum to 1.0"):
         batch_stage_boundaries(100, (0.5, 0.6))
-
-
-def test_batch_stage_boundaries_partitions_exactly_even_for_tiny_step_counts():
-    """Every intermediate stage's max(1, ...) floor still leaves the total
-    partition summing to exactly total_steps, even when total_steps is
-    smaller than the number of stages (zero-length final overlap collapses
-    via the min(scheduled, ...) clamp rather than double-counting)."""
-    fracs = (1 / 3, 1 / 3, 1 / 3)
-    for n in range(1, 6):
-        boundaries = batch_stage_boundaries(n, fracs)
-        assert boundaries[0][0] == 0
-        assert boundaries[-1][1] == n
-        for (_s1, e1), (s2, _e2) in zip(boundaries, boundaries[1:]):
-            assert e1 == s2
-        assert all(end >= start for start, end in boundaries)

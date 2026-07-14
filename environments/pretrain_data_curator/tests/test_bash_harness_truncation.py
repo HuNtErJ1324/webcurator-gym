@@ -11,7 +11,6 @@ import pytest
 
 from pretrain_data_curator.bash_harness import (
     load_program_run_bash,
-    truncating_program_source,
     wrap_bash_harness,
 )
 from pretrain_data_curator.models import CuratorConfig
@@ -50,13 +49,6 @@ def test_load_environment_wires_cap_into_bash_harness(monkeypatch):
     env2 = load_environment(max_tool_output_chars=5_000)
     assert env2.harness.config.env.get("MAX_TOOL_OUTPUT_CHARS") == "5000"
     assert env2.taskset.load()[0].config.curator.max_tool_output_chars == 5_000
-
-
-def test_truncating_program_source_patches_stock_run_bash():
-    src = truncating_program_source()
-    assert "_maybe_truncate" in src
-    assert "MAX_TOOL_OUTPUT_CHARS" in src
-    assert "return _maybe_truncate(result.stdout + result.stderr)" in src
 
 
 def test_program_run_bash_caps_over_20k_agent_visible_output():

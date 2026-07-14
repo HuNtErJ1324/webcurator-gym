@@ -788,7 +788,7 @@ validate_run_results() {
     echo "[validate] FAIL: provisioned project Python must be 3.12 (got $python_version at $PROJECT_PYTHON)" >&2
     return 1
   fi
-  "$PROJECT_PYTHON" "$PROJECT_ROOT/pretrain_data_curator/result_gate.py" \
+  "$PROJECT_PYTHON" "$PROJECT_ROOT/scripts_400m/result_gate.py" \
     "$PWD/$rel/results.jsonl" "$PWD/$EVAL_CONFIG"
 }
 
@@ -1002,7 +1002,7 @@ EOF
 
 validate_downloaded_results() {
   log "Validating downloaded 400M result semantics"
-  if ! python3 "$ENV_DIR/pretrain_data_curator/result_gate.py" \
+  if ! python3 "$ENV_DIR/scripts_400m/result_gate.py" \
     "$LOCAL_OUT_DIR/results.jsonl" "$LOCAL_OUT_DIR/config.toml"; then
     die "Downloaded result failed semantic validation; artifacts preserved at $LOCAL_OUT_DIR"
   fi

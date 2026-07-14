@@ -27,27 +27,3 @@ def truncate_tool_output(text: str | None, cap: int) -> tuple[str, bool]:
     if len(notice) >= cap:
         return notice[:cap], True
     return s[: cap - len(notice)] + notice, True
-
-
-def _wire_output_text(output: Any) -> str:
-    """Normalize Responses/Chat tool-result payloads to plain text."""
-    if output is None:
-        return ""
-    if isinstance(output, str):
-        return output
-    if isinstance(output, list):
-        parts: list[str] = []
-        for part in output:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                if part.get("type") in {"input_text", "output_text", "text"}:
-                    parts.append(str(part.get("text") or ""))
-                elif "text" in part:
-                    parts.append(str(part.get("text") or ""))
-                else:
-                    parts.append(str(part))
-            else:
-                parts.append(str(part))
-        return "".join(parts)
-    return str(output)

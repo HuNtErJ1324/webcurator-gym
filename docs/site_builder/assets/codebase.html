@@ -141,7 +141,6 @@ environments/pretrain_data_curator/
           <tbody>
             <tr><td><code>pretrain_data_curator.py</code></td><td>The <code>load_environment()</code> entry point: builds <code>CuratorTasksetConfig</code> and returns the environment.</td></tr>
             <tr><td><code>__init__.py</code></td><td>Bootstraps the real Verifiers v1 package at import time so the environment also loads inside Prime Hosted Training (which pre-loads a stub).</td></tr>
-            <tr><td><code>hosted_compat.py</code></td><td>v0/v1 bridge <code>Environment</code>: runs rollouts on the v1 episode engine and translates traces to the v0 state format consumed by <code>prime eval</code> and Hosted Training.</td></tr>
             <tr><td><code>runtime_config.py</code></td><td>Single source of truth deriving Docker/Modal runtime resources and timeouts from <code>ProxyStudentConfig</code>.</td></tr>
           </tbody>
         </table>
@@ -155,7 +154,6 @@ environments/pretrain_data_curator/
             <tr><td><code>taskset.py</code></td><td><code>CuratorTaskset</code>: rollout setup, manifest parsing and recovery, <code>finalize()</code>, reward/metric declarations, and the turn-cap stop condition. Exposes no MCP tools.</td></tr>
             <tr><td><code>tasks.py</code></td><td>The one typed v1 curation task, rendered as the initial user prompt.</td></tr>
             <tr><td><code>bash_harness.py</code></td><td>Patched bash harness that truncates tool output so giant Hub dumps can't overflow the model context.</td></tr>
-            <tr><td><code>truncating_client.py</code></td><td>Applies the same output cap at the API-interception boundary for compiled CLI agents (e.g. Codex) whose tool output never passes through a Python harness.</td></tr>
             <tr><td><code>self_score.py</code></td><td>Renders the standalone self-scoring script copied into each workspace; screens drafts against bundled benchmarks only, with the val-set repo blocked by hash.</td></tr>
             <tr><td><code>rollout_state.py</code></td><td>Typed <code>CuratorState</code> plus <code>RolloutStore</code> accessors for per-rollout bookkeeping.</td></tr>
           </tbody>
@@ -190,8 +188,8 @@ environments/pretrain_data_curator/
       <h3>Proxy-student training</h3>
       <p>
         Training budgets are measured in actual token presentations across the staged batch schedule.
-        <code>batch_schedule.py</code> finds the minimal optimizer-step count whose scheduled batches meet
-        <code>train_token_budget</code>, and <code>student_optimizer.py</code> uses the same boundary helper at
+        <code>train_gpt.py</code> finds the minimal optimizer-step count whose scheduled batches meet
+        <code>train_token_budget</code>, and the merged optimizer recipe uses the same boundary helper at
         runtime. For the standard 400M profile (batch 16, block 1024, equal <code>1×/2×/3×</code> stages),
         this yields 12,208 steps. The older base-batch-only calculation used 24,415 steps and presented
         roughly 800M tokens. Microbatch size remains a memory control and does not affect this accounting.
@@ -203,11 +201,7 @@ environments/pretrain_data_curator/
             <tr><td><code>trainer.py</code></td><td><code>ProxyStudentTrainer</code> interface, the CPU <code>HeuristicProxyTrainer</code> surrogate, and <code>RuntimeSelectedTrainer</code>, which dispatches to the backend matching the live harness runtime.</td></tr>
             <tr><td><code>docker_backend.py</code></td><td>Runs the training script in the rollout-owned Docker container: deadlines, concurrency limits, cancellation teardown, structured <code>RESULT_JSON</code> parsing.</td></tr>
             <tr><td><code>modal_backend.py</code></td><td>Same contract on a rollout-owned Modal GPU sandbox (GPU-type mapping, token auth, identical result validation).</td></tr>
-            <tr><td><code>docker_network.py</code></td><td>WSL2 shim: advertises the interception server on an address Docker Desktop containers can actually reach.</td></tr>
-            <tr><td><code>student_model.py</code></td><td>The fixed modded-nanogpt-style student architecture, embedded into the sandbox training script.</td></tr>
-            <tr><td><code>batch_schedule.py</code></td><td>Canonical stage boundaries and token-aware step budgeting. Shared by configuration accounting and the runtime optimizer so reported and processed token counts cannot drift.</td></tr>
-            <tr><td><code>student_train.py</code></td><td>The training loop embedded alongside it: LR schedule, contiguous batching, EOT-packed windows, multi-run averaging.</td></tr>
-            <tr><td><code>student_optimizer.py</code></td><td>Single-device port of the speedrun optimizer recipe (Muon / Polar Express / NorMuon on block weights, AdamW elsewhere).</td></tr>
+            <tr><td><code>train_gpt.py</code></td><td>Merged proxy-student training module: the modded-nanogpt student architecture, staged batch schedule + token-aware step budgeting, LR schedule / contiguous batching / EOT-packed windows, and the single-device optimizer recipe (Muon / Polar Express / NorMuon on block weights, AdamW elsewhere).</td></tr>
             <tr><td><code>debug_train.py</code></td><td>Manifest-backed debug workflow: materialize a corpus bundle once locally, then re-run the real training path against it repeatedly.</td></tr>
             <tr><td><code>utils.py</code></td><td>Small import-safe helpers (tool-output truncation).</td></tr>
           </tbody>
