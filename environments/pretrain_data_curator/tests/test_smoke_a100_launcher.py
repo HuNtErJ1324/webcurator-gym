@@ -784,6 +784,16 @@ def test_cpu_filter_excludes_massedcompute_case_insensitive():
         )
 
 
+def test_root_capable_provider_selected_over_unsupported():
+    # A root-capable provider must win even when a cheaper MassedCompute (unsupported)
+    # offer exists; this is the "root-capable provider selection" guarantee.
+    resources = [
+        _gpu_resource("mc-cheapest", "massedcompute", price="0.10"),
+        _gpu_resource("rp-root", "runpod", price="1.20"),
+    ]
+    assert _select_cloud_id("pick_cloud_id", resources) == "rp-root"
+
+
 def test_non_root_ssh_user_fail_fast_terminates_pod(tmp_path: Path):
     text = SMOKE_SCRIPT.read_text(encoding="utf-8")
     # The root check must sit between SSH auth and the rsync/sync step.
