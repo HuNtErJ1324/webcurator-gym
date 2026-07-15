@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 from pretrain_data_curator.models import CuratorConfig
-from pretrain_data_curator.self_score import (
+from pretrain_data_curator.gpu.self_score import (
     SELF_SCORE_FILENAME,
     render_self_score_script,
 )

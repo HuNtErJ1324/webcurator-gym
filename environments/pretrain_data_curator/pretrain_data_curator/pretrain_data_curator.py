@@ -10,7 +10,6 @@ from typing import Any
 import verifiers.v1 as vf
 import verifiers.v1.harnesses as vf_harnesses
 
-from .codex_harness import DEFAULT_MAX_CONTINUATIONS
 from .leakage import DEFAULT_DECON_BINARY
 from .models import MANIFEST_FILENAME, ProxyStudentConfig
 from .runtime_config import derive_env_harness_runtime
@@ -36,6 +35,10 @@ class Environment(vf.Environment):
         env_args: dict[str, object] | None = None,
     ) -> None:
         super().__init__(config)
+        # Legacy ``verifiers.utils.env_utils.load_environment`` assigns
+        # ``env_instance.env_id = env_instance.env_id or env_id``; v1 Environment
+        # does not define the attribute, so initialize it for eval compatibility.
+        self.env_id: str | None = TASKSET_ID
         self.env_args: dict[str, object] = dict(env_args or {})
 
 
@@ -71,8 +74,6 @@ def load_environment(
     decon_evals_dir: str | None = None,
     decon_threshold: float = 0.2,
     screen_val_set: bool = True,
-    max_tool_output_chars: int = 20_000,
-    codex_max_continuations: int = DEFAULT_MAX_CONTINUATIONS,
 ) -> vf.Environment:
     """Build the native verifiers v1 curation environment.
 
@@ -82,8 +83,8 @@ def load_environment(
     checked in taskset setup before a rollout starts (and again lazily at first
     Hub API use), so constructing the environment itself does not require
     ``HF_TOKEN`` in the orchestrator process.
-    ``harness_id`` selects one of the harnesses bundled with the installed
-    Verifiers package.
+    ``harness_id`` selects one of the stock harnesses bundled with the installed
+    Verifiers package (typically ``default`` or ``codex``).
     Unsupported keywords are rejected by Python with a clear ``TypeError`` rather
     than being silently dropped, so a misspelled or stale eval arg fails loudly.
     """
@@ -125,7 +126,6 @@ def load_environment(
         decon_evals_dir=decon_evals_dir,
         decon_threshold=decon_threshold,
         screen_val_set=screen_val_set,
-        max_tool_output_chars=max_tool_output_chars,
     )
     env_args = {
         "cutoff_date": cutoff_date,
@@ -156,11 +156,8 @@ def load_environment(
         "decon_evals_dir": decon_evals_dir,
         "decon_threshold": decon_threshold,
         "screen_val_set": screen_val_set,
-        "codex_max_continuations": codex_max_continuations,
     }
-    harness_env: dict[str, str] = {
-        "MAX_TOOL_OUTPUT_CHARS": str(max_tool_output_chars),
-    }
+    harness_env: dict[str, str] = {}
     ps = ProxyStudentConfig(**config.proxy_student)
     if use_real_trainer and ps.runtime_backend is None:
         raise ValueError(
@@ -176,13 +173,13 @@ def load_environment(
             )
         # Fail before evaluation when the pod cannot back the Docker --memory pin
         # (production 400M default is 96 GiB plus host headroom).
-        from .container_memory import (
+        from .util.container_memory import (
             assert_host_supports_container_memory,
             resolve_container_memory_gb,
         )
 
         assert_host_supports_container_memory(resolve_container_memory_gb(ps.memory_gb))
-        # The v1 bash harness runs as a cached PEP 723 uv script. On local Docker
+        # The v1 default harness runs as a cached PEP 723 uv script. On local Docker
         # trainer runs, a stale script env can miss pydantic-core's compiled
         # extension and fail before reward training starts. Reinstall only that
         # package on this path; hosted/Prime/default paths keep the normal cache.
@@ -199,7 +196,7 @@ def load_environment(
                 f"{', '.join(missing_modal_keys)}"
             )
         # Intentionally do not set UV_REINSTALL_PACKAGE here. That workaround
-        # originated when the Docker trainer's bash harness ran on the env-server
+        # originated when the Docker trainer's default harness ran on the env-server
         # and could reuse its host-cached PEP 723 environment. ModalRuntime creates
         # a fresh sandbox per rollout from the registry image and mounts no
         # persistent Volume or snapshot, so its uv script environment cannot carry
@@ -215,7 +212,7 @@ def load_environment(
         # keeps `hf` CLI auth consistent across runtime types.
         harness_env[hf_token_env] = hf_token
 
-    env = Environment(
+    return Environment(
         vf.EnvConfig(
             taskset=config,
             max_turns=max_turns,
@@ -226,25 +223,3 @@ def load_environment(
         ),
         env_args=env_args,
     )
-    # bash harness caps agent-visible tool results in-runtime by patching the uv
-    # program (MAX_TOOL_OUTPUT_CHARS flows in via harness_env above); the codex
-    # harness relies on the external runner for any wire-level capping.
-    if harness_id == "default":
-        from .bash_harness import wrap_bash_harness
-
-        env.harness = wrap_bash_harness(env.harness.config)
-    elif harness_id == "codex":
-        # The stock codex harness calls any clean exit `agent_completed`, so an
-        # empty model turn at turn 4/300 ends the rollout with no manifest and
-        # the turn budget unspent. Guard it: on a clean exit with no manifest
-        # and turns to spare, continue codex with a nudge (bounded, strict
-        # scoring untouched).
-        from .codex_harness import wrap_codex_harness
-
-        env.harness = wrap_codex_harness(
-            env.harness.config,
-            manifest_filename=manifest_filename,
-            max_turns=max_turns,
-            max_continuations=codex_max_continuations,
-        )
-    return env

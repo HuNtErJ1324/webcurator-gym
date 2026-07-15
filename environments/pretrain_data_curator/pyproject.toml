@@ -2,7 +2,7 @@
 name = "pretrain-data-curator"
 description = "Agent curates an LLM pretraining corpus from the pre-cutoff Hugging Face universe, scored by proxy-student cross-entropy plus a leakage penalty."
 tags = ["huggingface", "datasets", "data-curation", "pretraining", "tool-use", "multi-turn", "train", "eval"]
-version = "0.8.8"
+version = "0.8.10"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@f68cac097de14d5a129e8944292c1b4247b69cc1",
@@ -38,7 +38,7 @@ num_examples = 1
 rollouts_per_example = 1
 
 [project.scripts]
-pdc-debug-train = "pretrain_data_curator.debug_train:main"
+pdc-debug-train = "pretrain_data_curator.util.debug_train:main"
 
 [dependency-groups]
 dev = [

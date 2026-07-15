@@ -27,7 +27,7 @@ from pretrain_data_curator.corpus import (
     SourceCorpus,
     _iter_sampling,
 )
-from pretrain_data_curator.hf_access import (
+from pretrain_data_curator.util.hf_access import (
     DatasetAccessError,
     FetchKey,
     HuggingFaceDatasetClient,
@@ -36,7 +36,7 @@ from pretrain_data_curator.hf_access import (
     loop_local_semaphore,
     run_blocking_with_retry,
 )
-from pretrain_data_curator.hf_cli_parse import extract_hf_commands
+from pretrain_data_curator.util.utils import extract_hf_commands
 from pretrain_data_curator.models import (
     CuratorConfig,
     FilterSpec,
@@ -54,7 +54,7 @@ from pretrain_data_curator.models import (
 from pretrain_data_curator.pretrain_data_curator import load_environment
 from pretrain_data_curator.rewards import CuratorScorer
 from pretrain_data_curator.rollout_state import CuratorState, RolloutStore
-from pretrain_data_curator.self_score import (
+from pretrain_data_curator.gpu.self_score import (
     SELF_SCORE_FILENAME,
     SELF_SCORE_TRAIN_FILENAME,
     render_self_score_script,
@@ -85,7 +85,7 @@ from pretrain_data_curator.trainer import (
     TrainResult,
     estimate_param_count,
 )
-from pretrain_data_curator.train_gpt import GPT2_SMALL_PARAM_COUNT
+from pretrain_data_curator.gpu.train_gpt import GPT2_SMALL_PARAM_COUNT
 from pretrain_data_curator.val_set import (
     NANOGPT_VAL_DATASET_ID,
     NANOGPT_VAL_FILENAME,
@@ -400,7 +400,7 @@ for name in list(sys.modules):
 
 import pretrain_data_curator  # noqa: F401
 
-from pretrain_data_curator.train_gpt import steps_for_token_budget
+from pretrain_data_curator.gpu.train_gpt import steps_for_token_budget
 
 assert steps_for_token_budget(
     32,
@@ -475,7 +475,6 @@ def test_load_environment_returns_v1_environment(monkeypatch):
     assert env.taskset.config.manifest_filename == MANIFEST_FILENAME
     assert env.harness.config.id == "default"
     assert env.harness.config.env == {
-        "MAX_TOOL_OUTPUT_CHARS": "20000",
         "HF_TOKEN": "test-token",
     }
     assert env.env_args["harness_id"] == "default"
@@ -837,7 +836,6 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
         proxy_student={"runtime_backend": "docker", "gpu_count": 1},
     )
     assert docker_env.harness.config.env == {
-        "MAX_TOOL_OUTPUT_CHARS": "20000",
         "UV_REINSTALL_PACKAGE": "pydantic-core",
     }
     runtime = docker_env.harness.config.runtime
@@ -863,7 +861,6 @@ def test_load_environment_injects_hf_token_into_harness_env(monkeypatch):
 
     subprocess_env = load_environment(harness_id="codex")
     assert subprocess_env.harness.config.env == {
-        "MAX_TOOL_OUTPUT_CHARS": "20000",
         "HF_TOKEN": "hf_test_token",
     }
 
@@ -1843,7 +1840,7 @@ def test_train_token_budget_default_preserves_step_behavior():
 
 def test_train_token_budget_equal_stages_400m_is_schedule_aware():
     """400M / 16 / 1024 under [1,2,3] equal stages ≈ 12,208 steps (not 24,415)."""
-    from pretrain_data_curator.train_gpt import scheduled_presentation_tokens
+    from pretrain_data_curator.gpu.train_gpt import scheduled_presentation_tokens
 
     cfg = ProxyStudentConfig(
         train_token_budget=400_000_000,
@@ -1882,7 +1879,7 @@ def test_train_token_budget_equal_stages_400m_is_schedule_aware():
 
 
 def test_train_token_budget_irregular_stage_fractions():
-    from pretrain_data_curator.train_gpt import scheduled_presentation_tokens
+    from pretrain_data_curator.gpu.train_gpt import scheduled_presentation_tokens
 
     fracs = (0.1, 0.2, 0.7)
     muls = (1, 2, 4)
@@ -2871,7 +2868,7 @@ def test_self_score_redacts_forbidden_source_from_all_stdout(tmp_path):
 def test_self_score_script_exposes_agent_controlled_cli_flags():
     """Self-score caps are agent-chosen via CLI flags, not baked into the script."""
     import re as _re
-    from pretrain_data_curator import self_score as _self_score
+    from pretrain_data_curator.gpu import self_score as _self_score
 
     script = _self_score._SCRIPT
     assert '--limit"' in script
@@ -4447,7 +4444,7 @@ def test_self_score_train_script_renders_and_compiles():
 
 def test_self_score_script_preserves_trainer_stderr_tail_before_cleanup():
     """Rendered self_score must read WORKDIR/stderr.txt before rmtree on failure."""
-    from pretrain_data_curator import self_score as _self_score
+    from pretrain_data_curator.gpu import self_score as _self_score
 
     script = _self_score._SCRIPT
     assert "def _read_trainer_stderr_tail(" in script
@@ -5070,7 +5067,7 @@ def test_self_score_contains_no_val_reference():
     The self-score script runs inside the agent container and must NEVER
     reference, derive, or expose the held-out validation set.
     """
-    from pretrain_data_curator.self_score import render_self_score_script
+    from pretrain_data_curator.gpu.self_score import render_self_score_script
 
     config = CuratorConfig(token_budget=1_000)
     script = render_self_score_script(config)
@@ -5145,7 +5142,7 @@ def _reduce_selfscore(lines, total_tokens):
     """
     import json as _json
     import re
-    from pretrain_data_curator import self_score as _self_score
+    from pretrain_data_curator.gpu import self_score as _self_score
 
     script = _self_score._SCRIPT
     match = re.search(
@@ -5422,7 +5419,7 @@ def _perf_selfscore(config, loss):
     dev-time perf curve is verified to stay in parity with production
     ``CuratorScorer._target_scaled_perf`` across p and γ.
     """
-    from pretrain_data_curator.self_score import render_self_score_script
+    from pretrain_data_curator.gpu.self_score import render_self_score_script
 
     script = render_self_score_script(config).decode()
     ns: dict[str, object] = {"__name__": "_self_score_perf_parity"}

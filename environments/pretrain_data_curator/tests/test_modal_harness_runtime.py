@@ -100,7 +100,7 @@ def test_load_environment_uses_modal_config_and_gpu_mapping(monkeypatch):
     )
 
     runtime = env.harness.config.runtime
-    assert env.harness.config.env == {"MAX_TOOL_OUTPUT_CHARS": "20000"}
+    assert env.harness.config.env == {}
     assert isinstance(runtime, ModalConfig)
     assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
     assert runtime.workdir == "/workspace"
@@ -172,3 +172,4 @@ async def test_taskset_setup_rejects_modal_trainer_on_other_runtime(monkeypatch)
     )
     with pytest.raises(TrainerError, match="Docker or Modal harness runtime"):
         await task.setup(trace, FakeRuntime(runtime_type="subprocess"))
+

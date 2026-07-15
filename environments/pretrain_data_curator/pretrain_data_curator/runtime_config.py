@@ -15,7 +15,7 @@ from typing import Any
 
 import verifiers.v1 as vf
 
-from .container_memory import resolve_container_memory_gb
+from .util.container_memory import resolve_container_memory_gb
 from .models import ProxyStudentConfig
 
 _MODAL_GPU_MAP: dict[str, str] = {

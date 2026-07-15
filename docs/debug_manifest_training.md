@@ -37,7 +37,7 @@ The manifest must use `kind: "local"` sources with **workspace-relative** paths
 
 ```bash
 # 1) First run: curate the bundle from the manifest, then train (CPU).
-python -m pretrain_data_curator.debug_train \
+python -m pretrain_data_curator.util.debug_train \
   --manifest ws/manifest.json \
   --base-dir ws \
   --bundle-dir pdc-debug-bundle \
@@ -48,15 +48,15 @@ python -m pretrain_data_curator.debug_train \
 #    (manifest identity is checked against the bundle's provenance first.)
 
 # Force re-curation after you change the manifest:
-python -m pretrain_data_curator.debug_train --manifest ws/manifest.json \
+python -m pretrain_data_curator.util.debug_train --manifest ws/manifest.json \
   --base-dir ws --bundle-dir pdc-debug-bundle --output-dir pdc-debug-out --refresh
 
 # Only materialize (skip training):
-python -m pretrain_data_curator.debug_train --manifest ws/manifest.json \
+python -m pretrain_data_curator.util.debug_train --manifest ws/manifest.json \
   --base-dir ws --bundle-dir pdc-debug-bundle --no-train
 
 # Recover the manifest from a bundle that already has one:
-python -m pretrain_data_curator.debug_train --bundle-dir pdc-debug-bundle --output-dir pdc-debug-out
+python -m pretrain_data_curator.util.debug_train --bundle-dir pdc-debug-bundle --output-dir pdc-debug-out
 ```
 
 A console script alias is also installed: `pdc-debug-train` (same arguments).

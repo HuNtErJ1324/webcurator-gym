@@ -1,31 +1,32 @@
-# Docker smoke config for the taskset/harness [[eval]] path. Regenerated to
-# match the current load_environment signature and ProxyStudentConfig fields
-# (validated by test_single_smoke_config_exhaustively_matches_source_options).
-# Includes perf_scaling_exponent from feat/perf-reward-curve.
+# Native Verifiers v1 smoke: 10M tokens / 100 turns / stock codex / Docker real trainer.
+# Standard entrypoint (NOT prime eval run):
+#   uv run eval @ configs/eval/10M-100turn-smoke.toml
 
-env_dir_path = ".."
-
-[[eval]]
-name = "pretrain-data-curator-deepseek-v4-flash-smoke"
-env_id = "pretrain-data-curator"
 model = "deepseek/deepseek-v4-flash"
-num_examples = 1
-rollouts_per_example = 1
+num_tasks = 1
+num_rollouts = 1
 max_concurrent = 1
-max_tokens = 2048
-temperature = 0.2
+max_turns = 100
+verbose = true
+rich = true
+push = true
 
-[eval.args]
+[sampling]
+temperature = 0.6
+top_p = 0.9
+max_tokens = 8192
+
+[taskset]
+id = "pretrain-data-curator"
 cutoff_date = "2024-12-31"
-token_budget = 25_000_000
+token_budget = 10_000_000
 hf_token_env = "HF_TOKEN"
 manifest_filename = "manifest.json"
 candidate_limit = 64
 allow_trace_id_manifest_fallback = false
 allow_local_sources = true
 max_local_source_bytes = 134_217_728
-max_turns = 60
-harness_id = "default"
+max_turns = 100
 alpha_perf = 1.0
 lambda_leakage = 1.0
 perf_baseline_loss = 10.825839875788878
@@ -43,7 +44,7 @@ decon_evals_dir = ""
 decon_threshold = 0.2
 screen_val_set = true
 
-[eval.args.proxy_student]
+[taskset.proxy_student]
 n_layer = 12
 n_head = 6
 n_embd = 768
@@ -52,9 +53,9 @@ lm_head_softcap = 30.0
 num_value_embeds = 3
 attn_scale = 0.12
 block_size = 1024
-batch_size = 16
+batch_size = 8
 steps = 200
-train_token_budget = 25000000
+train_token_budget = 10_000_000
 training_recipe = "speedrun_muon"
 muon_lr = 0.023
 muon_weight_decay = 0.05
@@ -75,10 +76,10 @@ value_embed_wd_mul = 5.0
 scalar_wd_mul = 0.0
 adam_on_odd_steps = true
 batch_schedule_enabled = true
-batch_stage_fracs = [0.3333333333333333, 0.3333333333333333, 0.3333333333333333]
+batch_stage_fracs = [0.3333333333, 0.3333333333, 0.3333333334]
 batch_stage_muls = [1, 2, 3]
 lr_stage_muls = [1.0, 1.52, 1.73]
-lr_cooldown_frac = 0.6
+lr_cooldown_frac = 0.60
 lr_cooldown_floor = 0.15
 learning_rate = 0.0003
 seed = 0
@@ -91,19 +92,30 @@ warmup_steps = 256
 lr_min_ratio = 0.1
 n_train_runs = 1
 runtime_backend = "docker"
-docker_image = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
+docker_image = "webcurator-runtime:latest"
 gpu_count = 1
-cpu_cores = 4
-memory_gb = 16
-disk_size_gb = 20
-max_corpus_chars = 100000000
+cpu_cores = 8
+memory_gb = 32
+disk_size_gb = 40
+max_corpus_chars = 100_000_000
 timeout_minutes = 90
-upload_timeout_seconds = 120.0
+upload_timeout_seconds = 600.0
 
-[eval.args.validation_set]
+[taskset.validation_set]
 dataset_id = "kjj0/fineweb10B-gpt2"
 filename = "fineweb_val_000000.bin"
 repo_type = "dataset"
 tokenizer = "gpt2"
 val_tokens = 10_485_760
 
+[harness]
+id = "codex"
+
+[harness.runtime]
+type = "docker"
+image = "webcurator-runtime:latest"
+workdir = "/workspace"
+gpu = "1"
+cpu = 8.0
+memory = 32.0
+disk = 40.0

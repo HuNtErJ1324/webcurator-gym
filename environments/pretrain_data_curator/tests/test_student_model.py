@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from pretrain_data_curator.train_gpt import (
+from pretrain_data_curator.gpu.train_gpt import (
     _causal_attn_mask,
     _combine_attn_masks,
     _sliding_window_mask,
@@ -28,7 +28,7 @@ from pretrain_data_curator.train_gpt import (
     XSA,
     MultiTokenHeads,
 )
-from pretrain_data_curator.train_gpt import build_document_attn_mask
+from pretrain_data_curator.gpu.train_gpt import build_document_attn_mask
 
 
 def _randomize(model: torch.nn.Module) -> None:

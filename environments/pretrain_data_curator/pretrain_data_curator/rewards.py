@@ -33,7 +33,7 @@ from typing import Any
 import verifiers.v1 as vf
 
 from .corpus import CorpusBuilder, CuratedCorpus
-from .hf_access import DatasetAccessError
+from .util.hf_access import DatasetAccessError
 from .leakage import DeconError, DeconLeakageDetector, LeakageScores
 from .models import CuratorConfig
 from .rollout_state import CuratorState, RolloutStore

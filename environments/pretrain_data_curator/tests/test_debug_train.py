@@ -16,7 +16,7 @@ import pytest
 import tiktoken
 import torch
 
-from pretrain_data_curator.debug_train import (
+from pretrain_data_curator.util.debug_train import (
     ManifestMismatchError,
     TokenBudgetError,
     UnsafeOutputError,

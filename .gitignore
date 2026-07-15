@@ -69,3 +69,21 @@ Thumbs.db
 
 # Codex scratch / sandbox temp
 .codex-tmp/
+
+# Agent verify / local tool scratch
+.pi_verify/
+
+# Large model / training artifacts that may land in-tree
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+wandb/
+runs/
+lightning_logs/
+.cache/
+
+# Pod / runtime scratch
+.runpod/
+pod_scratch/
+**/torch_extensions/

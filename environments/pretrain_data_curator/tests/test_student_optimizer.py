@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from pretrain_data_curator.train_gpt import StudentModelConfig, GPT
-from pretrain_data_curator.train_gpt import (
+from pretrain_data_curator.gpu.train_gpt import StudentModelConfig, GPT
+from pretrain_data_curator.gpu.train_gpt import (
     Muon,
     build_batch_schedule,
     build_speedrun_optimizers,

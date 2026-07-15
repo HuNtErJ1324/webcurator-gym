@@ -35,13 +35,13 @@ from typing import Callable
 import numpy as np
 from pydantic import BaseModel, Field
 
-from .hf_access import (
+from .util.hf_access import (
     DatasetAccessError,
     RetryPolicy,
     hf_fetch_semaphore,
     run_blocking_with_retry,
 )
-from .train_gpt import plan_val_windows
+from .gpu.train_gpt import plan_val_windows
 
 # --- NanoGPT speedrun validation-set spec (verified against modded-nanogpt) ---
 # Source dataset (GPT-2-BPE-tokenized FineWeb sample-10BT) and the val shard.

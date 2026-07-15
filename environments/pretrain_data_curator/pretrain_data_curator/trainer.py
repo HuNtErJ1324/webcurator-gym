@@ -24,14 +24,14 @@ from typing import Any, Protocol
 import verifiers.v1 as vf
 from pydantic import BaseModel
 
-from .container_memory import (
+from .util.container_memory import (
     collect_oom_diagnostics,
     format_oom_diagnostics,
     inspect_container_memory,
     resolve_container_memory_gb,
 )
 from .corpus import CuratedCorpus
-from .hf_access import loop_local_semaphore
+from .util.hf_access import loop_local_semaphore
 from .models import ProxyStudentConfig
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ def estimate_param_count(config: ProxyStudentConfig) -> int:
     runtime torch dependency. Real GPU training embeds the model source into
     the sandbox script and never needs this import path.
     """
-    from .train_gpt import estimate_instantiated_param_count
+    from .gpu.train_gpt import estimate_instantiated_param_count
 
     return estimate_instantiated_param_count(
         num_layers=config.n_layer,
@@ -186,7 +186,7 @@ def _source_diversity(corpus: CuratedCorpus) -> float:
     return entropy / math.log(len(non_empty))
 
 
-TRAIN_GPT_PATH = Path(__file__).with_name("train_gpt.py")
+TRAIN_GPT_PATH = Path(__file__).resolve().parent / "gpu" / "train_gpt.py"
 
 
 def _nanogpt_train_script() -> str:

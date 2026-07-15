@@ -17,8 +17,8 @@ from __future__ import annotations
 import hashlib
 from textwrap import dedent
 
-from .models import CuratorConfig
-from .trainer import _nanogpt_train_script
+from ..models import CuratorConfig
+from ..trainer import _nanogpt_train_script
 
 SELF_SCORE_FILENAME = "self_score.py"
 SELF_SCORE_TRAIN_FILENAME = "self_score_train.py"
@@ -1546,7 +1546,7 @@ def render_self_score_script(
     decon_threshold: float = 0.2,
 ) -> bytes:
     """Return a configured self-score script without exposing held-out data."""
-    from .leakage import resolve_decon_binary, resolve_decon_evals_dir
+    from ..leakage import resolve_decon_binary, resolve_decon_evals_dir
 
     replacements: dict[str, object] = {
         "__EXPECTED_TOKEN_BUDGET__": config.token_budget,

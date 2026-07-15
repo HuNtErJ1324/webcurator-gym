@@ -20,7 +20,7 @@ Before nontrivial `hf` work, read `/workspace/.agents/skills/hf-cli/SKILL.md`. E
 - Performance: normalized loss progress is squared in the performance term (default exponent 2.0), so equal loss improvements earn more reward later than earlier; negative progress stays linear. Target loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
 
 ## Research
-Explore broadly before locking a mixture: search the web, read papers/writeups, and study modern pretraining practice — no prescribed recipe. Use the installed `hf papers` CLI to discover or access papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
+Explore broadly before locking a mixture: read papers/writeups, and study modern pretraining practice — no prescribed recipe. Use the installed `hf papers` CLI to discover or access papers. Useful directions include source discovery and vetting, quality and toxicity filtering, deduplication, domain/reasoning/code/math balancing, synthetic or rewritten corpora, multilingual tradeoffs, and mixture-weighting heuristics. Let what you learn inform your manifest design and filtering choices.
 
 ## Deliverable
 Write the mixture as one JSON object to `{manifest_path}` with this contract:

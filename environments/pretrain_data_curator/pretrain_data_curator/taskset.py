@@ -50,8 +50,8 @@ from pydantic import ValidationError, field_validator, model_validator
 
 from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .leakage import DeconLeakageDetector
-from .hf_access import HuggingFaceDatasetClient, RetryPolicy
-from .hf_cli_parse import content_text, extract_hf_commands
+from .util.hf_access import HuggingFaceDatasetClient, RetryPolicy
+from .util.utils import content_text, extract_hf_commands
 from .leakage import DEFAULT_DECON_BINARY, DEFAULT_EVAL_SETS_DIR
 from .models import (
     CuratorConfig,
@@ -72,7 +72,7 @@ from .models import (
 from .rewards import CuratorScorer
 from .rollout_state import CuratorState, RolloutStore
 from .runtime_config import derive_task_runtime_updates
-from .self_score import (
+from .gpu.self_score import (
     SELF_SCORE_FILENAME,
     SELF_SCORE_TRAIN_FILENAME,
     render_self_score_script,
@@ -494,8 +494,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     decon_evals_dir: str | None = None
     decon_threshold: float = 0.2
     screen_val_set: bool = True
-    # Cap on tool / bash output captured from runtimes; <=0 disables truncation.
-    max_tool_output_chars: int = 20_000
 
     @field_validator("manifest_filename")
     @classmethod
@@ -580,7 +578,6 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             use_real_trainer=config.use_real_trainer,
             proxy_student=ProxyStudentConfig(**(config.proxy_student or {})),
             validation_set=ValidationSetConfig(**(config.validation_set or {})),
-            max_tool_output_chars=config.max_tool_output_chars,
         )
 
     @classmethod
@@ -681,7 +678,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
                 self.curator.use_real_trainer
                 and self.curator.proxy_student.runtime_backend == "docker"
             ):
-                from .container_memory import (
+                from .util.container_memory import (
                     resolve_container_memory_gb,
                     verify_runtime_memory_limit,
                 )
@@ -1171,3 +1168,4 @@ __all__ = [
     "parse_manifest",
     "extract_json_object",
 ]
+

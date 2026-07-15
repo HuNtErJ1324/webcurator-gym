@@ -51,10 +51,10 @@ from typing import Any, Callable
 import tiktoken
 import torch
 
-from .corpus import CorpusBuilder, CuratedCorpus
-from .models import Manifest, ProxyStudentConfig
-from .rollout_state import CuratorState
-from .train_gpt import (
+from ..corpus import CorpusBuilder, CuratedCorpus
+from ..models import Manifest, ProxyStudentConfig
+from ..rollout_state import CuratorState
+from ..gpu.train_gpt import (
     GPT,
     averaged_train_and_eval,
     encode_document_tokens,

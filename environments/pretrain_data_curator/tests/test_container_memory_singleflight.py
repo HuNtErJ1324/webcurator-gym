@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import verifiers.v1 as vf
 
-from pretrain_data_curator.container_memory import (
+from pretrain_data_curator.util.container_memory import (
     DEFAULT_HOST_HEADROOM_GIB,
     ENV_CONTAINER_MEMORY_GB,
     ENV_DOCKER_CONTAINER_MEMORY_GB,
@@ -40,7 +40,7 @@ from pretrain_data_curator.container_memory import (
 )
 from pretrain_data_curator.models import CuratorConfig, ProxyStudentConfig
 from pretrain_data_curator.runtime_config import derive_trainer_resources
-from pretrain_data_curator.self_score import render_self_score_script
+from pretrain_data_curator.gpu.self_score import render_self_score_script
 from pretrain_data_curator.rollout_state import CuratorState
 from pretrain_data_curator.taskset import CuratorTaskset, CuratorTasksetConfig
 
@@ -155,7 +155,7 @@ def test_verify_runtime_memory_limit_uses_inspect(monkeypatch):
         }
 
     monkeypatch.setattr(
-        "pretrain_data_curator.container_memory.inspect_container_memory",
+        "pretrain_data_curator.util.container_memory.inspect_container_memory",
         fake_inspect,
     )
     info = verify_runtime_memory_limit(runtime, configured_gb=96)
@@ -269,7 +269,7 @@ def test_collect_oom_diagnostics_payload():
 
 def _load_self_score_helpers():
     """Exec process-group helpers from the rendered self_score script template."""
-    from pretrain_data_curator import self_score as mod
+    from pretrain_data_curator.gpu import self_score as mod
 
     script = mod._SCRIPT
     start = script.index("# --- Progress heartbeats")
@@ -290,7 +290,7 @@ def _load_self_score_helpers():
 
 
 def test_self_score_script_embeds_single_flight_and_process_group_controls():
-    from pretrain_data_curator import self_score as mod
+    from pretrain_data_curator.gpu import self_score as mod
 
     script = mod._SCRIPT
     assert "start_new_session=True" in script
@@ -576,7 +576,7 @@ def test_signal_handler_cleans_active_process_group(tmp_path):
 
 def test_signal_delivery_terminates_trainer_group_and_exits(tmp_path):
     """Real subprocess: helper installs handlers, gets SIGTERM, trainer PGID dies."""
-    from pretrain_data_curator import self_score as mod
+    from pretrain_data_curator.gpu import self_score as mod
 
     script = mod._SCRIPT
     hs = script.index("# --- Progress heartbeats")
@@ -723,7 +723,7 @@ async def test_heuristic_docker_setup_skips_memory_pin(monkeypatch):
         raise AssertionError("heuristic docker setup must not verify memory pin")
 
     monkeypatch.setattr(
-        "pretrain_data_curator.container_memory.verify_runtime_memory_limit",
+        "pretrain_data_curator.util.container_memory.verify_runtime_memory_limit",
         boom,
     )
     taskset = CuratorTaskset(
@@ -761,7 +761,7 @@ async def test_real_docker_setup_verifies_memory_pin(monkeypatch):
         return {"memory_bytes": memory_gb_to_bytes(configured_gb)}
 
     monkeypatch.setattr(
-        "pretrain_data_curator.container_memory.verify_runtime_memory_limit",
+        "pretrain_data_curator.util.container_memory.verify_runtime_memory_limit",
         fake_verify,
     )
     taskset = CuratorTaskset(

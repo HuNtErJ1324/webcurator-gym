@@ -305,21 +305,34 @@ with provenance metrics.
 
 ## Module Layout
 
+High-level environment package (top level):
+
 - `__init__.py` — `_bootstrap_verifiers_v1()`: patches `verifiers.__path__` at import time so the real v1 is importable inside Prime's Hosted Training orchestrator (which pre-loads a `verifiers==0.0.0` stub).
 - `pretrain_data_curator.py` — `load_environment` entry point; builds `CuratorTasksetConfig` and returns a native v1 `Environment` (plus a thin `Environment` subclass that only stashes the loader's `env_args` for callers/tests).
 - `models.py` — Pydantic contracts (`Manifest`, `Source`, `FilterSpec`, `CuratorConfig`, `ProxyStudentConfig`, ...).
-- `hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers. Setup checks credentials before rollout; the client checks again at first Hub use.
-- `hf_cli_parse.py` — parse `hf` CLI argv from shell/command text for manifest recovery and val-set access detection.
 - `corpus.py` — `CorpusBuilder` + `DocumentFilter` (materialize manifest into documents).
 - `leakage.py` — `DeconLeakageDetector` (decon n-gram contamination vs bundled benchmarks + optional ephemeral held-out val screen), `LeakageScores`, `DeconError`, and the token-weighted `_reduce_report`.
 - `val_set.py` — held-out validation token stream (`ValidationSetConfig`, `ValTokenLoader`, `.bin` parser); NanoGPT-speedrun set by default.
 - `trainer.py` — `ProxyStudentTrainer` interface, the heuristic backend, and one `RuntimeProxyTrainer` using the builtin v1 `Runtime` interface; Docker adds cgroup/OOM diagnostics as an optional layer.
-- `train_gpt.py` — single-file modded-nanogpt proxy student: architecture, Muon/AdamW optimizers, batch/LR schedule, validation, and training loop. Backends copy this file directly into the sandbox.
 - `rewards.py` — `CuratorScorer`, the framework-agnostic heavy scoring pass.
 - `rollout_state.py` — typed `CuratorState` plus `RolloutStore` accessors.
 - `taskset.py` — `CuratorTaskset`, manifest parsing/recovery, `finalize()`, decorated rewards/metrics, and `@vf.stop` turn cap. No MCP tool server.
 - `tasks.py` — one typed v1 curation task rendered as the initial user prompt.
-- `self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace; runs decon against the bundled **benchmarks only** (never the held-out val set).
+
+Harness selection uses stock Verifiers v1 ids only (`default`, `codex`, …) via
+`harness_id` / `--harness.id`; there are no env-local harness subclasses.
+
+`util/` — shared helpers:
+
+- `util/hf_access.py` — `DatasetSearchClient` Protocol, live HF client, cutoff/query helpers.
+- `util/utils.py` — `hf` CLI argv parsing helpers (formerly `hf_cli_parse.py`).
+- `util/container_memory.py` — Docker memory preflight, cgroup verification, OOM diagnostics for real-trainer runs.
+- `util/debug_train.py` — local CPU debug training entrypoint (`pdc-debug-train` / `python -m pretrain_data_curator.util.debug_train`).
+
+`gpu/` — code copied or executed on GPU:
+
+- `gpu/train_gpt.py` — single-file modded-nanogpt proxy student; backends copy this file into the sandbox.
+- `gpu/self_score.py` — renders the standalone leakage-safe development proxy copied into each rollout workspace.
 
 ## Notes And Limitations
 
@@ -338,3 +351,4 @@ with provenance metrics.
 - Token counts use `max(word_count, character_count // 4)` on the env side; the
   real trainer tokenizes inside the sandbox.
 - Filtering is expressed via the structured `filters` argument.
+

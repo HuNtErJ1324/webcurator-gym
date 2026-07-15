@@ -1,7 +1,4 @@
-"""Parse Hugging Face ``hf`` CLI invocations from shell/command text.
-
-Used by finalize for manifest ID recovery and validation-set access detection.
-"""
+"""Small helpers for the curator environment (pure-Python, import-safe)."""
 
 from __future__ import annotations
 
@@ -48,4 +45,7 @@ def extract_hf_commands(text: str) -> list[list[str]]:
     return cmds
 
 
-__all__ = ["content_text", "extract_hf_commands"]
+__all__ = [
+    "content_text",
+    "extract_hf_commands",
+]

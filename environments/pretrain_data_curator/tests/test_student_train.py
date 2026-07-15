@@ -9,8 +9,8 @@ import pytest
 import tiktoken
 import torch
 
-from pretrain_data_curator.train_gpt import StudentModelConfig
-from pretrain_data_curator.train_gpt import (
+from pretrain_data_curator.gpu.train_gpt import StudentModelConfig
+from pretrain_data_curator.gpu.train_gpt import (
     averaged_train_and_eval,
     batch_document_attn_mask,
     build_document_attn_mask,
@@ -138,7 +138,7 @@ def test_batching_draws_each_contiguous_window_before_repeating(monkeypatch):
     # of the window starts each epoch) rather than sampling offsets with
     # replacement: across exactly one epoch every window start is drawn once. Tokens
     # are a plain arange so each example's first token == its window start index.
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     block, batch = 8, 1
     n = 8 * block + 1  # 8 full contiguous windows
@@ -195,7 +195,7 @@ def test_batching_draws_each_contiguous_window_before_repeating(monkeypatch):
 
 
 def test_recipe_applies_adamw_betas_weight_decay_grad_clip_and_schedule(monkeypatch):
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     captured: dict = {}
     real_adamw = torch.optim.AdamW
@@ -302,7 +302,7 @@ def test_grad_clip_zero_skips_clipping(monkeypatch):
 
 
 def test_averaged_train_and_eval_averages_loss_and_sums_flops(monkeypatch):
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V = 16
     cfg = _tiny_cfg(V)
@@ -345,7 +345,7 @@ def test_averaged_train_and_eval_averages_loss_and_sums_flops(monkeypatch):
 
 
 def test_averaged_train_and_eval_nonfinite_run_collapses_to_sentinel(monkeypatch):
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V = 16
     cfg = _tiny_cfg(V)
@@ -387,7 +387,7 @@ def test_averaged_train_and_eval_nonfinite_run_collapses_to_sentinel(monkeypatch
 
 def test_n_train_runs_one_equals_a_single_run(monkeypatch):
     # Default n_runs=1 is exactly one train+eval (cost + calibration unchanged).
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V = 16
     cfg = _tiny_cfg(V)
@@ -502,7 +502,7 @@ def test_discriminative_signal_requires_contiguous_recipe_not_replacement(monkey
     # Tokens are a plain arange so each example's first token == its window start.
     import collections
 
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     block, batch, epochs = 8, 1, 3
     n = 8 * block + 1  # 8 full contiguous windows
@@ -937,7 +937,7 @@ def test_training_with_multi_token_pred():
 def test_training_with_multi_token_pred_and_speedrun():
     """Multi-token prediction must also work under the speedrun_muon recipe."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -970,7 +970,7 @@ def test_training_with_multi_token_pred_and_speedrun():
 
 def test_full_training_with_speedrun_and_nor_muon():
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1017,10 +1017,10 @@ def test_max_document_tokens_rejects_instead_of_splitting_a_document():
 def test_multi_token_pred_targets_shifted_correctly(monkeypatch):
     """Verify multi-token prediction targets are correctly shifted by k+2
     positions, not constructed from a single-element slice of train_src."""
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V = 64
-    from pretrain_data_curator.train_gpt import GPT
+    from pretrain_data_curator.gpu.train_gpt import GPT
 
     model = GPT(
         vocab_size=V, num_layers=2, model_dim=32, num_heads=2, multi_token_pred=2
@@ -1071,10 +1071,10 @@ def test_multi_token_pred_targets_shifted_correctly(monkeypatch):
 def test_untie_embed_lm_head_at_frac(monkeypatch):
     """With untie_at_frac > 0, the embedding and lm_head weights start tied
     and are untied (different data pointers) after the scheduled step."""
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V = 32
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1119,7 +1119,7 @@ def test_untie_does_not_tie_when_frac_zero():
     """With untie_at_frac=0.0, the weight tying step is skipped entirely,
     so embed and lm_head have separate weight tensors."""
     V = 32
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1155,7 +1155,7 @@ def test_untie_does_not_tie_when_frac_zero():
 
 def test_full_training_with_polar_express():
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1193,7 +1193,7 @@ def test_untie_at_frac_with_bigram_hash_embed_does_not_crash():
     """untie_at_frac > 0 with bigram_hash_embed=True must not crash on
     model.embed.weight (BigramHashEmbedding has no .weight attribute)."""
     V = 32
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(
         model_dim=32,
@@ -1236,13 +1236,13 @@ def test_untie_at_frac_with_bigram_hash_embed_does_not_crash():
 def test_untie_at_frac_registers_lm_head_in_optimizer(monkeypatch):
     """After untie the new lm_head.weight must be registered in AdamW."""
     V = 32
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
     data = torch.randint(0, V, (200,))
     gen = torch.Generator().manual_seed(0)
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     lm_head_param_ids = set()
     real_add = torch.optim.AdamW.add_param_group
@@ -1282,7 +1282,7 @@ def test_untied_lm_head_weight_actually_updates():
     """Regression: the newly untied lm_head.weight changes during subsequent
     training steps (proves it is registered in the optimizer and stepped)."""
     V = 32
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1322,7 +1322,7 @@ def test_grad_accum_embed_head_finite_and_produces_loss():
     """Gradient accumulation for embed+head must produce a finite loss and
     non-zero tokens (smoke test: no crash, the loop actually runs)."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1357,7 +1357,7 @@ def test_grad_accum_embed_head_embed_and_lm_head_weights_update():
     """With accum>1 the embed and lm_head weights must change from their
     initial values (proving accumulated grads are applied)."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1397,7 +1397,7 @@ def test_grad_accum_embed_head_with_untie_at_frac():
     """Combined: gradient accumulation + weight untie must not crash and
     produce finite loss (tests both blockers together)."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1435,7 +1435,7 @@ def test_grad_accum_embed_head_no_duplicate_first_step_counting(monkeypatch):
     spying on per-backward grad norms: each backward in a micro-step should
     produce a fresh single-batch gradient, not a growing accumulation."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1496,7 +1496,7 @@ def test_grad_accum_embed_head_muon_grads_fresh_per_micro_step(monkeypatch):
     norm is single-batch-scale, not a multi-step accumulation."""
 
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1568,7 +1568,7 @@ def test_grad_accum_embed_head_clip_called(monkeypatch):
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy_clip)
 
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1610,7 +1610,7 @@ def test_grad_accum_embed_head_non_embed_adam_bounded(monkeypatch):
     carryover across outer steps)."""
 
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -1666,7 +1666,7 @@ def test_grad_accum_embed_head_produces_correct_weight_changes(monkeypatch):
     — not the exact equivalence test (which is impossible due to different Muon
     stepping frequency), but a guard against catastrophic corruption."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
 
@@ -1764,7 +1764,7 @@ def test_prepare_student_model_dtype_cuda_casts_muon_keeps_adam_fp32(monkeypatch
 
     Mock ``_is_cuda_device`` so the cast path runs on CPU-resident tensors.
     """
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     monkeypatch.setattr(st, "_is_cuda_device", lambda device: True)
     model = _tiny_cfg(32).build()
@@ -1786,7 +1786,7 @@ def test_prepare_student_model_dtype_cuda_forward_runs_end_to_end(monkeypatch):
     cast the activations it hands to the blocks accordingly. Mock
     ``_is_cuda_device`` so this runs on CPU-resident bfloat16 tensors.
     """
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     monkeypatch.setattr(st, "_is_cuda_device", lambda device: True)
     V = 64
@@ -1928,7 +1928,7 @@ def test_ema_loss_updates_every_step_not_just_at_log_points(monkeypatch, capsys)
     # full per-step EMA (decay=0.9) over ALL of them, and confirm the final
     # logged line's reported loss matches it -- which only holds if the EMA is
     # actually updated every step.
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V = 16
     model = _tiny_cfg(V).build()
@@ -2069,7 +2069,7 @@ def test_grad_accum_non_embed_adam_grads_fresh_per_micro_step(monkeypatch):
     within an accumulation cycle.  This is the Adam counterpart of
     test_grad_accum_embed_head_muon_grads_fresh_per_micro_step."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -2128,7 +2128,7 @@ def test_grad_accum_multi_heads_in_buffer_with_accum(monkeypatch):
     gradients are accumulated across micro-steps (not silently lost or
     double-counted)."""
     V = 16
-    from pretrain_data_curator.train_gpt import GPT
+    from pretrain_data_curator.gpu.train_gpt import GPT
 
     model = GPT(
         vocab_size=V,
@@ -2183,7 +2183,7 @@ def test_grad_accum_partial_cycle_flushes_remaining_grads():
     silently dropping them.  Use steps=7 with accum=3 → 2 full cycles + 1
     partial cycle (7 steps, micro-steps 1-2-3, 4-5-6, 7 being partial)."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
     model = cfg.build()
@@ -2233,7 +2233,7 @@ def test_grad_accum_partial_cycle_vs_full_cycle_similar_delta():
     Compare a divisible-step run vs a non-divisible one with the same total
     data schedule."""
     V = 16
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)
 
@@ -2329,7 +2329,7 @@ def test_flush_on_even_step_applies_adam_grads():
     accumulated grads.  After the fix, force_adam=True on the flush path
     ensures Adam always steps."""
     V = 16
-    from pretrain_data_curator.train_gpt import GPT
+    from pretrain_data_curator.gpu.train_gpt import GPT
 
     model = GPT(
         vocab_size=V,
@@ -2395,7 +2395,7 @@ def test_flush_on_even_step_updates_all_embed_lm_head_multi_heads():
       - Partial micro-step at step 4 (even, flush) → must apply Adam via
         force_adam, otherwise multi_heads gradient is silently dropped."""
     V = 16
-    from pretrain_data_curator.train_gpt import GPT
+    from pretrain_data_curator.gpu.train_gpt import GPT
 
     model = GPT(
         vocab_size=V,
@@ -2469,7 +2469,7 @@ def test_in_loop_full_cycle_closes_on_even_step_forces_adam(monkeypatch):
     accumulated embed/head/multi_heads grads — AdamW's ``.step()`` was never
     invoked at all for that cycle."""
     V = 16
-    from pretrain_data_curator.train_gpt import GPT
+    from pretrain_data_curator.gpu.train_gpt import GPT
 
     model = GPT(
         vocab_size=V, num_layers=2, model_dim=32, num_heads=2, multi_token_pred=2
@@ -2477,7 +2477,7 @@ def test_in_loop_full_cycle_closes_on_even_step_forces_adam(monkeypatch):
     data = torch.randint(0, V, (300,))
     gen = torch.Generator().manual_seed(0)
 
-    import pretrain_data_curator.train_gpt as student_train_mod
+    import pretrain_data_curator.gpu.train_gpt as student_train_mod
 
     real_step_fn = student_train_mod.step_speedrun_optimizers
     calls: list[tuple[int, bool]] = []
@@ -2702,7 +2702,7 @@ def test_non_accum_path_adam_grad_accumulates_across_even_odd_pair(monkeypatch):
 
 def test_eval_val_loss_respects_microbatch_cap(monkeypatch):
     """Validation must never forward more than ``batch`` windows at once."""
-    from pretrain_data_curator.train_gpt import _eval_val_loss
+    from pretrain_data_curator.gpu.train_gpt import _eval_val_loss
 
     V, block, n_tokens = 64, 8, 65  # 64 targets -> 8 full-length windows
     model = _tiny_cfg(V).build().eval()
@@ -2736,7 +2736,7 @@ def test_eval_val_loss_respects_microbatch_cap(monkeypatch):
 
 def test_eval_val_loss_chunked_matches_full_vocab_semantics():
     """Chunked lm_head scoring must match a single full-vocab pass exactly."""
-    from pretrain_data_curator.train_gpt import _eval_val_loss
+    from pretrain_data_curator.gpu.train_gpt import _eval_val_loss
 
     V, block, n_tokens = 64, 8, 41
     torch.manual_seed(0)
@@ -2769,7 +2769,7 @@ def test_eval_val_loss_chunked_matches_full_vocab_semantics():
 
 def test_eval_val_loss_processes_all_validation_targets_under_cap():
     """Every predictable target is scored even when microbatch + chunk caps are tiny."""
-    from pretrain_data_curator.train_gpt import _eval_val_loss
+    from pretrain_data_curator.gpu.train_gpt import _eval_val_loss
     from pretrain_data_curator.val_set import plan_val_windows
 
     V, block, n_tokens = 48, 5, 23
@@ -2808,7 +2808,7 @@ def test_eval_val_loss_processes_all_validation_targets_under_cap():
 
 def test_train_and_eval_honors_separate_val_batch_size(monkeypatch):
     """``val_batch_size`` must drive validation, not training ``batch_size``."""
-    from pretrain_data_curator import train_gpt as st
+    from pretrain_data_curator.gpu import train_gpt as st
 
     V = 64
     model = _tiny_cfg(V).build()
@@ -2855,7 +2855,7 @@ def test_train_and_eval_honors_separate_val_batch_size(monkeypatch):
 
 def test_proxy_payload_and_shared_training_remap_carry_microbatch_knobs():
     from pretrain_data_curator.models import ProxyStudentConfig
-    from pretrain_data_curator.train_gpt import training_kwargs_from_config
+    from pretrain_data_curator.gpu.train_gpt import training_kwargs_from_config
 
     payload = ProxyStudentConfig(
         val_batch_size=1, val_logit_chunk_tokens=1024, train_microbatch_size=16
@@ -2873,7 +2873,7 @@ def test_proxy_payload_and_shared_training_remap_carry_microbatch_knobs():
 
 
 def test_microbatch_ranges_covers_effective_batch():
-    from pretrain_data_curator.train_gpt import _microbatch_ranges
+    from pretrain_data_curator.gpu.train_gpt import _microbatch_ranges
 
     assert list(_microbatch_ranges(16, None)) == [(0, 16)]
     assert list(_microbatch_ranges(16, 16)) == [(0, 16)]
@@ -2891,7 +2891,7 @@ def _assert_microbatch_grads_match_full_batch(
     *, batch: int, microbatch: int, seq: int = 8, vocab: int = 64, seed: int = 0
 ) -> None:
     """Loss-scaled microbatch grads must equal a single full-batch backward."""
-    from pretrain_data_curator.train_gpt import (
+    from pretrain_data_curator.gpu.train_gpt import (
         _microbatch_ranges,
         _scaled_microbatch_loss,
     )
@@ -2998,7 +2998,7 @@ def test_train_microbatch_uneven_48_32_matches_full_batch_grads_and_adamw():
 
 def test_train_microbatch_preserves_tokens_and_schedule_ramp(monkeypatch):
     """Scheduled effective batch still drives token accounting under microbatching."""
-    from pretrain_data_curator import train_gpt as st
+    from pretrain_data_curator.gpu import train_gpt as st
 
     V = 64
     model = _tiny_cfg(V).build()
@@ -3161,7 +3161,7 @@ def test_grad_accum_microbatch_feeds_optimizer_full_batch_grads(
     value-embed LR would otherwise amplify pure fp32 summation-order noise into
     visible weight drift. ``grad_clip=0`` so nothing perturbs the raw accumulation.
     """
-    from pretrain_data_curator import train_gpt as st
+    from pretrain_data_curator.gpu import train_gpt as st
 
     V = 48
     data = torch.randint(0, V, (256,), dtype=torch.long)
@@ -3228,8 +3228,8 @@ def test_score_hidden_chunked_bf16_hidden_fp32_head_cpu():
     """
     import torch.nn.functional as F
 
-    import pretrain_data_curator.train_gpt as st
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    import pretrain_data_curator.gpu.train_gpt as st
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     V, dim = 50, 32
     model = SMC(
@@ -3282,7 +3282,7 @@ def test_score_hidden_chunked_else_branch_bf16_hidden_fp32_head_cpu():
     """
     import torch.nn.functional as F
 
-    import pretrain_data_curator.train_gpt as st
+    import pretrain_data_curator.gpu.train_gpt as st
 
     V, dim, softcap = 50, 32, 30.0
     model = _make_fp32_head_stub(dim, V, softcap)  # fp32 weights, no apply_lm_head
@@ -3318,8 +3318,8 @@ def test_untie_lm_head_adam_group_retains_betas(monkeypatch):
     group must retain the speedrun recipe betas ``(0.5, 0.95)`` rather than
     inheriting Adam defaults ``(0.9, 0.999)``.
     """
-    import pretrain_data_curator.train_gpt as st
-    from pretrain_data_curator.train_gpt import StudentModelConfig as SMC
+    import pretrain_data_curator.gpu.train_gpt as st
+    from pretrain_data_curator.gpu.train_gpt import StudentModelConfig as SMC
 
     V = 32
     cfg = SMC(model_dim=32, num_layers=2, num_heads=2, vocab_size=V, num_value_embeds=1)

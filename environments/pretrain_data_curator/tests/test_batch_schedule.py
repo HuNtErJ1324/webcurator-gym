@@ -13,7 +13,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from pretrain_data_curator.train_gpt import (
+from pretrain_data_curator.gpu.train_gpt import (
     batch_stage_boundaries,
     build_batch_schedule,
     scheduled_presentation_tokens,

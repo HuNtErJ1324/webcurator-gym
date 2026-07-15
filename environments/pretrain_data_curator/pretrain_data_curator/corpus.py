@@ -38,7 +38,7 @@ from typing import Any
 
 import verifiers.v1 as vf
 
-from .hf_access import (
+from .util.hf_access import (
     DatasetAccessError,
     DatasetSearchClient,
     FetchKey,
