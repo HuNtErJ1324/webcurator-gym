@@ -1,0 +1,41 @@
+# Benchmark-oriented Hosted Training run using the native v1 environment.
+# Publish this package as hunterj/pretrain-curation-gym before launching.
+name = "pretrain-curation-gym-gpt20b-modal"
+model = "openai/gpt-oss-20b"
+loss = "rl"
+
+max_steps = 1
+batch_size = 4
+rollouts_per_example = 2
+
+[sampling]
+max_tokens = 65536
+temperature = 0.9
+
+[[env]]
+name = "pretrain-curation-gym"
+max_turns = 64
+
+[env.taskset]
+id = "hunterj/pretrain-curation-gym"
+
+[env.taskset.task]
+manifest_filename = "manifest.json"
+
+[env.taskset.task.curator]
+token_budget = 400000000
+max_turns = 64
+candidate_limit = 32
+max_concurrent_fetches = 16
+fetch_timeout_seconds = 120.0
+fetch_max_attempts = 5
+use_real_trainer = true
+
+[env.taskset.task.curator.proxy_student]
+runtime_backend = "modal"
+modal_gpu = "H100"
+train_token_budget = 400000000
+upload_timeout_seconds = 1800.0
+
+[env.harness]
+id = "default"
