@@ -101,6 +101,8 @@ lr_stage_muls = [
 ]
 lr_cooldown_frac = 0.6
 lr_cooldown_floor = 0.15
+
+# Top-level runtime config (the harness reads runtime from here, not proxy_student).
 runtime_backend = "docker"
 docker_image = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
 gpu_count = 1
@@ -120,3 +122,7 @@ val_tokens = 10485760
 
 [harness]
 id = "codex"
+forward_env = ["HF_TOKEN", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]
+
+[harness.runtime]
+type = "docker"
