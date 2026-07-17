@@ -1,4 +1,4 @@
-"""Typed curation tasks and their single initial prompt."""
+"""Typed curation task data and its initial prompt."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ Before nontrivial `hf` work, read `.agents/skills/hf-cli/SKILL.md` from the runt
 
 ## Setup
 - Sole curation budget: {token_budget} tokens.
-- Turn limit: {max_turns} model turns; the episode stops when reached. `python turn_count.py` shows the current turn and turns remaining.
+- Turn limit: {max_turns} model turns. Run `python turns.py` to see the current turn and how many remain.
 - Data cutoff: on or before {cutoff_date}. Local sources are {local_source_status}.
 - Scoring: `{alpha_perf} * performance - {lambda_leakage} * leakage` on the fixed student.
 - Performance: normalized loss progress is squared in the performance term, so equal loss improvements earn more reward later than earlier; negative progress stays linear. Target loss `{perf_target_loss}` → `1.0`; worse than neutral is negative; beating `{perf_target_loss}` exceeds `1.0`.
@@ -75,9 +75,12 @@ class CuratorTaskData(vf.TaskData):
     answer: str
     token_budget: int
     cutoff_date: str
+    max_turns: int
 
     @classmethod
-    def from_config(cls, config: CuratorTaskConfig) -> "CuratorTaskData":
+    def from_config(
+        cls, config: CuratorTaskConfig, *, max_turns: int
+    ) -> "CuratorTaskData":
         """Render the single row directly from its task-owned config."""
         curator = config.curator
         local_source_status = (
@@ -92,7 +95,7 @@ class CuratorTaskData(vf.TaskData):
                 token_budget=curator.token_budget,
                 manifest_path=config.manifest_filename,
                 local_source_status=local_source_status,
-                max_turns=curator.max_turns,
+                max_turns=max_turns,
                 alpha_perf=curator.alpha_perf,
                 lambda_leakage=curator.lambda_leakage,
                 perf_target_loss=curator.perf_target_loss,
@@ -101,6 +104,7 @@ class CuratorTaskData(vf.TaskData):
             answer=curator.cutoff_date,
             token_budget=curator.token_budget,
             cutoff_date=curator.cutoff_date,
+            max_turns=max_turns,
         )
 
 

@@ -37,22 +37,20 @@ htmlcov/
 /environments/*/docs/
 /docs/**/__pycache__/
 /docs/**/*.py[cod]
-/docs/site/
-/environments/pretrain_data_curator/scripts/
+/docs/
 /environments/nanogpt_speedrun/
 secrets.env
 *.env
 !.env.example
 
-# Local eval / RL / GEPA configs (re-add curated configs when iteration is done)
+# Local eval / RL / GEPA configs (keep local; use prime eval run / pyproject defaults)
 /configs/
 /environments/*/configs/
-!/environments/pretrain_curation_gym/configs/
-!/environments/pretrain_curation_gym/configs/**
 
 # Ephemeral local eval / scratch helpers (use configs/ and prime eval run instead)
 /run_eval_*.py
 /scripts/
+/environments/*/scripts/
 .scratch_*.py
 
 # Editor / OS cruft
@@ -89,3 +87,6 @@ lightning_logs/
 .runpod/
 pod_scratch/
 **/torch_extensions/
+
+
+--- lean-ctx: ctx_compose bundles search+read+symbols in one call ---

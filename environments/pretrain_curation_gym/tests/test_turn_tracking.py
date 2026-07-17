@@ -1,11 +1,9 @@
-"""Turn tracking and self-score iteration telemetry.
+"""Agent-visible turn state and self-score iteration telemetry.
 
 Covers the three additions around rollout visibility:
 
-* the task prompt states the configured turn limit and points at the workspace
-  ``turn_count.py`` script (and never mentions web search);
-* the environment refreshes ``.turn_state.json`` from the per-turn ``@vf.stop``
-  check so ``turn_count.py`` reports the live turn;
+* the prompt reports the framework turn limit and points to ``turns.py``;
+* a telemetry-only v1 stop hook refreshes its state before each model call;
 * ``self_score.py`` appends one JSON line per run to
   ``.self_score_history.jsonl``, which finalize folds into zero-weight metrics.
 """
@@ -21,11 +19,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pretrain_curation_gym import CuratorEnvConfig, load_environment
 from pretrain_curation_gym.models import CuratorConfig
 from pretrain_curation_gym.gpu.self_score import (
     SELF_SCORE_FILENAME,
     SELF_SCORE_HISTORY_FILENAME,
     render_self_score_script,
+)
+from pretrain_curation_gym.gpu.turns import (
+    TURNS_FILENAME,
+    TURN_STATE_FILENAME,
+    render_turn_state,
+    render_turns_script,
 )
 from pretrain_curation_gym.rollout_state import CuratorState, RolloutStore
 from pretrain_curation_gym.taskset import (
@@ -33,26 +38,19 @@ from pretrain_curation_gym.taskset import (
     CuratorTasksetConfig,
     _parse_self_score_history,
 )
-from pretrain_curation_gym.tasks import build_tasks
-from pretrain_curation_gym.gpu.turns import (
-    TURN_COUNT_FILENAME,
-    TURN_STATE_FILENAME,
-    render_turn_count_script,
-    render_turn_state,
-)
-
+from pretrain_curation_gym.taskdata import build_tasks
 import verifiers.v1 as vf
+from verifiers.v1.session import RolloutLimits
 
 
 # --- prompt contract ---------------------------------------------------------
 
 
-def test_prompt_states_the_configured_turn_limit_and_counter_script():
-    task = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=37)).load()[0]
+def test_prompt_reports_the_framework_turn_limit():
+    task = load_environment(CuratorEnvConfig(max_turns=37)).taskset.load()[0]
     prompt = str(task.data.prompt)
     assert "Turn limit: 37 model turns" in prompt
-    assert "python turn_count.py" in prompt
-    assert "turns remaining" in prompt
+    assert "python turns.py" in prompt
 
 
 def test_prompt_never_mentions_web_search():
@@ -66,89 +64,71 @@ def test_prompt_discloses_the_self_score_history_file():
     assert SELF_SCORE_HISTORY_FILENAME in prompt
 
 
-# --- turn state file + agent-facing script -----------------------------------
+def test_framework_limit_tracks_the_trace_turn_count():
+    limits = RolloutLimits(max_turns=5)
+    trace = SimpleNamespace(num_turns=2)
+    assert limits.reached(trace) is None
+    trace.num_turns = 5
+    assert limits.reached(trace) == "max_turns"
 
 
-def test_render_turn_state_reports_the_upcoming_turn():
-    state = json.loads(render_turn_state(0, 64))
-    assert state == {
-        "turns_completed": 0,
-        "current_turn": 1,
-        "max_turns": 64,
-        "turns_remaining": 63,
-    }
-    # the final allowed turn: nothing remains after it, and it never overshoots
-    state = json.loads(render_turn_state(63, 64))
-    assert state["current_turn"] == 64
-    assert state["turns_remaining"] == 0
-    assert json.loads(render_turn_state(64, 64))["current_turn"] == 64
-
-
-def test_turn_count_script_prints_the_live_state(tmp_path: Path):
-    (tmp_path / TURN_COUNT_FILENAME).write_bytes(render_turn_count_script())
-    (tmp_path / TURN_STATE_FILENAME).write_bytes(render_turn_state(4, 64))
+def test_turns_script_reports_the_current_framework_state(tmp_path: Path):
+    (tmp_path / TURNS_FILENAME).write_bytes(render_turns_script())
+    (tmp_path / TURN_STATE_FILENAME).write_bytes(render_turn_state(4, 37))
     result = subprocess.run(
-        [sys.executable, TURN_COUNT_FILENAME],
+        [sys.executable, TURNS_FILENAME],
         cwd=tmp_path,
         capture_output=True,
         text=True,
         timeout=60,
     )
     assert result.returncode == 0, result.stderr
-    assert "turn 5 of 64 (59 remaining after this one)" in result.stdout
-    # machine-readable line for scripting agents
-    assert json.loads(result.stdout.splitlines()[-1])["current_turn"] == 5
-
-
-def test_turn_count_script_fails_gracefully_without_state(tmp_path: Path):
-    (tmp_path / TURN_COUNT_FILENAME).write_bytes(render_turn_count_script())
-    result = subprocess.run(
-        [sys.executable, TURN_COUNT_FILENAME],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 1
-    assert "turn state unavailable" in result.stdout
+    assert "turn 5 of 37 (32 remaining after this one)" in result.stdout
+    assert json.loads(result.stdout.splitlines()[-1]) == {
+        "current_turn": 5,
+        "max_turns": 37,
+        "turns_completed": 4,
+        "turns_remaining": 32,
+    }
 
 
 class _RecordingRuntime:
+    type = "subprocess"
+
     def __init__(self):
         self.writes: list[tuple[str, bytes]] = []
 
-    async def write(self, path: str, data) -> None:
+    async def write(self, path: str, data: bytes) -> None:
         self.writes.append((path, bytes(data)))
 
 
-def test_stop_check_refreshes_the_turn_state_each_turn():
-    task = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=5)).load()[0]
+@pytest.mark.asyncio
+async def test_setup_installs_the_agent_turn_script_and_initial_state():
+    task = load_environment(CuratorEnvConfig(max_turns=37)).taskset.load()[0]
+    state = CuratorState()
+    trace = vf.Trace(
+        task=vf.TraceTask(type=type(task).__name__, data=task.data), state=state
+    )
     runtime = _RecordingRuntime()
-    trace = SimpleNamespace(id="t-1", num_turns=2, state=CuratorState())
-    task._turn_runtimes[trace.id] = runtime
 
-    assert asyncio.run(task.max_turns_reached(trace)) is False
+    await task.setup(trace, runtime)
+
+    writes = dict(runtime.writes)
+    assert writes[TURNS_FILENAME] == render_turns_script()
+    assert writes[TURN_STATE_FILENAME] == render_turn_state(0, 37)
+    assert state._turn_runtime is runtime
+
+
+def test_turn_hook_refreshes_telemetry_without_enforcing_a_second_limit():
+    task = load_environment(CuratorEnvConfig(max_turns=5)).taskset.load()[0]
+    runtime = _RecordingRuntime()
+    state = CuratorState()
+    state._turn_runtime = runtime
+    trace = SimpleNamespace(num_turns=2, state=state)
+
+    assert asyncio.run(task.refresh_turn_state(trace)) is False
     assert runtime.writes == [(TURN_STATE_FILENAME, render_turn_state(2, 5))]
-
-    # at the limit the check stops the rollout and skips the (pointless) write
-    trace.num_turns = 5
-    assert asyncio.run(task.max_turns_reached(trace)) is True
-    assert len(runtime.writes) == 1
-
-
-def test_stop_check_survives_a_dead_runtime_and_a_missing_one():
-    task = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=5)).load()[0]
-
-    class _DeadRuntime:
-        async def write(self, path, data):
-            raise RuntimeError("runtime gone")
-
-    trace = SimpleNamespace(id="t-dead", num_turns=1, state=CuratorState())
-    task._turn_runtimes[trace.id] = _DeadRuntime()
-    assert asyncio.run(task.max_turns_reached(trace)) is False
-
-    orphan = SimpleNamespace(id="t-unknown", num_turns=1, state=CuratorState())
-    assert asyncio.run(task.max_turns_reached(orphan)) is False
+    assert not hasattr(task.config.curator, "max_turns")
 
 
 # --- self-score history file --------------------------------------------------
@@ -266,7 +246,7 @@ class _MetricScorer:
 
 def _record_metrics(task, trace) -> dict[str, float]:
     task._scorer = _MetricScorer()
-    asyncio.run(task.score_manifest(trace))
+    asyncio.run(task.score(trace))
     return trace.metrics
 
 
@@ -295,9 +275,8 @@ def test_self_score_metrics_default_to_zero_without_any_run():
 
 def test_num_turns_metric_reports_the_trace_turn_count():
     task = CuratorTaskset(CuratorTasksetConfig(id="test")).load()[0]
-    trace = _metric_trace(task)
-    trace.nodes = [SimpleNamespace(sampled=True)] * 17
-    assert _record_metrics(task, trace)["num_turns"] == 17.0
+    trace = SimpleNamespace(num_turns=17)
+    assert asyncio.run(task.num_turns(trace)) == 17.0
 
 
 class _HistoryRuntime:

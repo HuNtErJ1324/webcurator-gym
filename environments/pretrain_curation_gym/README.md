@@ -49,14 +49,19 @@ it concurrently. Their unchanged component results are joined before the final
 reward is reduced.
 
 The heuristic student remains the fast default. Set
-`taskset.task.curator.use_real_trainer=true` and select a Docker or Modal
-`proxy_student.runtime_backend` for meaningful fixed-student CE.
+`taskset.task.curator.use_real_trainer=true` and configure the native
+`[harness.runtime]` table for meaningful fixed-student CE. Docker eval profiles
+use the repository-built `webcurator-runtime:latest` image; Modal profiles must
+name a registry-accessible image because a local Docker tag is not visible to
+Modal.
 
 ## v1 configuration
 
 Configuration follows ownership rather than duplicating loader kwargs:
 
 ```toml
+max_turns = 64
+
 [taskset]
 id = "pretrain-curation-gym"
 
@@ -67,7 +72,6 @@ hf_token_env = "HF_TOKEN"
 [taskset.task.curator]
 cutoff_date = "2024-12-31"
 token_budget = 1000000
-max_turns = 64
 alpha_perf = 1.0
 lambda_leakage = 1.0
 use_real_trainer = false
@@ -84,7 +88,7 @@ id = "default"
 Run `uv run --project environments/pretrain_curation_gym eval
 pretrain-curation-gym --help` for the complete typed CLI surface.
 
-Sixteen migrated evaluation profiles live in `configs/eval/`. They retain the
+Twenty evaluation profiles live in `configs/eval/`. They retain the
 predecessor's model, budget, turn, runtime, and scoring choices in native v1
 sections. For example:
 
@@ -106,7 +110,9 @@ with the intended public/private visibility before launching either profile.
 - Same fixed proxy-student architecture and heuristic/Docker/Modal trainers.
 - Same decon detector and ephemeral held-out validation screening.
 - Same strict workspace-file finalization and non-production trace candidates.
-- Same self-scoring script, history diagnostics, turn counter, and 27 metrics.
+- Same self-scoring script, history diagnostics, and agent-callable `turns.py`,
+  with 29 v1 metrics (the 27 preserved from the predecessor plus
+  `empty_rollout` and `hf_cli_calls`).
 - Same external-failure, trainer-error, and provenance telemetry.
 
 The runtime workspace is now addressed relatively. This is equivalent to
@@ -117,8 +123,8 @@ other runtimes, whose workspace root is provider-owned.
 
 - `config.py` — the three v1 config ownership boundaries.
 - `taskset.py` — a small loader that constructs one typed task.
-- `tasks.py` — immutable task data and prompt rendering.
-- `task.py` — v1 setup/finalize/stop/scoring lifecycle.
+- `taskdata.py` — immutable task data and prompt rendering.
+- `task.py` — v1 setup/finalize/turn-telemetry/scoring lifecycle.
 - `state.py` — typed rollout state, scratch files, and document cache.
 - `manifest.py` — manifest parsing and compatibility-only trace candidates.
 - `corpus.py` — streaming materialization, filtering, sampling, and local files.
@@ -126,11 +132,10 @@ other runtimes, whose workspace root is provider-owned.
 - `trainer.py`, `gpu/` — heuristic and fixed-student training implementations.
 - `leakage.py`, `val_set.py` — contamination and held-out validation inputs.
 
-Unlike the populated predecessor, scoring is registered as one keyed
-`@vf.reward`. It materializes/trains/screens exactly once, records all diagnostic
-metrics on the v1 trace, and returns the two named reward contributions. This
-removes the cache/lock required when dozens of metric wrappers raced the same
-heavy scoring operation.
+Scoring uses v1 `@vf.metric` methods for trace activity and diagnostics, plus one
+keyed `@vf.reward` for the two reward contributions. The expensive
+materialize/train/screen pass is retained on rollout state and reused by the
+reward, so the native metric surface does not duplicate heavy work.
 
 ## Validation
 

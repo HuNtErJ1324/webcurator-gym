@@ -8,15 +8,15 @@ from types import SimpleNamespace
 
 import pytest
 import verifiers.v1 as vf
-from pydantic import ValidationError
 from verifiers.v1.runtimes.modal import ModalConfig
 
+from pretrain_curation_gym.config import CuratorEnvConfig, CuratorTaskConfig
 from pretrain_curation_gym.corpus import CuratedCorpus, SourceCorpus
-from pretrain_curation_gym.runtime_config import _modal_gpu_for
-from pretrain_curation_gym.models import ProxyStudentConfig
-from pretrain_curation_gym.pretrain_curation_gym import load_environment
+from pretrain_curation_gym.environment import load_environment
+from pretrain_curation_gym.models import CuratorConfig, ProxyStudentConfig
 from pretrain_curation_gym.rollout_state import CuratorState
-from pretrain_curation_gym.taskset import CuratorTaskset, CuratorTasksetConfig
+from pretrain_curation_gym.taskset import CuratorTaskset
+from pretrain_curation_gym.config import CuratorTasksetConfig
 from pretrain_curation_gym.trainer import RuntimeProxyTrainer, TrainerError
 
 
@@ -76,42 +76,50 @@ async def test_swallowed_wait_for_cancellation_is_reraised(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await RuntimeProxyTrainer().train_and_eval(
             _corpus(),
-            ProxyStudentConfig(runtime_backend="modal"),
+            ProxyStudentConfig(),
             runtime=runtime,
         )
 
     assert runtime.stop_calls == 1
 
 
-def test_load_environment_uses_modal_config_and_gpu_mapping(monkeypatch):
+def test_load_environment_preserves_native_modal_config(monkeypatch):
     monkeypatch.setenv("MODAL_TOKEN_ID", "test-id")
     monkeypatch.setenv("MODAL_TOKEN_SECRET", "test-secret")
 
+    runtime_config = ModalConfig(
+        image="registry.example/curator:gpu",
+        workdir="/workspace",
+        gpu="A100-80GB",
+        cpu=8.0,
+        memory=32.0,
+        disk=40.0,
+    )
     env = load_environment(
-        use_real_trainer=True,
-        proxy_student={
-            "runtime_backend": "modal",
-            "modal_gpu": "A100",
-            "cpu_cores": 8,
-            "memory_gb": 32,
-            "disk_size_gb": 40,
-            "timeout_minutes": 45,
-        },
+        CuratorEnvConfig(
+            taskset=CuratorTasksetConfig(
+                task=CuratorTaskConfig(
+                    curator=CuratorConfig(
+                        use_real_trainer=True,
+                        proxy_student=ProxyStudentConfig(timeout_minutes=45),
+                    )
+                )
+            ),
+            harness=vf.HarnessConfig(runtime=runtime_config),
+            timeout=vf.TimeoutConfig(scoring=3240.0),
+        )
     )
 
     runtime = env.harness.config.runtime
     assert env.harness.config.env == {}
     assert isinstance(runtime, ModalConfig)
-    assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
+    assert runtime.image == "registry.example/curator:gpu"
     assert runtime.workdir == "/workspace"
     assert runtime.gpu == "A100-80GB"
     assert runtime.cpu == 8.0
     assert runtime.memory == 32.0
     assert runtime.disk == 40.0
-    assert env.config.timeout.scoring == 45 * 60 + 540
-    assert _modal_gpu_for("H100") == "H100"
-    assert _modal_gpu_for("H200") == "H200"
-    assert _modal_gpu_for("unknown") == "L4"
+    assert env.config.timeout.scoring == 3240.0
 
 
 def test_load_environment_requires_modal_credentials(monkeypatch):
@@ -120,38 +128,32 @@ def test_load_environment_requires_modal_credentials(monkeypatch):
 
     with pytest.raises(ValueError, match="MODAL_TOKEN_ID, MODAL_TOKEN_SECRET"):
         load_environment(
-            use_real_trainer=True,
-            proxy_student={"runtime_backend": "modal"},
+            CuratorEnvConfig(
+                taskset=CuratorTasksetConfig(
+                    task=CuratorTaskConfig(curator=CuratorConfig(use_real_trainer=True))
+                ),
+                harness=vf.HarnessConfig(runtime=ModalConfig()),
+            )
         )
 
 
-def test_native_modal_tasks_declare_runtime_requirements_and_deadline():
-    taskset = CuratorTaskset(
-        CuratorTasksetConfig(
-            id="pretrain-curation-gym",
-            use_real_trainer=True,
-            proxy_student={
-                "runtime_backend": "modal",
-                "docker_image": "registry.example/curator:gpu",
-                "modal_gpu": "H200",
-                "timeout_minutes": 45,
-            },
+def test_modal_timeout_cannot_exceed_runtime_lifetime(monkeypatch):
+    monkeypatch.setenv("MODAL_TOKEN_ID", "test-id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "test-secret")
+    with pytest.raises(ValueError, match="Modal 24h sandbox maximum"):
+        load_environment(
+            CuratorEnvConfig(
+                taskset=CuratorTasksetConfig(
+                    task=CuratorTaskConfig(
+                        curator=CuratorConfig(
+                            use_real_trainer=True,
+                            proxy_student=ProxyStudentConfig(timeout_minutes=1441),
+                        )
+                    )
+                ),
+                harness=vf.HarnessConfig(runtime=ModalConfig()),
+            )
         )
-    )
-
-    task = taskset.load()[0]
-
-    assert task.data.image == "registry.example/curator:gpu"
-    assert task.data.workdir == "/workspace"
-    assert task.data.resources.gpu == "H200"
-    assert task.data.resources.cpu == 4.0
-    assert task.data.resources.memory == 16.0
-    assert task.data.timeout.scoring == 45 * 60 + 540
-
-
-def test_modal_timeout_cannot_exceed_runtime_lifetime():
-    with pytest.raises(ValidationError, match="Modal 24h sandbox maximum"):
-        ProxyStudentConfig(runtime_backend="modal", timeout_minutes=1441)
 
 
 @pytest.mark.asyncio
@@ -160,8 +162,7 @@ async def test_taskset_setup_rejects_modal_trainer_on_other_runtime(monkeypatch)
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="pretrain-curation-gym",
-            use_real_trainer=True,
-            proxy_student={"runtime_backend": "modal"},
+            task=CuratorTaskConfig(curator=CuratorConfig(use_real_trainer=True)),
         )
     )
 

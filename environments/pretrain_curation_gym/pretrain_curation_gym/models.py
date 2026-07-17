@@ -61,7 +61,6 @@ _CHARS_PER_TOKEN = 4  # matches hf_access.estimate_tokens (chars // 4)
 _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
 _MAX_CORPUS_CHARS = 2_000_000_000  # absolute ceiling on the uploaded corpus blob
 # Sandbox lifetime derivation. Modal v1 runtimes cap a remote sandbox at 24 hours.
-_MAX_SANDBOX_TIMEOUT_MINUTES = 1440
 _MIN_SANDBOX_TIMEOUT_MINUTES = (
     30  # historical default; floor keeps small budgets unchanged
 )
@@ -72,7 +71,6 @@ _SANDBOX_TOKENS_PER_MINUTE = 500_000  # conservative floor for benchmark-sized r
 # MUST ship torch + CUDA; this is the runtime image — switch to the matching
 # ``-devel`` tag if a run needs build tooling (e.g. nvcc for torch.compile/custom
 # kernels). torch 2.7 / CUDA 12.6 matches recent H100/H200 driver stacks.
-_DEFAULT_DOCKER_TRAINER_IMAGE = "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
 
 
 class FilterSpec(BaseModel):
@@ -302,29 +300,7 @@ class ProxyStudentConfig(BaseModel):
     nor_muon: bool = True
     # Polar Express (ONI-based orthogonalization in Muon)
     polar_express: bool = False
-    # --- real-trainer backend selection (only used when use_real_trainer) -----
-    # Static, pre-runtime hint only: shapes ``load_environment``'s harness.runtime
-    # and the task data's image/resources/timeout declarations, and gates the
-    # Modal timeout ceiling check below. It is NEVER read when selecting which
-    # trainer actually runs at score time -- that is driven purely by the live
-    # harness runtime's ``type``. No default:
-    # a real-trainer run must explicitly pick ``'docker'`` or ``'modal'``.
-    runtime_backend: Literal["docker", "modal"] | None = None
-    # Retained for config compatibility, but remote Docker is not supported by
-    # the shared harness-runtime path. ``load_environment`` rejects a non-None
-    # value for the docker backend. Ignored by modal.
-    docker_host: str | None = None
-    # Modal GPU type for the modal backend. Maps to a Modal GPU specifier string:
-    # ``"H100"`` → ``"H100"``, ``"H200"`` → ``"H200"``, ``"A100"`` → ``"A100-80GB"``,
-    # anything else → ``"L4"`` (default, cheapest; adequate for smoke budgets on the
-    # ~278M GPT-2-small-class default student). Ignored by the docker backend.
-    modal_gpu: str = Field(default="L4", min_length=1)
-    # Sandbox/container backend settings (used by both real-trainer backends).
-    docker_image: str = Field(default=_DEFAULT_DOCKER_TRAINER_IMAGE, min_length=1)
-    gpu_count: int = Field(default=1, ge=0, le=8)
-    cpu_cores: int = Field(default=4, ge=1, le=256)
-    memory_gb: int = Field(default=16, ge=1, le=2048)
-    disk_size_gb: int = Field(default=20, ge=1, le=10_000)
+    # Runtime placement and resources belong to the native v1 harness runtime.
     # Upper char cap on the corpus blob uploaded to the sandbox. ``None`` (default)
     # derives it from the training budget (so a large run is not silently capped at
     # the historical ~1.25M-unique-token corpus); an explicit value overrides.
@@ -481,9 +457,8 @@ class ProxyStudentConfig(BaseModel):
 
         An explicit ``timeout_minutes`` wins; otherwise derived from the budget
         (setup overhead + tokens / throughput), floored at the historical 30.
-        Modal additionally clamps the derived value to the
-        ``_MAX_SANDBOX_TIMEOUT_MINUTES`` (24h) platform max via this property;
-        Docker has no such ceiling, so its derived timeout is left uncapped.
+        Backend-specific ceilings are validated against the selected native
+        harness runtime by ``load_environment``.
         """
         if self.timeout_minutes is not None:
             return self.timeout_minutes
@@ -492,15 +467,7 @@ class ProxyStudentConfig(BaseModel):
             _SANDBOX_SETUP_MINUTES
             + math.ceil(self.effective_train_tokens / _SANDBOX_TOKENS_PER_MINUTE),
         )
-        if self.runtime_backend == "modal":
-            return min(_MAX_SANDBOX_TIMEOUT_MINUTES, derived)
         return derived
-
-    @property
-    def effective_scoring_timeout_seconds(self) -> float:
-        """Framework deadline for the full harness-runtime scoring phase."""
-        margin = max(300.0, self.upload_timeout_seconds * 4 + 60.0)
-        return self.effective_timeout_minutes * 60 + margin
 
     @model_validator(mode="before")
     @classmethod
@@ -560,29 +527,11 @@ class ProxyStudentConfig(BaseModel):
             )
         return self
 
-    @model_validator(mode="after")
-    def _check_modal_timeout_ceiling(self) -> "ProxyStudentConfig":
-        if (
-            self.runtime_backend == "modal"
-            and self.timeout_minutes is not None
-            and self.timeout_minutes > _MAX_SANDBOX_TIMEOUT_MINUTES
-        ):
-            raise ValueError(
-                f"timeout_minutes ({self.timeout_minutes}) exceeds the Modal 24h "
-                f"sandbox maximum ({_MAX_SANDBOX_TIMEOUT_MINUTES}); lower it"
-            )
-        return self
-
-
 class CuratorConfig(BaseModel):
     """Central, validated configuration for the environment and reward."""
 
     cutoff_date: str = "2024-12-31"
     token_budget: int = Field(default=1_000_000, gt=0)
-    # Safety-only harness cap. It is disclosed for pacing and surfaced as a
-    # diagnostic, but never contributes to reward: token_budget remains the
-    # sole optimization budget.
-    max_turns: int = Field(default=64, ge=1, le=1000)
 
     candidate_limit: int = Field(
         default=8,

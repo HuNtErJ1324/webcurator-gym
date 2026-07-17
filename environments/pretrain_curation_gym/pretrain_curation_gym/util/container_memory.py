@@ -1,11 +1,11 @@
 """Host/container memory preflight, cgroup verification, and OOM diagnostics.
 
-Production 400M Docker runs pin ``proxy_student.memory_gb`` into Verifiers'
-``DockerConfig.memory`` / ``TaskResources.memory``, which becomes
+Production Docker runs pin ``harness.runtime.memory`` into Verifiers'
+``DockerConfig.memory``, which becomes
 ``docker run --memory Ng``. This module:
 
 - resolves an optional Docker-only ``PDC_DOCKER_CONTAINER_MEMORY_GB`` override
-  (bounded like ``ProxyStudentConfig.memory_gb`` to 1..2048); Modal ignores it
+  (bounded to 1..2048 GiB); Modal ignores it
 - fails before evaluation when host RAM cannot support the requested limit
   plus a configurable headroom reserve
 - verifies the live container's cgroup / ``HostConfig.Memory`` matches
@@ -32,7 +32,7 @@ GIB = 1024**3
 DEFAULT_HOST_HEADROOM_GIB = 4.0
 # Docker may round the applied limit by a page or two; tolerate 16 MiB.
 MEMORY_LIMIT_TOLERANCE_BYTES = 16 * 1024 * 1024
-# Match ProxyStudentConfig.memory_gb Field(ge=1, le=2048).
+# Keep legacy launcher overrides within the historical 1..2048 GiB bounds.
 MEMORY_GB_MIN = 1.0
 MEMORY_GB_MAX = 2048.0
 
@@ -66,7 +66,7 @@ def _bound_memory_gb(value: float, *, source: str) -> float:
         raise ContainerMemoryError(
             f"{source}={value:g} must be in "
             f"[{MEMORY_GB_MIN:g}, {MEMORY_GB_MAX:g}] GiB "
-            "(same bounds as ProxyStudentConfig.memory_gb)"
+            "(allowed bounds: 1..2048 GiB)"
         )
     return float(value)
 

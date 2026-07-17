@@ -38,8 +38,7 @@ from pretrain_curation_gym.util.container_memory import (
     resolve_container_memory_gb,
     verify_runtime_memory_limit,
 )
-from pretrain_curation_gym.models import CuratorConfig, ProxyStudentConfig
-from pretrain_curation_gym.runtime_config import derive_trainer_resources
+from pretrain_curation_gym.models import CuratorConfig
 from pretrain_curation_gym.gpu.self_score import render_self_score_script
 from pretrain_curation_gym.rollout_state import CuratorState
 from pretrain_curation_gym.taskset import CuratorTaskset, CuratorTasksetConfig
@@ -56,7 +55,7 @@ def test_production_400m_configs_default_to_96gib():
     assert configs
     for path in configs:
         text = path.read_text(encoding="utf-8")
-        assert re.search(r"^memory_gb\s*=\s*96\b", text, re.M), path.name
+        assert re.search(r"^memory\s*=\s*96(?:\.0)?\b", text, re.M), path.name
 
 
 def test_resolve_container_memory_gb_docker_override_bounds(monkeypatch):
@@ -71,21 +70,6 @@ def test_resolve_container_memory_gb_docker_override_bounds(monkeypatch):
     monkeypatch.setenv(ENV_DOCKER_CONTAINER_MEMORY_GB, "4096")
     with pytest.raises(ContainerMemoryError, match="must be in"):
         resolve_container_memory_gb(48, backend="docker")
-
-
-def test_docker_memory_override_does_not_affect_modal(monkeypatch):
-    monkeypatch.setenv(ENV_DOCKER_CONTAINER_MEMORY_GB, "96")
-    monkeypatch.setenv(ENV_CONTAINER_MEMORY_GB, "128")
-    docker = derive_trainer_resources(
-        ProxyStudentConfig(runtime_backend="docker", memory_gb=48, gpu_count=1),
-        backend="docker",
-    )
-    modal = derive_trainer_resources(
-        ProxyStudentConfig(runtime_backend="modal", memory_gb=48, gpu_count=1),
-        backend="modal",
-    )
-    assert docker["memory"] == 96.0
-    assert modal["memory"] == 48.0
 
 
 def test_legacy_container_memory_env_still_honored_for_docker(monkeypatch):
@@ -749,6 +733,7 @@ async def test_real_docker_setup_verifies_memory_pin(monkeypatch):
     class FakeRuntime:
         type = "docker"
         _container = "pdc-real"
+        config = SimpleNamespace(memory=96.0)
 
         async def write(self, path, data):
             return None

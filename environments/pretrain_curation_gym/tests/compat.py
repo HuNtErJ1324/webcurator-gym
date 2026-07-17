@@ -28,11 +28,15 @@ from pretrain_curation_gym.models import CuratorConfig, Manifest
 from pretrain_curation_gym.rewards import CuratorScorer
 from pretrain_curation_gym.state import CuratorState
 from pretrain_curation_gym.task import CuratorTask
-from pretrain_curation_gym.tasks import CuratorTaskData
+from pretrain_curation_gym.taskdata import CuratorTaskData
 
 
 def legacy_taskset_config(id: str = "test", **values: Any) -> NativeTasksetConfig:
     """Translate the predecessor's flat TasksetConfig into v1-owned leaves."""
+    # v1 owns this at EnvConfig; taskset-only predecessor tests cannot enforce
+    # it, but accepting the old argument keeps unrelated behavior regressions
+    # constructible.
+    values.pop("max_turns", None)
     task_fields = set(CuratorTaskConfig.model_fields) - {"curator", "judges"}
     curator_fields = set(CuratorConfig.model_fields)
     task_values = {key: values.pop(key) for key in list(values) if key in task_fields}
@@ -54,11 +58,39 @@ def legacy_taskset_config(id: str = "test", **values: Any) -> NativeTasksetConfi
 def legacy_load_environment(**values: Any):
     """Translate predecessor loader kwargs to the concrete v1 EnvConfig."""
     harness_id = values.pop("harness_id", "default")
+    max_turns = values.pop("max_turns", 64)
     taskset = legacy_taskset_config(id="pretrain-curation-gym", **values)
+    proxy = values.get("proxy_student", {})
+    backend = proxy.get("runtime_backend") if isinstance(proxy, dict) else None
+    if backend == "docker":
+        runtime: vf.RuntimeConfig = vf.DockerConfig(
+            image=proxy.get("docker_image", "webcurator-runtime:latest"),
+            workdir="/workspace",
+            gpu=str(proxy.get("gpu_count", 1)),
+            cpu=float(proxy.get("cpu_cores", 4)),
+            memory=float(proxy.get("memory_gb", 16)),
+            disk=float(proxy.get("disk_size_gb", 20)),
+        )
+    elif backend == "modal":
+        from verifiers.v1.runtimes.modal import ModalConfig
+
+        runtime = ModalConfig(
+            image=proxy.get(
+                "docker_image",
+                "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime",
+            ),
+            workdir="/workspace",
+            gpu=proxy.get("modal_gpu", "L4"),
+            cpu=float(proxy.get("cpu_cores", 4)),
+            memory=float(proxy.get("memory_gb", 16)),
+            disk=float(proxy.get("disk_size_gb", 20)),
+        )
+    else:
+        runtime = vf.SubprocessConfig()
     config = CuratorEnvConfig(
         taskset=taskset,
-        harness=vf.HarnessConfig(id=harness_id),
-        max_turns=taskset.task.curator.max_turns,
+        harness=vf.HarnessConfig(id=harness_id, runtime=runtime),
+        max_turns=max_turns,
     )
     environment = native_load_environment(config)
     environment.env_args = dict(values)
@@ -86,14 +118,17 @@ def legacy_build_tasks(
                 cutoff_date=cutoff_date,
                 token_budget=token_budget,
                 allow_local_sources=allow_local_sources,
-                max_turns=max_turns,
                 alpha_perf=alpha_perf,
                 lambda_leakage=lambda_leakage,
                 perf_target_loss=perf_target_loss,
             ),
         )
     )
-    return [CuratorTask(CuratorTaskData.from_config(task_config), task_config)]
+    return [
+        CuratorTask(
+            CuratorTaskData.from_config(task_config, max_turns=max_turns), task_config
+        )
+    ]
 
 
 class RolloutStore:

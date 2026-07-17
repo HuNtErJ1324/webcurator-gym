@@ -442,7 +442,7 @@ async def test_trainer_error_str_preserves_training_traceback():
         )
     )
 
-    await task.score_manifest(trace, runtime)
+    await task.score(trace, runtime)
     err = state.trainer_error or ""
 
     assert 'File "/workspace/train.py", line 217, in <module>' in err
@@ -476,7 +476,7 @@ async def test_build_real_trainer_uses_one_runtime_implementation():
         )
 
 
-def test_native_docker_tasks_declare_runtime_requirements_and_deadline():
+def test_native_tasks_do_not_duplicate_harness_runtime_requirements():
     taskset = CuratorTaskset(
         CuratorTasksetConfig(
             id="pretrain-curation-gym",
@@ -492,12 +492,10 @@ def test_native_docker_tasks_declare_runtime_requirements_and_deadline():
 
     task = taskset.load()[0]
 
-    assert task.data.image == "pretrain-curation-gym:gpu"
-    assert task.data.workdir == "/workspace"
-    assert task.data.resources.gpu == "1"
-    assert task.data.resources.cpu == 4.0
-    assert task.data.resources.memory == 16.0
-    assert task.data.timeout.scoring == 45 * 60 + 540
+    assert task.data.image is None
+    assert task.data.workdir is None
+    assert task.data.resources == vf.TaskResources()
+    assert task.data.timeout == vf.TaskTimeout()
 
 
 def test_package_is_discoverable_as_a_native_v1_taskset():

@@ -8,9 +8,10 @@ import logging
 import math
 import os
 from importlib import resources
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import verifiers.v1 as vf
+from verifiers.v1.errors import RolloutError
 
 from .config import CuratorTaskConfig
 from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
@@ -22,10 +23,10 @@ from .gpu.self_score import (
     render_self_score_train_script,
 )
 from .gpu.turns import (
-    TURN_COUNT_FILENAME,
+    TURNS_FILENAME,
     TURN_STATE_FILENAME,
-    render_turn_count_script,
     render_turn_state,
+    render_turns_script,
 )
 from .leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
 from .manifest import ManifestParser, TraceManifestCandidates
@@ -42,21 +43,37 @@ from .models import (
 )
 from .rewards import CuratorScorer
 from .state import CuratorState
-from .tasks import CuratorTaskData
+from .taskdata import CuratorTaskData
 from .trainer import HeuristicProxyTrainer, RuntimeProxyTrainer, TrainerError
 from .util.hf_access import HuggingFaceDatasetClient, RetryPolicy
-from .util.utils import content_text
+from .util.utils import content_text, extract_hf_commands
 from .val_set import ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
 
+class EmptyRolloutError(RolloutError):
+    """A rollout produced no usable artifact — no valid workspace manifest and
+    zero self-scores — while ``error_on_empty_rollout`` was enabled.
+
+    Under an opaque agent harness (e.g. codex) the trace carries no turns,
+    messages, or token usage, so this workspace-derived signature is the only
+    reliable evidence that the agent never engaged the task. Because setup and
+    the harness came up first, it points to an infrastructure or model-endpoint
+    failure rather than a legitimate empty submission. Subclassing
+    ``RolloutError`` makes the framework capture it as
+    ``error.type='EmptyRolloutError'`` so ``[retries.rollout]
+    include=['EmptyRolloutError']`` retries the whole rollout — a transient blip
+    self-heals instead of being scored as a silent zero-reward success.
+    """
+
+
 class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
     """Own setup, finalization, and one keyed scoring pass.
 
-    The stock v1 task machinery records the keyed reward mapping.  The same pass
-    records all diagnostics on ``Trace`` directly, removing the old collection
-    of metric wrappers and its per-trace scoring cache.
+    The stock v1 task machinery records metric and reward mappings. The heavy
+    scoring result is retained only on rollout state so those primitives share
+    one materialization/training pass.
     """
 
     FINALIZE_ATTEMPTS = 6
@@ -84,9 +101,6 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         self.parser = ManifestParser()
         self.candidates = TraceManifestCandidates(self.parser)
         self._scorer: CuratorScorer | None = None
-        # ``@stop`` receives no runtime.  This narrow process handle exists only
-        # to refresh the agent-visible turn counter and is removed at finalize.
-        self._turn_runtimes: dict[str, vf.Runtime] = {}
 
     @property
     def curator(self) -> CuratorConfig:
@@ -155,21 +169,16 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         if (
             self.curator.use_real_trainer
             and runtime.type == "docker"
-            and self.curator.proxy_student.runtime_backend == "docker"
         ):
-            from .util.container_memory import (
-                resolve_container_memory_gb,
-                verify_runtime_memory_limit,
-            )
+            from .util.container_memory import verify_runtime_memory_limit
 
-            await asyncio.to_thread(
-                verify_runtime_memory_limit,
-                runtime,
-                configured_gb=resolve_container_memory_gb(
-                    self.curator.proxy_student.memory_gb,
-                    backend="docker",
-                ),
-            )
+            configured_gb = getattr(getattr(runtime, "config", None), "memory", None)
+            if configured_gb is not None:
+                await asyncio.to_thread(
+                    verify_runtime_memory_limit,
+                    runtime,
+                    configured_gb=configured_gb,
+                )
 
         await runtime.write(
             SELF_SCORE_FILENAME,
@@ -183,30 +192,31 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         )
         skill = self.hf_skill_package_file()
         await runtime.write(self.HF_SKILL_PATH, skill.read_bytes())
-        await runtime.write(TURN_COUNT_FILENAME, render_turn_count_script())
+        state = cast(CuratorState, trace.state)
+        state._turn_runtime = runtime
+        await runtime.write(TURNS_FILENAME, render_turns_script())
         await runtime.write(
             TURN_STATE_FILENAME,
-            render_turn_state(trace.num_turns, self.curator.max_turns),
+            render_turn_state(trace.num_turns, self.data.max_turns),
         )
-        self._turn_runtimes[trace.id] = runtime
         if self.curator.use_real_trainer:
             await runtime.write(
                 SELF_SCORE_TRAIN_FILENAME, render_self_score_train_script()
             )
 
     @vf.stop
-    async def max_turns_reached(self, trace: vf.Trace) -> bool:
-        stopping = trace.num_turns >= self.curator.max_turns
-        runtime = self._turn_runtimes.get(trace.id)
-        if runtime is not None and not stopping:
+    async def refresh_turn_state(self, trace: vf.Trace) -> bool:
+        """Refresh agent-visible telemetry without enforcing a second limit."""
+        state = cast(CuratorState, trace.state)
+        if state._turn_runtime is not None:
             try:
-                await runtime.write(
+                await state._turn_runtime.write(
                     TURN_STATE_FILENAME,
-                    render_turn_state(trace.num_turns, self.curator.max_turns),
+                    render_turn_state(trace.num_turns, self.data.max_turns),
                 )
             except Exception:  # runtime backends expose different transport errors
                 logger.debug("turn-state refresh failed", exc_info=True)
-        return stopping
+        return False
 
     async def read_workspace_manifest(
         self, runtime: vf.Runtime | None, *, warn_invalid: bool = True
@@ -291,7 +301,6 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
 
     async def finalize(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         state = cast(CuratorState, trace.state)
-        self._turn_runtimes.pop(trace.id, None)
         await self.ingest_self_score_history(state, runtime)
 
         status, manifest = await self.read_workspace_manifest(runtime)
@@ -368,59 +377,95 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
                 return True
         return False
 
-    @vf.reward
-    async def score_manifest(
+    def _empty_rollout(self, state: CuratorState) -> bool:
+        """Whether the rollout produced nothing usable: no valid workspace
+        manifest (provenance is ``missing``) and the agent never ran the
+        self-score script. See ``EmptyRolloutError``."""
+        return (
+            state.manifest_provenance == MANIFEST_PROVENANCE_MISSING
+            and state.self_score_runs == 0
+        )
+
+    async def _compute_scoring(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> dict[str, Any]:
+        """Run and retain the one expensive scoring pass for this rollout."""
+        state = cast(CuratorState, trace.state)
+        if state._scoring_result is None:
+            state._scoring_result = await self.scorer().compute_scoring(state, runtime)
+        return state._scoring_result
+
+    @vf.metric
+    async def hf_cli_calls(self, trace: vf.Trace) -> float:
+        """Number of observed ``hf`` CLI invocations in agent tool calls."""
+        return float(
+            sum(
+                len(extract_hf_commands(self.candidates.shell_command(call.arguments)))
+                for message in trace.assistant_messages
+                for call in message.tool_calls or []
+            )
+        )
+
+    @vf.metric
+    async def num_turns(self, trace: vf.Trace) -> float:
+        """Framework-recorded model turns for the rollout."""
+        return float(trace.num_turns)
+
+    @vf.metric
+    async def scoring_diagnostics(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> dict[str, float]:
-        """Run materialization/training/decon once and emit keyed rewards."""
+        """Materialize once and expose scoring/lifecycle diagnostics as metrics."""
         state = cast(CuratorState, trace.state)
-        scoring = await self.scorer().compute_scoring(state, runtime)
+        scoring = await self._compute_scoring(trace, runtime)
         first = state.self_score_first_reward
         last = state.self_score_last_reward
         trainer_error = (state.trainer_error or "")[: self.TRAINER_ERROR_LIMIT]
         if trainer_error:
             logger.warning("trainer error: %s", trainer_error)
 
-        trace.record_metrics(
-            {
-                "perf_loss": scoring["loss"],
-                "perf_accuracy": scoring["accuracy"],
-                "perf_vs_baseline": scoring["perf_vs_baseline"],
-                "train_flops": scoring["flops"],
-                "corpus_tokens": scoring["tokens"],
-                "budget_fill_ratio": scoring["budget_fill_ratio"],
-                "num_sources": scoring["num_sources"],
-                "local_source_count": state.local_source_count,
-                "local_source_bytes": state.local_source_bytes,
-                "local_source_truncated": float(state.local_source_truncated),
-                "val_set_access": float(state.val_set_access),
-                "leakage_score": scoring["leakage"]["leakage_score"],
-                "num_contaminated_matches": scoring["leakage"][
-                    "num_contaminated_matches"
-                ],
-                "self_score_runs": state.self_score_runs,
-                "self_score_ok_runs": state.self_score_ok_runs,
-                "self_score_best_reward": state.self_score_best_reward or 0.0,
-                "self_score_last_reward": last or 0.0,
-                "self_score_improvement": (last - first)
-                if first is not None and last is not None
-                else 0.0,
-                "num_turns": trace.num_turns,
-                "finalized": float(state.manifest_finalized),
-                "manifest_missing": float(
-                    state.manifest_provenance == MANIFEST_PROVENANCE_MISSING
-                ),
-                "manifest_invalid": float(
-                    state.manifest_provenance
-                    == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
-                ),
-                "tool_error_count": state.tool_error_count,
-                "external_failure": float(state.external_failure),
-                "decon_error": scoring.get("decon_error", 0.0),
-                "val_screen_skipped": scoring.get("val_screen_skipped", 0.0),
-                "trainer_error_msg": float(bool(trainer_error)),
-            }
-        )
+        return {
+            "perf_loss": scoring["loss"],
+            "perf_accuracy": scoring["accuracy"],
+            "perf_vs_baseline": scoring["perf_vs_baseline"],
+            "train_flops": scoring["flops"],
+            "corpus_tokens": scoring["tokens"],
+            "budget_fill_ratio": scoring["budget_fill_ratio"],
+            "num_sources": scoring["num_sources"],
+            "local_source_count": state.local_source_count,
+            "local_source_bytes": state.local_source_bytes,
+            "local_source_truncated": float(state.local_source_truncated),
+            "val_set_access": float(state.val_set_access),
+            "leakage_score": scoring["leakage"]["leakage_score"],
+            "num_contaminated_matches": scoring["leakage"]["num_contaminated_matches"],
+            "self_score_runs": state.self_score_runs,
+            "self_score_ok_runs": state.self_score_ok_runs,
+            "self_score_best_reward": state.self_score_best_reward or 0.0,
+            "self_score_last_reward": last or 0.0,
+            "self_score_improvement": (last - first)
+            if first is not None and last is not None
+            else 0.0,
+            "finalized": float(state.manifest_finalized),
+            "manifest_missing": float(
+                state.manifest_provenance == MANIFEST_PROVENANCE_MISSING
+            ),
+            "manifest_invalid": float(
+                state.manifest_provenance == MANIFEST_PROVENANCE_INVALID_WORKSPACE_FILE
+            ),
+            "tool_error_count": state.tool_error_count,
+            "external_failure": float(state.external_failure),
+            "empty_rollout": float(self._empty_rollout(state)),
+            "decon_error": scoring.get("decon_error", 0.0),
+            "val_screen_skipped": scoring.get("val_screen_skipped", 0.0),
+            "trainer_error_msg": float(bool(trainer_error)),
+        }
+
+    @vf.reward
+    async def score_manifest(
+        self, trace: vf.Trace, runtime: vf.Runtime | None = None
+    ) -> dict[str, float]:
+        """Emit reward components from the scoring pass already used by metrics."""
+        scoring = await self._compute_scoring(trace, runtime)
         return {
             "perf_reward": self.curator.alpha_perf * scoring["perf"],
             "leakage_penalty": -self.curator.lambda_leakage
@@ -431,8 +476,16 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         try:
             await super().score(trace, runtime)
         finally:
-            self._turn_runtimes.pop(trace.id, None)
             cast(CuratorState, trace.state).cleanup()
+        if self.config.error_on_empty_rollout and self._empty_rollout(
+            cast(CuratorState, trace.state)
+        ):
+            raise EmptyRolloutError(
+                "rollout produced no usable artifact (no valid workspace "
+                "manifest, self_score_runs=0); treating as an infrastructure / "
+                "model-endpoint failure. Set error_on_empty_rollout=false to "
+                "record it as a zero-reward sample instead."
+            )
 
 
-__all__ = ["CuratorTask"]
+__all__ = ["CuratorTask", "EmptyRolloutError"]

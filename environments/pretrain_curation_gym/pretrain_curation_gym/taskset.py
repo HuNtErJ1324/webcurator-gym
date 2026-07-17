@@ -5,9 +5,8 @@ from __future__ import annotations
 import verifiers.v1 as vf
 
 from .config import CuratorTasksetConfig
-from .runtime_config import derive_task_runtime_updates
 from .task import CuratorTask
-from .tasks import CuratorTaskData
+from .taskdata import CuratorTaskData
 
 
 # The framework's TaskT bound is invariant over Task state/config today, even
@@ -19,12 +18,10 @@ class CuratorTaskset(  # pyright: ignore[reportInvalidTypeArguments]
 
     def load(self) -> list[CuratorTask]:
         config = self.config.task
-        data = CuratorTaskData.from_config(config)
-        runtime_fields = derive_task_runtime_updates(
-            config.curator.proxy_student,
-            use_real_trainer=config.curator.use_real_trainer,
+        data = CuratorTaskData.from_config(
+            config, max_turns=self.config._resolved_max_turns
         )
-        return [CuratorTask(data.model_copy(update=runtime_fields), config)]
+        return [CuratorTask(data, config)]
 
 
 __all__ = ["CuratorTaskset"]

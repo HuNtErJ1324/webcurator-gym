@@ -23,7 +23,7 @@ from pretrain_curation_gym.models import (
 )
 from pretrain_curation_gym.pretrain_curation_gym import load_environment
 from pretrain_curation_gym.rollout_state import CuratorState, RolloutStore
-from pretrain_curation_gym.tasks import build_tasks
+from pretrain_curation_gym.taskdata import build_tasks
 from pretrain_curation_gym.taskset import _coerce_source
 from pretrain_curation_gym.val_set import NANOGPT_VAL_DATASET_ID
 
@@ -466,7 +466,7 @@ async def test_local_provenance_metrics_read_rollout_state():
             }
 
     task._scorer = EmptyScorer()
-    await task.score_manifest(trace)
+    trace.record_metrics(await task.scoring_diagnostics(trace))
 
     assert trace.metrics["local_source_count"] == 1.0
     assert trace.metrics["local_source_bytes"] == 123.0

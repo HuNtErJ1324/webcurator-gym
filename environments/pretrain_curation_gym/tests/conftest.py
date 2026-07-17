@@ -8,7 +8,7 @@ from types import ModuleType
 import pytest
 
 import pretrain_curation_gym.taskset as taskset_module
-import pretrain_curation_gym.tasks as tasks_module
+import pretrain_curation_gym.taskdata as taskdata_module
 from pretrain_curation_gym.manifest import ManifestParser, TraceManifestCandidates
 from pretrain_curation_gym.task import CuratorTask
 
@@ -59,7 +59,7 @@ def _legacy_parse_manifest(
 
 
 taskset_module.parse_manifest = _legacy_parse_manifest
-tasks_module.build_tasks = legacy_build_tasks
+taskdata_module.build_tasks = legacy_build_tasks
 sys.modules["pretrain_curation_gym.rollout_state"] = compatibility_module(
     "pretrain_curation_gym.rollout_state"
 )
@@ -105,7 +105,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(outside_package)
         elif (
             item.path.name == "test_self_score_progress.py"
-            and getattr(item.function, "__code__", None).co_firstlineno >= 667
+            and getattr(item.function, "__code__", None).co_firstlineno >= 650
         ):
             item.add_marker(outside_package)
 

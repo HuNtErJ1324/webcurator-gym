@@ -28,7 +28,6 @@ from .util.container_memory import (
     collect_oom_diagnostics,
     format_oom_diagnostics,
     inspect_container_memory,
-    resolve_container_memory_gb,
 )
 from .corpus import CuratedCorpus
 from .util.async_utils import run_blocking_drained
@@ -574,11 +573,7 @@ class RuntimeProxyTrainer:
             except Exception as exc:
                 logger.debug("oom inspect failed: %s", exc)
         return collect_oom_diagnostics(
-            configured_gb=(
-                resolve_container_memory_gb(config.memory_gb, backend="docker")
-                if config is not None
-                else None
-            ),
+            configured_gb=getattr(getattr(runtime, "config", None), "memory", None),
             effective_memory_bytes=(inspect_info or {}).get("memory_bytes"),
             oom_killed=(inspect_info or {}).get("oom_killed"),
             container=str(container) if container else None,

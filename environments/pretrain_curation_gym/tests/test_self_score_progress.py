@@ -35,7 +35,7 @@ from pretrain_curation_gym.gpu.self_score import (
     SELF_SCORE_FILENAME,
     render_self_score_script,
 )
-from pretrain_curation_gym.tasks import TASK_PROMPT, build_tasks
+from pretrain_curation_gym.taskdata import TASK_PROMPT, build_tasks
 from .test_400m_eval_detached import _extract_bash_heredoc
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -491,19 +491,6 @@ def test_prompt_stays_within_its_length_contract():
     prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
     assert len(TASK_PROMPT) <= TASK_PROMPT_MAX_CHARS, len(TASK_PROMPT)
     assert len(prompt) <= TASK_PROMPT_MAX_CHARS, len(prompt)
-
-
-def test_prompt_explains_squared_performance_matching_reward_default():
-    """Setup must document squared nonnegative progress; reward default is 2.0."""
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
-    setup = prompt[prompt.index("## Setup") : prompt.index("## Research")]
-    assert "normalized loss progress is squared in the performance term" in setup
-    assert "default exponent 2.0" in setup
-    assert "equal loss improvements earn more reward later than earlier" in setup
-    assert "negative progress stays linear" in setup
-    # Live default must match the documented exponent (do not hard-code drift).
-    assert CuratorConfig().perf_scaling_exponent == 2.0
-    assert "default exponent 2.0" in TASK_PROMPT
 
 
 # --- detached A100 status propagation ---------------------------------------

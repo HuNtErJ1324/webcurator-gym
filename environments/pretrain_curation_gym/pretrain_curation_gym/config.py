@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator
 
 import verifiers.v1 as vf
 
@@ -10,6 +10,7 @@ from .leakage import DEFAULT_DECON_BINARY
 from .models import CuratorConfig, MANIFEST_FILENAME
 
 ENV_ID = "pretrain-curation-gym"
+DEFAULT_MAX_TURNS = 64
 
 
 class CuratorTaskConfig(vf.TaskConfig):
@@ -22,6 +23,13 @@ class CuratorTaskConfig(vf.TaskConfig):
     decon_evals_dir: str | None = None
     decon_threshold: float = 0.2
     screen_val_set: bool = True
+    error_on_empty_rollout: bool = False
+    """Raise a retryable ``EmptyRolloutError`` when a rollout produced no usable
+    artifact — no valid workspace manifest and zero self-scores. Off by default
+    so RL keeps its legitimate silent zero-reward signal; smoke/eval configs
+    enable it together with ``[retries.rollout] include=['EmptyRolloutError']``
+    so a transient model-endpoint failure retries instead of being recorded as a
+    spurious zero-reward success."""
 
     @field_validator("manifest_filename")
     @classmethod
@@ -40,6 +48,9 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     task: CuratorTaskConfig = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
         default_factory=CuratorTaskConfig
     )
+    # Derived from EnvConfig.max_turns by load_environment. It is deliberately
+    # private so there is still exactly one user-configurable turn-limit field.
+    _resolved_max_turns: int = PrivateAttr(default=DEFAULT_MAX_TURNS)
 
 
 class CuratorEnvConfig(vf.EnvConfig):
@@ -51,23 +62,14 @@ class CuratorEnvConfig(vf.EnvConfig):
     harness: vf.HarnessConfig = Field(
         default_factory=lambda: vf.HarnessConfig(id="default")
     )
-    max_turns: int | None = 64
-
-    @model_validator(mode="after")
-    def align_turn_limits(self) -> "CuratorEnvConfig":
-        task_limit = self.taskset.task.curator.max_turns
-        if self.max_turns is None:
-            self.max_turns = task_limit
-        elif self.max_turns != task_limit:
-            raise ValueError(
-                "max_turns and taskset.task.curator.max_turns must match "
-                f"({self.max_turns} != {task_limit})"
-            )
-        return self
+    # This is the sole turn limit. EnvConfig passes it to the framework's
+    # interception session, which enforces it for every harness.
+    max_turns: int = Field(default=DEFAULT_MAX_TURNS, ge=1, le=1000)
 
 
 __all__ = [
     "ENV_ID",
+    "DEFAULT_MAX_TURNS",
     "CuratorEnvConfig",
     "CuratorTaskConfig",
     "CuratorTasksetConfig",

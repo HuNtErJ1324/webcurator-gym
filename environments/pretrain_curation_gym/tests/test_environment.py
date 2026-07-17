@@ -32,22 +32,35 @@ def test_taskset_is_thin_v1_composition() -> None:
     assert task.data.system_prompt is None
     assert "Sole curation budget: 1000000 tokens" in task.data.prompt
     assert "Turn limit: 64 model turns" in task.data.prompt
+    assert "python turns.py" in task.data.prompt
     assert "to `manifest.json`" in task.data.prompt
     assert "/workspace/manifest.json" not in task.data.prompt
     assert len(discover_decorated(task, "reward")) == 1
-    assert len(discover_decorated(task, "metric")) == 0
-    assert len(discover_decorated(task, "stop")) == 1
+    assert len(discover_decorated(task, "metric")) == 3
+    assert [stop.__name__ for stop in discover_decorated(task, "stop")] == [
+        "refresh_turn_state"
+    ]
 
 
-def test_config_has_one_task_owned_surface() -> None:
-    config = CuratorTasksetConfig(
-        task=CuratorTaskConfig(curator={"token_budget": 12_345, "max_turns": 7})
+def test_max_turns_has_one_framework_owned_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    config = CuratorEnvConfig(
+        max_turns=7,
+        taskset=CuratorTasksetConfig(
+            task=CuratorTaskConfig(curator={"token_budget": 12_345})
+        ),
     )
-    [task] = CuratorTaskset(config).load()
+    environment = load_environment(config)
+    [task] = environment.taskset.load()
 
+    assert config.max_turns == 7
     assert task.data.token_budget == 12_345
+    assert task.data.max_turns == 7
     assert "Turn limit: 7 model turns" in task.data.prompt
-    assert not hasattr(config, "token_budget")
+    assert not hasattr(config.taskset.task.curator, "max_turns")
+    assert not hasattr(config.taskset, "max_turns")
 
 
 def test_environment_loader_composes_native_v1(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,6 +70,7 @@ def test_environment_loader_composes_native_v1(monkeypatch: pytest.MonkeyPatch) 
     assert isinstance(environment, vf.Environment)
     assert environment.config.taskset.id == "pretrain-curation-gym"
     assert environment.config.max_turns == 64
+    assert environment.taskset.load()[0].data.max_turns == 64
     assert "HF_TOKEN" in environment.config.harness.forward_env
 
 
@@ -135,7 +149,39 @@ async def test_one_keyed_reward_pass_records_all_diagnostics() -> None:
     assert trace.metrics["perf_loss"] == 4.0
     assert trace.metrics["corpus_tokens"] == 900.0
     assert trace.metrics["finalized"] == 1.0
-    assert len(trace.metrics) == 27
+    assert trace.metrics["hf_cli_calls"] == 0.0
+    assert len(trace.metrics) == 29
+
+
+@pytest.mark.asyncio
+async def test_hf_cli_invocations_are_framework_metrics() -> None:
+    [task] = CuratorTaskset(CuratorTasksetConfig()).load()
+    trace = type(
+        "ActivityTrace",
+        (),
+        {
+            "num_turns": 1,
+            "assistant_messages": [
+                vf.AssistantMessage(
+                    content="",
+                    tool_calls=[
+                        vf.ToolCall(
+                            id="tc-1",
+                            name="bash",
+                            arguments=json.dumps(
+                                {
+                                    "command": "hf datasets info owner/data; "
+                                    "hf download owner/data --repo-type dataset"
+                                }
+                            ),
+                        )
+                    ],
+                )
+            ],
+        },
+    )()
+
+    assert await task.hf_cli_calls(trace) == 2.0
 
 
 @pytest.mark.asyncio

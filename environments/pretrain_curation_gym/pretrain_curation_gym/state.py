@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import verifiers.v1 as vf
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from .models import MANIFEST_PROVENANCE_MISSING, Manifest, ManifestProvenance
 
@@ -50,6 +50,12 @@ class CuratorState(vf.State):
     self_score_first_reward: float | None = None
     self_score_best_reward: float | None = None
     self_score_last_reward: float | None = None
+
+    # Task.score runs @metric methods before @reward methods. Keep the one
+    # expensive scoring result on rollout-owned state so both v1 primitives use
+    # it without materializing/training twice.
+    _scoring_result: dict[str, Any] | None = PrivateAttr(default=None)
+    _turn_runtime: vf.Runtime | None = PrivateAttr(default=None)
 
     @property
     def parsed_manifest(self) -> Manifest:
@@ -118,6 +124,7 @@ class CuratorState(vf.State):
         if self.scratch_dir is not None:
             shutil.rmtree(self.scratch_dir, ignore_errors=True)
         self.scratch_dir = None
+        self._turn_runtime = None
         self.doc_cache = {}
 
 

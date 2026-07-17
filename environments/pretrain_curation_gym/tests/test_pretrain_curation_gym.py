@@ -59,7 +59,7 @@ from pretrain_curation_gym.gpu.self_score import (
     render_self_score_script,
     render_self_score_train_script,
 )
-from pretrain_curation_gym.tasks import TASK_PROMPT, build_tasks
+from pretrain_curation_gym.taskdata import TASK_PROMPT, build_tasks
 from pretrain_curation_gym.taskset import (
     HF_CLI_SKILL_FILENAME,
     HF_CLI_SKILL_RESOURCE,
@@ -457,19 +457,16 @@ def test_single_smoke_config_exhaustively_matches_source_options():
 
     assert config["taskset"]["id"] == "pretrain-curation-gym"
     assert config["model"] == "deepseek/deepseek-v4-flash"
-    assert config["max_turns"] == args["max_turns"]
+    assert config["max_turns"] == 60
+    assert "max_turns" not in args
     assert task["screen_val_set"] is True
     assert set(args["validation_set"]) == set(ValidationSetConfig.model_fields)
     # Exact match against all ProxyStudentConfig fields except those intentionally
-    # absent from the Docker smoke config:
-    #   - docker_host must be unset (None) for the Docker backend; an empty
-    #     string would trip the guard in load_environment.
-    #   - modal_gpu is Modal-only and irrelevant to the Docker backend.
-    #   - sliding_window_size defaults to None (full context); TOML 1.0 has no
+    # absent from the Docker smoke config. Runtime resources are native
+    # ``harness.runtime`` fields and are not part of ProxyStudentConfig.
+    # sliding_window_size defaults to None (full context); TOML 1.0 has no
     #     null literal, so omitting it is the canonical smoke-config spelling.
     expected_proxy_fields = set(ProxyStudentConfig.model_fields) - {
-        "docker_host",
-        "modal_gpu",
         "sliding_window_size",
         # Optional None defaults; TOML 1.0 has no null literal, so omitting them
         # is the canonical smoke-config spelling.
@@ -527,10 +524,10 @@ def test_400m_eval_configs_use_webcurator_runtime_image(config_name):
     """Every *400M* eval config must use the baked hf+decon image, not bare pytorch."""
     config_path = Path(__file__).resolve().parents[1] / "configs" / "eval" / config_name
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    proxy = config["taskset"]["task"]["curator"]["proxy_student"]
-    assert proxy["runtime_backend"] == "docker"
-    assert proxy["docker_image"] == "webcurator-runtime:latest"
-    assert "pytorch/pytorch" not in proxy["docker_image"]
+    runtime = config["harness"]["runtime"]
+    assert runtime["type"] == "docker"
+    assert runtime["image"] == "webcurator-runtime:latest"
+    assert "pytorch/pytorch" not in runtime["image"]
 
 
 @pytest.mark.parametrize("config_name", _400m_eval_config_names())
@@ -795,13 +792,14 @@ def test_load_environment_uses_declarative_docker_runtime_for_docker_trainer():
     }
     runtime = docker_env.harness.config.runtime
     assert isinstance(runtime, vf.DockerConfig)
-    assert runtime.image == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
+    assert runtime.image == "webcurator-runtime:latest"
     assert runtime.workdir == "/workspace"
     assert runtime.gpu == "1"
     assert runtime.cpu == 4.0
     assert runtime.memory == 16.0
     assert runtime.disk == 20.0
-    assert docker_env.config.timeout.scoring == 2340.0
+    # The loader no longer derives an outer deadline from trainer settings.
+    assert docker_env.config.timeout.scoring is None
 
 
 def test_load_environment_injects_hf_token_into_harness_env(monkeypatch):
@@ -823,17 +821,6 @@ def test_load_environment_omits_hf_token_from_harness_env_when_unset(monkeypatch
     monkeypatch.delenv("HF_TOKEN", raising=False)
     with pytest.raises(ValueError, match="HF_TOKEN"):
         load_environment(harness_id="codex")
-
-
-def test_load_environment_rejects_remote_docker_host():
-    with pytest.raises(ValueError, match="docker_host is not supported"):
-        load_environment(
-            use_real_trainer=True,
-            proxy_student={
-                "runtime_backend": "docker",
-                "docker_host": "ssh://user@gpu-host",
-            },
-        )
 
 
 def test_taskset_exposes_no_tools_so_non_mcp_gate_passes():
@@ -1734,7 +1721,6 @@ class FailingClient(FakeClient):
 def test_config_valid_defaults_and_overrides():
     cfg = CuratorConfig(candidate_limit=4)
     assert cfg.candidate_limit == 4
-    assert cfg.max_turns == 64
     assert ProxyStudentConfig(n_embd=128, n_head=4).n_embd == 128
 
 
@@ -1899,22 +1885,15 @@ def test_effective_max_corpus_chars_scales_with_budget():
 
 def test_effective_timeout_minutes_scales_and_is_bounded():
     # Default budget keeps the historical 30-minute timeout; a large budget grows
-    # it; an explicit value overrides. Modal caps the derived timeout at its 24h
-    # (1440-minute) platform sandbox limit and rejects an explicit value above
-    # it; docker (and no runtime_backend set) has no such ceiling.
+    # it; an explicit value overrides. Backend-specific ceilings are checked by
+    # load_environment against the native harness runtime.
     assert ProxyStudentConfig().effective_timeout_minutes == 30
     big = ProxyStudentConfig(train_token_budget=300_000_000)
     assert 30 < big.effective_timeout_minutes <= 1440
     assert ProxyStudentConfig(timeout_minutes=45).effective_timeout_minutes == 45
     huge_docker = ProxyStudentConfig(train_token_budget=1_000_000_000)
     assert huge_docker.effective_timeout_minutes > 1440
-    huge_modal = ProxyStudentConfig(
-        train_token_budget=1_000_000_000, runtime_backend="modal"
-    )
-    assert huge_modal.effective_timeout_minutes == 1440
     assert ProxyStudentConfig(timeout_minutes=1441).effective_timeout_minutes == 1441
-    with pytest.raises(ValidationError):
-        ProxyStudentConfig(runtime_backend="modal", timeout_minutes=1441)
 
 
 # --- Tier C: per-task token budget seeds the parsed manifest ----------------
@@ -2110,14 +2089,17 @@ async def test_scoring_runs_build_and_training_once_under_concurrency():
     curator = await _make(client=client, corpus_builder=builder, trainer=trainer)
     await _finalized(curator)
 
-    # The rewrite exposes one keyed reward pass, so materialization/training is
-    # structurally single-shot rather than coordinated through 29 wrappers.
+    # Native metrics and the keyed reward share the rollout-owned scoring result.
     trace = curator.trace()
     funcs = discover_decorated(curator.taskset, "reward")
     assert len(funcs) == 1
-    assert not discover_decorated(curator.taskset, "metric")
-    rewards = await funcs[0](trace)
-    assert set(rewards) == {"perf_reward", "leakage_penalty"}
+    assert {f.__name__ for f in discover_decorated(curator.taskset, "metric")} == {
+        "hf_cli_calls",
+        "num_turns",
+        "scoring_diagnostics",
+    }
+    await curator.taskset.score(trace)
+    assert set(trace.rewards) == {"perf_reward", "leakage_penalty"}
     assert builder.materialize_calls == 1
     assert trainer.calls == 1
 
@@ -2442,13 +2424,16 @@ def test_heuristic_flops_scale_with_budget_when_corpus_permits():
 
 
 def test_telemetry_metrics_are_zero_weight():
-    # Diagnostics are recorded by the keyed reward pass but are absent from its
-    # returned mapping, so they cannot affect reward aggregation.
+    # v1 metrics are recorded separately from weighted reward contributions.
     taskset = _Curator().taskset
     assert {f.__name__ for f in discover_decorated(taskset, "reward")} == {
         "score_manifest"
     }
-    assert discover_decorated(taskset, "metric") == []
+    assert {f.__name__ for f in discover_decorated(taskset, "metric")} == {
+        "hf_cli_calls",
+        "num_turns",
+        "scoring_diagnostics",
+    }
 
 
 @pytest.mark.asyncio
@@ -2521,10 +2506,8 @@ def test_task_prompt_contract():
     assert "--limit N" in prompt
     assert "--max-steps N" in prompt
     assert "Never ask the user" in prompt
-    # The turn cap is disclosed so the agent can pace itself, alongside the
-    # workspace script that reports the live turn.
-    assert "Turn limit: 7 model turns" in prompt
-    assert "python turn_count.py" in prompt
+    assert "Turn limit: 64 model turns" in prompt
+    assert "python turns.py" in prompt
     assert "discovery budget" not in prompt.lower()
     assert "discovery round" not in prompt.lower()
     assert "Contamination against any eval set incurs the leakage penalty" in prompt
@@ -2614,7 +2597,7 @@ def test_discovery_has_no_call_or_output_stop():
     taskset = CuratorTaskset(CuratorTasksetConfig(id="test"))
     stops = discover_decorated(taskset.load()[0], "stop")
 
-    assert [stop.__name__ for stop in stops] == ["max_turns_reached"]
+    assert [stop.__name__ for stop in stops] == ["refresh_turn_state"]
 
 
 def test_task_prompt_manifest_contract_covers_hf_and_local_sources():
@@ -3578,7 +3561,7 @@ async def test_finalize_absent_workspace_manifest_reports_missing_with_assistant
     assert scoring["perf"] == 0.0
     assert scoring["flops"] == 0.0
     assert scoring["tokens"] == 0
-    await curator.taskset.score_manifest(trace)
+    trace.record_metrics(await curator.taskset.scoring_diagnostics(trace))
     assert trace.metrics["manifest_missing"] == 1.0
     assert trace.metrics["manifest_invalid"] == 0.0
 
@@ -3614,7 +3597,7 @@ async def test_finalize_malformed_workspace_manifest_reports_invalid(
     assert scoring["perf"] == 0.0
     assert scoring["flops"] == 0.0
     assert scoring["tokens"] == 0
-    await curator.taskset.score_manifest(trace)
+    trace.record_metrics(await curator.taskset.scoring_diagnostics(trace))
     assert trace.metrics["manifest_missing"] == 0.0
     assert trace.metrics["manifest_invalid"] == 1.0
 
@@ -3644,7 +3627,7 @@ async def test_finalize_empty_sources_workspace_manifest_reports_invalid():
     scoring = await curator.prepared()
     assert scoring["flops"] == 0.0
     assert scoring["tokens"] == 0
-    await curator.taskset.score_manifest(trace)
+    trace.record_metrics(await curator.taskset.scoring_diagnostics(trace))
     assert trace.metrics["manifest_invalid"] == 1.0
 
 
@@ -3668,7 +3651,7 @@ async def test_finalize_graceful_zero_when_no_manifest():
     assert scoring["num_sources"] == 0
     assert scoring["flops"] == 0.0
     assert scoring["tokens"] == 0
-    await curator.taskset.score_manifest(trace)
+    trace.record_metrics(await curator.taskset.scoring_diagnostics(trace))
     assert trace.metrics["manifest_missing"] == 1.0
     assert trace.metrics["manifest_invalid"] == 0.0
 
@@ -4237,10 +4220,9 @@ async def test_finalize_ignores_draft_json_workspace_file():
     assert scoring["tokens"] == 0
 
 
-def test_turn_cap_is_disclosed_in_agent_prompt():
-    """The configured turn cap is rendered into the prompt (and nothing else moves)."""
-    short = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=7)).load()
-    long = CuratorTaskset(CuratorTasksetConfig(id="test", max_turns=200)).load()
+def test_turn_cap_is_not_duplicated_in_task_prompt_or_config():
+    short = load_environment(max_turns=7).taskset.load()
+    long = load_environment(max_turns=200).taskset.load()
     assert "Turn limit: 7 model turns" in short[0].data.prompt
     assert "Turn limit: 200 model turns" in long[0].data.prompt
     assert (
@@ -4249,6 +4231,7 @@ def test_turn_cap_is_disclosed_in_agent_prompt():
         )
         == long[0].data.prompt
     )
+    assert not hasattr(short[0].config.curator, "max_turns")
     assert short[0].data.system_prompt is None
     assert long[0].data.system_prompt is None
 
@@ -4568,37 +4551,28 @@ assert "pretrain_curation_gym.modal_backend" not in sys.modules
 def test_backend_default_is_heuristic_and_no_runtime_backend_selector():
     # There is no default runtime_backend selector, and the default
     # (use_real_trainer False) path still yields the heuristic trainer.
-    assert CuratorConfig().proxy_student.runtime_backend is None
-    assert ProxyStudentConfig().runtime_backend is None
+    assert "runtime_backend" not in ProxyStudentConfig.model_fields
     ts = _real_trainer_taskset(use_real_trainer=False)
     assert isinstance(ts.scorer().trainer, HeuristicProxyTrainer)
 
 
-def test_docker_runtime_backend_construction_has_no_platform_timeout_ceiling():
-    # No more vm/gpu_type fields to set at all; an explicit > 24h timeout
-    # constructs cleanly on docker (only modal has a platform ceiling).
-    cfg = ProxyStudentConfig(runtime_backend="docker", timeout_minutes=5000)
-    assert cfg.runtime_backend == "docker"
+def test_trainer_timeout_has_no_backend_policy():
+    cfg = ProxyStudentConfig(timeout_minutes=5000)
     assert cfg.timeout_minutes == 5000
     assert cfg.effective_timeout_minutes == 5000  # not clamped to 1440
 
 
-def test_docker_image_default_is_shared_across_backends():
-    # There is a single shared docker_image default now (no more prime/docker
-    # split); an explicit image wins regardless of runtime_backend.
-    assert (
-        ProxyStudentConfig().docker_image
-        == "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
-    )
-    assert ProxyStudentConfig(runtime_backend="docker").docker_image == (
-        "pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime"
-    )
-    assert (
-        ProxyStudentConfig(
-            runtime_backend="docker", docker_image="me/img:1"
-        ).docker_image
-        == "me/img:1"
-    )
+def test_proxy_student_has_no_runtime_resource_fields():
+    assert not {
+        "runtime_backend",
+        "docker_host",
+        "modal_gpu",
+        "docker_image",
+        "gpu_count",
+        "cpu_cores",
+        "memory_gb",
+        "disk_size_gb",
+    } & set(ProxyStudentConfig.model_fields)
 
 
 # --- Tier S: baseline-relative Perf signal (default-ON) ----------------------
@@ -5284,14 +5258,6 @@ def test_gamma_config_rejection(bad):
         )
 
 
-def test_gamma_default_is_two():
-    """Default perf_scaling_exponent is 2.0 on both config models."""
-    cfg = CuratorConfig()
-    assert cfg.perf_scaling_exponent == 2.0
-    tscfg = CuratorTasksetConfig(id="test")
-    assert tscfg.task.curator.perf_scaling_exponent == 2.0
-
-
 def test_gamma_anchors_are_invariant():
     """p=0 → 0.0 and p=1 → 1.0 for any valid gamma (indep of exponent)."""
     for gamma in [1.0, 2.0, 3.0, 0.5]:
@@ -5321,44 +5287,6 @@ def test_gamma_sentinel_still_zero():
         loss=float("inf"), accuracy=0.0, flops=0.0, tokens_trained=0, backend="error"
     )
     assert scorer._perf(sentinel) == 0.0
-
-
-def test_prompt_documents_default_squared_performance_curve():
-    """Rendered Setup must match the live default squared/linear reward contract."""
-    cfg = CuratorConfig()
-    assert cfg.perf_scaling_exponent == 2.0
-    prompt = str(build_tasks("2024-12-31", 1_000_000)[0].data.prompt)
-    setup = prompt[prompt.index("## Setup") : prompt.index("## Research")]
-    assert "normalized loss progress is squared in the performance term" in setup
-    assert f"default exponent {cfg.perf_scaling_exponent:g}" in setup
-    assert "equal loss improvements earn more reward later than earlier" in setup
-    assert "negative progress stays linear" in setup
-
-    # Equal normalized-progress steps: later step earns more under γ=2.
-    scorer = _scorer(
-        HeuristicProxyTrainer(),
-        config=CuratorConfig(
-            perf_scaling_exponent=cfg.perf_scaling_exponent,
-            perf_baseline_loss=10.0,
-            perf_target_loss=2.0,
-        ),
-    )
-    early = TrainResult(
-        loss=8.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
-    )
-    mid = TrainResult(loss=6.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
-    late = TrainResult(loss=4.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x")
-    # p: 0.25 → 0.50 → 0.75; squared: 0.0625 → 0.25 → 0.5625
-    assert scorer._perf(mid) - scorer._perf(early) == pytest.approx(0.1875)
-    assert scorer._perf(late) - scorer._perf(mid) == pytest.approx(0.3125)
-    assert (scorer._perf(late) - scorer._perf(mid)) > (
-        scorer._perf(mid) - scorer._perf(early)
-    )
-    # Negative branch stays linear (not squared).
-    worse = TrainResult(
-        loss=14.0, accuracy=0.0, flops=0.0, tokens_trained=0, backend="x"
-    )
-    assert scorer._perf(worse) == pytest.approx(-0.5)
 
 
 def test_load_environment_accepts_perf_scaling_exponent(monkeypatch):
