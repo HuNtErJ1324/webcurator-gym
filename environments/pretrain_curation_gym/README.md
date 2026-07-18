@@ -68,12 +68,15 @@ pretrain-curation-gym --help` for the full option list.
 
 ### Evaluation profiles
 
-Ready-made configs live in `configs/eval/`:
+`configs/` is workspace-local and git-ignored, so these profiles are **not** part
+of the published package — they are reference settings to copy, not files a
+`prime env install` provides. Ready-made configs live in `configs/eval/`:
 
 | Config | Token budget | Turns |
 | --- | --- | --- |
 | `deepseek-v4-pro-10M-100turn.toml` | 10M | 100 |
 | `deepseek-v4-pro-100M-300turn.toml` | 100M | 300 |
+| `deepseek-v4-pro-100M-300turn-claude-code.toml` | 100M | 300 |
 | `deepseek-v4-pro-400M-300turn.toml` | 400M | 300 |
 
 ```bash
@@ -84,6 +87,32 @@ uv run --project environments/pretrain_curation_gym \
 Hosted training profiles are in `configs/rl/`. Publish the package to
 `hunterj/pretrain-curation-gym` before launching those runs.
 
+Codex and Claude Code are opaque external harnesses: Verifiers does not receive
+their native conversation nodes. When such a harness returns an empty trace,
+the environment adds a clearly labeled workspace-telemetry trajectory containing
+the task prompt and every `.self_score_history.jsonl` record. The same records
+are retained under `trace.info.self_score_history` and exposed as indexed metrics
+such as `self_score_001_reward` and `self_score_001_elapsed_seconds` for plotting.
+Hugging Face CLI calls are counted by a redacting workspace wrapper rather than
+inferred from unavailable harness nodes.
+
+## Speedrun fidelity
+
+The portable proxy trainer is audited against
+[`KellerJordan/modded-nanogpt@edf47a05`](https://github.com/KellerJordan/modded-nanogpt/commit/edf47a05a12062d661c4cfd4eef848c5ab5bed32).
+Pinned training semantics include the staged `896 -> 2048` context ratio
+(scaled to this trainer's maximum context), stationary-half one-token key
+shift, projection-removal XSA, paired-layer topology, and weight-preserving
+late embedding/head untie.
+
+Intentional scale adaptations remain: steps are derived to meet each token
+budget after scheduling, batch sizes are profile-specific, Muon
+warmup/cooldown scale with run length, and `wd_ref_steps` preserves the
+weight-decay timescale. Portability differences are explicit in
+`gpu/train_gpt.py`: single-GPU SDPA with document masks, 1024 maximum context,
+an unfused attention block at layer 6, compact sign-derived bigram features,
+and no FP8/fused kernels.
+
 ## Development
 
 ```bash
@@ -92,3 +121,16 @@ uv run --project environments/pretrain_curation_gym \
 uv run --project environments/pretrain_curation_gym \
   ruff check environments/pretrain_curation_gym
 ```
+
+`.gitignore` keeps `**/tests/` and `**/test_*.py` local, so the suite under
+`environments/pretrain_curation_gym/tests/` stays workspace-only and is not
+part of the published package.
+
+### Runtime PATH
+
+Task setup writes a redacting `hf` audit wrapper to `<workdir>/.agents/bin/hf`,
+which populates the `hf_cli_calls` metric and `trace.info.hf_cli_history`. It
+records nothing unless that directory precedes the real CLI on `PATH`.
+`Dockerfile.runtime` sets this up for every container; `load_environment`
+re-prepends the directory when a harness config supplies its own `PATH`. A
+custom runtime image must do the same, or the audit log will be silently empty.

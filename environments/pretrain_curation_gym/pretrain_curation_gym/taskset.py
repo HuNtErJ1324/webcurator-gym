@@ -18,10 +18,7 @@ class CuratorTaskset(  # pyright: ignore[reportInvalidTypeArguments]
 
     def load(self) -> list[CuratorTask]:
         config = self.config.task
-        data = CuratorTaskData.from_config(
-            config, max_turns=self.config._resolved_max_turns
-        )
-        return [CuratorTask(data, config)]
+        return [CuratorTask(CuratorTaskData.from_config(config), config)]
 
 
 __all__ = ["CuratorTaskset"]

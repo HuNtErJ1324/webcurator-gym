@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, field_validator
 
 import verifiers.v1 as vf
 
@@ -17,6 +17,22 @@ class CuratorTaskConfig(vf.TaskConfig):
     """Knobs consumed by one curation task and its scoring lifecycle."""
 
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
+    max_turns: int = Field(default=DEFAULT_MAX_TURNS, ge=1, le=1000)
+    """Turn budget the agent is TOLD it has: rendered into the task prompt and
+    reported by the workspace ``turns.py``.
+
+    It must equal ``EnvConfig.max_turns``, which is what actually enforces the
+    limit. It cannot be derived from that field at load time: v1 never plumbs
+    ``RolloutLimits`` to task code, and the CLI builds the taskset straight from
+    ``[taskset.*]`` via ``loaders.load_taskset`` without calling
+    ``load_environment``. So this is a real, serialized field — a private
+    attribute set by ``load_environment`` reaches neither the CLI (which skips
+    that function) nor an env-server worker (which rebuilds the config from
+    ``model_dump``, and private attributes do not serialize).
+
+    ``load_environment`` reconciles the two for programmatic callers, so setting
+    either one there is enough. A TOML-driven run has no such hook: set the
+    framework's ``max_turns`` and this to the same value."""
     hf_token_env: str = "HF_TOKEN"
     manifest_filename: str = MANIFEST_FILENAME
     decon_binary: str = DEFAULT_DECON_BINARY
@@ -33,6 +49,13 @@ class CuratorTaskConfig(vf.TaskConfig):
     enable it together with ``[retries.rollout] include=['EmptyRolloutError']``
     so a transient model-endpoint failure retries instead of being recorded as a
     spurious zero-reward success."""
+    error_on_decon_failure: bool = False
+    """Raise a retryable ``DeconUnavailableError`` when the contamination screen
+    could not run. Independent of the reward, which is always withheld in that
+    case — an unscreened corpus is never scoreable. Off by default so RL records
+    a zero-reward sample rather than erroring; eval configs enable it together
+    with ``[retries.rollout] include=['DeconUnavailableError']`` so a transient
+    detector failure retries instead of banking an unscoreable rollout."""
 
     @field_validator("manifest_filename")
     @classmethod
@@ -51,9 +74,6 @@ class CuratorTasksetConfig(vf.TasksetConfig):
     task: CuratorTaskConfig = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
         default_factory=CuratorTaskConfig
     )
-    # Derived from EnvConfig.max_turns by load_environment. It is deliberately
-    # private so there is still exactly one user-configurable turn-limit field.
-    _resolved_max_turns: int = PrivateAttr(default=DEFAULT_MAX_TURNS)
 
 
 class CuratorEnvConfig(vf.EnvConfig):
@@ -65,8 +85,9 @@ class CuratorEnvConfig(vf.EnvConfig):
     harness: vf.HarnessConfig = Field(
         default_factory=lambda: vf.HarnessConfig(id="default")
     )
-    # This is the sole turn limit. EnvConfig passes it to the framework's
-    # interception session, which enforces it for every harness.
+    # The ENFORCED turn limit: EnvConfig passes it to the framework's interception
+    # session, which refuses turns past it for every harness. The agent-visible
+    # copy is CuratorTaskConfig.max_turns; load_environment reconciles them.
     max_turns: int = Field(default=DEFAULT_MAX_TURNS, ge=1, le=1000)
 
 

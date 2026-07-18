@@ -307,13 +307,13 @@ class StudentFeaturesConfig(BaseModel):
     bigram_hash_embed: bool = False
     # Learned 1-token lookback smear on the embedding stream
     smear_embed: bool = False
-    # Partial key offset for RoPE (fractional offset; None = disabled)
-    partial_key_offset: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Upstream stationary-key one-token shift (disabled by default)
+    partial_key_offset: bool = False
     # Paired head attention (even num_heads required)
     paired_head: bool = False
     # MUDD multi-layer skip connection pairs
     mudd_pairs: int = Field(default=0, ge=0, le=16)
-    # Learnable cross-self-attention
+    # Learnable per-head XSA projection removal on eligible attention layers
     xsa_enabled: bool = False
     xsa_pairs: int = Field(default=0, ge=0, le=16)
     # Single activation input for the last K attention layers
@@ -467,6 +467,7 @@ class ProxyStudentConfig(BaseModel):
             batch_stage_muls=self.schedule.batch_stage_muls,
             batch_stage_fracs=self.schedule.batch_stage_fracs,
             batch_schedule_enabled=self.schedule.batch_schedule_enabled,
+            seq_len_schedule=self.features.seq_len_schedule,
         )
 
     @property
@@ -497,6 +498,7 @@ class ProxyStudentConfig(BaseModel):
             batch_stage_muls=self.schedule.batch_stage_muls,
             batch_stage_fracs=self.schedule.batch_stage_fracs,
             batch_schedule_enabled=self.schedule.batch_schedule_enabled,
+            seq_len_schedule=self.features.seq_len_schedule,
         )
 
     @property

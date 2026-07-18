@@ -128,7 +128,7 @@ class CuratorScorer:
         state: CuratorState,
     ) -> _LeakageResult:
         if self.decon_detector is None:
-            return _LeakageResult(LeakageScores(0.0, 0, ()))
+            return _LeakageResult(LeakageScores(0.0, 0))
 
         val_set = None
         val_screen_skipped = False
@@ -154,7 +154,7 @@ class CuratorScorer:
             logger.warning("[curator] decon detection failed: %s", exc)
             state.record_error("decon")
             return _LeakageResult(
-                LeakageScores(0.0, 0, ()),
+                LeakageScores(0.0, 0),
                 decon_error=True,
                 val_screen_skipped=val_screen_skipped,
             )

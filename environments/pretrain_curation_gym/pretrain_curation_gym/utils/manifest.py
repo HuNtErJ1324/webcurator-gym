@@ -15,6 +15,7 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable
 
 import verifiers.v1 as vf
+from verifiers.v1.types import content_text  # pyright: ignore[reportAttributeAccessIssue]
 from pydantic import ValidationError
 
 from .models import FilterSpec, Manifest, Sampling, Source
@@ -352,21 +353,11 @@ class TraceManifestCandidates:
             )
         return raw
 
-    @staticmethod
-    def message_text(content: Any) -> str:
-        """Flatten a message body into text for trace inspection."""
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content
-        parts: list[str] = []
-        for part in content:
-            text = getattr(part, "text", None)
-            if text is None and isinstance(part, dict):
-                text = part.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-        return "\n".join(parts)
+    # Flattening a message body to text is the framework's `content_text`: same
+    # contract (str passes through, parts join on "\n", images drop). Kept as a
+    # method so call sites read the same; trace messages are validated models by
+    # this point, so the framework's TextContentPart check covers them.
+    message_text = staticmethod(content_text)
 
     @classmethod
     def hf_commands(cls, text: str) -> list[list[str]]:

@@ -56,6 +56,8 @@ class CuratorState(vf.State):
     self_score_first_reward: float | None = None
     self_score_best_reward: float | None = None
     self_score_last_reward: float | None = None
+    self_score_history: list[dict[str, Any]] = Field(default_factory=list)
+    hf_cli_history: list[dict[str, Any]] = Field(default_factory=list)
 
     # Task.score runs @metric methods before @reward methods. Keep the one
     # expensive scoring result on rollout-owned state so both v1 primitives use
@@ -95,12 +97,18 @@ class CuratorState(vf.State):
         self.local_source_bytes += int(bytes_pulled)
         self.local_source_truncated = self.local_source_truncated or truncated
 
-    def set_self_score_summary(self, *, runs: int, rewards: list[float]) -> None:
+    def set_self_score_summary(
+        self, *, runs: int, rewards: list[float], history: list[dict[str, Any]]
+    ) -> None:
         self.self_score_runs = int(runs)
         self.self_score_ok_runs = len(rewards)
         self.self_score_first_reward = rewards[0] if rewards else None
         self.self_score_best_reward = max(rewards) if rewards else None
         self.self_score_last_reward = rewards[-1] if rewards else None
+        self.self_score_history = list(history)
+
+    def set_hf_cli_history(self, history: list[dict[str, Any]]) -> None:
+        self.hf_cli_history = list(history)
 
     def workspace(self) -> Path:
         """Return the lazily-created scratch directory for this rollout."""

@@ -54,8 +54,8 @@ As soon as you have a viable candidate, create `{manifest_path}` and continuousl
 ```text
 python self_score.py {manifest_path} [--limit N] [--max-steps N] [--max-corpus-chars N] [--train-timeout SEC]
 ```
-Flags: `--limit N` docs/source (default 8); `--max-steps N` proxy steps (default: student steps); `--max-corpus-chars N` joined-text cap (default: all); `--train-timeout SEC` (default 900).
-Samples sources, trains the proxy student (corpus-split CE), runs decon, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (no held-out validation). `ok: false` + `reward: null` is a diagnostic, not a score: a source sampled zero documents (see `reason`). A scored mixture is `ok: true` with a numeric reward, even 0.0. Each run appends a summary line to `.self_score_history.jsonl`.
+Flags: `--limit N` maximum fetched docs/source (default 8); `--max-steps N` proxy steps (default: student steps); `--max-corpus-chars N` weighted proxy-corpus cap (default: all fetched text); `--train-timeout SEC` (default 900). You choose these controls independently on every attempt, so you may run cheap broad comparisons followed by more expensive confirmation when useful.
+Self-score applies the manifest's actual mixture weights and per-source sampling caps, creates deterministic train/validation document partitions within every viable source, trains the same single-seed proxy student recipe, runs decon, and prints the same `{alpha_perf} * performance - {lambda_leakage} * leakage` reward as final scoring — directional only (the authoritative held-out validation set remains inaccessible). `ok: false` + `reward: null` is a diagnostic, not a score: a source sampled zero documents or the stratified proxy split was too small (see `reason`). A scored mixture is `ok: true` with a numeric reward, even 0.0. Each run appends a summary line to `.self_score_history.jsonl`.
 Long silent runs with idle GPU are normal; `[self-score] phase=` heartbeats go to stderr. Never kill or signal any process/group/shell: it can kill your harness. Wait for it to return or time out.
 Before further experiments or voluntary completion, keep `{manifest_path}` a valid non-empty manifest; temporary experimental variants are fine, but the best-known scoreable mixture must stay at the authoritative path.
 
@@ -78,11 +78,10 @@ class CuratorTaskData(vf.TaskData):
     max_turns: int
 
     @classmethod
-    def from_config(
-        cls, config: CuratorTaskConfig, *, max_turns: int
-    ) -> "CuratorTaskData":
+    def from_config(cls, config: CuratorTaskConfig) -> "CuratorTaskData":
         """Render the single row directly from its task-owned config."""
         curator = config.curator
+        max_turns = config.max_turns
         local_source_status = (
             "enabled for workspace-relative plain-text or JSONL files"
             if curator.allow_local_sources
@@ -101,7 +100,7 @@ class CuratorTaskData(vf.TaskData):
                 perf_target_loss=curator.perf_target_loss,
             ),
             system_prompt=None,
-            answer=curator.cutoff_date,
+            answer=config.manifest_filename,
             token_budget=curator.token_budget,
             cutoff_date=curator.cutoff_date,
             max_turns=max_turns,

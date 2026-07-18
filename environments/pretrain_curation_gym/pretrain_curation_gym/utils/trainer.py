@@ -16,7 +16,6 @@ import json
 import logging
 import math
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Protocol
 
 import verifiers.v1 as vf
@@ -76,6 +75,7 @@ def estimate_param_count(config: ProxyStudentConfig) -> int:
     from ..gpu.train_gpt import estimate_instantiated_param_count
 
     arch = config.arch
+    features = config.features
     return estimate_instantiated_param_count(
         num_layers=arch.n_layer,
         model_dim=arch.n_embd,
@@ -85,6 +85,16 @@ def estimate_param_count(config: ProxyStudentConfig) -> int:
         num_value_embeds=arch.num_value_embeds,
         attn_scale=arch.attn_scale,
         sliding_window_size=arch.sliding_window_size,
+        bigram_hash_embed=features.bigram_hash_embed,
+        smear_embed=features.smear_embed,
+        partial_key_offset=features.partial_key_offset,
+        paired_head=features.paired_head,
+        mudd_pairs=features.mudd_pairs,
+        xsa_enabled=features.xsa_enabled,
+        xsa_pairs=features.xsa_pairs,
+        single_act_last_k=features.single_act_last_k,
+        exp_residual_decay=features.exp_residual_decay,
+        multi_token_pred=features.multi_token_pred,
     )
 
 
@@ -315,7 +325,7 @@ class RuntimeProxyTrainer:
 
     async def _run_training(
         self, runtime: vf.Runtime, config: ProxyStudentConfig
-    ) -> Any:
+    ) -> vf.ProgramResult:
         docker = runtime.type == "docker"
         timeout = config.effective_timeout_minutes * 60
         try:
@@ -332,7 +342,7 @@ class RuntimeProxyTrainer:
         redirected = (
             await self._read_redirected_stderr(runtime, config) if docker else ""
         )
-        stderr = self._merge_stderr(getattr(result, "stderr", None), redirected)
+        stderr = self._merge_stderr(result.stderr, redirected)
         await self._persist_logs(
             runtime,
             result,
@@ -343,14 +353,13 @@ class RuntimeProxyTrainer:
         if result.exit_code not in (0, None):
             raise TrainerError(
                 f"proxy-student training exited with code {result.exit_code}",
-                stderr_tail=self._training_diagnostic(
-                    getattr(result, "stdout", ""), stderr
-                ),
+                stderr_tail=self._training_diagnostic(result.stdout, stderr),
             )
-        return SimpleNamespace(
-            stdout=getattr(result, "stdout", "") or "",
+        # The runtime's own result shape, rebuilt with the merged stderr.
+        return vf.ProgramResult(
+            exit_code=result.exit_code,
+            stdout=result.stdout or "",
             stderr=stderr,
-            exit_code=getattr(result, "exit_code", None),
         )
 
     async def _read_redirected_stderr(
@@ -381,14 +390,14 @@ class RuntimeProxyTrainer:
     async def _persist_logs(
         self,
         runtime: vf.Runtime,
-        result: Any,
+        result: vf.ProgramResult,
         config: ProxyStudentConfig,
         *,
         redirected: str,
         stderr: str,
     ) -> None:
         logs = {
-            "/workspace/train_stdout.log": getattr(result, "stdout", "") or "",
+            "/workspace/train_stdout.log": result.stdout or "",
             "/workspace/train_stderr.log": stderr,
         }
         if runtime.type == "docker":

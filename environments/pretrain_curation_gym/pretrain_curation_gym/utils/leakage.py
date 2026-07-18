@@ -11,8 +11,9 @@ image.
 
 PRODUCTION path (leakage.py): reads eval sets from the baked
 decon/bundled-evals directory combined with the cached val eval file.
-DEV path (self_score payload) runs decon against only the baked benchmark eval
-sets — the val set is NEVER exposed inside the agent container.
+DEV path (rendered self_score script) uses the same pinned detect argv as
+production, but only against the baked benchmark eval sets — the val set is
+NEVER exposed inside the agent container.
 
 The report JSONL schema (observed from decon detect):
   contamination_score: float [0,1] — combined score for this match
@@ -98,8 +99,10 @@ _VAL_EVAL_CHUNK_TOKENS = 1024  # GPT-2 BPE tokens per val eval record
 # deviation is ``--sample-every-m-tokens 1``: OLMo 3 strides its sampling for
 # throughput over trillions of tokens, while our final pass scores one corpus
 # of at most a few hundred million tokens, so exhaustive sampling is
-# affordable and maximizes recall.
-_OLMO3_DETECT_ARGS = (
+# affordable and maximizes recall. Shared with the rendered self-score script.
+DEFAULT_DECON_TOKENIZER = "cl100k"
+DEFAULT_DECON_NGRAM_SIZE = 5
+OLMO3_DETECT_ARGS = (
     "--sample-every-m-tokens", "1",
     "--question-max-consecutive-misses", "11",
     "--answer-ngram-size", "3",
@@ -112,11 +115,46 @@ _OLMO3_DETECT_ARGS = (
 _DECON_TIMEOUT_SECONDS = 1800  # exhaustive stride at 400M-token corpora
 
 
+def build_decon_detect_command(
+    binary: str,
+    *,
+    training_dir: str,
+    evals_dir: str,
+    report_output_dir: str,
+    threshold: float,
+    content_key: str = "text",
+    tokenizer: str = DEFAULT_DECON_TOKENIZER,
+    ngram_size: int = DEFAULT_DECON_NGRAM_SIZE,
+) -> list[str]:
+    """Build the pinned ``decon detect`` argv used by final scoring and self-score."""
+    return [
+        binary,
+        "detect",
+        "--training-dir",
+        training_dir,
+        "--content-key",
+        content_key,
+        "--evals-dir",
+        evals_dir,
+        "--report-output-dir",
+        report_output_dir,
+        "--tokenizer",
+        tokenizer,
+        "--ngram-size",
+        str(ngram_size),
+        "--contamination-score-threshold",
+        str(threshold),
+        *OLMO3_DETECT_ARGS,
+    ]
+
+
 class DeconError(RuntimeError):
     """Raised when the decon detector fails (binary missing, timeout, crash).
 
-    The scorer catches this and records a diagnostic error metric rather than
-    silently awarding zero leakage (which would be exploitable in RL).
+    The scorer records a diagnostic error metric AND withholds the reward:
+    awarding zero leakage here would score an unscreened corpus strictly higher
+    than the same corpus with a working detector, which is exploitable in RL.
+    See ``CuratorTask.score_manifest`` and ``DeconUnavailableError``.
     """
 
 
@@ -124,7 +162,6 @@ class DeconError(RuntimeError):
 class LeakageScores:
     leakage_score: float
     num_contaminated_matches: int
-    contamination_details: tuple[dict[str, object], ...]
 
 
 class DeconLeakageDetector:
@@ -143,8 +180,8 @@ class DeconLeakageDetector:
         decon_binary: str = DEFAULT_DECON_BINARY,
         evals_dir: str | None = None,
         threshold: float = 0.8,
-        ngram_size: int = 5,
-        tokenizer: str = "cl100k",
+        ngram_size: int = DEFAULT_DECON_NGRAM_SIZE,
+        tokenizer: str = DEFAULT_DECON_TOKENIZER,
         screen_val_set: bool = True,
     ) -> None:
         self._binary = decon_binary
@@ -294,7 +331,7 @@ class DeconLeakageDetector:
                     fh.write(b"\n")
 
             if total_chars == 0:
-                return LeakageScores(0.0, 0, ())
+                return LeakageScores(0.0, 0)
 
             if self._screen_val_set and val_set is not None:
                 evals_dir = self._combined_evals_dir(val_set)
@@ -306,25 +343,15 @@ class DeconLeakageDetector:
             os.makedirs(report_dir, exist_ok=True)
 
             binary = self._check_binary()
-            cmd = [
+            cmd = build_decon_detect_command(
                 binary,
-                "detect",
-                "--training-dir",
-                temp_dir,
-                "--content-key",
-                "text",
-                "--evals-dir",
-                evals_dir,
-                "--report-output-dir",
-                report_dir,
-                "--tokenizer",
-                self._tokenizer,
-                "--ngram-size",
-                str(self._ngram_size),
-                "--contamination-score-threshold",
-                str(self._threshold),
-                *_OLMO3_DETECT_ARGS,
-            ]
+                training_dir=temp_dir,
+                evals_dir=evals_dir,
+                report_output_dir=report_dir,
+                threshold=self._threshold,
+                tokenizer=self._tokenizer,
+                ngram_size=self._ngram_size,
+            )
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -354,7 +381,7 @@ class DeconLeakageDetector:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         if not report_lines:
-            return LeakageScores(0.0, 0, ())
+            return LeakageScores(0.0, 0)
 
         return self._reduce_report(report_lines, total_tokens)
 
@@ -375,7 +402,6 @@ class DeconLeakageDetector:
              divided by ``CHARS_PER_TOKEN``.
         """
         best_per_doc: dict[tuple[str, int], float] = {}
-        details: list[dict[str, object]] = []
 
         for line in report_lines:
             line = line.strip()
@@ -414,21 +440,12 @@ class DeconLeakageDetector:
             if doc_key not in best_per_doc or contribution > best_per_doc[doc_key]:
                 best_per_doc[doc_key] = contribution
 
-            details.append(
-                {
-                    "eval_dataset": r.get("eval_dataset", ""),
-                    "contamination_score": score,
-                    "span_tokens": est_tokens,
-                }
-            )
-
         if not best_per_doc:
-            return LeakageScores(0.0, 0, ())
+            return LeakageScores(0.0, 0)
 
         total_weighted = sum(best_per_doc.values())
         leakage = total_weighted / total_tokens
         return LeakageScores(
             leakage_score=min(1.0, leakage),
             num_contaminated_matches=len(best_per_doc),
-            contamination_details=tuple(details),
         )

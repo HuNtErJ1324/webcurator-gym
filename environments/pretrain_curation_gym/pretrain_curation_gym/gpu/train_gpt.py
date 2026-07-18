@@ -5,7 +5,8 @@ optimizers, batch and learning-rate schedules, validation, and training loop. It
 is imported by the local CPU debugger and copied byte-for-byte into the Docker
 or Modal training workspace.
 
-Speedrun fidelity (KellerJordan/modded-nanogpt): the Muon core (Newton-Schulz
+Speedrun fidelity is audited against KellerJordan/modded-nanogpt commit
+``edf47a05a12062d661c4cfd4eef848c5ab5bed32``. The Muon core (Newton-Schulz
 ``(2, -1.5, 0.5)`` x 12, aspect-ratio scaling, fp32 momentum) follows
 ``records/track_3_optimization/train_gpt_simple.py`` exactly; the architecture
 and recipe (QK-norm, half-truncate RoPE base 1024, attn scale 0.12,
@@ -14,9 +15,15 @@ x0/resid lambdas, 12-dim attention gate, odd-step Adam with per-group betas,
 momentum 0.85->0.95 warmup/cooldown, batch muls 1/2/3 with LR muls
 1.0/1.52/1.73 decaying over the final 40% to floor 0.15, padded vocab 50304,
 EOT-prefixed documents, bf16 blocks with fp32 Adam groups and fp32 CE) follow
-the main record lineage. Deliberate portability deviations: single GPU, SDPA
-document masks instead of flash-attn varlen, fixed 1024-token windows instead
-of the records' long-context window ramp, and no FP8 head.
+the main record lineage. Pinned semantics include the 896→2048 staged context
+ratio, stationary-half one-token key shift, per-head projection-removal XSA,
+paired-layer topology, and weight-preserving late untie. Deliberate portability
+deviations: single GPU, SDPA document masks instead of flash-attn varlen, a
+1024-token maximum context with the upstream ratio scaled down, an attention
+block at layer 6 instead of the fused MLP-only special case, a compact
+sign-derived bigram channel instead of the upstream 15×-vocabulary learned
+table, and no FP8/fused head kernels. Budget-derived steps, batch-size choices,
+and timescale-referenced weight decay are intentional scale adaptations.
 
 The schedule-accounting functions above the guarded PyTorch section deliberately
 use only the standard library. Package configuration imports those helpers even
@@ -41,6 +48,38 @@ TRAIN_WORKDIR = "/workspace"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 _FRAC_SUM_TOL = 1e-6
+MODDED_NANOGPT_UPSTREAM_COMMIT = "edf47a05a12062d661c4cfd4eef848c5ab5bed32"
+
+
+def parse_document_payload(corpus_text):
+    """Return explicit train/validation document lists from a corpus payload."""
+    try:
+        payload = json.loads(corpus_text)
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    if payload.get("format") == "document-list-v1":
+        documents = payload.get("documents")
+        if not isinstance(documents, list) or not all(
+            isinstance(doc, str) for doc in documents
+        ):
+            raise ValueError("invalid document-list-v1 corpus payload")
+        return documents, None
+    if payload.get("format") == "document-split-v1":
+        documents = payload.get("train_documents")
+        val_documents = payload.get("val_documents")
+        if (
+            not isinstance(documents, list)
+            or not documents
+            or not all(isinstance(doc, str) for doc in documents)
+            or not isinstance(val_documents, list)
+            or not val_documents
+            or not all(isinstance(doc, str) for doc in val_documents)
+        ):
+            raise ValueError("invalid document-split-v1 corpus payload")
+        return documents, val_documents
+    return None, None
 
 
 def batch_stage_boundaries(
@@ -63,6 +102,24 @@ def batch_stage_boundaries(
     return [(ends[i], ends[i + 1]) for i in range(len(stage_fracs))]
 
 
+def make_seq_len_schedule(total_steps, max_block):
+    """Scale the pinned upstream 896→2048 context schedule to ``max_block``.
+
+    modded-nanoGPT commit ``edf47a0`` uses 896 tokens for the first third of
+    training and 2048 thereafter. The 7/16 ratio is preserved for this
+    portable trainer's configurable context length. This pure helper is shared
+    by execution and token-budget accounting so their presentations agree.
+    """
+    max_block = int(max_block)
+    short_steps = max(1, round(int(total_steps) / 3))
+    short_block = max(8, round(max_block * 7 / 16))
+
+    def block_at_step(step):
+        return short_block if int(step) < short_steps else max_block
+
+    return block_at_step
+
+
 def scheduled_presentation_tokens(
     steps: int,
     *,
@@ -71,29 +128,40 @@ def scheduled_presentation_tokens(
     batch_stage_muls: Sequence[int],
     batch_stage_fracs: Sequence[float],
     batch_schedule_enabled: bool = True,
+    seq_len_schedule: bool = False,
 ) -> int:
     """Tokens presented across ``steps`` under the staged batch schedule.
 
-    Each step presents ``batch_size * stage_mul * block_size`` tokens. When the
-    schedule is disabled, every step uses the base batch (mul = 1).
+    Each step presents ``batch_size * stage_mul * block(step)`` tokens, where
+    ``block(step)`` is ``block_size`` unless ``seq_len_schedule`` is enabled,
+    in which case the shared staged context schedule applies. When the
+    batch schedule is disabled, every step uses the base batch (mul = 1).
     """
     steps = max(0, int(steps))
     if steps == 0:
         return 0
     per_base = int(batch_size) * int(block_size)
-    if not batch_schedule_enabled:
-        return steps * per_base
-    if len(batch_stage_fracs) != len(batch_stage_muls):
-        raise ValueError(
-            "batch_stage_fracs and batch_stage_muls must have equal length"
+    if batch_schedule_enabled:
+        if len(batch_stage_fracs) != len(batch_stage_muls):
+            raise ValueError(
+                "batch_stage_fracs and batch_stage_muls must have equal length"
+            )
+        boundaries = batch_stage_boundaries(steps, batch_stage_fracs)
+        muls = [int(m) for m in batch_stage_muls]
+    else:
+        boundaries = [(0, steps)]
+        muls = [1]
+    if not seq_len_schedule:
+        return sum(
+            (end - start) * per_base * mul
+            for (start, end), mul in zip(boundaries, muls, strict=True)
         )
+    block_at = make_seq_len_schedule(steps, int(block_size))
+    batch = int(batch_size)
     total = 0
-    for (start, end), mul in zip(
-        batch_stage_boundaries(steps, batch_stage_fracs),
-        batch_stage_muls,
-        strict=True,
-    ):
-        total += (end - start) * per_base * int(mul)
+    for (start, end), mul in zip(boundaries, muls, strict=True):
+        for step in range(start, end):
+            total += batch * mul * block_at(step)
     return total
 
 
@@ -118,14 +186,25 @@ def steps_for_token_budget(
     batch_stage_muls: Sequence[int],
     batch_stage_fracs: Sequence[float],
     batch_schedule_enabled: bool = True,
+    seq_len_schedule: bool = False,
 ) -> int:
     """Minimal steps whose scheduled presentations meet ``budget``.
 
     See module docstring for the non-monotonicity of
     ``scheduled_presentation_tokens`` and the provably-sufficient bounded
     window this scans exhaustively (no assumption that the ">= budget"
-    predicate is sorted in ``N``).
+    predicate is sorted in ``N``). When ``seq_len_schedule`` is enabled, the
+    shared sequence-length warmup is included in the token accounting.
     """
+    if seq_len_schedule:
+        return _steps_for_budget_with_seq_len_schedule(
+            budget,
+            batch_size=batch_size,
+            block_size=block_size,
+            batch_stage_muls=batch_stage_muls,
+            batch_stage_fracs=batch_stage_fracs,
+            batch_schedule_enabled=batch_schedule_enabled,
+        )
     budget = int(budget)
     if budget < 1:
         return 1
@@ -192,6 +271,88 @@ def steps_for_token_budget(
 
     # Unreachable given the proof above; n_ceiling is always valid.
     return n_ceiling
+
+
+_SEQ_BUDGET_STEPS_CACHE: dict = {}
+
+
+def _steps_for_budget_with_seq_len_schedule(
+    budget: int,
+    *,
+    batch_size: int,
+    block_size: int,
+    batch_stage_muls: Sequence[int],
+    batch_stage_fracs: Sequence[float],
+    batch_schedule_enabled: bool,
+) -> int:
+    """Minimal steps meeting ``budget`` when the seq-len warmup shrinks windows.
+
+    The warmup only ever REMOVES tokens relative to the fixed-block schedule
+    (``block_at_step(s) <= block_size`` for every ``s``), so the fixed-block
+    answer is a strict lower bound and the search proceeds upward from it:
+    geometric bracket, bisection, then a short exhaustive sweep below the
+    bisection answer to absorb the small stage/warmup rounding wiggles (the
+    same bounded-deviation philosophy as the fixed-block solver). Results are
+    memoized because ``effective_steps`` is re-derived many times per rollout
+    and each evaluation is an O(steps) walk of the warmup ramp.
+    """
+    budget = int(budget)
+    if budget < 1:
+        return 1
+    key = (
+        budget,
+        int(batch_size),
+        int(block_size),
+        tuple(int(m) for m in batch_stage_muls),
+        tuple(float(f) for f in batch_stage_fracs),
+        bool(batch_schedule_enabled),
+    )
+    cached = _SEQ_BUDGET_STEPS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def tokens_at(n: int) -> int:
+        return scheduled_presentation_tokens(
+            n,
+            batch_size=batch_size,
+            block_size=block_size,
+            batch_stage_muls=batch_stage_muls,
+            batch_stage_fracs=batch_stage_fracs,
+            batch_schedule_enabled=batch_schedule_enabled,
+            seq_len_schedule=True,
+        )
+
+    lo = steps_for_token_budget(
+        budget,
+        batch_size=batch_size,
+        block_size=block_size,
+        batch_stage_muls=batch_stage_muls,
+        batch_stage_fracs=batch_stage_fracs,
+        batch_schedule_enabled=batch_schedule_enabled,
+        seq_len_schedule=False,
+    )
+    if tokens_at(lo) >= budget:
+        # No smaller N can qualify: for N < lo even the fixed-block schedule
+        # (an upper bound on seq-schedule tokens) falls short of the budget.
+        _SEQ_BUDGET_STEPS_CACHE[key] = lo
+        return lo
+    hi = lo
+    while tokens_at(hi) < budget:
+        hi = max(hi + 1, int(hi * 1.05))
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if tokens_at(mid) >= budget:
+            hi = mid
+        else:
+            lo = mid + 1
+    # Rounding wiggles are far smaller than one step's tokens; a short sweep
+    # below the bisection answer restores exact minimality.
+    for n in range(max(1, lo - 48), lo):
+        if tokens_at(n) >= budget:
+            lo = n
+            break
+    _SEQ_BUDGET_STEPS_CACHE[key] = lo
+    return lo
 
 
 def plan_val_windows(n_tokens, block):
@@ -276,33 +437,6 @@ else:
             y2 = x1 * (-sin) + x2 * cos
             return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
-    class RotaryWithOffset(nn.Module):
-        """RoPE with configurable position offset (for Partial Key Offset)."""
-
-        def __init__(self, head_dim: int, base_inv_freq: float = 1024.0):
-            super().__init__()
-            if head_dim % 4 != 0:
-                raise ValueError(f"head_dim must be divisible by 4, got {head_dim}")
-            angular_freq = (1.0 / base_inv_freq) ** torch.linspace(
-                0, 1, steps=head_dim // 4, dtype=torch.float32
-            )
-            angular_freq = torch.cat(
-                [angular_freq, angular_freq.new_zeros(head_dim // 4)]
-            )
-            self.register_buffer("angular_freq", angular_freq, persistent=False)
-
-        def forward(
-            self, x_BTHD: torch.Tensor, pos_offset: float = 0.0
-        ) -> torch.Tensor:
-            T = x_BTHD.size(1)
-            pos = torch.arange(T, dtype=torch.float32, device=x_BTHD.device)
-            theta = torch.outer(pos + pos_offset, self.angular_freq)[None, :, None, :]
-            cos, sin = theta.cos(), theta.sin()
-            x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-            y1 = x1 * cos + x2 * sin
-            y2 = x1 * (-sin) + x2 * cos
-            return torch.cat((y1, y2), 3).type_as(x_BTHD)
-
     def _sliding_window_mask(
         seq_len: int, window_size: int, device: torch.device
     ) -> torch.Tensor:
@@ -358,7 +492,14 @@ else:
     class CausalSelfAttention(nn.Module):
         """Causal self-attention with QK-norm, RoPE, value-residual mix, and head gating."""
 
-        def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
+        def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            *,
+            attn_scale: float = 0.12,
+            xsa_enabled: bool = False,
+        ):
             super().__init__()
             if dim % num_heads != 0:
                 raise ValueError(
@@ -375,6 +516,9 @@ else:
             self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
             self.attn_gate = nn.Linear(12, num_heads, bias=False)
             self.rotary = Rotary(self.head_dim)
+            self.xsa_alpha = (
+                nn.Parameter(torch.zeros(num_heads)) if xsa_enabled else None
+            )
 
         def forward(
             self,
@@ -382,7 +526,7 @@ else:
             value_embed: torch.Tensor | None,
             *,
             window_size: int | None = None,
-            partial_key_offset: float | None = None,
+            partial_key_offset: bool = False,
             attn_mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
             B, T = x.size(0), x.size(1)
@@ -396,10 +540,15 @@ else:
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
             q, k = self.rotary(q), self.rotary(k)
-            if partial_key_offset is not None:
-                k_rot = RotaryWithOffset(self.head_dim)
-                k_rot.angular_freq = self.rotary.angular_freq
-                k = k_rot(k, pos_offset=partial_key_offset)
+            if partial_key_offset:
+                # Pinned upstream semantics (edf47a0): shift the stationary
+                # half of K forward by one token after RoPE, enabling one-layer
+                # induction without changing the rotating half.
+                half = self.head_dim // 2
+                stationary = torch.cat(
+                    [k[:, :1, :, half:], k[:, :-1, :, half:]], dim=1
+                )
+                k = torch.cat([k[..., :half], stationary], dim=-1)
             q_t = q.transpose(1, 2)
             k_t = k.transpose(1, 2)
             v_t = v.transpose(1, 2)
@@ -418,6 +567,15 @@ else:
                     attn_mask=combined,
                     scale=self.attn_scale,
                 ).transpose(1, 2)
+            if self.xsa_alpha is not None:
+                # Pinned upstream XSA: remove a learned per-head fraction of
+                # the attention output aligned with normalized V.
+                value_direction = F.normalize(v, dim=-1, eps=1e-4)
+                projection = (y * value_direction).sum(-1, keepdim=True)
+                alpha = torch.tanh(self.xsa_alpha).type_as(y).view(
+                    1, 1, self.num_heads, 1
+                )
+                y = y - alpha * projection * value_direction
             gate = torch.sigmoid(self.attn_gate(x[..., :12])).view(
                 B, T, self.num_heads, 1
             )
@@ -460,7 +618,7 @@ else:
             value_embed: torch.Tensor | None,
             *,
             window_size: int | None = None,
-            partial_key_offset: float | None = None,
+            partial_key_offset: bool = False,
             attn_mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
             B, T = x.size(0), x.size(1)
@@ -473,11 +631,9 @@ else:
                 v = self.lambdas[0] * v + self.lambdas[1] * value_embed.view_as(v)
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
+            # Upstream does not apply stationary-key offset or XSA on paired
+            # attention layers because their interleaved head geometry differs.
             q, k = self.rotary(q), self.rotary(k)
-            if partial_key_offset is not None:
-                k_rot = RotaryWithOffset(self.head_dim)
-                k_rot.angular_freq = self.rotary.angular_freq
-                k = k_rot(k, pos_offset=partial_key_offset)
             # Reshape V to pair structure: (B,T,num_heads,head_dim) -> (B,T,num_pairs,2*head_dim)
             v_pair = v.view(B, T, self.num_pairs, 2, self.head_dim).reshape(
                 B, T, self.num_pairs, 2 * self.head_dim
@@ -534,10 +690,14 @@ else:
             *,
             attn_scale: float = 0.12,
             paired_head: bool = False,
+            xsa_enabled: bool = False,
         ):
             super().__init__()
             attn_cls = PairedHeadAttention if paired_head else CausalSelfAttention
-            self.attn = attn_cls(dim, num_heads, attn_scale=attn_scale)
+            attn_kwargs = {"attn_scale": attn_scale}
+            if not paired_head:
+                attn_kwargs["xsa_enabled"] = xsa_enabled
+            self.attn = attn_cls(dim, num_heads, **attn_kwargs)
             self.mlp = MLP(dim, mlp_ratio)
             self.norm1 = RMSNorm(dim)
             self.norm2 = RMSNorm(dim)
@@ -548,7 +708,7 @@ else:
             value_embed: torch.Tensor | None,
             *,
             window_size: int | None = None,
-            partial_key_offset: float | None = None,
+            partial_key_offset: bool = False,
             attn_mask: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             attn_out = self.attn(
@@ -665,57 +825,20 @@ else:
         ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
             if layer_idx >= self.num_skip_pairs:
                 return None, None
+            # MUDD projections are Adam-managed and stay float32 while the
+            # trunk runs bfloat16 on CUDA (prepare_student_model_dtype):
+            # compute in the weights' dtype and hand activations back in the
+            # caller's dtype, since F.linear rejects mixed dtypes and a
+            # promoted fp32 residual would crash the next bf16 block.
+            proj_dtype = self.resid_projs[layer_idx].weight.dtype
+            src = source.to(dtype=proj_dtype)
             resid = torch.sigmoid(self.resid_gates[layer_idx]) * self.resid_projs[
                 layer_idx
-            ](source)
+            ](src)
             val = torch.sigmoid(self.value_gates[layer_idx]) * self.value_projs[
                 layer_idx
-            ](source)
-            return resid, val
-
-    class XSA(nn.Module):
-        """Learnable cross-self-attention across layer pairs.
-
-        A lightweight attention module that lets decoder layers attend to encoder
-        layer outputs, with learnable interpolation between XSA and local context.
-        """
-
-        def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
-            super().__init__()
-            self.num_heads = num_heads
-            self.head_dim = dim // num_heads
-            self.attn_scale = float(attn_scale)
-            self.q = nn.Linear(dim, dim, bias=False)
-            self.k = nn.Linear(dim, dim, bias=False)
-            self.v = nn.Linear(dim, dim, bias=False)
-            self.proj = nn.Linear(dim, dim, bias=False)
-            self.proj.weight.data.zero_()
-            self.gate = nn.Parameter(torch.tensor(0.0))
-            self.norm_kv = RMSNorm(dim)
-            self.rotary = Rotary(self.head_dim)
-
-        def forward(self, x: torch.Tensor, cross_src: torch.Tensor) -> torch.Tensor:
-            B, T = x.shape[0], x.shape[1]
-            q = self.q(x).view(B, T, self.num_heads, self.head_dim)
-            k = self.k(self.norm_kv(cross_src)).view(
-                B, -1, self.num_heads, self.head_dim
-            )
-            v = self.v(self.norm_kv(cross_src)).view(
-                B, -1, self.num_heads, self.head_dim
-            )
-            q = F.rms_norm(q, (q.size(-1),))
-            k = F.rms_norm(k, (k.size(-1),))
-            q, k = self.rotary(q), self.rotary(k)
-            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = (
-                F.scaled_dot_product_attention(
-                    q_t, k_t, v_t, is_causal=False, scale=self.attn_scale
-                )
-                .transpose(1, 2)
-                .contiguous()
-                .view(B, T, -1)
-            )
-            return torch.tanh(self.gate) * self.proj(y)
+            ](src)
+            return resid.type_as(source), val.type_as(source)
 
     class MultiTokenHeads(nn.Module):
         """Extra LM prediction heads for multi-token prediction (future tokens)."""
@@ -757,7 +880,7 @@ else:
             # ---- portable feature flags (all off by default) ----
             bigram_hash_embed: bool = False,
             smear_embed: bool = False,
-            partial_key_offset: float | None = None,
+            partial_key_offset: bool = False,
             paired_head: bool = False,
             mudd_pairs: int = 0,
             xsa_enabled: bool = False,
@@ -810,9 +933,21 @@ else:
                         num_heads,
                         mlp_ratio,
                         attn_scale=attn_scale,
-                        paired_head=paired_head,
+                        # Pinned upstream 12-layer topology: paired attention
+                        # on {0,2,5,9}; XSA on the six non-paired attention
+                        # layers {1,3,4,7,8,10}. Layer 6 remains a normal block
+                        # in this portable U-net rather than upstream's MLP-only
+                        # systems-optimized special case.
+                        paired_head=paired_head and layer_idx in {0, 2, 5, 9},
+                        xsa_enabled=(
+                            xsa_enabled
+                            and {1: 0, 3: 1, 4: 2, 7: 3, 8: 4, 10: 5}.get(
+                                layer_idx, 6
+                            )
+                            < xsa_pairs
+                        ),
                     )
-                    for _ in range(num_layers)
+                    for layer_idx in range(num_layers)
                 ]
             )
 
@@ -823,17 +958,10 @@ else:
             else:
                 self.mudd = None
 
-            # XSA (cross-self-attention)
+            # XSA is implemented inside eligible attention layers, matching
+            # upstream's per-head projection-removal operation.
             self.xsa_enabled = xsa_enabled
             self.xsa_pairs = xsa_pairs
-            if xsa_enabled and xsa_pairs > 0:
-                self.xsa_modules = nn.ModuleList(
-                    [
-                        XSA(model_dim, num_heads, attn_scale=attn_scale)
-                        for _ in range(xsa_pairs)
-                    ]
-                )
-                self.xsa_layer_map: list[tuple[int, int]] = []
 
             # Multi-token prediction heads
             if multi_token_pred > 0:
@@ -896,7 +1024,9 @@ else:
                     x,
                     ve_enc[i],
                     window_size=ws,
-                    partial_key_offset=self.partial_key_offset,
+                    # Upstream applies stationary-key shift only on its two
+                    # long-window attention layers.
+                    partial_key_offset=self.partial_key_offset and i in {3, 10},
                     attn_mask=attn_mask,
                 )
                 x = (
@@ -918,7 +1048,6 @@ else:
                 s_start = max(0, self.num_encoder_layers - self.single_act_last_k)
                 single_act = encoder_outputs[s_start] if encoder_outputs else x
 
-            xsa_src: list[torch.Tensor] = list(reversed(encoder_outputs))
             for i in range(self.num_decoder_layers):
                 layer_idx = self.num_encoder_layers + i
 
@@ -930,16 +1059,6 @@ else:
                         mudd_resid, mudd_val = self.mudd(encoder_outputs[src_idx], i)
 
                 x = x + torch.sigmoid(self.skip_gates[i]) * skip_connections.pop()
-
-                # XSA contribution
-                if (
-                    self.xsa_enabled
-                    and self.xsa_pairs > 0
-                    and i < self.xsa_pairs
-                    and xsa_src
-                ):
-                    xsa_out = self.xsa_modules[i](x, xsa_src[i])
-                    x = x + xsa_out
 
                 # Determine attention input: single activation for last k layers
                 attn_input = x
@@ -962,7 +1081,9 @@ else:
                     attn_input,
                     ve_i,
                     window_size=ws,
-                    partial_key_offset=self.partial_key_offset,
+                    partial_key_offset=(
+                        self.partial_key_offset and layer_idx in {3, 10}
+                    ),
                     attn_mask=attn_mask,
                 )
 
@@ -1027,7 +1148,7 @@ else:
         # --- portable feature flags ---
         bigram_hash_embed: bool = False
         smear_embed: bool = False
-        partial_key_offset: float | None = None
+        partial_key_offset: bool = False
         paired_head: bool = False
         mudd_pairs: int = 0
         xsa_enabled: bool = False
@@ -1076,7 +1197,7 @@ else:
         sliding_window_size: int | None = None,
         bigram_hash_embed: bool = False,
         smear_embed: bool = False,
-        partial_key_offset: float | None = None,
+        partial_key_offset: bool = False,
         paired_head: bool = False,
         mudd_pairs: int = 0,
         xsa_enabled: bool = False,
@@ -1779,24 +1900,6 @@ else:
         permutation = torch.randperm(len(starts), generator=generator)
         return [starts[index] for index in permutation.tolist()]
 
-    def make_seq_len_schedule(total_steps, max_block, warmup_frac=0.25):
-        """Produce a sequence-length schedule that warms up from small to ``max_block``.
-
-        Returns a callable ``block_at_step(step) -> int``.
-        """
-        max_block = int(max_block)
-        warmup_steps = max(1, int(total_steps * warmup_frac))
-        min_block = max(8, max_block // 8)
-
-        def block_at_step(step):
-            step = int(step)
-            if step >= warmup_steps:
-                return max_block
-            frac = step / warmup_steps
-            return int(min_block + frac * (max_block - min_block))
-
-        return block_at_step
-
     def _score_hidden_chunked(
         model, hidden, targets, *, vocab_size, logit_chunk_tokens
     ):
@@ -1922,9 +2025,12 @@ else:
             return main_loss
         mt_loss = 0.0
         mt_weight = 0.3
+        # Multi-token heads are Adam-managed float32 while the trunk hidden is
+        # bfloat16 on CUDA; project from a float32 copy (mirrors apply_lm_head).
+        hidden_f = hidden.float()
         for k, head in enumerate(multi_heads.heads):
             if k < len(y_future) and y_future[k] is not None:
-                head_logits = head(hidden).float()
+                head_logits = head(hidden_f)
                 mt_loss = mt_loss + F.cross_entropy(
                     head_logits.view(-1, vocab_size), y_future[k].view(-1)
                 )
@@ -2444,10 +2550,12 @@ else:
                         and model.lm_head.weight.data_ptr()
                         == model.embed.weight.data_ptr()
                     ):
+                        # The split KEEPS the tied values (only optimizer state
+                        # starts fresh); zero-initing the new head here -- the
+                        # previous behavior -- discarded 2/3 of training.
                         model.lm_head.weight = nn.Parameter(
                             model.lm_head.weight.data.clone()
                         )
-                        model.lm_head.weight.data.zero_()
                         lr_val = adam_lr * lm_head_lr_mul
                         wd_val = adam_weight_decay * lm_head_wd_mul
                         adam_opt.add_param_group(
@@ -2677,21 +2785,7 @@ else:
         with open(os.path.join(workdir, "corpus.txt"), encoding="utf-8") as f:
             corpus_text = f.read()
 
-        try:
-            corpus_payload = json.loads(corpus_text)
-        except json.JSONDecodeError:
-            corpus_payload = None
-        if (
-            isinstance(corpus_payload, dict)
-            and corpus_payload.get("format") == "document-list-v1"
-        ):
-            documents = corpus_payload.get("documents")
-            if not isinstance(documents, list) or not all(
-                isinstance(doc, str) for doc in documents
-            ):
-                raise ValueError("invalid document-list-v1 corpus payload")
-        else:
-            documents = None
+        documents, explicit_val_documents = parse_document_payload(corpus_text)
 
         seed = int(cfg["seed"])
         torch.manual_seed(seed)
@@ -2720,7 +2814,16 @@ else:
         corpus = torch.tensor(corpus_ids, dtype=torch.long)
 
         val_path = os.path.join(workdir, "val.bin")
-        if os.path.exists(val_path):
+        if explicit_val_documents is not None:
+            val_ids, _ = encode_document_tokens(
+                explicit_val_documents,
+                encoder,
+                cfg.get("max_document_tokens", cfg.get("max_doc_len")),
+            )
+            train_data = corpus
+            val_data = torch.tensor(val_ids, dtype=torch.long)
+            val_source = "stratified_corpus_split"
+        elif os.path.exists(val_path):
             val_ids = np.fromfile(val_path, dtype="<u2").astype(np.int64)
             train_data = corpus
             val_data = torch.from_numpy(val_ids)

@@ -2,7 +2,7 @@
 """Development sample scorer: corpus-split CE + benchmark decon only.
 
 This module IS the ``self_score.py`` file written into each rollout's runtime
-workspace: ``gpu/self_score.py``'s renderer substitutes the scoring-constant
+workspace: ``gpu/self_score_renderer.py`` substitutes the scoring-constant
 assignments below with the task's configured values and ships the result
 verbatim. It runs standalone on the container's Python with only the standard
 library, so nothing here may import the package or third-party code.
@@ -35,7 +35,7 @@ from typing import NoReturn
 
 # --- scoring constants -------------------------------------------------------
 # The defaults keep this module importable/testable; the renderer replaces each
-# assignment with the task's configured value (see render_self_score_script).
+# assignment with the task's configured value (see self_score_renderer.py).
 EXPECTED_TOKEN_BUDGET = 0
 PERF_BASELINE_LOSS = 10.825839875788878  # ln(50304)
 PERF_TARGET_LOSS = 3.28
@@ -51,6 +51,10 @@ HF_TOKEN_ENV = "HF_TOKEN"
 DECON_BINARY = "decon"
 DECON_EVALS_DIR = ""
 DECON_THRESHOLD = 0.8
+# Pinned to match production ``leakage.build_decon_detect_command`` / OLMo 3.
+DECON_TOKENIZER = "cl100k"
+DECON_NGRAM_SIZE = 5
+DECON_DETECT_EXTRA_ARGS = ("--sample-every-m-tokens", "1", "--question-max-consecutive-misses", "11", "--answer-ngram-size", "3", "--passage-ngram-size", "4", "--perfect-match-decay-start", "20", "--perfect-match-decay-end", "50", "--eval-min-token-length", "20", "--eval-min-unique-word-count", "4")
 CHARS_PER_TOKEN = 4
 EST_TOKENS_PER_DOC = 250
 
@@ -291,26 +295,146 @@ def apply_filters(docs, filters):
     return result
 
 
-def joined_corpus(docs, cap):
-    """Serialize a capped document-list-v1 payload for proxy training.
-
-    Cap semantics match production ``CuratedCorpus.joined_text``: whole
-    documents only — the first document that would cross the cap stops the
-    stream, and documents are never truncated. ``cap=None`` keeps everything.
-    """
-    documents = []
-    remaining = None if cap is None else max(0, int(cap))
-    for doc in docs:
-        if remaining is not None:
-            if len(doc) > remaining:
-                break
-            remaining -= len(doc)
-        documents.append(doc)
+def joined_corpus(train_docs, val_docs):
+    """Serialize an explicit stratified corpus split for proxy training."""
     return json.dumps(
-        {"format": "document-list-v1", "documents": documents},
+        {
+            "format": "document-split-v1",
+            "train_documents": train_docs,
+            "val_documents": val_docs,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _source_cap(source, name):
+    sampling = source.get("sampling")
+    if not isinstance(sampling, dict):
+        sampling = {}
+    value = source.get(name, sampling.get(name))
+    if value is None:
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _take_for_budget(docs, token_cap, max_docs=None, already_docs=0):
+    """Mirror production whole-document token sampling and return surplus."""
+    chosen = []
+    surplus = []
+    budget = max(0, int(token_cap))
+    count = int(already_docs)
+    for doc in docs:
+        if max_docs is not None and count >= max_docs:
+            surplus.append(doc)
+            continue
+        cost = estimate_tokens(doc)
+        if cost > budget:
+            surplus.append(doc)
+            continue
+        chosen.append(doc)
+        budget -= cost
+        count += 1
+    return chosen, surplus
+
+
+def weighted_sample(source_docs, sources, weights, token_budget):
+    """Apply production-style weighted token targets and surplus redistribution."""
+    total_weight = sum(weights)
+    selected = [[] for _ in sources]
+    surplus = [[] for _ in sources]
+    targets = []
+    for index, (docs, source, weight) in enumerate(zip(source_docs, sources, weights)):
+        target = int(token_budget * weight / total_weight) if weight > 0 else 0
+        max_tokens = _source_cap(source, "max_tokens")
+        if max_tokens is not None:
+            target = min(target, max_tokens)
+        targets.append(target)
+        selected[index], surplus[index] = _take_for_budget(
+            docs,
+            target,
+            max_docs=_source_cap(source, "max_docs"),
+        )
+
+    used = sum(estimate_tokens(doc) for docs in selected for doc in docs)
+    remaining = max(0, int(token_budget) - used)
+    # Production redistributes unfilled weighted allocation to fetched surplus
+    # in manifest order without another network request.
+    for index, (source, docs) in enumerate(zip(sources, surplus)):
+        if remaining <= 0:
+            break
+        max_tokens = _source_cap(source, "max_tokens")
+        source_used = sum(estimate_tokens(doc) for doc in selected[index])
+        allowance = remaining
+        if max_tokens is not None:
+            allowance = min(allowance, max(0, max_tokens - source_used))
+        extra, _ = _take_for_budget(
+            docs,
+            allowance,
+            max_docs=_source_cap(source, "max_docs"),
+            already_docs=len(selected[index]),
+        )
+        selected[index].extend(extra)
+        added = sum(estimate_tokens(doc) for doc in extra)
+        remaining -= added
+    return selected, targets
+
+
+def stratified_split(source_docs, sources, val_fraction):
+    """Deterministically split every viable source at document granularity."""
+    train = []
+    val = []
+    stats = []
+    for source_index, (docs, source) in enumerate(zip(source_docs, sources)):
+        ranked = sorted(
+            range(len(docs)),
+            key=lambda index: hashlib.sha256(
+                (
+                    "%s\0%s\0%s\0%d\0%s"
+                    % (
+                        source_dataset_id(source),
+                        source.get("config") or "",
+                        source.get("split") or "train",
+                        index,
+                        docs[index],
+                    )
+                ).encode("utf-8")
+            ).digest(),
+        )
+        if len(docs) >= 2:
+            n_val = max(1, min(len(docs) - 1, int(round(len(docs) * val_fraction))))
+            val_indices = set(ranked[:n_val])
+        else:
+            val_indices = set()
+        source_train = [doc for index, doc in enumerate(docs) if index not in val_indices]
+        source_val = [doc for index, doc in enumerate(docs) if index in val_indices]
+        # Hash-sort across sources so neither training nor validation is a
+        # manifest-order suffix while remaining reproducible across candidates.
+        train.extend((source_index, doc) for doc in source_train)
+        val.extend((source_index, doc) for doc in source_val)
+        stats.append({
+            "train_documents": len(source_train),
+            "train_tokens": sum(estimate_tokens(doc) for doc in source_train),
+            "val_documents": len(source_val),
+            "val_tokens": sum(estimate_tokens(doc) for doc in source_val),
+        })
+
+    def stable_mix(items, split):
+        return [
+            doc
+            for _, doc in sorted(
+                items,
+                key=lambda item: hashlib.sha256(
+                    ("%s\0%d\0%s" % (split, item[0], item[1])).encode("utf-8")
+                ).digest(),
+            )
+        ]
+
+    return stable_mix(train, "train"), stable_mix(val, "val"), stats
 
 
 def scaled_perf(loss):
@@ -1215,7 +1339,10 @@ def decon_score(docs):
                     "--content-key", "text",
                     "--evals-dir", evals_dir,
                     "--report-output-dir", report_dir,
+                    "--tokenizer", DECON_TOKENIZER,
+                    "--ngram-size", str(DECON_NGRAM_SIZE),
                     "--contamination-score-threshold", str(DECON_THRESHOLD),
+                    *DECON_DETECT_EXTRA_ARGS,
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True,
@@ -1235,14 +1362,15 @@ def decon_score(docs):
             )
         except subprocess.TimeoutExpired:
             # A slow decon must never cost the run its JSON result: kill and reap
-            # the detector, report it, and score with leakage unavailable.
+            # the detector, report it, and report leakage as unavailable.
             _terminate_process_group(proc, expected_starttime=starttime)
             progress("decon_timeout", documents=len(docs), timeout="%ds" % decon_timeout)
             print(
                 "[self-score] WARNING: decon timed out after %ds on %d sampled "
-                "documents; leakage_score is null for this run (reward omits the "
-                "leakage term). Re-run with fewer docs (--limit) to get a leakage "
-                "reading." % (decon_timeout, len(docs)),
+                "documents; leakage_score is null, so this candidate is NOT "
+                "scored (ok=false, reward=null) -- an unmeasured leakage term is "
+                "not a zero one. Re-run with fewer docs (--limit) to get a "
+                "leakage reading." % (decon_timeout, len(docs)),
                 file=sys.stderr,
             )
             return None, None
@@ -1278,9 +1406,9 @@ def decon_score(docs):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
+def train_perf(train_docs, val_docs, *, max_steps, train_timeout):
     """Train the fixed proxy student on sampled docs; return (loss, perf, backend)."""
-    if not USE_REAL_TRAINER or not docs:
+    if not USE_REAL_TRAINER or not train_docs or not val_docs:
         return None, None, None
     train_script = Path(__file__).with_name(TRAIN_SCRIPT_NAME)
     if not train_script.is_file():
@@ -1289,7 +1417,7 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
             file=sys.stderr,
         )
         return None, None, None
-    text = joined_corpus(docs, max_corpus_chars)
+    text = joined_corpus(train_docs, val_docs)
     if not text.strip():
         return None, None, None
 
@@ -1299,7 +1427,12 @@ def train_perf(docs, *, max_corpus_chars, max_steps, train_timeout):
     try:
         _install_train_signal_handlers()
         # Serialize GPU trainers across concurrent self_score invocations.
-        progress("train_lock_wait", documents=len(docs), corpus_chars=len(text))
+        progress(
+            "train_lock_wait",
+            train_documents=len(train_docs),
+            val_documents=len(val_docs),
+            corpus_chars=len(text),
+        )
         lock_fh = _train_lock()
         steps = int(max_steps if max_steps is not None else STUDENT_CONFIG["steps"])
         warmup_steps = min(int(STUDENT_CONFIG["warmup_steps"]), steps)
@@ -1509,7 +1642,7 @@ def main():
         type=int,
         default=8,
         metavar="N",
-        help="documents sampled per source (agent-chosen; default 8)",
+        help="maximum documents fetched per source (agent-chosen; default 8)",
     )
     parser.add_argument(
         "--max-steps",
@@ -1523,7 +1656,7 @@ def main():
         type=int,
         default=None,
         metavar="N",
-        help="joined corpus character cap for proxy training (default: all sampled text)",
+        help="weighted proxy corpus character cap (default: all fetched text)",
     )
     parser.add_argument(
         "--train-timeout",
@@ -1567,8 +1700,8 @@ def main():
     progress("start", manifest=args.manifest, sources=len(sources), limit=args.limit)
 
     source_stats = []
+    fetched_by_source = []
     estimated_total = 0
-    all_docs: list = []
     for index, (source, weight) in enumerate(zip(sources, weights), start=1):
         kind = source.get("kind", "hf")
         dataset_id = str(source_dataset_id(source))
@@ -1581,13 +1714,16 @@ def main():
         progress("sampling", source=label, index="%d/%d" % (index, len(sources)))
         meta = {}
         try:
-            sampled, meta = (
-                local_docs(source, args.limit)
-                if kind == "local"
-                else remote_docs(source, args.limit)
-            )
-            docs = [x for x in apply_filters(sampled, source.get("filters")) if x]
-            all_docs.extend(docs)
+            if weight == 0:
+                sampled, docs = [], []
+                meta = {"read_kind": "zero_weight_skipped"}
+            else:
+                sampled, meta = (
+                    local_docs(source, args.limit)
+                    if kind == "local"
+                    else remote_docs(source, args.limit)
+                )
+                docs = [x for x in apply_filters(sampled, source.get("filters")) if x]
             sample_tokens = sum(estimate_tokens(x) for x in docs)
             average_tokens = sample_tokens / len(docs) if docs else 0.0
             target = int(token_budget * weight / total_weight)
@@ -1605,11 +1741,12 @@ def main():
             error = "%s: %s" % (type(exc).__name__, exc)
             reason = error
         estimated_total += estimated_tokens
+        fetched_by_source.append(docs)
         source_stats.append({
             "source": label,
-            "ok": bool(docs),
-            "sampled_documents": len(docs),
-            "sampled_tokens": sample_tokens,
+            "ok": bool(docs) or weight == 0,
+            "fetched_documents": len(docs),
+            "fetched_tokens": sample_tokens,
             "estimated_materialized_tokens": estimated_tokens,
             "error": error,
             "reason": reason,
@@ -1622,13 +1759,62 @@ def main():
             tokens=sample_tokens,
         )
 
+    available_tokens = sum(
+        estimate_tokens(doc) for docs in fetched_by_source for doc in docs
+    )
+    proxy_token_budget = min(token_budget, available_tokens)
+    if args.max_corpus_chars is not None:
+        proxy_token_budget = min(proxy_token_budget, args.max_corpus_chars // CHARS_PER_TOKEN)
+    selected_by_source, proxy_targets = weighted_sample(
+        fetched_by_source,
+        sources,
+        weights,
+        proxy_token_budget,
+    )
+    train_docs, val_docs, split_stats = stratified_split(
+        selected_by_source,
+        sources,
+        float(STUDENT_CONFIG.get("val_fraction", 0.1)),
+    )
+    all_docs = train_docs + val_docs
+    total_selected_tokens = sum(estimate_tokens(doc) for doc in all_docs)
+    for source_index, (stat, selected, target, split) in enumerate(
+        zip(source_stats, selected_by_source, proxy_targets, split_stats)
+    ):
+        selected_tokens = sum(estimate_tokens(doc) for doc in selected)
+        stat.update(split)
+        stat["proxy_target_tokens"] = target
+        stat["sampled_documents"] = len(selected)
+        stat["sampled_tokens"] = selected_tokens
+        stat["realized_proxy_weight"] = (
+            selected_tokens / total_selected_tokens
+            if total_selected_tokens
+            else 0.0
+        )
+        if stat["ok"] and selected_tokens == 0 and weights[source_index] > 0:
+            stat["ok"] = False
+            stat["reason"] = "weighted proxy allocation selected zero documents"
+        elif stat["ok"] and len(selected) < 2 and weights[source_index] > 0:
+            stat["ok"] = False
+            stat["reason"] = (
+                "weighted stratified split requires at least two selected "
+                "documents per positive-weight source; increase --limit or "
+                "--max-corpus-chars"
+            )
+
     failed = [stat for stat in source_stats if not stat["ok"]]
     sampled_documents = len(all_docs)
-    sampled_tokens = sum(stat["sampled_tokens"] for stat in source_stats)
+    sampled_tokens = sum(estimate_tokens(doc) for doc in all_docs)
+    proxy_weight_l1_error = 0.5 * sum(
+        abs(stat["realized_proxy_weight"] - (weight / total_weight))
+        for stat, weight in zip(source_stats, weights)
+    )
     progress(
         "corpus_complete",
         documents=sampled_documents,
         tokens=sampled_tokens,
+        train_documents=len(train_docs),
+        val_documents=len(val_docs),
         failed_sources=len(failed),
     )
 
@@ -1636,8 +1822,8 @@ def main():
 
     def run_train_score():
         return train_perf(
-            all_docs,
-            max_corpus_chars=args.max_corpus_chars,
+            train_docs,
+            val_docs,
             max_steps=args.max_steps,
             train_timeout=args.train_timeout,
         )
@@ -1651,12 +1837,20 @@ def main():
     )
     progress("scoring", perf_loss=perf_loss, leakage_score=leakage_score)
 
-    ok = not failed and sampled_documents > 0 and sampled_tokens > 0
-    if ok:
+    ok = (
+        not failed
+        and sampled_documents > 0
+        and sampled_tokens > 0
+        and bool(train_docs)
+        and bool(val_docs)
+        # An unmeasured leakage term is not a zero leakage term. Final scoring
+        # withholds the reward when its screen fails, so a candidate whose decon
+        # run died must not preview a leakage-free score here either.
+        and leakage_score is not None
+    )
+    if ok and leakage_score is not None:
         perf_reward = ALPHA_PERF * (perf or 0.0)
-        leakage_penalty = (
-            -LAMBDA_LEAKAGE * leakage_score if leakage_score is not None else 0.0
-        )
+        leakage_penalty = -LAMBDA_LEAKAGE * leakage_score
         reward = perf_reward + leakage_penalty
     else:
         # A candidate with a dead source was never scored as written: part of the
@@ -1676,6 +1870,18 @@ def main():
                 "%s: %s" % (stat["source"], stat["reason"]) for stat in failed
             ),
         )
+    elif leakage_score is None and sampled_documents > 0:
+        error = (
+            "the contamination screen did not complete, so leakage is unknown "
+            "and the candidate was not scored (final scoring withholds the "
+            "reward in the same case). Re-run, or lower --limit to give decon a "
+            "smaller corpus."
+        )
+    elif not train_docs or not val_docs:
+        error = (
+            "weighted stratified split requires at least one training and one "
+            "validation document; increase --limit or loosen filters"
+        )
 
     progress("complete", ok=ok, reward=reward, documents=sampled_documents)
     append_history({
@@ -1690,6 +1896,10 @@ def main():
         "leakage_score": leakage_score,
         "sampled_documents": sampled_documents,
         "sampled_tokens": sampled_tokens,
+        "train_documents": len(train_docs),
+        "val_documents": len(val_docs),
+        "proxy_token_budget": proxy_token_budget,
+        "proxy_weight_l1_error": proxy_weight_l1_error,
         "budget_fill_ratio": fill,
         "settings": {
             "limit": args.limit,
@@ -1703,8 +1913,13 @@ def main():
         "error": error,
         "sampled_documents": sampled_documents,
         "sampled_tokens": sampled_tokens,
+        "train_documents": len(train_docs),
+        "val_documents": len(val_docs),
+        "proxy_token_budget": proxy_token_budget,
+        "proxy_weight_l1_error": proxy_weight_l1_error,
         "signal": (
-            "development sample; corpus-split cross-entropy + benchmark decon only; "
+            "development sample; weighted stratified corpus-split cross-entropy + "
+            "benchmark decon only; "
             "not the final held-out validation score"
         ),
         "validation_data_used": False,

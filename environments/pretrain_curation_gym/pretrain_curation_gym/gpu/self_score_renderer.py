@@ -1,7 +1,7 @@
 """Render the leakage-safe development self-scoring script for a rollout.
 
 The rendered script samples candidate training sources named in the agent's
-draft manifest. Its implementation lives in ``self_score_payload.py`` — a real,
+draft manifest. Its implementation lives in ``self_score_runtime.py`` — a real,
 lint-checked, directly importable module — and rendering substitutes that
 module's scoring-constant assignments with the task's configured values, so
 the shipped file stays standalone (stdlib-only) with everything baked in.
@@ -33,27 +33,27 @@ SELF_SCORE_TRAIN_FILENAME = "self_score_train.py"
 SELF_SCORE_HISTORY_FILENAME = ".self_score_history.jsonl"
 SELF_SCORE_TRAIN_TIMEOUT_SECONDS = 900
 
-_PAYLOAD_PATH = Path(__file__).resolve().with_name("self_score_payload.py")
+_RUNTIME_PATH = Path(__file__).resolve().with_name("self_score_runtime.py")
 
 
-def _payload_source() -> str:
+def _runtime_source() -> str:
     """The self-score implementation, read verbatim from its module file."""
-    return _PAYLOAD_PATH.read_text(encoding="utf-8")
+    return _RUNTIME_PATH.read_text(encoding="utf-8")
 
 
 def __getattr__(name: str) -> str:
-    # Historical alias for the template text; the payload module now IS the
+    # Historical alias for the template text; the runtime module now IS the
     # template, so expose its source under the tested name without keeping a
     # second copy in memory at import time.
     if name == "_SCRIPT":
-        return _payload_source()
+        return _runtime_source()
     raise AttributeError(name)
 
 
 def _substitute_constants(source: str, values: dict[str, object]) -> str:
     """Replace each module-level ``NAME = <default>`` with the configured value.
 
-    Every constant must match exactly once, so a renamed or removed payload
+    Every constant must match exactly once, so a renamed or removed runtime
     constant fails loudly at render time instead of silently shipping a
     default.
     """
@@ -63,7 +63,7 @@ def _substitute_constants(source: str, values: dict[str, object]) -> str:
         source, count = pattern.subn(lambda _: replacement, source, count=1)
         if count != 1:
             raise RuntimeError(
-                f"self-score payload constant {name!r} not found for substitution"
+                f"self-score runtime constant {name!r} not found for substitution"
             )
     return source
 
@@ -79,7 +79,13 @@ def render_self_score_script(
     """Return a configured self-score script without exposing held-out data."""
     from ..utils.corpus import EST_TOKENS_PER_DOC
     from ..utils.hf_access import CHARS_PER_TOKEN
-    from ..utils.leakage import resolve_decon_binary, resolve_decon_evals_dir
+    from ..utils.leakage import (
+        DEFAULT_DECON_NGRAM_SIZE,
+        DEFAULT_DECON_TOKENIZER,
+        OLMO3_DETECT_ARGS,
+        resolve_decon_binary,
+        resolve_decon_evals_dir,
+    )
 
     values: dict[str, object] = {
         "EXPECTED_TOKEN_BUDGET": config.token_budget,
@@ -99,16 +105,37 @@ def render_self_score_script(
         "DECON_BINARY": resolve_decon_binary(decon_binary),
         "DECON_EVALS_DIR": resolve_decon_evals_dir(decon_evals_dir),
         "DECON_THRESHOLD": decon_threshold,
+        "DECON_TOKENIZER": DEFAULT_DECON_TOKENIZER,
+        "DECON_NGRAM_SIZE": DEFAULT_DECON_NGRAM_SIZE,
+        "DECON_DETECT_EXTRA_ARGS": OLMO3_DETECT_ARGS,
         "CHARS_PER_TOKEN": CHARS_PER_TOKEN,
         "EST_TOKENS_PER_DOC": EST_TOKENS_PER_DOC,
     }
-    return _substitute_constants(_payload_source(), values).encode()
+    return _substitute_constants(_runtime_source(), values).encode()
 
 
 def render_self_score_train_script() -> bytes:
     """Return the workspace-local proxy-student trainer used by ``self_score.py``."""
     body = _nanogpt_train_script()
-    body = body.replace('TRAIN_WORKDIR = "/workspace"', "TRAIN_WORKDIR = WORKDIR")
+    # Point the trainer at the directory passed as argv[1] instead of the baked
+    # ``/workspace``. This cannot route through ``_substitute_constants``: that
+    # helper emits ``repr(value)`` for constants, whereas the replacement here is
+    # a bare name reference rather than a literal. The raise-on-miss contract is
+    # the same, and is the point — ``train_perf`` hands the trainer a private
+    # temp directory, while the workspace root holds the identically-named
+    # ``config.json`` / ``corpus.txt`` that final scoring writes. A silently
+    # unsubstituted constant would send the trainer to those instead.
+    body, substitutions = re.subn(
+        r"^TRAIN_WORKDIR = .*$",
+        lambda _: "TRAIN_WORKDIR = WORKDIR",
+        body,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if substitutions != 1:
+        raise RuntimeError(
+            "train_gpt constant 'TRAIN_WORKDIR' not found for substitution"
+        )
     wrapper = (
         "#!/usr/bin/env python3\n"
         '"""Workspace-local proxy-student trainer for self_score.py."""\n'

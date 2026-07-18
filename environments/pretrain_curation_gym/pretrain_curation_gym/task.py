@@ -8,7 +8,7 @@ import logging
 import math
 import os
 from importlib import resources
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import verifiers.v1 as vf
 from verifiers.v1.errors import RolloutError
@@ -16,12 +16,17 @@ from verifiers.v1.errors import RolloutError
 from .config import CuratorTaskConfig
 from .utils.async_utils import run_blocking_drained
 from .utils.corpus import EST_TOKENS_PER_DOC, CorpusBuilder
-from .gpu.self_score import (
+from .gpu.self_score_renderer import (
     SELF_SCORE_FILENAME,
     SELF_SCORE_HISTORY_FILENAME,
     SELF_SCORE_TRAIN_FILENAME,
     render_self_score_script,
     render_self_score_train_script,
+)
+from .gpu.hf_cli_audit import (
+    HF_CLI_AUDIT_FILENAME,
+    HF_CLI_WRAPPER_FILENAME,
+    render_hf_cli_wrapper,
 )
 from .gpu.turns import (
     TURNS_FILENAME,
@@ -66,6 +71,22 @@ class EmptyRolloutError(RolloutError):
     ``error.type='EmptyRolloutError'`` so ``[retries.rollout]
     include=['EmptyRolloutError']`` retries the whole rollout — a transient blip
     self-heals instead of being scored as a silent zero-reward success.
+    """
+
+
+class DeconUnavailableError(RolloutError):
+    """The contamination screen could not run, while ``error_on_decon_failure``
+    was enabled.
+
+    A failed detector is not a clean corpus. Decon owns the only leakage signal,
+    so a missing binary, crash, or timeout would otherwise reduce the reward to
+    ``alpha_perf * perf - 0`` — strictly larger than the same corpus scored with
+    a working detector, and therefore an RL incentive to break the screen (the
+    exhaustive ``--sample-every-m-tokens 1`` pass is timeout-bounded, so a large
+    enough corpus can reach it). ``CuratorTask.score_manifest`` always withholds
+    the reward in that case; this error additionally lets eval profiles retry the
+    rollout via ``[retries.rollout] include=['DeconUnavailableError']`` instead
+    of banking an unscoreable sample.
     """
 
 
@@ -180,6 +201,13 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         )
         skill = self.hf_skill_package_file()
         await runtime.write(self.HF_SKILL_PATH, skill.read_bytes())
+        await runtime.write(HF_CLI_WRAPPER_FILENAME, render_hf_cli_wrapper())
+        chmod = await runtime.run(["chmod", "+x", HF_CLI_WRAPPER_FILENAME], {})
+        if chmod.exit_code != 0:
+            raise RuntimeError(
+                "failed to make the workspace hf audit wrapper executable: "
+                + chmod.stderr.strip()[-500:]
+            )
         state = cast(CuratorState, trace.state)
         state._turn_runtime = runtime
         await runtime.write(TURNS_FILENAME, render_turns_script())
@@ -273,6 +301,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             return
         runs = 0
         rewards: list[float] = []
+        history: list[dict[str, Any]] = []
         for line in lines:
             try:
                 record = json.loads(line)
@@ -281,6 +310,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             if not isinstance(record, dict):
                 continue
             runs += 1
+            history.append(record)
             reward = record.get("reward")
             if (
                 record.get("ok") is True
@@ -289,11 +319,83 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
                 and math.isfinite(reward)
             ):
                 rewards.append(float(reward))
-        state.set_self_score_summary(runs=runs, rewards=rewards)
+        state.set_self_score_summary(runs=runs, rewards=rewards, history=history)
+
+    async def ingest_hf_cli_history(
+        self, state: CuratorState, runtime: vf.Runtime | None
+    ) -> None:
+        if runtime is None:
+            return
+        try:
+            lines = (await runtime.read(HF_CLI_AUDIT_FILENAME)).decode().splitlines()
+        except Exception:
+            return
+        history: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                history.append(record)
+        state.set_hf_cli_history(history)
+
+    def add_workspace_telemetry_trace(self, trace: vf.Trace, state: CuratorState) -> None:
+        """Populate an otherwise-opaque harness trace with labeled workspace telemetry."""
+        if trace.nodes:
+            return
+        parent: int | None = None
+
+        def append(message: vf.Message) -> None:
+            nonlocal parent
+            trace.nodes.append(vf.MessageNode(parent=parent, message=message))
+            parent = len(trace.nodes) - 1
+
+        append(vf.UserMessage(content=self.data.prompt or ""))
+        append(
+            vf.AssistantMessage(
+                content=(
+                    "[workspace telemetry] The external coding harness is opaque to "
+                    "Verifiers; the following records were recovered from files the "
+                    "agent produced in its runtime workspace."
+                )
+            )
+        )
+        for index, record in enumerate(state.self_score_history, start=1):
+            call_id = f"workspace-self-score-{index}"
+            append(
+                vf.AssistantMessage(
+                    tool_calls=[
+                        vf.ToolCall(
+                            id=call_id,
+                            name="workspace_self_score_telemetry",
+                            arguments=json.dumps(
+                                record.get("settings") or {}, sort_keys=True
+                            ),
+                        )
+                    ]
+                )
+            )
+            append(
+                vf.ToolMessage(
+                    tool_call_id=call_id,
+                    name="workspace_self_score_telemetry",
+                    content=json.dumps(record, sort_keys=True),
+                )
+            )
+        append(
+            vf.AssistantMessage(
+                content=(
+                    "[workspace telemetry] Final deliverable: "
+                    f"{self.config.manifest_filename}"
+                )
+            )
+        )
 
     async def finalize(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         state = cast(CuratorState, trace.state)
         await self.ingest_self_score_history(state, runtime)
+        await self.ingest_hf_cli_history(state, runtime)
 
         status, manifest = await self.read_workspace_manifest(runtime)
         if status != "valid":
@@ -337,7 +439,11 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             state.set_manifest(telemetry, finalized=False)
         else:
             state.manifest_finalized = False
-        state.val_set_access = self.accessed_validation_set(trace)
+        state.val_set_access = self.accessed_validation_set(trace, state)
+        trace.info["self_score_history"] = state.self_score_history
+        trace.info["hf_cli_history"] = state.hf_cli_history
+        trace.info["workspace_telemetry_trace"] = not bool(trace.nodes)
+        self.add_workspace_telemetry_trace(trace, state)
 
     def warn_unreachable_budget(self, manifest: Manifest) -> None:
         if manifest.sample_docs_per_source is None:
@@ -357,8 +463,19 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
                 reachable,
             )
 
-    def accessed_validation_set(self, trace: vf.Trace) -> bool:
+    def accessed_validation_set(self, trace: vf.Trace, state: CuratorState) -> bool:
+        """Whether the agent named the held-out validation repository.
+
+        Codex and Claude Code return no conversation nodes, so the trace scan
+        below is empty for exactly the harnesses the eval profiles use. The
+        workspace ``hf`` audit log is the only evidence that survives an opaque
+        harness, so it is scanned too. Decon's val screen remains the scoring
+        backstop; this is the diagnostic that says the agent went looking.
+        """
         dataset_id = self.curator.validation_set.dataset_id
+        for record in state.hf_cli_history:
+            if any(dataset_id in str(arg) for arg in record.get("argv") or []):
+                return True
         for message in trace.assistant_messages:
             if dataset_id in self.candidates.message_text(message.content):
                 return True
@@ -378,6 +495,15 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             and state.self_score_runs == 0
         )
 
+    def _decon_failed(self, state: CuratorState) -> bool:
+        """Whether the scoring pass ran but its contamination screen did not.
+
+        An empty rollout never reaches decon, so its zero-signal sentinel is not
+        a detector failure. See ``DeconUnavailableError``.
+        """
+        scoring = state._scoring_result
+        return scoring is not None and scoring.decon_error
+
     async def _compute_scoring(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> ScoringResult:
@@ -389,18 +515,8 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
 
     @vf.metric
     async def hf_cli_calls(self, trace: vf.Trace) -> float:
-        """Number of observed ``hf`` CLI invocations in agent tool calls."""
-        return float(
-            sum(
-                len(
-                    self.candidates.hf_commands(
-                        self.candidates.shell_command(call.arguments)
-                    )
-                )
-                for message in trace.assistant_messages
-                for call in message.tool_calls or []
-            )
-        )
+        """Number of workspace-audited ``hf`` CLI invocations."""
+        return float(len(cast(CuratorState, trace.state).hf_cli_history))
 
     @vf.metric
     async def num_turns(self, trace: vf.Trace) -> float:
@@ -420,7 +536,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         if trainer_error:
             logger.warning("trainer error: %s", trainer_error)
 
-        return {
+        metrics = {
             "perf_loss": scoring.loss,
             "perf_accuracy": scoring.accuracy,
             "perf_vs_baseline": scoring.perf_vs_baseline,
@@ -455,28 +571,80 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             "val_screen_skipped": float(scoring.val_screen_skipped),
             "trainer_error_msg": float(bool(trainer_error)),
         }
+        first_ts = next(
+            (
+                float(record["ts"])
+                for record in state.self_score_history
+                if isinstance(record.get("ts"), (int, float))
+            ),
+            None,
+        )
+        for index, record in enumerate(state.self_score_history, start=1):
+            prefix = f"self_score_{index:03d}"
+            metrics[f"{prefix}_ok"] = float(record.get("ok") is True)
+            for field in (
+                "reward",
+                "perf_reward",
+                "leakage_penalty",
+                "perf_loss",
+                "leakage_score",
+                "sampled_documents",
+                "sampled_tokens",
+                "budget_fill_ratio",
+                "train_documents",
+                "val_documents",
+                "proxy_token_budget",
+                "proxy_weight_l1_error",
+            ):
+                value = record.get(field)
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                ):
+                    metrics[f"{prefix}_{field}"] = float(value)
+            timestamp = record.get("ts")
+            if first_ts is not None and isinstance(timestamp, (int, float)):
+                metrics[f"{prefix}_elapsed_seconds"] = float(timestamp) - first_ts
+        return metrics
 
     @vf.reward
     async def score_manifest(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> dict[str, float]:
-        """Emit reward components from the scoring pass already used by metrics."""
+        """Emit reward components from the scoring pass already used by metrics.
+
+        A failed contamination screen cannot certify a clean corpus, so it yields
+        no reward at all rather than the unscreened ``alpha_perf * perf - 0``.
+        Withholding is unconditional: scoring a corpus whose leakage is unknown
+        is never a legitimate configuration. See ``DeconUnavailableError``.
+        """
         scoring = await self._compute_scoring(trace, runtime)
+        if scoring.decon_error:
+            return {"perf_reward": 0.0, "leakage_penalty": 0.0}
         return {
             "perf_reward": self.curator.alpha_perf * scoring.perf,
             "leakage_penalty": -self.curator.lambda_leakage * scoring.leakage_score,
         }
 
     async def score(self, trace: vf.Trace, runtime: vf.Runtime | None = None) -> None:
+        state = cast(CuratorState, trace.state)
         try:
             await super().score(trace, runtime)
         finally:
             # Scratch corpora can be large; recursive deletion must not stall
             # unrelated rollouts sharing this event loop.
-            await run_blocking_drained(cast(CuratorState, trace.state).cleanup)
-        if self.config.error_on_empty_rollout and self._empty_rollout(
-            cast(CuratorState, trace.state)
-        ):
+            await run_blocking_drained(state.cleanup)
+        # The reward is already withheld by score_manifest; raising here only
+        # converts an unscoreable sample into a retryable one.
+        if self.config.error_on_decon_failure and self._decon_failed(state):
+            raise DeconUnavailableError(
+                "the contamination screen did not run, so corpus leakage is "
+                "unknown and the reward was withheld. Set "
+                "error_on_decon_failure=false to record it as a zero-reward "
+                "sample instead."
+            )
+        if self.config.error_on_empty_rollout and self._empty_rollout(state):
             raise EmptyRolloutError(
                 "rollout produced no usable artifact (no valid workspace "
                 "manifest, self_score_runs=0); treating as an infrastructure / "
@@ -485,4 +653,4 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             )
 
 
-__all__ = ["CuratorTask", "EmptyRolloutError"]
+__all__ = ["CuratorTask", "DeconUnavailableError", "EmptyRolloutError"]

@@ -93,4 +93,3 @@ pod_scratch/
 /environments/*/tests/
 **/tests/
 **/test_*.py
-!**/gpu/test_*.py

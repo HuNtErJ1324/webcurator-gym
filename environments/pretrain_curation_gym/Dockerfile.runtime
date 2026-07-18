@@ -1,17 +1,38 @@
 FROM pytorch/pytorch:2.7.0-cuda12.6-cudnn9-runtime
 
 # Match the harness DockerConfig workdir so baked assets land where the agent
-# (and self_score.py) probe them: /workspace/decon/...
+# (and the rendered self-score script) probe them: /workspace/decon/...
 WORKDIR /workspace
+
+# Task setup writes a redacting `hf` audit wrapper to <workdir>/.agents/bin/hf.
+# It only records anything if that directory precedes the real CLI on PATH, so
+# put it there for every container by default; ${PATH} expands at build time, so
+# no system path is hardcoded. A harness config that sets its own PATH replaces
+# this wholesale — load_environment re-prepends the directory in that case.
+ENV PATH="/workspace/.agents/bin:${PATH}"
 
 # One image serves both phases of the rollout: the bash harness needs the `hf`
 # discovery CLI, while scoring needs CUDA PyTorch and the proxy-student tokenizer.
+# - huggingface-hub >= 1.17: first release whose `hf` CLI ships the `papers`
+#   subcommand the task prompt directs agents to use.
+# - numpy / tiktoken / tqdm: imported by the in-container trainer (train.py /
+#   self_score_train.py). numpy also arrives with the torch base image, but is
+#   declared here so a base-image change cannot silently drop it; the host
+#   package no longer depends on tqdm, so this image is its sole provider.
+# - zstandard: lets in-container tooling handle zstd-compressed dataset files.
 RUN python -m pip install --no-cache-dir \
-    "huggingface-hub>=0.34" \
+    "huggingface-hub>=1.17" \
+    numpy \
     tiktoken \
     tqdm \
     uv \
     "zstandard>=0.23.0"
+
+# Pre-bake the GPT-2 BPE files at a deterministic path so the scoring-phase
+# trainer never depends on a first-use network fetch (a transient blob-store
+# failure there would fail the whole reward pass).
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
+RUN python -c "import tiktoken; tiktoken.get_encoding('gpt2')"
 
 # Bake the decon Rust n-gram detector binary and its bundled public-benchmark
 # eval sets for fully offline contamination detection.
