@@ -6,8 +6,8 @@ from pydantic import Field, PrivateAttr, field_validator
 
 import verifiers.v1 as vf
 
-from .leakage import DEFAULT_DECON_BINARY
-from .models import CuratorConfig, MANIFEST_FILENAME
+from .utils.leakage import DEFAULT_DECON_BINARY
+from .utils.models import CuratorConfig, MANIFEST_FILENAME
 
 ENV_ID = "pretrain-curation-gym"
 DEFAULT_MAX_TURNS = 64
@@ -21,7 +21,10 @@ class CuratorTaskConfig(vf.TaskConfig):
     manifest_filename: str = MANIFEST_FILENAME
     decon_binary: str = DEFAULT_DECON_BINARY
     decon_evals_dir: str | None = None
-    decon_threshold: float = 0.2
+    # OLMo 3's calibrated contamination decision threshold (paper Appendix A.5;
+    # the decon package's production default). Matches below it are increasingly
+    # likely to be eval *source material* rather than eval-derived text.
+    decon_threshold: float = 0.8
     screen_val_set: bool = True
     error_on_empty_rollout: bool = False
     """Raise a retryable ``EmptyRolloutError`` when a rollout produced no usable

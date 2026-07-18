@@ -5,6 +5,19 @@ optimizers, batch and learning-rate schedules, validation, and training loop. It
 is imported by the local CPU debugger and copied byte-for-byte into the Docker
 or Modal training workspace.
 
+Speedrun fidelity (KellerJordan/modded-nanogpt): the Muon core (Newton-Schulz
+``(2, -1.5, 0.5)`` x 12, aspect-ratio scaling, fp32 momentum) follows
+``records/track_3_optimization/train_gpt_simple.py`` exactly; the architecture
+and recipe (QK-norm, half-truncate RoPE base 1024, attn scale 0.12,
+``30*tanh(x/30)`` softcap, 3 first/last value-embed tables, U-net skips,
+x0/resid lambdas, 12-dim attention gate, odd-step Adam with per-group betas,
+momentum 0.85->0.95 warmup/cooldown, batch muls 1/2/3 with LR muls
+1.0/1.52/1.73 decaying over the final 40% to floor 0.15, padded vocab 50304,
+EOT-prefixed documents, bf16 blocks with fp32 Adam groups and fp32 CE) follow
+the main record lineage. Deliberate portability deviations: single GPU, SDPA
+document masks instead of flash-attn varlen, fixed 1024-token windows instead
+of the records' long-context window ramp, and no FP8 head.
+
 The schedule-accounting functions above the guarded PyTorch section deliberately
 use only the standard library. Package configuration imports those helpers even
 when PyTorch is not installed; all model and training definitions are therefore
@@ -1267,7 +1280,7 @@ else:
         stage_fracs: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
         batch_muls: tuple[int, int, int] = (1, 2, 3),
         lr_muls: tuple[float, float, float] = (1.0, 1.52, 1.73),
-        cooldown_frac: float = 0.60,
+        cooldown_frac: float = 0.40,
         cooldown_floor: float = 0.15,
     ) -> tuple[list[tuple[int, int]], BatchScheduleStage, float, float]:
         """Return stage boundaries, stage lookup metadata, cooldown start, and floor.
@@ -1986,7 +1999,7 @@ else:
         batch_stage_fracs=(1 / 3, 1 / 3, 1 / 3),
         batch_stage_muls=(1, 2, 3),
         lr_stage_muls=(1.0, 1.52, 1.73),
-        lr_cooldown_frac=0.60,
+        lr_cooldown_frac=0.40,
         lr_cooldown_floor=0.15,
         muon_momentum_min=0.85,
         muon_momentum_max=0.95,
@@ -2630,7 +2643,7 @@ else:
             "batch_stage_fracs": tuple(cfg.get("batch_stage_fracs", (1 / 3,) * 3)),
             "batch_stage_muls": tuple(cfg.get("batch_stage_muls", (1, 2, 3))),
             "lr_stage_muls": tuple(cfg.get("lr_stage_muls", (1.0, 1.52, 1.73))),
-            "lr_cooldown_frac": float(cfg.get("lr_cooldown_frac", 0.60)),
+            "lr_cooldown_frac": float(cfg.get("lr_cooldown_frac", 0.40)),
             "lr_cooldown_floor": float(cfg.get("lr_cooldown_floor", 0.15)),
             "muon_momentum_min": float(cfg.get("muon_momentum_min", 0.85)),
             "muon_momentum_max": float(cfg.get("muon_momentum_max", 0.95)),
@@ -2684,7 +2697,11 @@ else:
         torch.manual_seed(seed)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         encoder = tiktoken.get_encoding(str(cfg.get("tokenizer", "gpt2")))
-        vocab_size = encoder.n_vocab
+        # Speedrun-style padded vocab: next multiple of 128 (50257 -> 50304), so
+        # embed/lm_head shapes match the records (and this package's host-side
+        # parameter estimates) and stay tensor-core friendly. Padded ids never
+        # occur in data, so CE semantics are unchanged.
+        vocab_size = ((encoder.n_vocab + 127) // 128) * 128
 
         eos_aligned_batches = bool(cfg.get("eos_aligned_batches", True))
         if documents is None:

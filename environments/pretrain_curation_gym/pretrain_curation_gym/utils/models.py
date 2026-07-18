@@ -1,7 +1,7 @@
 """Pydantic contracts for the pretraining-data curation environment.
 
 Everything the agent produces and everything the reward consumes is expressed
-here so the manifest and configuration have one strict home.
+here so the manifest, configuration, and scoring result have one strict home.
 """
 
 from __future__ import annotations
@@ -12,7 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_serializer, model_validator
 
-from .gpu.train_gpt import scheduled_presentation_tokens, steps_for_token_budget
+from ..gpu.train_gpt import scheduled_presentation_tokens, steps_for_token_budget
+from .hf_access import CHARS_PER_TOKEN
 from .val_set import ValidationSetConfig
 
 MANIFEST_FILENAME = "manifest.json"
@@ -57,7 +58,6 @@ _RESERVED_WORKSPACE_FILES = frozenset(
 # When set, steps are chosen so *scheduled* presentations under ``batch_stage_muls``
 # meet the budget (not base-batch alone); see ``train_gpt.py``.
 _MAX_TRAIN_TOKEN_BUDGET = 1_000_000_000  # generous H100/H200 upper bound
-_CHARS_PER_TOKEN = 4  # matches hf_access.estimate_tokens (chars // 4)
 _MIN_CORPUS_CHARS = 5_000_000  # historical default cap; floor for small budgets
 _MAX_CORPUS_CHARS = 2_000_000_000  # absolute ceiling on the uploaded corpus blob
 # Sandbox lifetime derivation. Modal v1 runtimes cap a remote sandbox at 24 hours.
@@ -66,11 +66,6 @@ _MIN_SANDBOX_TIMEOUT_MINUTES = (
 )
 _SANDBOX_SETUP_MINUTES = 15  # image pull + pip(tiktoken) + uploads + val download
 _SANDBOX_TOKENS_PER_MINUTE = 500_000  # conservative floor for benchmark-sized runs
-
-# Default container image for the real-trainer backends (docker or modal). It
-# MUST ship torch + CUDA; this is the runtime image — switch to the matching
-# ``-devel`` tag if a run needs build tooling (e.g. nvcc for torch.compile/custom
-# kernels). torch 2.7 / CUDA 12.6 matches recent H100/H200 driver stacks.
 
 
 class FilterSpec(BaseModel):
@@ -143,23 +138,22 @@ class Manifest(BaseModel):
     sample_docs_per_source: int | None = Field(default=None, ge=1)
 
 
-class ProxyStudentConfig(BaseModel):
-    """Fixed GPT-2-scale student config. Only the training corpus varies.
+class StudentArchConfig(BaseModel):
+    """Fixed GPT-2-scale student architecture. Only the training corpus varies.
 
-    Every field carries bounds so an out-of-range proxy spec fails fast with a
-    clear ``ValidationError`` instead of producing a degenerate (or unschedulable)
-    sandbox training job.
+    Defaults mirror ``train_gpt.GPT2_SMALL`` (modded-nanogpt / speedrun record_01
+    architecture): 12 layers, 768-wide, 6 heads, ~278M instantiated params.
+    Every field carries bounds so an out-of-range spec fails fast with a clear
+    ``ValidationError`` instead of producing a degenerate sandbox training job.
     """
 
-    # Defaults mirror ``train_gpt.GPT2_SMALL`` (modded-nanogpt / speedrun record_01
-    # architecture): 12 layers, 768-wide, 6 heads, ~278M instantiated params.
     n_layer: int = Field(default=12, ge=2, le=64)
     n_head: int = Field(default=6, ge=1, le=64)
     n_embd: int = Field(default=768, ge=8, le=4096)
     # Modern (modded-nanogpt) student knobs: ReLU**2 MLP width ratio, the tanh
     # logit-softcap constant, and the number of distinct sparse value-embedding
-    # tables (SparsifyEmbeds; clamped to n_layer//2 by the model). The model itself
-    # lives in ``train_gpt.py``.
+    # tables (SparsifyEmbeds; clamped to n_layer//2 by the model). The model
+    # itself lives in ``train_gpt.py``.
     mlp_ratio: int = Field(default=4, ge=1, le=16)
     lm_head_softcap: float = Field(default=30.0, gt=0.0, le=1000.0)
     num_value_embeds: int = Field(default=3, ge=1, le=32)
@@ -168,6 +162,34 @@ class ProxyStudentConfig(BaseModel):
     # Optional causal sliding-window attention (SDPA mask). ``None`` = full context.
     sliding_window_size: int | None = Field(default=None, ge=2)
     block_size: int = Field(default=1024, ge=8, le=8192)
+
+    @model_validator(mode="after")
+    def _check_student_dims(self) -> "StudentArchConfig":
+        # The modern student (train_gpt.GPT) requires: n_embd divisible by
+        # n_head, a head_dim that is a multiple of 4 (half-truncate RoPE), and an
+        # even depth >= 2 (symmetric U-net encoder/decoder skips). Reject anything
+        # unbuildable here so it fails fast instead of inside the GPU sandbox.
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
+            )
+        head_dim = self.n_embd // self.n_head
+        if head_dim % 4 != 0:
+            raise ValueError(
+                f"head_dim (n_embd/n_head = {head_dim}) must be a multiple of 4 "
+                "for half-truncate RoPE"
+            )
+        if self.n_layer % 2 != 0:
+            raise ValueError(
+                f"n_layer ({self.n_layer}) must be even for the U-net encoder/"
+                "decoder skip structure"
+            )
+        return self
+
+
+class StudentRunConfig(BaseModel):
+    """Training-run shape: batching, length/budget, seeding, and validation."""
+
     batch_size: int = Field(default=16, ge=1, le=4096)
     # Cap peak training activation memory without changing scheduled effective-batch
     # token accounting. When set (e.g. 16 on A100-80GB), each optimizer step still
@@ -197,7 +219,18 @@ class ProxyStudentConfig(BaseModel):
     train_token_budget: int | None = Field(
         default=None, ge=1, le=_MAX_TRAIN_TOKEN_BUDGET
     )
-    # --- training recipe (modded-nanogpt speedrun vs legacy record_01 AdamW) ----
+    seed: int = Field(default=0, ge=0)
+    val_fraction: float = Field(default=0.1, gt=0.0, lt=1.0)
+    # Number of independent train+eval runs (distinct seeds) whose val loss/accuracy
+    # are AVERAGED into a lower-variance signal. Default 1 keeps the historical cost
+    # AND calibration unchanged; >1 multiplies compute (FLOPs/tokens summed across
+    # runs, so cost accounting bills every run).
+    n_train_runs: int = Field(default=1, ge=1, le=64)
+
+
+class StudentOptimizerConfig(BaseModel):
+    """Training recipe: modded-nanogpt speedrun Muon vs legacy record_01 AdamW."""
+
     training_recipe: Literal["speedrun_muon", "record_01_adamw"] = "speedrun_muon"
     # Classic Muon (2-D block weights)
     muon_lr: float = Field(default=0.023, gt=0.0, le=1.0)
@@ -208,7 +241,7 @@ class ProxyStudentConfig(BaseModel):
     muon_cooldown_steps: int | None = Field(default=None, ge=0)
     # AdamW groups (embed / head / value embeds / scalars). ``adam_eps`` is the
     # canonical Speedrun epsilon; the legacy record_01 optimizer has its own
-    # explicitly named epsilon below so this value cannot be shadowed.
+    # explicitly named ``record_adam_eps`` below so this value cannot be shadowed.
     adam_lr: float = Field(default=0.008, gt=0.0, le=1.0)
     adam_eps: float = Field(default=1e-10, gt=0.0, le=1e-1)
     adam_weight_decay: float = Field(default=0.005, ge=0.0, le=1.0)
@@ -221,26 +254,13 @@ class ProxyStudentConfig(BaseModel):
     value_embed_wd_mul: float = Field(default=5.0, ge=0.0, le=1000.0)
     scalar_wd_mul: float = Field(default=0.0, ge=0.0, le=1000.0)
     adam_on_odd_steps: bool = True
-    # Batch-size + LR schedule (BatchSizeSchedule record defaults)
-    batch_schedule_enabled: bool = True
-    batch_stage_fracs: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3)
-    batch_stage_muls: tuple[int, int, int] = (1, 2, 3)
-    lr_stage_muls: tuple[float, float, float] = (1.0, 1.52, 1.73)
-    lr_cooldown_frac: float = Field(default=0.60, ge=0.0, le=1.0)
-    lr_cooldown_floor: float = Field(default=0.15, ge=0.0, le=1.0)
-    # Legacy record_01 AdamW path (used when training_recipe='record_01_adamw')
-    learning_rate: float = Field(default=3e-4, gt=0.0, le=1.0)
-    seed: int = Field(default=0, ge=0)
-    val_fraction: float = Field(default=0.1, gt=0.0, lt=1.0)
-    # --- record_01 (nanogpt-speedrun) optimizer schedule + regularization -----
-    # These upgrade the REAL (sandbox) trainer's training recipe to the
-    # ``leloy/nanogpt-speedrun`` record_01 baseline — AdamW + LR warmup + cosine
+    # --- legacy record_01 (nanogpt-speedrun) AdamW path ----------------------
+    # Used when training_recipe='record_01_adamw': AdamW + LR warmup + cosine
     # cooldown + decoupled weight decay + grad clipping + contiguous-window
-    # batching + averaged runs. They are consumed only by the real trainer's
-    # sandbox script; the default heuristic backend ignores them entirely (so its
-    # synthetic loss/cost calibration is unchanged). Each knob keeps a faithful
-    # record_01 default, so a default-config real run differs from the old
-    # constant-LR plain-AdamW path ONLY by the improved schedule/batching.
+    # batching. Each knob keeps a faithful record_01 default; the default
+    # heuristic backend ignores them entirely (so its synthetic loss/cost
+    # calibration is unchanged).
+    learning_rate: float = Field(default=3e-4, gt=0.0, le=1.0)
     weight_decay: float = Field(default=0.1, ge=0.0, le=1.0)
     # record_01 AdamW moments + epsilon (the Karpathy GPT-2 reproduction values the
     # first speedrun record inherits): betas (0.9, 0.95), eps 1e-8.
@@ -252,16 +272,37 @@ class ProxyStudentConfig(BaseModel):
     grad_clip: float = Field(default=0.0, ge=0.0)
     # LR warmup length (steps). ``None`` (default) derives a sensible fraction of the
     # run, ``min(256, max(1, effective_steps // 10))``; an explicit value is clamped
-    # to the run length. See ``effective_warmup_steps``.
+    # to the run length. See ``ProxyStudentConfig.effective_warmup_steps``.
     warmup_steps: int | None = Field(default=None, ge=0)
     # Cosine cooldown floor as a fraction of the peak LR (record_01 decays to ~10%).
     lr_min_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
-    # Number of independent train+eval runs (distinct seeds) whose val loss/accuracy
-    # are AVERAGED into a lower-variance signal. Default 1 keeps the historical cost
-    # AND calibration unchanged; >1 multiplies compute (FLOPs/tokens summed across
-    # runs, so cost accounting bills every run).
-    n_train_runs: int = Field(default=1, ge=1, le=64)
-    # --- portable proxy-student features (all off by default) ----------------
+    # --- scale referencing ----------------------------------------------------
+    # Weight-decay timescale reference. Decoupled weight decay compounds once
+    # per optimizer step (cumulative shrinkage ~ lr * wd * steps), so a recipe
+    # tuned at the speedrun record's ~1,390 steps over-decays at 12k steps and
+    # under-decays at 150. When set (1390 = the record's step count), the
+    # emitted Muon/Adam weight decay are scaled by ``wd_ref_steps /
+    # effective_steps`` so cumulative decay matches the reference run length.
+    # ``None`` (default) emits the raw configured values unchanged.
+    wd_ref_steps: int | None = Field(default=None, ge=1)
+
+
+class StudentScheduleConfig(BaseModel):
+    """Batch-size + LR schedule (BatchSizeSchedule record defaults)."""
+
+    batch_schedule_enabled: bool = True
+    batch_stage_fracs: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3)
+    batch_stage_muls: tuple[int, int, int] = (1, 2, 3)
+    lr_stage_muls: tuple[float, float, float] = (1.0, 1.52, 1.73)
+    # Fraction of the run over which the LR decays linearly to the floor.
+    # 0.40 matches the current speedrun record (decay spans the final 40%).
+    lr_cooldown_frac: float = Field(default=0.40, ge=0.0, le=1.0)
+    lr_cooldown_floor: float = Field(default=0.15, ge=0.0, le=1.0)
+
+
+class StudentFeaturesConfig(BaseModel):
+    """Portable proxy-student features (all off by default except EOS packing)."""
+
     # Bigram hash embedding on 1/4 of model_dim with sign trick
     bigram_hash_embed: bool = False
     # Learned 1-token lookback smear on the embedding stream
@@ -286,7 +327,8 @@ class ProxyStudentConfig(BaseModel):
     # Disable only for legacy flat-stream compatibility.
     eos_aligned_batches: bool = True
     # Canonical per-document token cap, including the leading EOT/BOS token.
-    # Historical spellings remain accepted by the compatibility validator below.
+    # Historical spellings remain accepted by the compatibility validator on
+    # ``ProxyStudentConfig``.
     max_document_tokens: int | None = Field(default=None, ge=8)
     # True 2-step gradient accumulation for embed+lm_head before update
     grad_accum_embed_head_steps: int = Field(default=1, ge=1, le=8)
@@ -300,178 +342,58 @@ class ProxyStudentConfig(BaseModel):
     nor_muon: bool = True
     # Polar Express (ONI-based orthogonalization in Muon)
     polar_express: bool = False
-    # Runtime placement and resources belong to the native v1 harness runtime.
+
+
+class StudentSandboxConfig(BaseModel):
+    """Sandbox sizing; derived from the training budget unless overridden.
+
+    Runtime placement and resources belong to the native v1 harness runtime.
+    """
+
     # Upper char cap on the corpus blob uploaded to the sandbox. ``None`` (default)
     # derives it from the training budget (so a large run is not silently capped at
     # the historical ~1.25M-unique-token corpus); an explicit value overrides.
     max_corpus_chars: int | None = Field(default=None, ge=1, le=_MAX_CORPUS_CHARS)
     # Sandbox/container lifetime / command timeout (minutes). ``None`` (default)
     # derives a budget-sized timeout (floored at the historical 30). The Modal 24h
-    # ceiling is enforced in ``_check_modal_timeout_ceiling`` (the self-hosted
-    # docker backend has no such cap), so the static field bound is just the lower
-    # bound.
+    # ceiling is enforced against the selected native harness runtime by
+    # ``load_environment``; the static field bound is just the lower bound.
     timeout_minutes: int | None = Field(default=None, ge=1)
     upload_timeout_seconds: float = Field(default=120.0, gt=0.0)
 
-    @property
-    def effective_steps(self) -> int:
-        """Training steps actually run.
 
-        With ``train_token_budget`` set: minimal N whose staged presentations
-        meet the budget (see ``train_gpt.steps_for_token_budget``).
-        Otherwise: the explicit ``steps`` field (unchanged historical path).
-        """
-        if self.train_token_budget is None:
-            return self.steps
-        return steps_for_token_budget(
-            self.train_token_budget,
-            batch_size=self.batch_size,
-            block_size=self.block_size,
-            batch_stage_muls=self.batch_stage_muls,
-            batch_stage_fracs=self.batch_stage_fracs,
-            batch_schedule_enabled=self.batch_schedule_enabled,
-        )
+# Owning submodel for each flat (legacy) proxy-student field name; drives the
+# compatibility routing in ``ProxyStudentConfig._accept_legacy_flat_fields``.
+_STUDENT_SUBMODEL_FIELDS: dict[str, frozenset[str]] = {
+    "arch": frozenset(StudentArchConfig.model_fields),
+    "run": frozenset(StudentRunConfig.model_fields),
+    "optimizer": frozenset(StudentOptimizerConfig.model_fields),
+    "schedule": frozenset(StudentScheduleConfig.model_fields),
+    "features": frozenset(StudentFeaturesConfig.model_fields),
+    "sandbox": frozenset(StudentSandboxConfig.model_fields),
+}
 
-    @property
-    def effective_warmup_steps(self) -> int:
-        """LR warmup steps for the legacy ``record_01_adamw`` recipe only."""
-        if self.warmup_steps is not None:
-            return min(self.warmup_steps, self.effective_steps)
-        return min(256, max(1, self.effective_steps // 10))
 
-    def training_payload(self, *, tokenizer: str = "gpt2") -> dict[str, object]:
-        """JSON config blob consumed by the sandbox / self-score training scripts."""
-        return {
-            "n_layer": self.n_layer,
-            "n_head": self.n_head,
-            "n_embd": self.n_embd,
-            "mlp_ratio": self.mlp_ratio,
-            "lm_head_softcap": self.lm_head_softcap,
-            "num_value_embeds": self.num_value_embeds,
-            "attn_scale": self.attn_scale,
-            "sliding_window_size": self.sliding_window_size,
-            "block_size": self.block_size,
-            "batch_size": self.batch_size,
-            "train_microbatch_size": self.train_microbatch_size,
-            "val_batch_size": self.val_batch_size,
-            "val_logit_chunk_tokens": self.val_logit_chunk_tokens,
-            "steps": self.effective_steps,
-            "seed": self.seed,
-            "val_fraction": self.val_fraction,
-            "tokenizer": tokenizer,
-            "n_train_runs": self.n_train_runs,
-            "training_recipe": self.training_recipe,
-            "muon_lr": self.muon_lr,
-            "muon_weight_decay": self.muon_weight_decay,
-            "muon_momentum_min": self.muon_momentum_min,
-            "muon_momentum_max": self.muon_momentum_max,
-            "muon_warmup_steps": self.muon_warmup_steps,
-            "muon_cooldown_steps": self.muon_cooldown_steps,
-            "adam_lr": self.adam_lr,
-            "adam_eps": self.adam_eps,
-            "adam_weight_decay": self.adam_weight_decay,
-            "embed_lr_mul": self.embed_lr_mul,
-            "lm_head_lr_mul": self.lm_head_lr_mul,
-            "value_embed_lr_mul": self.value_embed_lr_mul,
-            "scalar_lr_mul": self.scalar_lr_mul,
-            "embed_wd_mul": self.embed_wd_mul,
-            "lm_head_wd_mul": self.lm_head_wd_mul,
-            "value_embed_wd_mul": self.value_embed_wd_mul,
-            "scalar_wd_mul": self.scalar_wd_mul,
-            "adam_on_odd_steps": self.adam_on_odd_steps,
-            "batch_schedule_enabled": self.batch_schedule_enabled,
-            "batch_stage_fracs": list(self.batch_stage_fracs),
-            "batch_stage_muls": list(self.batch_stage_muls),
-            "lr_stage_muls": list(self.lr_stage_muls),
-            "lr_cooldown_frac": self.lr_cooldown_frac,
-            "lr_cooldown_floor": self.lr_cooldown_floor,
-            # Legacy record_01 AdamW knobs (ignored by speedrun_muon)
-            "learning_rate": self.learning_rate,
-            "weight_decay": self.weight_decay,
-            "adam_beta1": self.adam_beta1,
-            "adam_beta2": self.adam_beta2,
-            "record_adam_eps": self.record_adam_eps,
-            "grad_clip": self.grad_clip,
-            "warmup_steps": self.effective_warmup_steps,
-            "lr_min_ratio": self.lr_min_ratio,
-            # Portable feature flags
-            "bigram_hash_embed": self.bigram_hash_embed,
-            "smear_embed": self.smear_embed,
-            "partial_key_offset": self.partial_key_offset,
-            "paired_head": self.paired_head,
-            "mudd_pairs": self.mudd_pairs,
-            "xsa_enabled": self.xsa_enabled,
-            "xsa_pairs": self.xsa_pairs,
-            "single_act_last_k": self.single_act_last_k,
-            "exp_residual_decay": self.exp_residual_decay,
-            "multi_token_pred": self.multi_token_pred,
-            "eos_aligned_batches": self.eos_aligned_batches,
-            "max_document_tokens": self.max_document_tokens,
-            "grad_accum_embed_head_steps": self.grad_accum_embed_head_steps,
-            "seq_len_schedule": self.seq_len_schedule,
-            "untie_at_frac": self.untie_at_frac,
-            "cautious_wd": self.cautious_wd,
-            "nor_muon": self.nor_muon,
-            "polar_express": self.polar_express,
-        }
+class ProxyStudentConfig(BaseModel):
+    """Fixed proxy-student specification, grouped by ownership.
 
-    @property
-    def effective_train_tokens(self) -> int:
-        """Tokens billed / consumed for the configured training length.
+    ``arch`` (model shape), ``run`` (batching/length/seeding), ``optimizer``
+    (speedrun Muon + legacy record_01 recipes), ``schedule`` (batch/LR stages),
+    ``features`` (portable architecture features), and ``sandbox`` (upload and
+    lifetime sizing). Legacy flat field names are accepted at construction and
+    routed into their owning submodel, so predecessor configs keep loading.
+    """
 
-        * No ``train_token_budget``: historical ``effective_steps * batch * block``
-          (unchanged even when the speedrun batch schedule is enabled).
-        * With ``train_token_budget``: actual scheduled presentations under
-          ``batch_stage_muls`` / fracs (see ``batch_schedule``), matching sandbox
-          ``tokens_trained``. ``train_microbatch_size`` does not change the total.
-
-        FLOP billing uses ``6 * n_params * effective_train_tokens``.
-        """
-        if self.train_token_budget is None:
-            return self.effective_steps * self.batch_size * self.block_size
-        return scheduled_presentation_tokens(
-            self.effective_steps,
-            batch_size=self.batch_size,
-            block_size=self.block_size,
-            batch_stage_muls=self.batch_stage_muls,
-            batch_stage_fracs=self.batch_stage_fracs,
-            batch_schedule_enabled=self.batch_schedule_enabled,
-        )
-
-    @property
-    def effective_max_corpus_chars(self) -> int:
-        """Char cap on the uploaded corpus blob.
-
-        An explicit ``max_corpus_chars`` wins; otherwise it grows with the training
-        budget (``_CHARS_PER_TOKEN * effective_train_tokens``), floored at the
-        historical ``_MIN_CORPUS_CHARS`` and ceilinged at ``_MAX_CORPUS_CHARS``.
-        """
-        if self.max_corpus_chars is not None:
-            return self.max_corpus_chars
-        derived = _CHARS_PER_TOKEN * self.effective_train_tokens
-        return max(_MIN_CORPUS_CHARS, min(derived, _MAX_CORPUS_CHARS))
-
-    @property
-    def effective_timeout_minutes(self) -> int:
-        """Sandbox lifetime / command timeout (minutes).
-
-        An explicit ``timeout_minutes`` wins; otherwise derived from the budget
-        (setup overhead + tokens / throughput), floored at the historical 30.
-        Backend-specific ceilings are validated against the selected native
-        harness runtime by ``load_environment``.
-        """
-        if self.timeout_minutes is not None:
-            return self.timeout_minutes
-        derived = max(
-            _MIN_SANDBOX_TIMEOUT_MINUTES,
-            _SANDBOX_SETUP_MINUTES
-            + math.ceil(self.effective_train_tokens / _SANDBOX_TOKENS_PER_MINUTE),
-        )
-        return derived
+    arch: StudentArchConfig = Field(default_factory=StudentArchConfig)
+    run: StudentRunConfig = Field(default_factory=StudentRunConfig)
+    optimizer: StudentOptimizerConfig = Field(default_factory=StudentOptimizerConfig)
+    schedule: StudentScheduleConfig = Field(default_factory=StudentScheduleConfig)
+    features: StudentFeaturesConfig = Field(default_factory=StudentFeaturesConfig)
+    sandbox: StudentSandboxConfig = Field(default_factory=StudentSandboxConfig)
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_legacy_training_names(cls, data: object) -> object:
+    def _accept_legacy_flat_fields(cls, data: object) -> object:
         if not isinstance(data, dict):
             return data
         values = dict(data)
@@ -497,35 +419,149 @@ class ProxyStudentConfig(BaseModel):
             and "record_adam_eps" not in values
         ):
             values["record_adam_eps"] = values["adam_eps"]
+        # Route remaining flat keys into their owning submodel. An explicit
+        # nested value for the same field is a contradiction, not a tiebreak.
+        for group, fields in _STUDENT_SUBMODEL_FIELDS.items():
+            flat = [key for key in values if key in fields]
+            if not flat:
+                continue
+            sub = values.setdefault(group, {})
+            if not isinstance(sub, dict):
+                raise ValueError(
+                    f"cannot combine flat proxy-student field(s) {sorted(flat)} "
+                    f"with a pre-built {group!r} submodel"
+                )
+            for key in flat:
+                if key in sub and sub[key] != values[key]:
+                    raise ValueError(
+                        f"{key!r} set both flat and under {group!r} with "
+                        "different values"
+                    )
+                sub[key] = values.pop(key)
         return values
+
+    def __getattr__(self, name: str) -> object:
+        # Deprecated flat access (``config.steps`` for ``config.run.steps``):
+        # predecessor code and tests read proxy-student fields without the
+        # owning submodel, so route those names transparently.
+        if not name.startswith("_"):
+            for group, fields in _STUDENT_SUBMODEL_FIELDS.items():
+                if name in fields:
+                    return getattr(getattr(self, group), name)
+        return super().__getattr__(name)  # pyright: ignore[reportAttributeAccessIssue]
+
+    @property
+    def effective_steps(self) -> int:
+        """Training steps actually run.
+
+        With ``run.train_token_budget`` set: minimal N whose staged presentations
+        meet the budget (see ``train_gpt.steps_for_token_budget``).
+        Otherwise: the explicit ``run.steps`` field (unchanged historical path).
+        """
+        if self.run.train_token_budget is None:
+            return self.run.steps
+        return steps_for_token_budget(
+            self.run.train_token_budget,
+            batch_size=self.run.batch_size,
+            block_size=self.arch.block_size,
+            batch_stage_muls=self.schedule.batch_stage_muls,
+            batch_stage_fracs=self.schedule.batch_stage_fracs,
+            batch_schedule_enabled=self.schedule.batch_schedule_enabled,
+        )
+
+    @property
+    def effective_warmup_steps(self) -> int:
+        """LR warmup steps for the legacy ``record_01_adamw`` recipe only."""
+        if self.optimizer.warmup_steps is not None:
+            return min(self.optimizer.warmup_steps, self.effective_steps)
+        return min(256, max(1, self.effective_steps // 10))
+
+    @property
+    def effective_train_tokens(self) -> int:
+        """Tokens billed / consumed for the configured training length.
+
+        * No ``train_token_budget``: historical ``effective_steps * batch * block``
+          (unchanged even when the speedrun batch schedule is enabled).
+        * With ``train_token_budget``: actual scheduled presentations under
+          ``batch_stage_muls`` / fracs (see ``batch_schedule``), matching sandbox
+          ``tokens_trained``. ``train_microbatch_size`` does not change the total.
+
+        FLOP billing uses ``6 * n_params * effective_train_tokens``.
+        """
+        if self.run.train_token_budget is None:
+            return self.effective_steps * self.run.batch_size * self.arch.block_size
+        return scheduled_presentation_tokens(
+            self.effective_steps,
+            batch_size=self.run.batch_size,
+            block_size=self.arch.block_size,
+            batch_stage_muls=self.schedule.batch_stage_muls,
+            batch_stage_fracs=self.schedule.batch_stage_fracs,
+            batch_schedule_enabled=self.schedule.batch_schedule_enabled,
+        )
+
+    @property
+    def effective_max_corpus_chars(self) -> int:
+        """Char cap on the uploaded corpus blob.
+
+        An explicit ``sandbox.max_corpus_chars`` wins; otherwise it grows with the
+        training budget (``CHARS_PER_TOKEN * effective_train_tokens``), floored at
+        the historical ``_MIN_CORPUS_CHARS`` and ceilinged at ``_MAX_CORPUS_CHARS``.
+        """
+        if self.sandbox.max_corpus_chars is not None:
+            return self.sandbox.max_corpus_chars
+        derived = CHARS_PER_TOKEN * self.effective_train_tokens
+        return max(_MIN_CORPUS_CHARS, min(derived, _MAX_CORPUS_CHARS))
+
+    @property
+    def effective_timeout_minutes(self) -> int:
+        """Sandbox lifetime / command timeout (minutes).
+
+        An explicit ``sandbox.timeout_minutes`` wins; otherwise derived from the
+        budget (setup overhead + tokens / throughput), floored at the historical
+        30. Backend-specific ceilings are validated against the selected native
+        harness runtime by ``load_environment``.
+        """
+        if self.sandbox.timeout_minutes is not None:
+            return self.sandbox.timeout_minutes
+        return max(
+            _MIN_SANDBOX_TIMEOUT_MINUTES,
+            _SANDBOX_SETUP_MINUTES
+            + math.ceil(self.effective_train_tokens / _SANDBOX_TOKENS_PER_MINUTE),
+        )
 
     @property
     def max_doc_len(self) -> int | None:
-        """Deprecated attribute alias for ``max_document_tokens``."""
-        return self.max_document_tokens
+        """Deprecated attribute alias for ``features.max_document_tokens``."""
+        return self.features.max_document_tokens
 
-    @model_validator(mode="after")
-    def _check_student_dims(self) -> "ProxyStudentConfig":
-        # The modern student (train_gpt.GPT) requires: n_embd divisible by
-        # n_head, a head_dim that is a multiple of 4 (half-truncate RoPE), and an
-        # even depth >= 2 (symmetric U-net encoder/decoder skips). Reject anything
-        # unbuildable here so it fails fast instead of inside the GPU sandbox.
-        if self.n_embd % self.n_head != 0:
-            raise ValueError(
-                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
-            )
-        head_dim = self.n_embd // self.n_head
-        if head_dim % 4 != 0:
-            raise ValueError(
-                f"head_dim (n_embd/n_head = {head_dim}) must be a multiple of 4 "
-                "for half-truncate RoPE"
-            )
-        if self.n_layer % 2 != 0:
-            raise ValueError(
-                f"n_layer ({self.n_layer}) must be even for the U-net encoder/"
-                "decoder skip structure"
-            )
-        return self
+    def training_payload(self, *, tokenizer: str = "gpt2") -> dict[str, object]:
+        """Flat JSON config blob consumed by the sandbox / self-score trainers.
+
+        Assembled from the submodel dumps so a newly added field cannot be
+        forgotten here; only the derived overrides are spelled out. The sandbox
+        group is deliberately absent — it sizes the upload, not the training.
+        """
+        payload: dict[str, object] = {
+            **self.arch.model_dump(mode="json"),
+            **self.run.model_dump(
+                mode="json", exclude={"steps", "train_token_budget"}
+            ),
+            **self.optimizer.model_dump(
+                mode="json", exclude={"warmup_steps", "wd_ref_steps"}
+            ),
+            **self.schedule.model_dump(mode="json"),
+            **self.features.model_dump(mode="json"),
+            "steps": self.effective_steps,
+            "warmup_steps": self.effective_warmup_steps,
+            "tokenizer": tokenizer,
+        }
+        if self.optimizer.wd_ref_steps is not None:
+            # Hold cumulative decay constant across run lengths (see field doc).
+            ratio = self.optimizer.wd_ref_steps / self.effective_steps
+            payload["muon_weight_decay"] = self.optimizer.muon_weight_decay * ratio
+            payload["adam_weight_decay"] = self.optimizer.adam_weight_decay * ratio
+        return payload
+
 
 class CuratorConfig(BaseModel):
     """Central, validated configuration for the environment and reward."""
@@ -567,7 +603,7 @@ class CuratorConfig(BaseModel):
     # Convex power-law scaling exponent γ for the baseline-relative perf signal.
     # When gamma > 1, progress near the target loss is amplified (p >= 0 → p^γ)
     # while the negative (below-baseline) branch stays linear (p < 0 → p).
-    # γ=1.0 recovers today's linear behavior exactly. Must be finite and > 0.
+    # γ=1.0 recovers the linear behavior exactly. Must be finite and > 0.
     perf_scaling_exponent: float = Field(default=2.0)
     # When True (the default), the Perf REWARD term is the linear improvement
     # from ``perf_baseline_loss`` to ``perf_target_loss`` instead of
@@ -610,3 +646,30 @@ class CuratorConfig(BaseModel):
                 f"perf_scaling_exponent must be finite and > 0 (got {exp})"
             )
         return self
+
+
+class ScoringResult(BaseModel, frozen=True):
+    """One rollout's heavy scoring pass, shared by the reward and diagnostics.
+
+    Produced exactly once per rollout by ``CuratorScorer.compute_scoring`` and
+    retained on rollout state, so the keyed reward and the metric surface read
+    the same materialize/train/screen outcome without recomputing it. The
+    defaults are the empty-rollout sentinels; only the perf-curve constants are
+    config-dependent and therefore required.
+    """
+
+    perf: float = 0.0
+    leakage_score: float = 0.0
+    num_contaminated_matches: int = 0
+    decon_error: bool = False
+    val_screen_skipped: bool = False
+    loss: float = 0.0
+    accuracy: float = 0.0
+    flops: float = 0.0
+    tokens: int = 0
+    num_sources: int = 0
+    budget_fill_ratio: float = 0.0
+    perf_vs_baseline: float = 0.0
+    perf_baseline_loss: float
+    perf_target_loss: float
+    perf_scaling_exponent: float

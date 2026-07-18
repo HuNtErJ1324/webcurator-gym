@@ -8,9 +8,6 @@ from verifiers import ensure_keys
 from .config import CuratorEnvConfig, CuratorTasksetConfig
 from .taskset import CuratorTaskset
 
-_MODAL_MAX_TIMEOUT_MINUTES = 1440
-
-
 def load_taskset(config: CuratorTasksetConfig) -> CuratorTaskset:
     return CuratorTaskset(config)
 
@@ -26,34 +23,24 @@ def load_environment(config: CuratorEnvConfig | None = None) -> vf.Environment:
     curator = task.curator
     ensure_keys([task.hf_token_env])
 
-    student = curator.proxy_student
     runtime = config.harness.runtime
-    if curator.use_real_trainer and runtime.type not in {"docker", "modal"}:
-        raise ValueError(
-            "use_real_trainer=True requires harness.runtime.type to be "
-            "'docker' or 'modal'"
-        )
-    if curator.use_real_trainer and runtime.type == "docker":
-        if runtime.memory is None:
+    harness_env = dict(config.harness.env)
+    if curator.use_real_trainer:
+        if runtime.type not in {"docker", "modal"}:
             raise ValueError(
-                "real Docker training requires harness.runtime.memory"
+                "use_real_trainer=True requires harness.runtime.type to be "
+                "'docker' or 'modal'"
             )
-        from .util.container_memory import assert_host_supports_container_memory
-
-        assert_host_supports_container_memory(runtime.memory)
-    if curator.use_real_trainer and runtime.type == "modal":
-        ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
-        if student.effective_timeout_minutes > _MODAL_MAX_TIMEOUT_MINUTES:
-            raise ValueError(
-                f"timeout_minutes ({student.effective_timeout_minutes}) exceeds "
-                f"the Modal 24h sandbox maximum ({_MODAL_MAX_TIMEOUT_MINUTES}); "
-                "lower it"
-            )
+        if runtime.type == "docker":
+            if runtime.memory is None:
+                raise ValueError(
+                    "real Docker training requires harness.runtime.memory"
+                )
+            harness_env.setdefault("UV_REINSTALL_PACKAGE", "pydantic-core")
+        else:
+            ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
 
     forwarded = list(dict.fromkeys([*config.harness.forward_env, task.hf_token_env]))
-    harness_env = dict(config.harness.env)
-    if curator.use_real_trainer and runtime.type == "docker":
-        harness_env.setdefault("UV_REINSTALL_PACKAGE", "pydantic-core")
 
     harness = config.harness.model_copy(
         update={

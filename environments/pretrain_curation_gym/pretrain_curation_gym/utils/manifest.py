@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shlex
 from pathlib import PurePosixPath
 from typing import Any, Iterable
 
@@ -17,9 +18,6 @@ import verifiers.v1 as vf
 from pydantic import ValidationError
 
 from .models import FilterSpec, Manifest, Sampling, Source
-from .util.utils import content_text, extract_hf_commands
-
-
 class ManifestParser:
     """Tolerant parser for the agent-authored manifest contract."""
 
@@ -47,6 +45,20 @@ class ManifestParser:
         data = self.extract_object(text)
         if data is None:
             return None
+        return self.parse_object(
+            data,
+            default_token_budget=default_token_budget,
+            reserved_local_filename=reserved_local_filename,
+        )
+
+    def parse_object(
+        self,
+        data: dict[str, Any],
+        *,
+        default_token_budget: int,
+        reserved_local_filename: str | None = None,
+    ) -> Manifest | None:
+        """Parse an already-decoded JSON object (no re-serialization round trip)."""
         raw_sources = data.get("sources")
         if not isinstance(raw_sources, list) or not raw_sources:
             return None
@@ -84,43 +96,35 @@ class ManifestParser:
         last_any: dict[str, Any] | None = None
         last_manifest: dict[str, Any] | None = None
         for candidate in candidates:
-            for chunk in self.json_objects(candidate):
-                try:
-                    value = json.loads(chunk)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(value, dict):
-                    continue
+            for value in self.json_objects(candidate):
                 last_any = value
                 if isinstance(value.get("sources"), list) and value["sources"]:
                     last_manifest = value
         return last_manifest or last_any
 
     @staticmethod
-    def json_objects(text: str) -> Iterable[str]:
-        depth = 0
-        start: int | None = None
-        quoted = False
-        escaped = False
-        for index, char in enumerate(text):
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    quoted = False
+    def json_objects(text: str) -> Iterable[dict[str, Any]]:
+        """Yield every top-level JSON object embedded in ``text``.
+
+        The stdlib decoder does the quote/escape-aware parsing: scan for
+        candidate ``{`` offsets, `raw_decode` at each, and resume after a
+        successful object so nested objects are not double-yielded. An
+        unparseable candidate advances one character, which also recovers
+        valid objects nested inside malformed enclosing braces.
+        """
+        decoder = json.JSONDecoder()
+        index = 0
+        while (start := text.find("{", index)) >= 0:
+            try:
+                value, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                index = start + 1
                 continue
-            if char == '"':
-                quoted = True
-            elif char == "{":
-                start = index if depth == 0 else start
-                depth += 1
-            elif char == "}" and depth:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    yield text[start : index + 1]
-                    start = None
+            if isinstance(value, dict):
+                yield value
+                index = end
+            else:
+                index = start + 1
 
     def source(self, raw: Any) -> Source | None:
         if isinstance(raw, str):
@@ -232,6 +236,7 @@ class TraceManifestCandidates:
         r"(?:/[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
         r"(?![A-Za-z0-9_./-])"
     )
+    HF_COMMAND = re.compile(r"(?<![\w./-])hf\s+([^\n;&|`<>]+)")
     INVALID_NAMESPACES = frozenset(
         {
             "http",
@@ -310,7 +315,7 @@ class TraceManifestCandidates:
         inspected: dict[str, None] = {}
         for message in trace.assistant_messages:
             for call in message.tool_calls or []:
-                for argv in extract_hf_commands(self.shell_command(call.arguments)):
+                for argv in self.hf_commands(self.shell_command(call.arguments)):
                     if (
                         len(argv) >= 3
                         and argv[:2] == ["datasets", "info"]
@@ -323,7 +328,7 @@ class TraceManifestCandidates:
 
         observed: dict[str, None] = {}
         for message in trace.tool_messages:
-            for match in self.HF_ID.finditer(content_text(message.content)):
+            for match in self.HF_ID.finditer(self.message_text(message.content)):
                 dataset_id = match.group(1)
                 if self.looks_like_dataset_id(dataset_id):
                     observed.setdefault(dataset_id, None)
@@ -346,6 +351,38 @@ class TraceManifestCandidates:
                 raw,
             )
         return raw
+
+    @staticmethod
+    def message_text(content: Any) -> str:
+        """Flatten a message body into text for trace inspection."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        parts: list[str] = []
+        for part in content:
+            text = getattr(part, "text", None)
+            if text is None and isinstance(part, dict):
+                text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n".join(parts)
+
+    @classmethod
+    def hf_commands(cls, text: str) -> list[list[str]]:
+        """Extract observed ``hf`` CLI invocations as argument vectors."""
+        commands: list[list[str]] = []
+        for match in cls.HF_COMMAND.finditer(text or ""):
+            arguments = match.group(1).strip()
+            if not arguments:
+                continue
+            try:
+                argv = shlex.split(arguments)
+            except ValueError:
+                argv = arguments.split()
+            if argv:
+                commands.append(argv)
+        return commands
 
     def looks_like_dataset_id(self, value: str) -> bool:
         if "/" not in value:

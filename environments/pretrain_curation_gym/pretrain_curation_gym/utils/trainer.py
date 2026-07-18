@@ -6,8 +6,7 @@
     loss/accuracy from corpus statistics. Used in tests and as the default so the
     environment is usable without GPU.
   - `RuntimeProxyTrainer`: trains a fixed small GPT-2-scale model through the
-    live v1 Runtime, with Docker-only OOM diagnostics layered around the common
-    launch path.
+    live v1 Runtime.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ import asyncio
 import json
 import logging
 import math
-import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol
@@ -24,25 +22,19 @@ from typing import Any, Protocol
 import verifiers.v1 as vf
 from pydantic import BaseModel
 
-from .util.container_memory import (
-    collect_oom_diagnostics,
-    format_oom_diagnostics,
-    inspect_container_memory,
-)
 from .corpus import CuratedCorpus
-from .util.async_utils import run_blocking_drained
-from .util.hf_access import loop_local_semaphore
+from .async_utils import LoopLocalSemaphore, run_blocking_drained, run_shielded
 from .models import ProxyStudentConfig
 
 logger = logging.getLogger(__name__)
 
 # Loop-local bound on concurrent sandbox-training jobs, so a rollout group with
 # the real trainer never spawns more GPU sandboxes than configured at once.
-_TRAIN_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+_TRAIN_SEMAPHORES = LoopLocalSemaphore()
 
 
 def training_semaphore(limit: int) -> asyncio.Semaphore:
-    return loop_local_semaphore(_TRAIN_SEMAPHORES, limit)
+    return _TRAIN_SEMAPHORES.get(limit)
 
 
 class TrainerError(RuntimeError):
@@ -81,17 +73,18 @@ def estimate_param_count(config: ProxyStudentConfig) -> int:
     runtime torch dependency. Real GPU training embeds the model source into
     the sandbox script and never needs this import path.
     """
-    from .gpu.train_gpt import estimate_instantiated_param_count
+    from ..gpu.train_gpt import estimate_instantiated_param_count
 
+    arch = config.arch
     return estimate_instantiated_param_count(
-        num_layers=config.n_layer,
-        model_dim=config.n_embd,
-        num_heads=config.n_head,
-        mlp_ratio=config.mlp_ratio,
-        softcap=config.lm_head_softcap,
-        num_value_embeds=config.num_value_embeds,
-        attn_scale=config.attn_scale,
-        sliding_window_size=config.sliding_window_size,
+        num_layers=arch.n_layer,
+        model_dim=arch.n_embd,
+        num_heads=arch.n_head,
+        mlp_ratio=arch.mlp_ratio,
+        softcap=arch.lm_head_softcap,
+        num_value_embeds=arch.num_value_embeds,
+        attn_scale=arch.attn_scale,
+        sliding_window_size=arch.sliding_window_size,
     )
 
 
@@ -195,7 +188,7 @@ def _source_diversity(corpus: CuratedCorpus) -> float:
     return entropy / math.log(len(non_empty))
 
 
-TRAIN_GPT_PATH = Path(__file__).resolve().parent / "gpu" / "train_gpt.py"
+TRAIN_GPT_PATH = Path(__file__).resolve().parent.parent / "gpu" / "train_gpt.py"
 
 
 def _nanogpt_train_script() -> str:
@@ -312,7 +305,7 @@ class RuntimeProxyTrainer:
         for path, data in files:
             try:
                 await asyncio.wait_for(
-                    runtime.write(path, data), timeout=config.upload_timeout_seconds
+                    runtime.write(path, data), timeout=config.sandbox.upload_timeout_seconds
                 )
                 self._raise_if_cancelling()
             except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -324,7 +317,6 @@ class RuntimeProxyTrainer:
         self, runtime: vf.Runtime, config: ProxyStudentConfig
     ) -> Any:
         docker = runtime.type == "docker"
-        before = await self._read_cgroup(runtime, config) if docker else None
         timeout = config.effective_timeout_minutes * 60
         try:
             result = await asyncio.wait_for(
@@ -332,45 +324,27 @@ class RuntimeProxyTrainer:
             )
             self._raise_if_cancelling()
         except (asyncio.TimeoutError, TimeoutError) as exc:
-            after = await self._read_cgroup(runtime, config) if docker else None
             raise TrainerError(
                 f"proxy-student training timed out after {timeout}s",
-                stderr_tail=await self._training_diagnostic_async(
-                    "",
-                    "",
-                    runtime=runtime,
-                    config=config,
-                    events_before=before,
-                    events_after=after,
-                    timed_out=True,
-                ),
+                stderr_tail=self._training_diagnostic("", ""),
             ) from exc
 
         redirected = (
             await self._read_redirected_stderr(runtime, config) if docker else ""
         )
         stderr = self._merge_stderr(getattr(result, "stderr", None), redirected)
-        after = await self._read_cgroup(runtime, config) if docker else None
         await self._persist_logs(
             runtime,
             result,
             config,
             redirected=redirected,
             stderr=stderr,
-            events_before=before,
-            events_after=after,
         )
         if result.exit_code not in (0, None):
             raise TrainerError(
                 f"proxy-student training exited with code {result.exit_code}",
-                stderr_tail=await self._training_diagnostic_async(
-                    getattr(result, "stdout", ""),
-                    stderr,
-                    runtime=runtime,
-                    config=config,
-                    events_before=before,
-                    events_after=after,
-                    returncode=result.exit_code,
+                stderr_tail=self._training_diagnostic(
+                    getattr(result, "stdout", ""), stderr
                 ),
             )
         return SimpleNamespace(
@@ -379,50 +353,13 @@ class RuntimeProxyTrainer:
             exit_code=getattr(result, "exit_code", None),
         )
 
-    async def _read_cgroup(
-        self, runtime: vf.Runtime, config: ProxyStudentConfig
-    ) -> dict[str, Any]:
-        script = (
-            "from pathlib import Path\n"
-            "import json\n"
-            "events=Path('/sys/fs/cgroup/memory.events')\n"
-            "mmax=Path('/sys/fs/cgroup/memory.max')\n"
-            "payload={'events':{}, 'memory_max': None, 'error': None}\n"
-            "try:\n"
-            "    if events.is_file():\n"
-            "        for line in events.read_text().splitlines():\n"
-            "            parts=line.split()\n"
-            "            if len(parts)==2 and parts[1].lstrip('-').isdigit():\n"
-            "                payload['events'][parts[0]]=int(parts[1])\n"
-            "    if mmax.is_file():\n"
-            "        raw=mmax.read_text().strip()\n"
-            "        payload['memory_max']=None if raw=='max' else int(raw)\n"
-            "except Exception as exc:\n"
-            "    payload['error']=str(exc)\n"
-            "print('CGROUP_JSON '+json.dumps(payload, sort_keys=True))\n"
-        )
-        try:
-            result = await asyncio.wait_for(
-                runtime.run(["python", "-c", script], {}),
-                timeout=min(30.0, config.upload_timeout_seconds),
-            )
-        except Exception as exc:  # diagnostics must not raise
-            return {"events": {}, "memory_max": None, "error": str(exc)}
-        for line in reversed((getattr(result, "stdout", "") or "").splitlines()):
-            if line.startswith("CGROUP_JSON "):
-                try:
-                    return json.loads(line[len("CGROUP_JSON ") :])
-                except json.JSONDecodeError:
-                    break
-        return {"events": {}, "memory_max": None, "error": "missing CGROUP_JSON"}
-
     async def _read_redirected_stderr(
         self, runtime: vf.Runtime, config: ProxyStudentConfig
     ) -> str:
         try:
             data = await asyncio.wait_for(
                 runtime.read("/workspace/stderr.txt"),
-                timeout=config.upload_timeout_seconds,
+                timeout=config.sandbox.upload_timeout_seconds,
             )
         except Exception:
             return ""
@@ -449,8 +386,6 @@ class RuntimeProxyTrainer:
         *,
         redirected: str,
         stderr: str,
-        events_before: dict[str, Any] | None,
-        events_after: dict[str, Any] | None,
     ) -> None:
         logs = {
             "/workspace/train_stdout.log": getattr(result, "stdout", "") or "",
@@ -458,22 +393,11 @@ class RuntimeProxyTrainer:
         }
         if runtime.type == "docker":
             logs["/workspace/train_stderr_redirect.log"] = redirected
-            diagnostics = await self._oom_diagnostics_async(
-                runtime,
-                config,
-                events_before=events_before,
-                events_after=events_after,
-                returncode=getattr(result, "exit_code", None),
-                stderr=stderr,
-            )
-            logs["/workspace/train_oom_diagnostics.json"] = json.dumps(
-                diagnostics, sort_keys=True, default=str
-            )
         try:
             for path, text in logs.items():
                 await asyncio.wait_for(
                     runtime.write(path, text.encode("utf-8", errors="replace")),
-                    timeout=config.upload_timeout_seconds,
+                    timeout=config.sandbox.upload_timeout_seconds,
                 )
         except Exception:
             logger.warning(
@@ -509,117 +433,31 @@ class RuntimeProxyTrainer:
                 stderr_tail=self._training_diagnostic(stdout, stderr),
             ) from exc
 
-    def _training_diagnostic(self, stdout: str, stderr: str, **kwargs: Any) -> str:
+    def _training_diagnostic(self, stdout: str, stderr: str) -> str:
         parts = [
             "--- stdout tail ---",
             self._diagnostic_stream(stdout or ""),
             "--- stderr tail ---",
             self._diagnostic_stream(stderr or ""),
         ]
-        runtime = kwargs.get("runtime")
-        if runtime is not None and runtime.type == "docker":
-            parts.append(
-                kwargs.get("memory_diagnostic")
-                or self._memory_diagnostic(
-                    runtime,
-                    kwargs.get("config"),
-                    events_before=kwargs.get("events_before"),
-                    events_after=kwargs.get("events_after"),
-                    returncode=kwargs.get("returncode"),
-                    stderr=stderr,
-                    timed_out=bool(kwargs.get("timed_out")),
-                )
-            )
         return "\n".join(parts)
-
-    async def _training_diagnostic_async(
-        self, stdout: str, stderr: str, **kwargs: Any
-    ) -> str:
-        runtime = kwargs.get("runtime")
-        if runtime is not None and runtime.type == "docker":
-            kwargs["memory_diagnostic"] = await self._memory_diagnostic_async(
-                runtime,
-                kwargs.get("config"),
-                events_before=kwargs.get("events_before"),
-                events_after=kwargs.get("events_after"),
-                returncode=kwargs.get("returncode"),
-                stderr=stderr,
-                timed_out=bool(kwargs.get("timed_out")),
-            )
-        return self._training_diagnostic(stdout, stderr, **kwargs)
 
     def _diagnostic_stream(self, text: str) -> str:
         marker_at = text.find(self.TRACEBACK_MARKER)
         return text[marker_at:] if marker_at >= 0 else text[-self.STREAM_TAIL :]
 
-    def _oom_diagnostics(
-        self,
-        runtime: vf.Runtime,
-        config: ProxyStudentConfig | None,
-        *,
-        events_before: dict[str, Any] | None = None,
-        events_after: dict[str, Any] | None = None,
-        returncode: int | None = None,
-        stderr: str | None = None,
-        timed_out: bool = False,
-        inspect_info: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        container = getattr(runtime, "_container", None) or getattr(
-            runtime, "name", None
-        )
-        if container and inspect_info is None:
-            try:
-                inspect_info = inspect_container_memory(str(container))
-            except Exception as exc:
-                logger.debug("oom inspect failed: %s", exc)
-        return collect_oom_diagnostics(
-            configured_gb=getattr(getattr(runtime, "config", None), "memory", None),
-            effective_memory_bytes=(inspect_info or {}).get("memory_bytes"),
-            oom_killed=(inspect_info or {}).get("oom_killed"),
-            container=str(container) if container else None,
-            events_before=events_before,
-            events_after=events_after,
-            returncode=returncode,
-            stderr=stderr,
-            timed_out=timed_out,
-        )
-
-    async def _oom_diagnostics_async(
-        self,
-        runtime: vf.Runtime,
-        config: ProxyStudentConfig | None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        container = getattr(runtime, "_container", None) or getattr(runtime, "name", "")
-        try:
-            inspect_info = await asyncio.to_thread(
-                inspect_container_memory, str(container)
-            )
-        except Exception:
-            inspect_info = None
-        return self._oom_diagnostics(
-            runtime, config, inspect_info=inspect_info, **kwargs
-        )
-
-    def _memory_diagnostic(
-        self, runtime: vf.Runtime, config: ProxyStudentConfig | None, **kwargs: Any
-    ) -> str:
-        return format_oom_diagnostics(self._oom_diagnostics(runtime, config, **kwargs))
-
-    async def _memory_diagnostic_async(
-        self, runtime: vf.Runtime, config: ProxyStudentConfig | None, **kwargs: Any
-    ) -> str:
-        return format_oom_diagnostics(
-            await self._oom_diagnostics_async(runtime, config, **kwargs)
-        )
-
     @staticmethod
     async def _stop_cancel_safe(runtime: vf.Runtime) -> None:
-        teardown = asyncio.create_task(runtime.stop())
+        """Drain runtime teardown to completion; cancellation wins, errors log.
+
+        ``run_shielded`` supplies the framework-native drain semantics: teardown
+        always finishes, a caller cancellation re-raises afterwards (with any
+        teardown error chained beneath it), and a plain teardown failure is
+        logged rather than masking the exception that triggered the stop.
+        """
         try:
-            await asyncio.shield(teardown)
+            await run_shielded(runtime.stop())
         except asyncio.CancelledError:
-            await asyncio.shield(teardown)
             raise
         except Exception:
             logger.warning("runtime teardown failed", exc_info=True)

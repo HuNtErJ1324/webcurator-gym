@@ -8,7 +8,6 @@ cross the state boundary.
 
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 import uuid
@@ -16,10 +15,17 @@ import weakref
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 import verifiers.v1 as vf
 from pydantic import Field, PrivateAttr
 
-from .models import MANIFEST_PROVENANCE_MISSING, Manifest, ManifestProvenance
+from .utils.models import (
+    MANIFEST_PROVENANCE_MISSING,
+    Manifest,
+    ManifestProvenance,
+    ScoringResult,
+)
 
 
 class CuratorState(vf.State):
@@ -54,7 +60,7 @@ class CuratorState(vf.State):
     # Task.score runs @metric methods before @reward methods. Keep the one
     # expensive scoring result on rollout-owned state so both v1 primitives use
     # it without materializing/training twice.
-    _scoring_result: dict[str, Any] | None = PrivateAttr(default=None)
+    _scoring_result: ScoringResult | None = PrivateAttr(default=None)
     _turn_runtime: vf.Runtime | None = PrivateAttr(default=None)
 
     @property
@@ -105,18 +111,19 @@ class CuratorState(vf.State):
         return Path(self.scratch_dir)
 
     def cached_documents(self, key: str) -> list[str] | None:
+        """Blocking read of a cached fetch; callers offload it via to_thread."""
         filename = self.doc_cache.get(key)
         if filename is None or self.scratch_dir is None:
             return None
-        with (Path(self.scratch_dir) / filename).open(encoding="utf-8") as file:
-            return [json.loads(line) for line in file]
+        with (Path(self.scratch_dir) / filename).open("rb") as file:
+            return [orjson.loads(line) for line in file]
 
     def cache_documents(self, key: str, documents: list[str]) -> None:
         filename = f"raw_{uuid.uuid4().hex}.jsonl"
-        with (self.workspace() / filename).open("w", encoding="utf-8") as file:
+        with (self.workspace() / filename).open("wb") as file:
             for document in documents:
-                file.write(json.dumps(document))
-                file.write("\n")
+                file.write(orjson.dumps(document))
+                file.write(b"\n")
         self.doc_cache[key] = filename
 
     def cleanup(self) -> None:

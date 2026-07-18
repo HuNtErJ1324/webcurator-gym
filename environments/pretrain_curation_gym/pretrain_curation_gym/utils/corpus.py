@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import re
 import shlex
@@ -36,9 +35,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import orjson
 import verifiers.v1 as vf
 
-from .util.hf_access import (
+from .async_utils import LoopLocalLocks, run_blocking_drained
+from .hf_access import (
     DatasetAccessError,
     DatasetSearchClient,
     FetchKey,
@@ -49,7 +50,7 @@ from .util.hf_access import (
     hf_fetch_semaphore,
 )
 from .models import FilterSpec, Manifest, Source
-from .state import CuratorState
+from ..state import CuratorState
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +66,10 @@ def _write_jsonl(path: Path, docs: Iterable[str]) -> tuple[int, int]:
     """
     doc_count = 0
     token_count = 0
-    with path.open("w", encoding="utf-8") as fh:
+    with path.open("wb") as fh:
         for doc in docs:
-            fh.write(json.dumps(doc))
-            fh.write("\n")
+            fh.write(orjson.dumps(doc))
+            fh.write(b"\n")
             doc_count += 1
             token_count += estimate_tokens(doc)
     return doc_count, token_count
@@ -77,9 +78,9 @@ def _write_jsonl(path: Path, docs: Iterable[str]) -> tuple[int, int]:
 def _iter_jsonl(path: Path | None) -> Iterator[str]:
     if path is None:
         return
-    with path.open("r", encoding="utf-8") as fh:
+    with path.open("rb") as fh:
         for line in fh:
-            yield json.loads(line)
+            yield orjson.loads(line)
 
 
 def _iter_local_documents(
@@ -99,8 +100,8 @@ def _iter_local_documents(
                 if not raw:
                     continue
                 try:
-                    value = json.loads(raw)
-                except json.JSONDecodeError:
+                    value = orjson.loads(raw)
+                except orjson.JSONDecodeError:
                     yield raw
                     continue
                 if isinstance(value, dict):
@@ -166,28 +167,11 @@ class SourceCorpus:
         *,
         dest_dir: Path | None = None,
     ) -> "SourceCorpus":
-        """Stream `docs` to a scratch file (see `from_iter`).
-
-        Kept as a named entry point so the materialization of an in-memory
-        document iterable is explicit; the async fetch/materialize paths call
-        this through `asyncio.to_thread` to keep the blocking disk write off the
-        event loop.
-        """
-        return cls.from_iter(dataset_id, config, weight, docs, dest_dir=dest_dir)
-
-    @classmethod
-    def from_iter(
-        cls,
-        dataset_id: str,
-        config: str | None,
-        weight: float,
-        docs: Iterable[str],
-        *,
-        dest_dir: Path | None = None,
-    ) -> "SourceCorpus":
         """Stream `docs` to a scratch file and return the resulting corpus.
 
-        `dest_dir` is normally a rollout's shared scratch directory (see
+        The blocking disk write is the point: the async fetch/materialize
+        paths call this through `asyncio.to_thread` to keep it off the event
+        loop. `dest_dir` is normally a rollout's shared scratch directory (see
         `CuratorState.workspace`), whose cleanup the caller owns. When
         omitted (standalone/test construction), a private temp directory is
         created and registered for best-effort cleanup via `weakref.finalize`
@@ -228,10 +212,10 @@ class SourceCorpus:
         path = self.path or dest_dir / f"src_{uuid.uuid4().hex}.jsonl"
         added_docs = 0
         added_tokens = 0
-        with path.open("a", encoding="utf-8") as fh:
+        with path.open("ab") as fh:
             for doc in docs:
-                fh.write(json.dumps(doc))
-                fh.write("\n")
+                fh.write(orjson.dumps(doc))
+                fh.write(b"\n")
                 added_docs += 1
                 added_tokens += estimate_tokens(doc)
         if added_docs:
@@ -287,11 +271,11 @@ class CuratedCorpus:
                 break
             documents.append(doc)
             remaining -= len(doc)
-        return json.dumps(
-            {"format": "document-list-v1", "documents": documents},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        # orjson output is compact and UTF-8 by default, matching the
+        # historical ensure_ascii=False + (",", ":") separators exactly.
+        return orjson.dumps(
+            {"format": "document-list-v1", "documents": documents}
+        ).decode("utf-8")
 
 
 def _iter_sampling(
@@ -394,18 +378,23 @@ def _alpha_ratio(text: str) -> float:
     return sum(1 for c in text if c.isalpha()) / len(text)
 
 
+def _doc_digest(text: str) -> bytes:
+    """16-byte identity digest for dedup bookkeeping (not adversarial hashing)."""
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+
+
 def _dedup_exact_iter(docs: Iterable[str]) -> Iterator[str]:
     """Streaming `dedup_exact`: a running set of fixed-size digests, not the
     full document list (nor the full stripped text -- a `set[str]` of
     stripped documents would itself be a second complete copy of every
     surviving document's text), is all that is needed to detect duplicates.
-    Collision probability at SHA-256 is astronomically below any realistic
+    Collision probability at BLAKE2b-128 is astronomically below any realistic
     corpus size, so this is exact in practice, matching the previous
     full-text-equality semantics.
     """
     seen: set[bytes] = set()
     for doc in docs:
-        digest = hashlib.sha256(doc.strip().encode("utf-8")).digest()
+        digest = _doc_digest(doc.strip())
         if digest in seen:
             continue
         seen.add(digest)
@@ -440,11 +429,9 @@ def _iter_unsampled(
     sampled_docs: Iterable[str],
 ) -> Iterator[str]:
     """Yield documents not already selected by the first sampling pass."""
-    sampled = Counter(
-        hashlib.sha256(doc.encode("utf-8")).digest() for doc in sampled_docs
-    )
+    sampled = Counter(_doc_digest(doc) for doc in sampled_docs)
     for doc in docs:
-        digest = hashlib.sha256(doc.encode("utf-8")).digest()
+        digest = _doc_digest(doc)
         remaining = sampled.get(digest, 0)
         if remaining:
             if remaining == 1:
@@ -501,72 +488,17 @@ class CorpusBuilder:
         # event loop stays free while the disk write is offloaded.
         self._store_lock = asyncio.Lock()
         # Loop-local single-flight guard: concurrent fetches sharing one
-        # (rollout, source key) coalesce onto a single Hub fetch. Locks bind to
-        # their running loop, and the rollout
-        # state must stay JSON-serializable, so they live here keyed by loop
-        # then by "<rollout token>\x00<cache key>", never in state (mirrors the
-        # loop-local registries in hf_access).
-        self._fetch_locks: weakref.WeakKeyDictionary[
-            asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
-        ] = weakref.WeakKeyDictionary()
-
-    def _fetch_lock(self, lock_key: str) -> asyncio.Lock:
-        """Loop-local single-flight lock for `lock_key`, created on demand."""
-        loop = asyncio.get_running_loop()
-        locks = self._fetch_locks.get(loop)
-        if locks is None:
-            locks = {}
-            self._fetch_locks[loop] = locks
-        lock = locks.get(lock_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            locks[lock_key] = lock
-        return lock
-
-    @staticmethod
-    async def _offloaded_to_completion(fn, *args, **kwargs):
-        """Await ``asyncio.to_thread(fn, *args, **kwargs)`` for a blocking write.
-
-        If *this* coroutine is cancelled while the worker thread is still running,
-        we do **not** release the surrounding critical-section guard (an asyncio
-        lock or the pipeline semaphore) until the worker has actually finished:
-        the underlying task is created explicitly, shielded from the cancellation,
-        and awaited to completion inside the guard before the ``CancelledError`` is
-        re-raised. Callers must therefore hold the relevant guard around this call
-        (the store-lock for ``store_docs``, the pipeline semaphore for
-        ``from_docs``) so a follower can never observe a half-written state or
-        transiently exceed ``fetch_limit``.
-
-        Exactly-once / error semantics:
-        - Normal completion: the result is returned and the guard releases.
-        - Worker error, no cancellation: the worker's exception propagates
-          unchanged (it is not wrapped in ``CancelledError``).
-        - Cancellation while the worker is still running: we wait for the worker;
-          if the worker then succeeds we re-raise ``CancelledError``, and if the
-          worker itself fails we re-raise the worker's exception (the cancellation
-          does not mask the real error).
-        """
-        worker = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
-        shielded = asyncio.shield(worker)
-        try:
-            return await shielded
-        except asyncio.CancelledError:
-            # The caller was cancelled, but the worker thread is still running
-            # (shield keeps it alive). Stay inside the guard and wait for the
-            # worker to finish so the write completes before any follower enters.
-            try:
-                await worker
-            except BaseException as exc:
-                # The worker failed: surface its error, not the cancellation.
-                raise exc
-            raise
-
-    def _discard_fetch_lock(self, lock_key: str) -> None:
-        """Drop a single-flight lock once its result is cached (bounds growth)."""
-        loop = asyncio.get_running_loop()
-        locks = self._fetch_locks.get(loop)
-        if locks is not None:
-            locks.pop(lock_key, None)
+        # (rollout, source key) coalesce onto a single Hub fetch. Guards are
+        # keyed by "<rollout token>\x00<cache key>" and live off-state (see
+        # LoopLocalLocks for why they cannot live in rollout state).
+        #
+        # Offloaded writes inside these guards go through
+        # `run_blocking_drained`, which awaits the worker thread to completion
+        # even under cancellation — so a guard (this lock, the store lock, or
+        # the pipeline semaphore) is never released while a worker can still
+        # be writing, and a follower can never observe a half-written state or
+        # transiently exceed `fetch_limit`.
+        self._fetch_locks = LoopLocalLocks()
 
     async def fetch_source_docs(
         self, state: CuratorState, key: FetchKey
@@ -586,7 +518,9 @@ class CorpusBuilder:
         and the losers read the cached result.
         """
         cache_key = key.as_str()
-        cached = state.cached_documents(cache_key)
+        # Cache files hold a source's full fetched docs; both the fast-path
+        # read and the re-check under the lock stay off the event loop.
+        cached = await run_blocking_drained(state.cached_documents, cache_key)
         if cached is not None:
             return cached, None
         # The single-flight lock is keyed per (rollout, fetch key). The rollout's
@@ -595,12 +529,14 @@ class CorpusBuilder:
         # rollout (mirrors the v0 fallback when no trajectory id was present).
         token = str(id(state))
         lock_key = f"{token}\x00{cache_key}"
-        lock = self._fetch_lock(lock_key)
+        lock = self._fetch_locks.get(lock_key)
         try:
             async with lock:
                 # Re-check under the lock: a racing caller may have already
                 # fetched and stored this key while we waited.
-                cached = state.cached_documents(cache_key)
+                cached = await run_blocking_drained(
+                    state.cached_documents, cache_key
+                )
                 if cached is not None:
                     return cached, None
                 try:
@@ -617,16 +553,16 @@ class CorpusBuilder:
                 # self._store_lock` serializes these across worker threads so the
                 # state's read-modify-write stays race-free; the lock lives on the
                 # event-loop thread and is never held on a worker thread. The
-                # helper holds the lock until the worker *completes*, so a
-                # cancellation mid-write cannot release the lock early and let a
+                # drained offload holds the lock until the worker *completes*, so
+                # a cancellation mid-write cannot release the lock early and let a
                 # second write race or observe a half-written state.
                 async with self._store_lock:
-                    await self._offloaded_to_completion(
+                    await run_blocking_drained(
                         state.cache_documents, cache_key, docs
                     )
                 return docs, None
         finally:
-            self._discard_fetch_lock(lock_key)
+            self._fetch_locks.discard(lock_key)
 
     def _local_fetch_key(self, source: Source) -> FetchKey:
         return FetchKey(
@@ -666,16 +602,18 @@ class CorpusBuilder:
                 "local source cannot be read without a live runtime",
             )
 
-        cached = state.cached_documents(cache_key)
+        cached = await run_blocking_drained(state.cached_documents, cache_key)
         if cached is not None:
             return cached, None
 
         token = str(id(state))
         lock_key = f"{token}\x00{cache_key}"
-        lock = self._fetch_lock(lock_key)
+        lock = self._fetch_locks.get(lock_key)
         try:
             async with lock:
-                cached = state.cached_documents(cache_key)
+                cached = await run_blocking_drained(
+                    state.cached_documents, cache_key
+                )
                 if cached is not None:
                     return cached, None
 
@@ -714,7 +652,7 @@ class CorpusBuilder:
 
                 raw_path = state.workspace() / f"local_raw_{uuid.uuid4().hex}"
                 try:
-                    docs = await asyncio.to_thread(
+                    docs = await run_blocking_drained(
                         _materialize_local_docs,
                         raw_path,
                         pulled.stdout,
@@ -727,7 +665,7 @@ class CorpusBuilder:
                     raw_path.unlink(missing_ok=True)
 
                 async with self._store_lock:
-                    await self._offloaded_to_completion(
+                    await run_blocking_drained(
                         state.cache_documents, cache_key, docs
                     )
                 truncated = size > cap
@@ -737,7 +675,7 @@ class CorpusBuilder:
                 )
                 return docs, None
         finally:
-            self._discard_fetch_lock(lock_key)
+            self._fetch_locks.discard(lock_key)
 
     async def materialize(
         self,
@@ -824,11 +762,11 @@ class CorpusBuilder:
                 filtered = tracked_filtered()
                 sampled = _iter_sampling(filtered, source, weight_target)
                 # Persistent write, offloaded. This runs inside `async with
-                # pipeline_sem` above, and the helper keeps the semaphore held
-                # until the worker finishes, so a cancellation mid-write cannot
-                # transiently release the slot and let another pipeline's write
-                # overlap beyond `fetch_limit`.
-                corpus = await self._offloaded_to_completion(
+                # pipeline_sem` above, and the drained offload keeps the
+                # semaphore held until the worker finishes, so a cancellation
+                # mid-write cannot transiently release the slot and let another
+                # pipeline's write overlap beyond `fetch_limit`.
+                corpus = await run_blocking_drained(
                     SourceCorpus.from_docs,
                     source.dataset_id,
                     source.config,
@@ -866,12 +804,14 @@ class CorpusBuilder:
                     break
                 if key is None or not has_surplus:
                     continue
-                raw = state.cached_documents(key.as_str())
+                raw = await run_blocking_drained(
+                    state.cached_documents, key.as_str()
+                )
                 if raw is None:
                     continue
                 filtered = self._filter.apply_iter(raw, source.filters)
                 surplus = _iter_unsampled(filtered, corpus.iter_documents())
-                _, added_tokens = await asyncio.to_thread(
+                _, added_tokens = await run_blocking_drained(
                     corpus.append_iter,
                     _iter_sampling(
                         surplus,

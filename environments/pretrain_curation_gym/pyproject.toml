@@ -15,14 +15,19 @@ tags = [
 version = "0.1.0"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "verifiers==0.2.1.dev42",
+    # verifiers[modal] carries the Modal SDK at the version the v1 modal
+    # harness runtime requires; the environment itself never imports modal.
+    "verifiers[modal]==0.2.1.dev42",
     "renderers==0.1.8.dev49",
     "datasets>=2.18.0",
     "huggingface-hub>=0.24.0",
     "numpy>=1.24.0",
-    "modal>=0.73",
+    "orjson>=3.9.0",
+    "tenacity>=8.5.0",
     "tiktoken>=0.7.0",
-    "tqdm>=4.66.0",
+    # Not imported directly: `datasets` needs it at runtime to stream
+    # zstd-compressed Hub sources an agent may cite. (The runtime image also
+    # installs it separately for the in-container `hf` CLI.)
     "zstandard>=0.23.0",
 ]
 
@@ -52,14 +57,14 @@ include = [
 num_examples = 1
 rollouts_per_example = 1
 
-[project.scripts]
-pcg-debug-train = "pretrain_curation_gym.util.debug_train:main"
-
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "torch==2.7.0",
+    # train_gpt's torch-guarded block imports tqdm; production hosts never
+    # reach it (no torch) and sandbox images bake their own copy.
+    "tqdm>=4.66.0",
 ]
 
 [tool.pytest.ini_options]

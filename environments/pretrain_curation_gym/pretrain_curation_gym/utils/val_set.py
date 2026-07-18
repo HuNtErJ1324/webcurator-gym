@@ -26,22 +26,22 @@ than crashing.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import weakref
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable
 
 import numpy as np
 from pydantic import BaseModel, Field
 
-from .util.hf_access import (
+from .async_utils import LoopLocalLocks
+from .hf_access import (
     DatasetAccessError,
     RetryPolicy,
     hf_fetch_semaphore,
     run_blocking_with_retry,
 )
-from .gpu.train_gpt import plan_val_windows
+from ..gpu.train_gpt import plan_val_windows
 
 # --- NanoGPT speedrun validation-set spec (verified against modded-nanogpt) ---
 # Source dataset (GPT-2-BPE-tokenized FineWeb sample-10BT) and the val shard.
@@ -91,14 +91,6 @@ class HeldOutValSet:
     def to_uint16_bytes(self) -> bytes:
         """Raw little-endian uint16 bytes (header-free) for upload to the trainer."""
         return np.ascontiguousarray(self.tokens, dtype=_TOKEN_DTYPE).tobytes()
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "dataset_id": self.dataset_id,
-            "filename": self.filename,
-            "tokenizer": self.tokenizer,
-            "n_tokens": self.n_tokens,
-        }
 
 
 def parse_token_shard(
@@ -195,10 +187,21 @@ def mean_held_out_ce(n_tokens, block, window_loss_sum):
 DownloadFn = Callable[[str, str, str], str]
 
 
-def _default_download(dataset_id: str, filename: str, repo_type: str) -> str:
+def _default_download(
+    dataset_id: str,
+    filename: str,
+    repo_type: str,
+    *,
+    token: str | None = None,
+) -> str:
     from huggingface_hub import hf_hub_download
 
-    return hf_hub_download(repo_id=dataset_id, filename=filename, repo_type=repo_type)
+    return hf_hub_download(
+        repo_id=dataset_id,
+        filename=filename,
+        repo_type=repo_type,
+        token=token,
+    )
 
 
 class ValTokenLoader:
@@ -216,19 +219,18 @@ class ValTokenLoader:
         config: ValidationSetConfig,
         *,
         download_fn: DownloadFn | None = None,
+        token: str | None = None,
         retry_policy: RetryPolicy | None = None,
         fetch_limit: int = 8,
     ) -> None:
         self._config = config
-        self._download_fn = download_fn or _default_download
+        self._download_fn = download_fn or partial(_default_download, token=token)
         self._retry = retry_policy or RetryPolicy()
         self._fetch_limit = fetch_limit
         self._cache: dict[str, HeldOutValSet] = {}
         # Loop-local single-flight locks (one per cache key), so concurrent first
         # loads coalesce onto a single download+parse and a single cache write.
-        self._locks: weakref.WeakKeyDictionary[
-            asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
-        ] = weakref.WeakKeyDictionary()
+        self._locks = LoopLocalLocks()
 
     @property
     def cache_key(self) -> str:
@@ -236,18 +238,6 @@ class ValTokenLoader:
             [self._config.dataset_id, self._config.filename, self._config.val_tokens],
             separators=(",", ":"),
         )
-
-    def _lock(self, key: str) -> asyncio.Lock:
-        loop = asyncio.get_running_loop()
-        locks = self._locks.get(loop)
-        if locks is None:
-            locks = {}
-            self._locks[loop] = locks
-        lock = locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            locks[key] = lock
-        return lock
 
     async def load(self) -> HeldOutValSet:
         """Return the held-out val set, fetching once. Raises ``DatasetAccessError``.
@@ -259,7 +249,7 @@ class ValTokenLoader:
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        async with self._lock(key):
+        async with self._locks.get(key):
             cached = self._cache.get(key)
             if cached is not None:
                 return cached

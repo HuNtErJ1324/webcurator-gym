@@ -27,20 +27,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import weakref
 from dataclasses import dataclass
-from typing import Any
 
 import verifiers.v1 as vf
 
-from .corpus import CorpusBuilder, CuratedCorpus
-from .leakage import DeconError, DeconLeakageDetector, LeakageScores
-from .models import CuratorConfig
+from .utils.corpus import CorpusBuilder, CuratedCorpus
+from .utils.leakage import DeconError, DeconLeakageDetector, LeakageScores
+from .utils.models import CuratorConfig, ScoringResult
 from .state import CuratorState
-from .trainer import ProxyStudentTrainer, TrainResult
-from .util.async_utils import run_blocking_drained
-from .util.hf_access import DatasetAccessError, loop_local_semaphore
-from .val_set import ValTokenLoader
+from .utils.trainer import ProxyStudentTrainer, TrainResult
+from .utils.async_utils import LoopLocalSemaphore, run_blocking_drained
+from .utils.hf_access import DatasetAccessError
+from .utils.val_set import ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +46,7 @@ logger = logging.getLogger(__name__)
 # overlap for a rollout without an eval fan-out spawning an unbounded number of
 # CPU/RAM-heavy Decon subprocesses. The shared config's heavy-scoring limit is
 # applied independently to both gates.
-_DECON_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+_DECON_SEMAPHORES = LoopLocalSemaphore()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,11 +78,10 @@ class CuratorScorer:
 
     async def compute_scoring(
         self, state: CuratorState, runtime: vf.Runtime | None = None
-    ) -> dict[str, Any]:
+    ) -> ScoringResult:
         manifest = state.parsed_manifest
-        finalized = state.manifest_finalized
-        if not finalized or not manifest.sources:
-            return self._empty_scoring(state)
+        if not state.manifest_finalized or not manifest.sources:
+            return self._empty_scoring()
 
         corpus = await self.corpus_builder.materialize(manifest, state, runtime=runtime)
         # Both final scorers only read the materialized corpus. Start training
@@ -105,22 +102,25 @@ class CuratorScorer:
         leakage_result = leakage_outcome
         train_result = train_outcome
 
-        return {
-            "perf": self._perf(train_result),
-            "leakage": leakage_result.scores.as_dict(),
-            "decon_error": float(leakage_result.decon_error),
-            "val_screen_skipped": float(leakage_result.val_screen_skipped),
-            "loss": train_result.loss if math.isfinite(train_result.loss) else 0.0,
-            "accuracy": float(train_result.accuracy or 0.0),
-            "flops": train_result.flops,
-            "tokens": corpus.total_tokens,
-            "num_sources": len([s for s in corpus.sources if s.doc_count]),
-            "budget_fill_ratio": state.budget_fill_ratio,
-            "perf_vs_baseline": self._relative_improvement(train_result),
-            "perf_baseline_loss": self.config.perf_baseline_loss,
-            "perf_target_loss": self.config.perf_target_loss,
-            "perf_scaling_exponent": self.config.perf_scaling_exponent,
-        }
+        scores = leakage_result.scores
+        return ScoringResult(
+            perf=self._perf(train_result),
+            # Rounded exactly as the historical LeakageScores.as_dict surface.
+            leakage_score=round(scores.leakage_score, 6),
+            num_contaminated_matches=scores.num_contaminated_matches,
+            decon_error=leakage_result.decon_error,
+            val_screen_skipped=leakage_result.val_screen_skipped,
+            loss=train_result.loss if math.isfinite(train_result.loss) else 0.0,
+            accuracy=float(train_result.accuracy or 0.0),
+            flops=train_result.flops,
+            tokens=corpus.total_tokens,
+            num_sources=len([s for s in corpus.sources if s.doc_count]),
+            budget_fill_ratio=state.budget_fill_ratio,
+            perf_vs_baseline=self._relative_improvement(train_result),
+            perf_baseline_loss=self.config.perf_baseline_loss,
+            perf_target_loss=self.config.perf_target_loss,
+            perf_scaling_exponent=self.config.perf_scaling_exponent,
+        )
 
     async def _score_leakage(
         self,
@@ -144,10 +144,7 @@ class CuratorScorer:
         # Decon owns a blocking subprocess and filesystem pass, so keep the
         # entire detector call off the event loop while GPU work is in flight.
         try:
-            async with loop_local_semaphore(
-                _DECON_SEMAPHORES,
-                self.config.max_concurrent_training,
-            ):
+            async with _DECON_SEMAPHORES.get(self.config.max_concurrent_training):
                 scores = await run_blocking_drained(
                     self.decon_detector.score,
                     corpus.iter_documents(),
@@ -195,23 +192,13 @@ class CuratorScorer:
                 backend="error",
             )
 
-    def _empty_scoring(self, state: CuratorState) -> dict[str, Any]:
-        return {
-            "perf": 0.0,
-            "leakage": {"leakage_score": 0.0, "num_contaminated_matches": 0},
-            "decon_error": 0.0,
-            "val_screen_skipped": 0.0,
-            "loss": 0.0,
-            "accuracy": 0.0,
-            "flops": 0.0,
-            "tokens": 0,
-            "num_sources": 0,
-            "budget_fill_ratio": 0.0,
-            "perf_vs_baseline": 0.0,
-            "perf_baseline_loss": self.config.perf_baseline_loss,
-            "perf_target_loss": self.config.perf_target_loss,
-            "perf_scaling_exponent": self.config.perf_scaling_exponent,
-        }
+    def _empty_scoring(self) -> ScoringResult:
+        """Zero-signal sentinel; every field default IS the empty outcome."""
+        return ScoringResult(
+            perf_baseline_loss=self.config.perf_baseline_loss,
+            perf_target_loss=self.config.perf_target_loss,
+            perf_scaling_exponent=self.config.perf_scaling_exponent,
+        )
 
     def _perf(self, result: TrainResult) -> float:
         if self.config.baseline_relative_perf:

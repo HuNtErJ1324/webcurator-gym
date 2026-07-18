@@ -1,16 +1,17 @@
-"""Benchmark + held-out val-set contamination detection via decon.
+"""Benchmark and held-out val-set contamination detection via decon.
 
 Replaces the previous exact/fuzzy/semantic detectors. Decon runs offline against
 *public benchmark eval sets* (bundled under ``decon/bundled-evals/``) AND,
 optionally, the held-out validation set (detokenised from GPT-2-BPE token IDs
-back to text via tiktoken). The val-derived eval set is built ephemerally at
-scoring time into a temp directory and cleaned up immediately afterwards — it
-is NEVER written into ``decon/bundled-evals/``, the workspace, or any
-container image.
+back to text via tiktoken). The val-derived eval set is built once per
+validation-set identity into a detector-owned temp directory that is reused by
+every scoring pass and removed when the detector is garbage-collected — it is
+NEVER written into ``decon/bundled-evals/``, the workspace, or any container
+image.
 
 PRODUCTION path (leakage.py): reads eval sets from the baked
-decon/bundled-evals directory combined with an ephemeral val eval file.
-DEV path (self_score.py) runs decon against only the baked benchmark eval
+decon/bundled-evals directory combined with the cached val eval file.
+DEV path (self_score payload) runs decon against only the baked benchmark eval
 sets — the val set is NEVER exposed inside the agent container.
 
 The report JSONL schema (observed from decon detect):
@@ -32,19 +33,22 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import orjson
+
+from .hf_access import CHARS_PER_TOKEN
 
 if TYPE_CHECKING:
     from .val_set import HeldOutValSet
 
 logger = logging.getLogger(__name__)
 
-# Character-to-token divisor used to estimate token counts from character spans
-# when decon does not report a resolved token count for the full span.
-_CHARS_PER_TOKEN = 4
 # Minimum tokens to avoid division by zero.
 _MIN_TOKENS = 1
 
@@ -53,11 +57,12 @@ DEFAULT_DECON_BINARY = "decon"
 
 def _bundled_asset(*parts: str) -> str:
     """Locate an asset in an installed wheel or the editable source tree."""
-    package_dir = Path(__file__).resolve().parent
-    packaged = package_dir.joinpath(*parts)
-    if packaged.exists():
-        return str(packaged)
-    return str(package_dir.parent.joinpath(*parts))
+    utils_dir = Path(__file__).resolve().parent
+    for root in (utils_dir, utils_dir.parent, utils_dir.parent.parent):
+        candidate = root.joinpath(*parts)
+        if candidate.exists():
+            return str(candidate)
+    return str(utils_dir.parent.joinpath(*parts))
 
 
 DEFAULT_EVAL_SETS_DIR = _bundled_asset("decon", "bundled-evals")
@@ -83,9 +88,28 @@ def resolve_decon_evals_dir(evals_dir: str | None = None) -> str:
     return os.path.abspath(path)
 
 
-# Decon eval-set constants for the ephemeral val-set eval file.
+# Decon eval-set constants for the cached val-set eval file.
 _VAL_EVAL_KEY = "heldout_val"
 _VAL_EVAL_CHUNK_TOKENS = 1024  # GPT-2 BPE tokens per val eval record
+
+# OLMo 3 decontamination parameters (paper Appendix A.5; decon's production
+# defaults). Pinned explicitly on the detect command so a vendored-binary
+# upgrade can never silently change final-scoring semantics. The one deliberate
+# deviation is ``--sample-every-m-tokens 1``: OLMo 3 strides its sampling for
+# throughput over trillions of tokens, while our final pass scores one corpus
+# of at most a few hundred million tokens, so exhaustive sampling is
+# affordable and maximizes recall.
+_OLMO3_DETECT_ARGS = (
+    "--sample-every-m-tokens", "1",
+    "--question-max-consecutive-misses", "11",
+    "--answer-ngram-size", "3",
+    "--passage-ngram-size", "4",
+    "--perfect-match-decay-start", "20",
+    "--perfect-match-decay-end", "50",
+    "--eval-min-token-length", "20",
+    "--eval-min-unique-word-count", "4",
+)
+_DECON_TIMEOUT_SECONDS = 1800  # exhaustive stride at 400M-token corpora
 
 
 class DeconError(RuntimeError):
@@ -102,31 +126,23 @@ class LeakageScores:
     num_contaminated_matches: int
     contamination_details: tuple[dict[str, object], ...]
 
-    def as_dict(self) -> dict[str, float | int]:
-        return {
-            "leakage_score": round(self.leakage_score, 6),
-            "num_contaminated_matches": self.num_contaminated_matches,
-        }
-
-    def overall(self) -> float:
-        return self.leakage_score
-
 
 class DeconLeakageDetector:
     """Runs decon via subprocess on a materialized corpus JSONL directory.
 
     When ``screen_val_set`` is ``True`` and a ``HeldOutValSet`` is passed to
-    ``score()``, the detector builds an ephemeral combined evals directory
-    (bundled benchmarks + held-out val set) inside the temp workspace and
-    points decon at it.  The val eval file is cleaned up with the temp dir
-    after scoring.
+    ``score()``, the detector points decon at a combined evals directory
+    (bundled benchmarks + detokenized held-out val set). That directory is
+    deterministic per validation-set identity, so it is built once, cached on
+    the detector, and reused by every scoring pass; it is removed when the
+    detector is garbage-collected.
     """
 
     def __init__(
         self,
         decon_binary: str = DEFAULT_DECON_BINARY,
         evals_dir: str | None = None,
-        threshold: float = 0.2,
+        threshold: float = 0.8,
         ngram_size: int = 5,
         tokenizer: str = "cl100k",
         screen_val_set: bool = True,
@@ -137,6 +153,11 @@ class DeconLeakageDetector:
         self._ngram_size = ngram_size
         self._tokenizer = tokenizer
         self._screen_val_set = screen_val_set
+        # ``score`` runs on worker threads; the caches below are shared across
+        # them, so their population is serialized.
+        self._cache_lock = threading.Lock()
+        self._probed_binary: str | None = None
+        self._combined_dirs: dict[tuple[str, str, int], str] = {}
 
     @staticmethod
     def _build_val_eval(
@@ -149,18 +170,19 @@ class DeconLeakageDetector:
         Each record contains one chunk of detokenized text in the ``question``
         field (``answer`` is left empty since this is raw text, not Q&A).
         The ``eval_key`` is ``"heldout_val"`` so decon report lines are
-        distinguishable from benchmark matches.
+        distinguishable from benchmark matches. Tokens are decoded chunk by
+        chunk so the (10M-token) stream is never materialized as one Python
+        list.
         """
         import tiktoken
 
         enc = tiktoken.get_encoding("gpt2")
-        tokens: list[int] = val_set.tokens.tolist()
+        tokens = val_set.tokens
 
-        with open(output_path, "w", encoding="utf-8") as fh:
+        with open(output_path, "wb") as fh:
             idx = 0
-            for i in range(0, len(tokens), chunk_tokens):
-                chunk = tokens[i : i + chunk_tokens]
-                text = enc.decode(chunk)
+            for i in range(0, int(tokens.shape[0]), chunk_tokens):
+                text = enc.decode(tokens[i : i + chunk_tokens].tolist())
                 if not text.strip():
                     continue
                 record = {
@@ -172,48 +194,76 @@ class DeconLeakageDetector:
                     "doc_id": idx + 1,
                     "fingerprint": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 }
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.write(orjson.dumps(record))
+                fh.write(b"\n")
                 idx += 1
 
-    @staticmethod
-    def _build_combined_evals_dir(evals_parent_dir: str, bundled_evals_dir: str) -> str:
-        """Copy bundled evals into a temp subdir (no symlinks to avoid
-        filesystem-boundary issues) and return the path."""
-        combined = os.path.join(evals_parent_dir, "combined_evals")
-        if os.path.isdir(bundled_evals_dir):
-            shutil.copytree(bundled_evals_dir, combined, dirs_exist_ok=True)
-        else:
-            os.makedirs(combined, exist_ok=True)
-        return combined
+    def _combined_evals_dir(self, val_set: HeldOutValSet) -> str:
+        """Bundled benchmarks + val eval file, built once per val identity.
+
+        Copied (no symlinks, to avoid filesystem-boundary issues) into a
+        detector-owned temp directory OUTSIDE any run's ``--training-dir`` so
+        decon's directory walk cannot ingest eval files as training input.
+        """
+        key = (val_set.dataset_id, val_set.filename, val_set.n_tokens)
+        with self._cache_lock:
+            cached = self._combined_dirs.get(key)
+            if cached is not None:
+                return cached
+            parent = tempfile.mkdtemp(prefix="decon_evals_")
+            try:
+                combined = os.path.join(parent, "combined_evals")
+                if os.path.isdir(self._evals_dir):
+                    shutil.copytree(self._evals_dir, combined, dirs_exist_ok=True)
+                else:
+                    os.makedirs(combined, exist_ok=True)
+                self._build_val_eval(
+                    val_set, os.path.join(combined, "heldout_val.jsonl")
+                )
+            except BaseException:
+                shutil.rmtree(parent, ignore_errors=True)
+                raise
+            weakref.finalize(self, shutil.rmtree, parent, ignore_errors=True)
+            self._combined_dirs[key] = combined
+            return combined
 
     def _check_binary(self) -> str:
-        binary = self._binary
-        if not os.path.isfile(binary):
-            resolved = _BUNDLED_DECON_BINARY
-            if os.path.isfile(resolved):
-                binary = resolved
-        if not os.path.isfile(binary):
-            return self._binary
-        try:
-            probe = subprocess.run(
-                [binary, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except OSError as exc:
-            raise DeconError(f"decon binary not executable at {binary}: {exc}") from exc
-        if probe.returncode != 0:
-            detail = (probe.stderr or probe.stdout or "").strip()
-            if "GLIBC_" in detail:
-                raise DeconError(
-                    f"decon at {binary} is incompatible with this host's glibc "
-                    f"({detail[:300]}). Rebuild with "
-                    "environments/pretrain_curation_gym/decon/build_from_source.sh "
-                    "on the target machine, or run build_static.sh for a portable binary."
+        """Resolve and smoke-test the decon binary once; reuse the result."""
+        with self._cache_lock:
+            if self._probed_binary is not None:
+                return self._probed_binary
+            binary = self._binary
+            if not os.path.isfile(binary):
+                resolved = _BUNDLED_DECON_BINARY
+                if os.path.isfile(resolved):
+                    binary = resolved
+            if not os.path.isfile(binary):
+                # Not cached: a later call may find a newly-installed binary,
+                # and the caller surfaces this as a typed DeconError anyway.
+                return self._binary
+            try:
+                probe = subprocess.run(
+                    [binary, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                 )
-            raise DeconError(f"decon at {binary} failed smoke test: {detail[:300]}")
-        return binary
+            except OSError as exc:
+                raise DeconError(
+                    f"decon binary not executable at {binary}: {exc}"
+                ) from exc
+            if probe.returncode != 0:
+                detail = (probe.stderr or probe.stdout or "").strip()
+                if "GLIBC_" in detail:
+                    raise DeconError(
+                        f"decon at {binary} is incompatible with this host's glibc "
+                        f"({detail[:300]}). Rebuild with "
+                        "environments/pretrain_curation_gym/decon/build_from_source.sh "
+                        "on the target machine, or run build_static.sh for a portable binary."
+                    )
+                raise DeconError(f"decon at {binary} failed smoke test: {detail[:300]}")
+            self._probed_binary = binary
+            return binary
 
     def score(
         self,
@@ -222,14 +272,9 @@ class DeconLeakageDetector:
     ) -> LeakageScores:
         """Run decon on ``docs`` against bundled benchmarks and optional val set.
 
-        Writes the document stream to a temporary JSONL file, optionally
-        detokenizes the held-out val tokens into an ephemeral decon eval file,
-        invokes the decon subprocess against the combined eval sets, parses its
-        report, and reduces to a token-weighted scalar.
-
-        The val eval file lives inside the temp workspace and is cleaned up
-        when this method returns.  It is NEVER written to
-        ``decon/bundled-evals/`` or any persistent path.
+        Writes the document stream to a temporary JSONL file, invokes the decon
+        subprocess against the (cached) combined eval sets, parses its report,
+        and reduces to a token-weighted scalar.
 
         Raises:
             DeconError: if the decon binary is missing, returns a non-zero exit
@@ -239,32 +284,24 @@ class DeconLeakageDetector:
         """
         total_chars = 0
         temp_dir = tempfile.mkdtemp(prefix="decon_corpus_")
-        evals_temp_dir = tempfile.mkdtemp(prefix="decon_evals_")
         corpus_path = os.path.join(temp_dir, "corpus.jsonl")
         binary = self._binary
         try:
-            with open(corpus_path, "w") as fh:
+            with open(corpus_path, "wb") as fh:
                 for doc in docs:
                     total_chars += len(doc)
-                    fh.write(json.dumps({"text": doc}, ensure_ascii=False) + "\n")
+                    fh.write(orjson.dumps({"text": doc}))
+                    fh.write(b"\n")
 
             if total_chars == 0:
                 return LeakageScores(0.0, 0, ())
 
-            # --- determine evals dir: benchmarks only or combined with val set ----
-            # Build combined evals OUTSIDE temp_dir so decon's directory-walk under
-            # --training-dir cannot accidentally ingest eval files as training input.
             if self._screen_val_set and val_set is not None:
-                evals_dir = self._build_combined_evals_dir(
-                    evals_temp_dir, self._evals_dir
-                )
-                self._build_val_eval(
-                    val_set, os.path.join(evals_dir, "heldout_val.jsonl")
-                )
+                evals_dir = self._combined_evals_dir(val_set)
             else:
                 evals_dir = self._evals_dir
 
-            total_tokens = max(_MIN_TOKENS, total_chars // _CHARS_PER_TOKEN)
+            total_tokens = max(_MIN_TOKENS, total_chars // CHARS_PER_TOKEN)
             report_dir = os.path.join(temp_dir, "report")
             os.makedirs(report_dir, exist_ok=True)
 
@@ -286,12 +323,13 @@ class DeconLeakageDetector:
                 str(self._ngram_size),
                 "--contamination-score-threshold",
                 str(self._threshold),
+                *_OLMO3_DETECT_ARGS,
             ]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=_DECON_TIMEOUT_SECONDS,
             )
             if result.returncode != 0:
                 raise DeconError(
@@ -307,17 +345,13 @@ class DeconLeakageDetector:
         except FileNotFoundError:
             raise DeconError(f"decon binary not found at {binary}")
         except subprocess.TimeoutExpired:
-            raise DeconError("decon timed out after 600s")
+            raise DeconError(f"decon timed out after {_DECON_TIMEOUT_SECONDS}s")
         except DeconError:
             raise
         except Exception as exc:
             raise DeconError(f"decon failed: {exc}")
         finally:
-            import shutil
-
             shutil.rmtree(temp_dir, ignore_errors=True)
-            if evals_temp_dir is not None:
-                shutil.rmtree(evals_temp_dir, ignore_errors=True)
 
         if not report_lines:
             return LeakageScores(0.0, 0, ())
@@ -338,7 +372,7 @@ class DeconLeakageDetector:
           1. ``cluster_token_length`` (the decon-reported token length of the
              matched n-gram cluster) when present and > 0.
           2. Character span derived from answer/question end-start offsets
-             divided by ``_CHARS_PER_TOKEN``.
+             divided by ``CHARS_PER_TOKEN``.
         """
         best_per_doc: dict[tuple[str, int], float] = {}
         details: list[dict[str, object]] = []
@@ -374,7 +408,7 @@ class DeconLeakageDetector:
                     q_end if q_end is not None else ans_end or 0,
                 )
                 span_chars = max(int(end) - int(start), 1)
-                est_tokens = max(_MIN_TOKENS, span_chars // _CHARS_PER_TOKEN)
+                est_tokens = max(_MIN_TOKENS, span_chars // CHARS_PER_TOKEN)
 
             contribution = score * est_tokens
             if doc_key not in best_per_doc or contribution > best_per_doc[doc_key]:

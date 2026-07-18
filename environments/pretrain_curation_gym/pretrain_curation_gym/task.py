@@ -8,13 +8,14 @@ import logging
 import math
 import os
 from importlib import resources
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 import verifiers.v1 as vf
 from verifiers.v1.errors import RolloutError
 
 from .config import CuratorTaskConfig
-from .corpus import EST_TOKENS_PER_DOC, CorpusBuilder
+from .utils.async_utils import run_blocking_drained
+from .utils.corpus import EST_TOKENS_PER_DOC, CorpusBuilder
 from .gpu.self_score import (
     SELF_SCORE_FILENAME,
     SELF_SCORE_HISTORY_FILENAME,
@@ -28,9 +29,9 @@ from .gpu.turns import (
     render_turn_state,
     render_turns_script,
 )
-from .leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
-from .manifest import ManifestParser, TraceManifestCandidates
-from .models import (
+from .utils.leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
+from .utils.manifest import ManifestParser, TraceManifestCandidates
+from .utils.models import (
     CuratorConfig,
     MANIFEST_CANDIDATE_ASSISTANT_MESSAGE,
     MANIFEST_CANDIDATE_TRACE_FALLBACK,
@@ -40,14 +41,14 @@ from .models import (
     Manifest,
     ManifestCandidate,
     ManifestProvenance,
+    ScoringResult,
 )
 from .rewards import CuratorScorer
 from .state import CuratorState
 from .taskdata import CuratorTaskData
-from .trainer import HeuristicProxyTrainer, RuntimeProxyTrainer, TrainerError
-from .util.hf_access import HuggingFaceDatasetClient, RetryPolicy
-from .util.utils import content_text, extract_hf_commands
-from .val_set import ValTokenLoader
+from .utils.trainer import HeuristicProxyTrainer, RuntimeProxyTrainer, TrainerError
+from .utils.hf_access import HuggingFaceDatasetClient, RetryPolicy
+from .utils.val_set import ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         policy = self.fetch_policy()
         val_loader = ValTokenLoader(
             self.curator.validation_set,
+            token=os.environ.get(self.config.hf_token_env),
             retry_policy=policy,
             fetch_limit=self.curator.max_concurrent_fetches,
         )
@@ -166,20 +168,6 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
                 "use_real_trainer=True requires a Docker or Modal harness runtime "
                 f"(got {runtime.type!r})"
             )
-        if (
-            self.curator.use_real_trainer
-            and runtime.type == "docker"
-        ):
-            from .util.container_memory import verify_runtime_memory_limit
-
-            configured_gb = getattr(getattr(runtime, "config", None), "memory", None)
-            if configured_gb is not None:
-                await asyncio.to_thread(
-                    verify_runtime_memory_limit,
-                    runtime,
-                    configured_gb=configured_gb,
-                )
-
         await runtime.write(
             SELF_SCORE_FILENAME,
             render_self_score_script(
@@ -241,10 +229,14 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             return "invalid", None
         except Exception:
             return "absent", None
-        manifest = self.parser.parse(
-            json.dumps(data) if isinstance(data, dict) else "",
-            default_token_budget=self.data.token_budget,
-            reserved_local_filename=self.config.manifest_filename,
+        manifest = (
+            self.parser.parse_object(
+                data,
+                default_token_budget=self.data.token_budget,
+                reserved_local_filename=self.config.manifest_filename,
+            )
+            if isinstance(data, dict)
+            else None
         )
         if manifest and manifest.sources:
             return "valid", manifest
@@ -368,7 +360,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
     def accessed_validation_set(self, trace: vf.Trace) -> bool:
         dataset_id = self.curator.validation_set.dataset_id
         for message in trace.assistant_messages:
-            if dataset_id in content_text(message.content):
+            if dataset_id in self.candidates.message_text(message.content):
                 return True
             if any(
                 dataset_id in self.candidates.shell_command(call.arguments)
@@ -388,7 +380,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
 
     async def _compute_scoring(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
-    ) -> dict[str, Any]:
+    ) -> ScoringResult:
         """Run and retain the one expensive scoring pass for this rollout."""
         state = cast(CuratorState, trace.state)
         if state._scoring_result is None:
@@ -400,7 +392,11 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         """Number of observed ``hf`` CLI invocations in agent tool calls."""
         return float(
             sum(
-                len(extract_hf_commands(self.candidates.shell_command(call.arguments)))
+                len(
+                    self.candidates.hf_commands(
+                        self.candidates.shell_command(call.arguments)
+                    )
+                )
                 for message in trace.assistant_messages
                 for call in message.tool_calls or []
             )
@@ -425,19 +421,19 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             logger.warning("trainer error: %s", trainer_error)
 
         return {
-            "perf_loss": scoring["loss"],
-            "perf_accuracy": scoring["accuracy"],
-            "perf_vs_baseline": scoring["perf_vs_baseline"],
-            "train_flops": scoring["flops"],
-            "corpus_tokens": scoring["tokens"],
-            "budget_fill_ratio": scoring["budget_fill_ratio"],
-            "num_sources": scoring["num_sources"],
+            "perf_loss": scoring.loss,
+            "perf_accuracy": scoring.accuracy,
+            "perf_vs_baseline": scoring.perf_vs_baseline,
+            "train_flops": scoring.flops,
+            "corpus_tokens": scoring.tokens,
+            "budget_fill_ratio": scoring.budget_fill_ratio,
+            "num_sources": scoring.num_sources,
             "local_source_count": state.local_source_count,
             "local_source_bytes": state.local_source_bytes,
             "local_source_truncated": float(state.local_source_truncated),
             "val_set_access": float(state.val_set_access),
-            "leakage_score": scoring["leakage"]["leakage_score"],
-            "num_contaminated_matches": scoring["leakage"]["num_contaminated_matches"],
+            "leakage_score": scoring.leakage_score,
+            "num_contaminated_matches": scoring.num_contaminated_matches,
             "self_score_runs": state.self_score_runs,
             "self_score_ok_runs": state.self_score_ok_runs,
             "self_score_best_reward": state.self_score_best_reward or 0.0,
@@ -455,8 +451,8 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             "tool_error_count": state.tool_error_count,
             "external_failure": float(state.external_failure),
             "empty_rollout": float(self._empty_rollout(state)),
-            "decon_error": scoring.get("decon_error", 0.0),
-            "val_screen_skipped": scoring.get("val_screen_skipped", 0.0),
+            "decon_error": float(scoring.decon_error),
+            "val_screen_skipped": float(scoring.val_screen_skipped),
             "trainer_error_msg": float(bool(trainer_error)),
         }
 
@@ -467,16 +463,17 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         """Emit reward components from the scoring pass already used by metrics."""
         scoring = await self._compute_scoring(trace, runtime)
         return {
-            "perf_reward": self.curator.alpha_perf * scoring["perf"],
-            "leakage_penalty": -self.curator.lambda_leakage
-            * scoring["leakage"]["leakage_score"],
+            "perf_reward": self.curator.alpha_perf * scoring.perf,
+            "leakage_penalty": -self.curator.lambda_leakage * scoring.leakage_score,
         }
 
     async def score(self, trace: vf.Trace, runtime: vf.Runtime | None = None) -> None:
         try:
             await super().score(trace, runtime)
         finally:
-            cast(CuratorState, trace.state).cleanup()
+            # Scratch corpora can be large; recursive deletion must not stall
+            # unrelated rollouts sharing this event loop.
+            await run_blocking_drained(cast(CuratorState, trace.state).cleanup)
         if self.config.error_on_empty_rollout and self._empty_rollout(
             cast(CuratorState, trace.state)
         ):
