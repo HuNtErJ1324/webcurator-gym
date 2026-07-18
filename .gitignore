@@ -90,3 +90,8 @@ pod_scratch/
 
 
 --- lean-ctx: ctx_compose bundles search+read+symbols in one call ---
+# Local test suites (keep out of remote)
+/environments/*/tests/
+**/tests/
+**/test_*.py
+!**/gpu/test_*.py
