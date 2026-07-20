@@ -7,7 +7,7 @@ import json
 TURNS_FILENAME = "turns.py"
 TURN_STATE_FILENAME = ".turn_state.json"
 
-_TURNS_SCRIPT = '''#!/usr/bin/env python3
+_TURNS_SCRIPT = '''
 """Print the current rollout turn and remaining framework turn budget."""
 import json
 import sys
@@ -22,14 +22,17 @@ def main() -> int:
     except (OSError, json.JSONDecodeError):
         print("turn state unavailable: cannot read %s" % STATE_PATH)
         return 1
-    print(
-        "turn %s of %s (%s remaining after this one)"
-        % (
-            state["current_turn"],
-            state["max_turns"],
-            state["turns_remaining"],
+    if state.get("max_turns") is None:
+        print("turn %s (limit not disclosed)" % state["current_turn"])
+    else:
+        print(
+            "turn %s of %s (%s remaining after this one)"
+            % (
+                state["current_turn"],
+                state["max_turns"],
+                state["turns_remaining"],
+            )
         )
-    )
     print(json.dumps(state, sort_keys=True))
     return 0
 
@@ -43,8 +46,18 @@ def render_turns_script() -> bytes:
     return _TURNS_SCRIPT.encode()
 
 
-def render_turn_state(turns_completed: int, max_turns: int) -> bytes:
+def render_turn_state(turns_completed: int, max_turns: int | None) -> bytes:
     """Render the pre-turn view consumed by ``turns.py``."""
+    if max_turns is None:
+        return json.dumps(
+            {
+                "turns_completed": turns_completed,
+                "current_turn": turns_completed + 1,
+                "max_turns": None,
+                "turns_remaining": None,
+            },
+            sort_keys=True,
+        ).encode()
     current_turn = min(turns_completed + 1, max_turns)
     return json.dumps(
         {

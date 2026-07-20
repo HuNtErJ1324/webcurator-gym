@@ -8,13 +8,24 @@ WORKDIR /workspace
 # It only records anything if that directory precedes the real CLI on PATH, so
 # put it there for every container by default; ${PATH} expands at build time, so
 # no system path is hardcoded. A harness config that sets its own PATH replaces
-# this wholesale — load_environment re-prepends the directory in that case.
+# this wholesale — `load_environment` re-prepends the directory in that case, but
+# only for programmatic callers (the CLI never runs it — see environment.py), so
+# this line is what actually holds for a TOML-driven run.
 ENV PATH="/workspace/.agents/bin:${PATH}"
+
+# This base image ships a pydantic-core that breaks the agent CLI's `uv` install;
+# forcing a reinstall is a property of the image, so it belongs here. It was
+# previously set on the harness env by `load_environment`, which no CLI path
+# calls — so it silently never applied. `uv` resolves a script env once per
+# content digest, so the extra reinstall is per-rollout, not per-call.
+ENV UV_REINSTALL_PACKAGE=pydantic-core
 
 # One image serves both phases of the rollout: the bash harness needs the `hf`
 # discovery CLI, while scoring needs CUDA PyTorch and the proxy-student tokenizer.
 # - huggingface-hub >= 1.17: first release whose `hf` CLI ships the `papers`
 #   subcommand the task prompt directs agents to use.
+# - datasets: agents probe configs/splits/columns with the Hugging Face
+#   `datasets` library during curation (alongside the `hf` CLI).
 # - numpy / tiktoken / tqdm: imported by the in-container trainer (train.py /
 #   self_score_train.py). numpy also arrives with the torch base image, but is
 #   declared here so a base-image change cannot silently drop it; the host
@@ -22,6 +33,7 @@ ENV PATH="/workspace/.agents/bin:${PATH}"
 # - zstandard: lets in-container tooling handle zstd-compressed dataset files.
 RUN python -m pip install --no-cache-dir \
     "huggingface-hub>=1.17" \
+    "datasets>=3.0.0" \
     numpy \
     tiktoken \
     tqdm \

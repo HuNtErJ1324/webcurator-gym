@@ -1,11 +1,4 @@
-"""Asyncio adapters for blocking scoring work.
-
-One shared home for the three loop-bound patterns the environment needs:
-draining offloaded work through cancellation (``run_blocking_drained``),
-single-flight keyed locks (``LoopLocalLocks``), and most-restrictive-limit
-semaphores (``LoopLocalSemaphore``). The drain semantics come from the
-framework's ``run_shielded`` rather than a local re-implementation.
-"""
+"""Asyncio adapters for blocking scoring work."""
 
 from __future__ import annotations
 
@@ -14,7 +7,7 @@ import weakref
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
-from verifiers.v1.utils.aio import (  # pyright: ignore[reportMissingImports]
+from verifiers.v1.utils.aio import (
     run_shielded as run_shielded,
 )
 
@@ -25,28 +18,12 @@ R = TypeVar("R")
 async def run_blocking_drained(
     fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs
 ) -> R:
-    """Run ``fn`` off-loop and finish its thread before propagating cancellation.
-
-    Cancelling an ``asyncio.to_thread`` await does not stop the underlying
-    function. Scoring callers own temporary corpus files (and hold semaphore
-    slots or locks around offloaded writes), so control must not return to
-    cleanup — or release a guard — while a worker thread can still be touching
-    those files. ``run_shielded`` provides the framework-native drain: the
-    worker always runs to completion, cancellation wins, and a worker error
-    raised during cancellation is chained under the ``CancelledError`` instead
-    of being silently lost.
-    """
+    """Run ``fn`` off-loop and finish its thread before propagating cancellation."""
     return await run_shielded(asyncio.to_thread(fn, *args, **kwargs))
 
 
 class LoopLocalLocks:
-    """Per-event-loop, per-key ``asyncio.Lock`` registry for single-flight work.
-
-    Locks bind to their running loop, and rollout state must stay
-    JSON-serializable, so single-flight guards live in registries like this
-    one — keyed first by loop (weakly, so finished loops are dropped) and then
-    by caller key — never in state.
-    """
+    """Per-event-loop, per-key ``asyncio.Lock`` registry for single-flight work."""
 
     def __init__(self) -> None:
         self._locks: weakref.WeakKeyDictionary[
@@ -74,35 +51,83 @@ class LoopLocalLocks:
             locks.pop(key, None)
 
 
-class LoopLocalSemaphore:
-    """Loop-local semaphore bound to the MOST RESTRICTIVE limit yet requested.
+class AdaptiveSemaphore:
+    """Semaphore whose limit may tighten without forgetting active holders."""
 
-    Semaphores bind to the running event loop on first use, so one is kept per
-    loop (a rare, explicitly sanctioned process-level handle). A later, smaller
-    limit tightens the bound, so a second env instance sharing the loop never
-    inherits a larger bound than it asked for. Finished loops are dropped
-    automatically.
-    """
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+        self._condition = asyncio.Condition()
+
+    def tighten(self, limit: int) -> None:
+        self._limit = min(self._limit, limit)
+
+    async def acquire(self) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._active < self._limit)
+            self._active += 1
+
+    async def release(self) -> None:
+        async with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+    async def __aenter__(self) -> "AdaptiveSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.release()
+
+
+class LoopLocalSemaphore:
+    """Loop-local adaptive semaphore using the most restrictive requested limit."""
 
     def __init__(self) -> None:
-        # Each loop maps to its (granted limit, semaphore) pair; the recorded
-        # limit is what lets a smaller later request win.
         self._semaphores: weakref.WeakKeyDictionary[
-            asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]
+            asyncio.AbstractEventLoop, AdaptiveSemaphore
         ] = weakref.WeakKeyDictionary()
 
-    def get(self, limit: int) -> asyncio.Semaphore:
+    def get(self, limit: int) -> AdaptiveSemaphore:
+        if limit < 1:
+            raise ValueError(f"semaphore limit must be >= 1, got {limit}")
         loop = asyncio.get_running_loop()
         entry = self._semaphores.get(loop)
-        if entry is None or entry[0] > limit:
-            entry = (limit, asyncio.Semaphore(limit))
+        if entry is None:
+            entry = AdaptiveSemaphore(limit)
             self._semaphores[loop] = entry
-        return entry[1]
+        else:
+            entry.tighten(limit)
+        return entry
+
+
+_FETCH_SEMAPHORES = LoopLocalSemaphore()
+_TRAIN_SEMAPHORES = LoopLocalSemaphore()
+_DECON_SEMAPHORES = LoopLocalSemaphore()
+
+
+def hf_fetch_semaphore(limit: int) -> AdaptiveSemaphore:
+    """Process-wide (loop-local) bound on concurrent Hugging Face fetches."""
+    return _FETCH_SEMAPHORES.get(limit)
+
+
+def training_semaphore(limit: int) -> AdaptiveSemaphore:
+    """Process-wide bound on concurrent sandbox proxy-student training jobs."""
+    return _TRAIN_SEMAPHORES.get(limit)
+
+
+def decon_semaphore(limit: int) -> AdaptiveSemaphore:
+    """Process-wide bound on concurrent Decon subprocesses (CPU/RAM heavy)."""
+    return _DECON_SEMAPHORES.get(limit)
 
 
 __all__ = [
+    "AdaptiveSemaphore",
     "LoopLocalLocks",
     "LoopLocalSemaphore",
+    "decon_semaphore",
+    "hf_fetch_semaphore",
     "run_blocking_drained",
     "run_shielded",
+    "training_semaphore",
 ]

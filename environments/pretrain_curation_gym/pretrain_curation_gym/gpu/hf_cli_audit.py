@@ -8,10 +8,8 @@ HF_CLI_WRAPPER_FILENAME = ".agents/bin/hf"
 
 def render_hf_cli_wrapper() -> bytes:
     """Return a transparent ``hf`` wrapper that logs redacted invocations."""
-    # Keep escape sequences literal in the generated Python source. In
-    # particular, ``"\\n"`` below must not become a physical newline between
-    # quotes, which would make the workspace wrapper fail to parse.
-    return br'''#!/usr/bin/env python3
+    # Escape sequences must stay literal in generated source.
+    return br'''
 import fcntl
 import json
 import os

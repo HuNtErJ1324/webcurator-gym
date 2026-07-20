@@ -1,35 +1,4 @@
-"""Single-file NanoGPT-speedrun proxy-student trainer.
-
-This is the written source of truth for the model architecture, Muon/AdamW
-optimizers, batch and learning-rate schedules, validation, and training loop. It
-is imported by the local CPU debugger and copied byte-for-byte into the Docker
-or Modal training workspace.
-
-Speedrun fidelity is audited against KellerJordan/modded-nanogpt commit
-``edf47a05a12062d661c4cfd4eef848c5ab5bed32``. The Muon core (Newton-Schulz
-``(2, -1.5, 0.5)`` x 12, aspect-ratio scaling, fp32 momentum) follows
-``records/track_3_optimization/train_gpt_simple.py`` exactly; the architecture
-and recipe (QK-norm, half-truncate RoPE base 1024, attn scale 0.12,
-``30*tanh(x/30)`` softcap, 3 first/last value-embed tables, U-net skips,
-x0/resid lambdas, 12-dim attention gate, odd-step Adam with per-group betas,
-momentum 0.85->0.95 warmup/cooldown, batch muls 1/2/3 with LR muls
-1.0/1.52/1.73 decaying over the final 40% to floor 0.15, padded vocab 50304,
-EOT-prefixed documents, bf16 blocks with fp32 Adam groups and fp32 CE) follow
-the main record lineage. Pinned semantics include the 896→2048 staged context
-ratio, stationary-half one-token key shift, per-head projection-removal XSA,
-paired-layer topology, and weight-preserving late untie. Deliberate portability
-deviations: single GPU, SDPA document masks instead of flash-attn varlen, a
-1024-token maximum context with the upstream ratio scaled down, an attention
-block at layer 6 instead of the fused MLP-only special case, a compact
-sign-derived bigram channel instead of the upstream 15×-vocabulary learned
-table, and no FP8/fused head kernels. Budget-derived steps, batch-size choices,
-and timescale-referenced weight decay are intentional scale adaptations.
-
-The schedule-accounting functions above the guarded PyTorch section deliberately
-use only the standard library. Package configuration imports those helpers even
-when PyTorch is not installed; all model and training definitions are therefore
-created only when the optional ``torch`` dependency is available.
-"""
+"""Single-file NanoGPT-speedrun proxy-student trainer."""
 
 import atexit
 import bisect
@@ -85,12 +54,7 @@ def parse_document_payload(corpus_text):
 def batch_stage_boundaries(
     total_steps: int, stage_fracs: Sequence[float]
 ) -> list[tuple[int, int]]:
-    """Half-open ``(start, end)`` stage intervals covering ``[0, total_steps)``.
-
-    Canonical shared implementation used by both runtime scheduling and config
-    accounting. Each non-final stage gets ``max(1, round(frac * scheduled))`` steps,
-    clamped so the last stage absorbs the remainder exactly.
-    """
+    """Half-open ``(start, end)`` stage intervals covering ``[0, total_steps)``."""
     frac_sum = sum(stage_fracs)
     if not math.isclose(frac_sum, 1.0, rel_tol=0, abs_tol=_FRAC_SUM_TOL):
         raise ValueError(f"stage_fracs must sum to 1.0, got {frac_sum}")
@@ -103,13 +67,7 @@ def batch_stage_boundaries(
 
 
 def make_seq_len_schedule(total_steps, max_block):
-    """Scale the pinned upstream 896→2048 context schedule to ``max_block``.
-
-    modded-nanoGPT commit ``edf47a0`` uses 896 tokens for the first third of
-    training and 2048 thereafter. The 7/16 ratio is preserved for this
-    portable trainer's configurable context length. This pure helper is shared
-    by execution and token-budget accounting so their presentations agree.
-    """
+    """Scale the pinned upstream 896→2048 context schedule to ``max_block``."""
     max_block = int(max_block)
     short_steps = max(1, round(int(total_steps) / 3))
     short_block = max(8, round(max_block * 7 / 16))
@@ -130,13 +88,7 @@ def scheduled_presentation_tokens(
     batch_schedule_enabled: bool = True,
     seq_len_schedule: bool = False,
 ) -> int:
-    """Tokens presented across ``steps`` under the staged batch schedule.
-
-    Each step presents ``batch_size * stage_mul * block(step)`` tokens, where
-    ``block(step)`` is ``block_size`` unless ``seq_len_schedule`` is enabled,
-    in which case the shared staged context schedule applies. When the
-    batch schedule is disabled, every step uses the base batch (mul = 1).
-    """
+    """Tokens presented across ``steps`` under the staged batch schedule."""
     steps = max(0, int(steps))
     if steps == 0:
         return 0
@@ -166,10 +118,7 @@ def scheduled_presentation_tokens(
 
 
 def _max_stage_deviation_bound(muls: Sequence[int]) -> int:
-    """Exact, N-independent bound ``P`` (in tokens / ``per_base``) on how far
-    ``scheduled_presentation_tokens(N) / per_base`` can deviate from the smooth
-    linear trend ``N * weighted_avg_mul``. See module docstring for the proof.
-    """
+    """N-independent bound on schedule deviation from the linear trend."""
     k = len(muls)
     if k <= 1:
         return 0
@@ -188,14 +137,7 @@ def steps_for_token_budget(
     batch_schedule_enabled: bool = True,
     seq_len_schedule: bool = False,
 ) -> int:
-    """Minimal steps whose scheduled presentations meet ``budget``.
-
-    See module docstring for the non-monotonicity of
-    ``scheduled_presentation_tokens`` and the provably-sufficient bounded
-    window this scans exhaustively (no assumption that the ">= budget"
-    predicate is sorted in ``N``). When ``seq_len_schedule`` is enabled, the
-    shared sequence-length warmup is included in the token accounting.
-    """
+    """Minimal steps whose scheduled presentations meet ``budget``."""
     if seq_len_schedule:
         return _steps_for_budget_with_seq_len_schedule(
             budget,
@@ -236,28 +178,18 @@ def steps_for_token_budget(
     max_mul = max(muls)
     min_mul = min(muls)
 
-    # Exact global bounds, valid regardless of rounding/non-monotonicity: every
-    # step contributes at most per_base*max_mul tokens, so no N below n_floor
-    # can ever reach the budget; every step contributes at least
-    # per_base*min_mul, so n_ceiling always reaches it.
     n_floor = max(1, math.ceil(budget / (per_base * max_mul)))
     n_ceiling = max(1, math.ceil(budget / (per_base * min_mul)))
 
     mul_avg = sum(float(f) * m for f, m in zip(batch_stage_fracs, muls, strict=True))
     if max_mul == min_mul or mul_avg <= 0:
-        # Every step contributes the same tokens: exactly linear, no
-        # perturbation possible regardless of stage-boundary rounding.
         return max(
             1, min(n_ceiling, math.ceil(budget / (per_base * max(mul_avg, min_mul))))
         )
 
-    # ``_max_stage_deviation_bound`` is in step*mul units (deviation of
-    # len_i(N) from its ideal frac_i*N, weighted by mul_i); it must be scaled
-    # by per_base to become a token-space bound comparable to ``budget``.
+    # Bound is step*mul units; scale by per_base for tokens.
     p_bound_tokens = per_base * _max_stage_deviation_bound(muls)
-    # Generous integer safety margin beyond the proven bound, guarding against
-    # any float/rounding slop in converting the real-valued inequality window
-    # to integer steps -- cheap, since the window stays O(P) either way.
+    # Integer margin for float/rounding slop.
     margin = 4
     lo = math.floor((budget - p_bound_tokens) / (per_base * mul_avg)) - margin
     hi = math.ceil((budget + p_bound_tokens) / (per_base * mul_avg)) + margin
@@ -269,7 +201,6 @@ def steps_for_token_budget(
         if tokens_at(n) >= budget:
             return n
 
-    # Unreachable given the proof above; n_ceiling is always valid.
     return n_ceiling
 
 
@@ -285,17 +216,7 @@ def _steps_for_budget_with_seq_len_schedule(
     batch_stage_fracs: Sequence[float],
     batch_schedule_enabled: bool,
 ) -> int:
-    """Minimal steps meeting ``budget`` when the seq-len warmup shrinks windows.
-
-    The warmup only ever REMOVES tokens relative to the fixed-block schedule
-    (``block_at_step(s) <= block_size`` for every ``s``), so the fixed-block
-    answer is a strict lower bound and the search proceeds upward from it:
-    geometric bracket, bisection, then a short exhaustive sweep below the
-    bisection answer to absorb the small stage/warmup rounding wiggles (the
-    same bounded-deviation philosophy as the fixed-block solver). Results are
-    memoized because ``effective_steps`` is re-derived many times per rollout
-    and each evaluation is an O(steps) walk of the warmup ramp.
-    """
+    """Minimal steps meeting ``budget`` when the seq-len warmup shrinks windows."""
     budget = int(budget)
     if budget < 1:
         return 1
@@ -332,8 +253,7 @@ def _steps_for_budget_with_seq_len_schedule(
         seq_len_schedule=False,
     )
     if tokens_at(lo) >= budget:
-        # No smaller N can qualify: for N < lo even the fixed-block schedule
-        # (an upper bound on seq-schedule tokens) falls short of the budget.
+        # N < lo cannot meet budget even under the fixed-block upper bound.
         _SEQ_BUDGET_STEPS_CACHE[key] = lo
         return lo
     hi = lo
@@ -345,8 +265,6 @@ def _steps_for_budget_with_seq_len_schedule(
             hi = mid
         else:
             lo = mid + 1
-    # Rounding wiggles are far smaller than one step's tokens; a short sweep
-    # below the bisection answer restores exact minimality.
     for n in range(max(1, lo - 48), lo):
         if tokens_at(n) >= budget:
             lo = n
@@ -356,21 +274,7 @@ def _steps_for_budget_with_seq_len_schedule(
 
 
 def plan_val_windows(n_tokens, block):
-    """Non-overlapping windows covering EVERY held-out next-token target.
-
-    Returns a list of ``(start, length)`` windows whose lengths sum to exactly the
-    number of predictable next-token targets (``n_tokens - 1``) -- including the
-    final partial window -- where window ``(start, length)`` scores the targets at
-    token indices ``start+1 .. start+length`` from an input of ``val[start:start+
-    length]``. Raises ``ValueError`` when there are no predictable positions, so an
-    empty or single-token val set can NEVER be silently scored as a perfect ``0.0``
-    cross-entropy (which would game the reward).
-
-    Kept deliberately annotation-free and dependency-free (builtins only): this
-    function now IS the GPU-only sandbox training script, and ``trainer.py`` reads
-    this file verbatim, so the CPU unit tests of this function guard the real
-    validation loop that no test can otherwise reach.
-    """
+    """Non-overlapping windows covering EVERY held-out next-token target."""
     block = int(block)
     if block < 1:
         raise ValueError(f"block must be >= 1, got {block}")
@@ -391,8 +295,6 @@ def plan_val_windows(n_tokens, block):
 try:
     import torch
 except ModuleNotFoundError:
-    # ``models.ProxyStudentConfig`` imports the pure schedule helpers above in
-    # Hub installs where torch is intentionally absent.
     torch = None
 else:
     import numpy as np
@@ -440,10 +342,7 @@ else:
     def _sliding_window_mask(
         seq_len: int, window_size: int, device: torch.device
     ) -> torch.Tensor:
-        """Causal band mask for SDPA: ``True`` means the key may participate.
-
-        Query ``i`` may attend to keys ``j`` in ``[i - window_size + 1, i]``.
-        """
+        """Causal band mask for SDPA: ``True`` means the key may participate."""
         idx = torch.arange(seq_len, device=device)
         return (idx[None, :] <= idx[:, None]) & (
             idx[None, :] >= idx[:, None] - window_size + 1
@@ -461,13 +360,7 @@ else:
         window_size: int | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """AND keep-masks into one SDPA boolean mask (``True`` = participate).
-
-        Returns ``None`` when pure ``is_causal=True`` SDPA is sufficient.
-        ``attn_mask`` may be ``(T, T)``, ``(B, T, T)``, or ``(B, 1, T, T)``.
-        Document masks are expected to already encode causality; this helper does
-        not re-apply a redundant causal term on top of them.
-        """
+        """AND keep-masks into one SDPA boolean mask (``True`` = participate)."""
         combined: torch.Tensor | None = None
         if window_size is not None and window_size < seq_len:
             combined = _sliding_window_mask(seq_len, window_size, device)
@@ -541,9 +434,7 @@ else:
             k = F.rms_norm(k, (k.size(-1),))
             q, k = self.rotary(q), self.rotary(k)
             if partial_key_offset:
-                # Pinned upstream semantics (edf47a0): shift the stationary
-                # half of K forward by one token after RoPE, enabling one-layer
-                # induction without changing the rotating half.
+                # Upstream (edf47a0): shift stationary K half +1 after RoPE.
                 half = self.head_dim // 2
                 stationary = torch.cat(
                     [k[:, :1, :, half:], k[:, :-1, :, half:]], dim=1
@@ -568,8 +459,7 @@ else:
                     scale=self.attn_scale,
                 ).transpose(1, 2)
             if self.xsa_alpha is not None:
-                # Pinned upstream XSA: remove a learned per-head fraction of
-                # the attention output aligned with normalized V.
+                # Upstream XSA: subtract learned per-head proj of attn onto V.
                 value_direction = F.normalize(v, dim=-1, eps=1e-4)
                 projection = (y * value_direction).sum(-1, keepdim=True)
                 alpha = torch.tanh(self.xsa_alpha).type_as(y).view(
@@ -583,10 +473,7 @@ else:
             return self.proj(y)
 
     class PairedHeadAttention(nn.Module):
-        """Paired-head self-attention: pairs of heads share Q/K projections.
-
-        Within each pair, heads have separate V projections and output projections.
-        """
+        """Paired-head self-attention: pairs of heads share Q/K projections."""
 
         def __init__(self, dim: int, num_heads: int, *, attn_scale: float = 0.12):
             super().__init__()
@@ -631,10 +518,8 @@ else:
                 v = self.lambdas[0] * v + self.lambdas[1] * value_embed.view_as(v)
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
-            # Upstream does not apply stationary-key offset or XSA on paired
-            # attention layers because their interleaved head geometry differs.
+            # No stationary-K / XSA on paired-attn layers (head geometry).
             q, k = self.rotary(q), self.rotary(k)
-            # Reshape V to pair structure: (B,T,num_heads,head_dim) -> (B,T,num_pairs,2*head_dim)
             v_pair = v.view(B, T, self.num_pairs, 2, self.head_dim).reshape(
                 B, T, self.num_pairs, 2 * self.head_dim
             )
@@ -656,7 +541,6 @@ else:
                     attn_mask=combined,
                     scale=self.attn_scale,
                 ).transpose(1, 2)
-            # y shape: (B, T, num_pairs, 2*head_dim) -> reshape to (B, T, num_heads, head_dim)
             y = y.reshape(B, T, self.num_heads, self.head_dim)
             gate = torch.sigmoid(self.attn_gate(x[..., :12])).view(
                 B, T, self.num_heads, 1
@@ -742,12 +626,7 @@ else:
             return tables + [None] * middle + tables
 
     class BigramHashEmbedding(nn.Module):
-        """Bigram hash embedding on 1/4 of model_dim with sign trick.
-
-        For each consecutive pair of tokens, a hash determines whether each element
-        in the embedding is +1 or -1 (sign trick). The remaining 3/4 of model_dim
-        uses a standard token embedding.
-        """
+        """Bigram hash embedding on 1/4 of model_dim with sign trick."""
 
         def __init__(self, vocab_size: int, model_dim: int):
             super().__init__()
@@ -786,11 +665,7 @@ else:
             return torch.cat([tok_part, hash_part], dim=-1)
 
     class Smear(nn.Module):
-        """Learned 1-token lookback smear on the embedding stream.
-
-        Each dimension has a learnable gate controlling how much of the previous
-        token's activation is added to the current token's activation.
-        """
+        """Learned 1-token lookback smear on the embedding stream."""
 
         def __init__(self, dim: int):
             super().__init__()
@@ -802,11 +677,7 @@ else:
             return x + gate * prev
 
     class MUDD(nn.Module):
-        """Multi-layer skip connections feeding residual stream and attention values.
-
-        MUDD connections project from early encoder layers to later decoder layers,
-        contributing to both the residual stream and the attention value input.
-        """
+        """Multi-layer skip connections feeding residual stream and attention values."""
 
         def __init__(self, dim: int, num_skip_pairs: int = 2):
             super().__init__()
@@ -825,11 +696,6 @@ else:
         ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
             if layer_idx >= self.num_skip_pairs:
                 return None, None
-            # MUDD projections are Adam-managed and stay float32 while the
-            # trunk runs bfloat16 on CUDA (prepare_student_model_dtype):
-            # compute in the weights' dtype and hand activations back in the
-            # caller's dtype, since F.linear rejects mixed dtypes and a
-            # promoted fp32 residual would crash the next bf16 block.
             proj_dtype = self.resid_projs[layer_idx].weight.dtype
             src = source.to(dtype=proj_dtype)
             resid = torch.sigmoid(self.resid_gates[layer_idx]) * self.resid_projs[
@@ -856,15 +722,7 @@ else:
             return [h(x) for h in self.heads]
 
     class GPT(nn.Module):
-        """Proxy-student transformer read verbatim by ``trainer.py`` for the GPU sandbox.
-
-        ``train_gpt.py`` is the written source of truth: ``trainer.py`` loads this
-        file's text (``NANOGPT_TRAIN_SCRIPT``) and copies it into the Docker/Modal
-        workspace, so this class is the model actually instantiated and trained
-        there. Architecture: decoder-only with U-net skips, sparse value
-        embeddings, multi-token prediction heads, and opt-in portable features
-        (bigram-hash / paired-head / MUDD / XSA).
-        """
+        """Proxy-student transformer read verbatim by ``trainer.py`` for the GPU sandbox."""
 
         def __init__(
             self,
@@ -877,7 +735,6 @@ else:
             num_value_embeds: int = 3,
             attn_scale: float = 0.12,
             sliding_window_size: int | None = None,
-            # ---- portable feature flags (all off by default) ----
             bigram_hash_embed: bool = False,
             smear_embed: bool = False,
             partial_key_offset: bool = False,
@@ -899,7 +756,6 @@ else:
             self.num_decoder_layers = num_layers - self.num_encoder_layers
             self.skip_gates = nn.Parameter(torch.ones(self.num_decoder_layers))
             self.post_lambdas = nn.Parameter(torch.ones(num_layers, 2))
-            # sqrt(1.1) per sublayer so cumulative per-layer residual scale is 1.1
             resid_init = math.sqrt(1.1)
             self.resid_lambdas_attn = nn.Parameter(
                 torch.full((num_layers,), resid_init)
@@ -933,11 +789,7 @@ else:
                         num_heads,
                         mlp_ratio,
                         attn_scale=attn_scale,
-                        # Pinned upstream 12-layer topology: paired attention
-                        # on {0,2,5,9}; XSA on the six non-paired attention
-                        # layers {1,3,4,7,8,10}. Layer 6 remains a normal block
-                        # in this portable U-net rather than upstream's MLP-only
-                        # systems-optimized special case.
+                        # Upstream topology: paired {0,2,5,9}; XSA on other attn layers.
                         paired_head=paired_head and layer_idx in {0, 2, 5, 9},
                         xsa_enabled=(
                             xsa_enabled
@@ -951,19 +803,15 @@ else:
                 ]
             )
 
-            # MUDD skip connections
             self.mudd_pairs = mudd_pairs
             if mudd_pairs > 0:
                 self.mudd = MUDD(model_dim, num_skip_pairs=mudd_pairs)
             else:
                 self.mudd = None
 
-            # XSA is implemented inside eligible attention layers, matching
-            # upstream's per-head projection-removal operation.
             self.xsa_enabled = xsa_enabled
             self.xsa_pairs = xsa_pairs
 
-            # Multi-token prediction heads
             if multi_token_pred > 0:
                 self.multi_heads = MultiTokenHeads(
                     model_dim, vocab_size, multi_token_pred
@@ -991,21 +839,11 @@ else:
             window_size: int | None = None,
             attn_mask: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            """Run the trunk through ``norm_out`` without materializing full-vocab logits.
-
-            Used by held-out validation to score CE in lm_head/softcap chunks so a
-            single A100 80GB pass never allocates oversized ``(B*T, vocab)`` tensors.
-            """
+            """Run the trunk through ``norm_out`` without materializing full-vocab logits."""
             ws = window_size if window_size is not None else self.sliding_window_size
             x = self.norm_in(self.embed(idx))
             if self.smear is not None:
                 x = self.smear(x)
-            # embed/smear are Adam-managed and stay float32 (see
-            # prepare_student_model_dtype) even when the Muon-managed
-            # blocks run in bfloat16 on CUDA. Cast the trunk activations (and the
-            # value embeddings mixed into attention, which are Adam-managed too) to
-            # the blocks' own dtype here so every block's Linear sees a matching
-            # input dtype instead of failing on the first CUDA forward pass.
             trunk_dtype = self.blocks[0].attn.q.weight.dtype
             x = x.to(dtype=trunk_dtype)
             x0 = x
@@ -1024,8 +862,7 @@ else:
                     x,
                     ve_enc[i],
                     window_size=ws,
-                    # Upstream applies stationary-key shift only on its two
-                    # long-window attention layers.
+                    # Stationary-K only on the two long-window attn layers.
                     partial_key_offset=self.partial_key_offset and i in {3, 10},
                     attn_mask=attn_mask,
                 )
@@ -1051,7 +888,6 @@ else:
             for i in range(self.num_decoder_layers):
                 layer_idx = self.num_encoder_layers + i
 
-                # MUDD contribution
                 mudd_resid, mudd_val = None, None
                 if self.mudd is not None:
                     src_idx = max(0, self.num_encoder_layers - 1 - i)
@@ -1060,7 +896,6 @@ else:
 
                 x = x + torch.sigmoid(self.skip_gates[i]) * skip_connections.pop()
 
-                # Determine attention input: single activation for last k layers
                 attn_input = x
                 if (
                     self.single_act_last_k > 0
@@ -1069,7 +904,6 @@ else:
                     if single_act is not None:
                         attn_input = single_act
 
-                # MUDD value contribution to attention
                 ve_i = ve_dec[i]
                 if mudd_val is not None:
                     if ve_i is None:
@@ -1087,7 +921,6 @@ else:
                     attn_mask=attn_mask,
                 )
 
-                # MUDD residual contribution
                 if mudd_resid is not None:
                     attn_out = attn_out + mudd_resid
 
@@ -1108,11 +941,7 @@ else:
             return self.norm_out(x)
 
         def apply_lm_head(self, hidden: torch.Tensor) -> torch.Tensor:
-            """Project hidden states through ``lm_head`` + tanh softcap in float32.
-
-            Softcap and CE are always computed in fp32 even when the trunk runs in
-            bfloat16 on CUDA, matching speedrun numerical practice.
-            """
+            """Project hidden states through ``lm_head`` + tanh softcap in float32."""
             logits = self.lm_head(hidden.float()).float()
             return self.softcap * torch.tanh(logits / self.softcap)
 
@@ -1145,7 +974,6 @@ else:
         num_value_embeds: int = 3
         attn_scale: float = 0.12
         sliding_window_size: int | None = None
-        # --- portable feature flags ---
         bigram_hash_embed: bool = False
         smear_embed: bool = False
         partial_key_offset: bool = False
@@ -1181,7 +1009,6 @@ else:
             )
 
     GPT2_SMALL = StudentModelConfig()
-    # Baseline count without opt-in portable features.
     GPT2_SMALL_PARAM_COUNT = 278_122_938
 
     def estimate_instantiated_param_count(
@@ -1232,11 +1059,7 @@ else:
             return sum(p.numel() for p in model.parameters())
 
     def zeropower_via_newtonschulz5(g: torch.Tensor) -> torch.Tensor:
-        """Orthogonalize a 2-D update via Newton–Schulz (Muon core step).
-
-        Runs in fp32 on CPU or GPU; the upstream record uses bf16 on GPU, but the math
-        is identical. Adapted from ``records/track_3_optimization/train_gpt_simple.py``.
-        """
+        """Orthogonalize a 2-D update via Newton–Schulz (Muon core step)."""
         assert g.ndim >= 2
         x = g.to(dtype=torch.float32)
         if g.size(-2) > g.size(-1):
@@ -1252,14 +1075,7 @@ else:
         return x.to(dtype=g.dtype)
 
     def zeropower_via_polar_express(g: torch.Tensor) -> torch.Tensor:
-        """Polar decomposition via ONI iteration variant (Polar Express).
-
-        Uses ``X_{k+1} = 0.5 * X_k @ (3*I - X_k^T @ X_k)`` for fast convergence
-        on near-orthogonal matrices. CPU-portable and operates in fp32.
-        The key difference from Newton-Schulz is the transposed quadratic form:
-        ``X^T @ X`` (n×n) instead of ``X @ X^T`` (m×m), making it more efficient
-        when n << m.
-        """
+        """Polar decomposition via ONI iteration variant (Polar Express)."""
         assert g.ndim >= 2
         x = g.to(dtype=torch.float32)
         if g.size(-2) > g.size(-1):
@@ -1281,14 +1097,7 @@ else:
         nesterov: bool = True,
         polar_express: bool = False,
     ) -> torch.Tensor:
-        """One Muon momentum + orthogonalization step (single tensor, no torch.compile).
-
-        When ``polar_express=True``, uses ONI-based polar decomposition instead of
-        Newton–Schulz iteration.
-
-        Momentum and orthogonalization run in float32 for stability even when the
-        parameter/grad tensors are bfloat16 on CUDA.
-        """
+        """One Muon momentum + orthogonalization step (single tensor, no torch.compile)."""
         grad_fp32 = grad.float()
         momentum.lerp_(grad_fp32, 1.0 - mu)
         update = grad_fp32.lerp(momentum, mu) if nesterov else momentum
@@ -1308,11 +1117,7 @@ else:
         nesterov: bool = True,
         polar_express: bool = False,
     ) -> torch.Tensor:
-        """NorMuon: normalized Muon update (RMS-normalize the update before applying).
-
-        First computes the standard Muon update, then RMS-normalizes it so that the
-        update magnitude is decoupled from the matrix scale.
-        """
+        """NorMuon: normalized Muon update (RMS-normalize the update before applying)."""
         update = muon_update(
             grad, momentum, mu=mu, nesterov=nesterov, polar_express=polar_express
         )
@@ -1363,7 +1168,6 @@ else:
                         continue
                     state = self.state[param]
                     if "momentum_buffer" not in state:
-                        # Keep Muon momentum in float32 even when params are bf16.
                         state["momentum_buffer"] = torch.zeros(
                             param.shape, dtype=torch.float32, device=param.device
                         )
@@ -1404,15 +1208,7 @@ else:
         cooldown_frac: float = 0.40,
         cooldown_floor: float = 0.15,
     ) -> tuple[list[tuple[int, int]], BatchScheduleStage, float, float]:
-        """Return stage boundaries, stage lookup metadata, cooldown start, and floor.
-
-        Stage boundaries are ``(start_step, end_step)`` half-open intervals covering
-        ``[0, total_steps)``, computed by ``batch_stage_boundaries`` -- the
-        single canonical implementation shared with the token-budget
-        accounting path, so the two can never drift apart. ``cooldown_frac``
-        applies to the *scheduled* portion (all but the optional extension steps —
-        we have none in the proxy trainer).
-        """
+        """Return stage boundaries, stage lookup metadata, cooldown start, and floor."""
         if len(stage_fracs) != len(batch_muls) or len(stage_fracs) != len(lr_muls):
             raise ValueError(
                 "stage_fracs, batch_muls, and lr_muls must have equal length"
@@ -1489,7 +1285,6 @@ else:
             elif name.startswith("embed."):
                 adam["embed"].append(param)
             elif name.startswith("lm_head."):
-                # Skip if same tensor as embed.weight (weight tying for untie_at_frac).
                 if not any(p is param for p in adam["embed"]):
                     adam["lm_head"].append(param)
             elif name.startswith("value_embeds."):
@@ -1516,19 +1311,10 @@ else:
         lm_head_wd_mul: float = 150.0,
         value_embed_wd_mul: float = 5.0,
         scalar_wd_mul: float = 0.0,
-        # --- portable optimizer features ---
         nor_muon: bool = True,
         polar_express: bool = False,
     ):
-        """Build Muon + multi-group AdamW optimizers for ``GPT``.
-
-        When ``nor_muon=True``, Muon uses normalized (RMS-normalized) updates.
-        When ``polar_express=True``, Muon uses ONI-based polar decomposition.
-
-        Adam betas are set per group to match the modern speedrun recipe:
-        embed/lm_head ``(0.5, 0.95)``, value embeddings ``(0.75, 0.95)``,
-        scalars ``(0.9, 0.99)``.
-        """
+        """Build Muon + multi-group AdamW optimizers for ``GPT``."""
         muon_params, adam = classify_speedrun_params(model)
         muon_opt = Muon(
             muon_params,
@@ -1581,11 +1367,7 @@ else:
         return muon_opt, adam_opt
 
     def init_speedrun_weights(model) -> None:
-        """Weight init aligned with modded-nanogpt block matrices (``train_gpt_simple``).
-
-        Projection matrices stay zero-init; ``lm_head`` uses ``N(0, 0.005)``; value
-        embeddings use ``N(0, 0.01)``; token embeddings use ``N(0, 0.02)``.
-        """
+        """Weight init aligned with modded-nanogpt block matrices (``train_gpt_simple``)."""
         for name, param in model.named_parameters():
             data = param.data
             if not name.endswith("weight"):
@@ -1650,28 +1432,13 @@ else:
         force_adam: bool = False,
         grad_clip: float = 0.0,
     ) -> bool:
-        """Muon every step; AdamW only on odd steps (heterogeneous batching record).
-
-        When ``cautious_wd=True``, weight decay on Muon groups is scaled by
-        ``lr_scale`` (cautious weight decay tied to LR).
-
-        When ``force_adam=True``, AdamW always steps regardless of step parity
-        (used during flush to avoid dropping accumulated embed/head grads).
-
-        Returns whether ``adam_opt.step()`` actually ran this call, so callers
-        know whether it is safe to zero Adam-managed grads (the original
-        ``train_gpt.py`` only clears an Adam param's ``.grad`` on the step that
-        actually applies it -- on a skipped step the grad is left alone so the
-        next ``backward()`` accumulates on top of it).
-        """
+        """Muon every step; AdamW only on odd steps (heterogeneous batching record)."""
         clip_optimizer_grads(muon_opt, grad_clip)
         muon_opt.step(
             momentum=muon_momentum, cautious_wd=cautious_wd, lr_scale=lr_scale
         )
         did_adam_step = force_adam or not adam_on_odd_steps or step % 2 == 1
         if did_adam_step:
-            # The retained even-step Adam gradients remain raw until this update;
-            # clipping happens once, after the odd contribution has been summed.
             clip_optimizer_grads(adam_opt, grad_clip)
             adam_opt.step()
         return did_adam_step
@@ -1682,12 +1449,7 @@ else:
         return isinstance(device, str) and device.startswith("cuda")
 
     def prepare_student_model_dtype(model, device):
-        """CUDA-only bfloat16 for Muon matrices; Adam groups stay float32.
-
-        CPU behavior is unchanged (all float32). On CUDA, cast the full module to
-        bfloat16 then restore Adam-managed parameters to float32 so optimizer state
-        and lm_head/softcap/CE remain numerically stable.
-        """
+        """CUDA-only bfloat16 for Muon matrices; Adam groups stay float32."""
         if not _is_cuda_device(device):
             return model
         model.to(dtype=torch.bfloat16)
@@ -1722,14 +1484,7 @@ else:
         return list(range(0, last_start + 1, block))
 
     def encode_document_tokens(documents, encoder, max_document_tokens=None):
-        """Build the official FineWeb document token stream and exact ranges.
-
-        KellerJordan/modded-nanogpt prefixes every source document, including an empty
-        one, with the GPT-2 EOT token 50256 and then appends
-        ``encoder.encode_ordinary(document)``. No text delimiter represents a boundary.
-        ``max_document_tokens`` is an explicit per-document validation limit (including
-        EOT); over-long documents are rejected rather than truncated.
-        """
+        """Build the official FineWeb document token stream and exact ranges."""
         token_ids = []
         document_ranges = []
         cap = None if max_document_tokens is None else int(max_document_tokens)
@@ -1750,29 +1505,7 @@ else:
         return token_ids, document_ranges
 
     def plan_eos_aligned_windows(n_tokens, block, document_ranges, lookahead=1):
-        """Plan training-window starts over an EOT-prefixed document stream.
-
-        Long documents (length >= ``block + lookahead``) keep non-overlapping
-        intra-document starts with stride ``block``.
-
-        Short documents are packed with deterministic sequential, non-overlapping
-        windows (portable adaptation of modded-nanogpt ``Shard.next_batch``): each
-        pack starts at the next unused short document's leading EOT/BOS, covers
-        ``block + lookahead`` tokens of the concatenated stream, and advances past
-        every document that overlaps that span so short docs are not oversampled.
-        If a pack truncates into a long document, residual intra-document stride
-        windows begin at the first uncovered position of that long document.
-
-        Boundary contract (Speedrun-aligned as far as this SDPA port allows):
-
-        * **Targets** use the flat next-token shift over the window, so a target may
-          be the next document's leading EOT (Speedrun ``buf[:-1]`` / ``buf[1:]``).
-        * **Attention** must not cross document boundaries: callers use
-          :func:`batch_document_attn_mask` for packed multi-document windows
-          (Speedrun uses flash-attn varlen ``cum_lengths`` for the same guarantee).
-        * Document ranges must be sorted, disjoint, and contiguous (no gaps).
-        * There is no flat-stream fallback that ignores ``document_ranges``.
-        """
+        """Plan training-window starts over an EOT-prefixed document stream."""
         block = int(block)
         n_tokens = int(n_tokens)
         lookahead = max(1, int(lookahead))
@@ -1823,16 +1556,7 @@ else:
         return starts
 
     def window_document_ids(start, length, document_ranges, device=None):
-        """Per-position document ids for ``train_src[start:start+length]``.
-
-        ``document_ranges`` are sorted, disjoint, and contiguous (no gaps) per the
-        contract documented on :func:`plan_eos_aligned_windows`, so only documents
-        overlapping ``[start, start+length)`` are relevant. Binary-search for the
-        first candidate instead of scanning every document in the corpus: with a
-        few hundred thousand documents, a per-window O(num_documents) scan (called
-        per training step, per batch item) made per-step wall time dominated by
-        this loop instead of GPU compute.
-        """
+        """Per-position document ids for ``train_src[start:start+length]``."""
         start = int(start)
         length = int(length)
         ids = torch.full((length,), -1, dtype=torch.long, device=device)
@@ -1854,11 +1578,7 @@ else:
         return ids
 
     def build_document_attn_mask(doc_ids):
-        """Boolean SDPA mask ``(B, T, T)``; ``True`` means the key may participate.
-
-        Keeps causal same-document positions. Gap ids (``< 0``) never attend to each
-        other; they are restricted to self-attention so softmax stays well-defined.
-        """
+        """Boolean SDPA mask ``(B, T, T)``; ``True`` means the key may participate."""
         if doc_ids.dim() != 2:
             raise ValueError(
                 f"doc_ids must be (batch, seq), got shape {tuple(doc_ids.shape)}"
@@ -1903,12 +1623,7 @@ else:
     def _score_hidden_chunked(
         model, hidden, targets, *, vocab_size, logit_chunk_tokens
     ):
-        """Sum CE + correct counts over ``hidden`` without a full (N, vocab) allocation.
-
-        When ``logit_chunk_tokens`` is set, projects ``lm_head``/softcap in row chunks so
-        peak activation memory stays O(chunk * vocab) instead of O(N * vocab). Mean CE
-        and accuracy over the full set are identical to a single full-vocab pass.
-        """
+        """Sum CE + correct counts over ``hidden`` without a full (N, vocab) allocation."""
         flat_h = hidden.reshape(-1, hidden.size(-1))
         flat_y = targets.reshape(-1)
         n = int(flat_h.size(0))
@@ -1945,13 +1660,7 @@ else:
         device,
         logit_chunk_tokens=None,
     ):
-        """Mean held-out CE / accuracy over every predictable val target.
-
-        ``batch`` is the validation microbatch (independent of training batch size).
-        When the model exposes ``forward_hidden``, the trunk runs once per microbatch
-        and ``lm_head``/softcap are applied in ``logit_chunk_tokens``-sized chunks so
-        oversized full-vocab logit tensors are never materialized.
-        """
+        """Mean held-out CE / accuracy over every predictable val target."""
         model.eval()
         val_windows = plan_val_windows(len(val_data), block)
         total = sum(length for _, length in val_windows)
@@ -2011,11 +1720,7 @@ else:
         return loss_sum / total, correct / total
 
     def _compute_multi_token_loss(logits, hidden, y, multi_heads, y_future, vocab_size):
-        """Total loss including auxiliary multi-token prediction losses.
-
-        Multi-token heads are applied to the final hidden states (pre-lm_head),
-        not to logits, since the heads are ``nn.Linear(model_dim, vocab_size)``.
-        """
+        """Total loss including auxiliary multi-token prediction losses."""
         main_loss = F.cross_entropy(logits.float().view(-1, vocab_size), y.view(-1))
         if (
             multi_heads is None
@@ -2025,8 +1730,6 @@ else:
             return main_loss
         mt_loss = 0.0
         mt_weight = 0.3
-        # Multi-token heads are Adam-managed float32 while the trunk hidden is
-        # bfloat16 on CUDA; project from a float32 copy (mirrors apply_lm_head).
         hidden_f = hidden.float()
         for k, head in enumerate(multi_heads.heads):
             if k < len(y_future) and y_future[k] is not None:
@@ -2039,13 +1742,7 @@ else:
         return main_loss
 
     def _microbatch_ranges(batch_size, microbatch_size):
-        """Yield ``(start, end)`` slices that cover ``batch_size`` without exceeding ``microbatch_size``.
-
-        ``microbatch_size is None`` (or >= batch) yields a single full-batch slice — legacy
-        behavior. Used so scheduled effective batches (16→32→48) can honor the intended
-        token/update semantics while never materializing full-vocab logits for the whole
-        effective batch at once.
-        """
+        """Yield ``(start, end)`` slices that cover ``batch_size`` without exceeding ``microbatch_size``."""
         n = int(batch_size)
         if n < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
@@ -2112,7 +1809,6 @@ else:
         muon_warmup_steps=None,
         muon_cooldown_steps=None,
         adam_on_odd_steps=True,
-        # --- portable feature flags ---
         document_ranges=None,
         grad_accum_embed_head_steps=1,
         seq_len_schedule=False,
@@ -2144,10 +1840,7 @@ else:
                 math.ceil((block + 2) / max(len(train_src), 1))
             )
 
-        # Document-aware training never falls back to flat windows that ignore
-        # document_ranges. Short documents are packed into fixed blocks; long
-        # documents keep intra-document starts. Packed multi-document windows use
-        # an SDPA document mask so attention does not cross EOT boundaries.
+        # Never ignore document_ranges for packing.
         if document_ranges is not None:
             starts = plan_eos_aligned_windows(
                 len(train_src),
@@ -2163,7 +1856,6 @@ else:
         else:
             starts = plan_train_windows(len(train_src), block)
 
-        # --- Portable: seq length schedule ---
         block_fn = make_seq_len_schedule(steps, block) if seq_len_schedule else None
 
         order = []
@@ -2226,8 +1918,6 @@ else:
                 current_block = block_fn(step) if block_fn else block
                 x, y, _batch_starts, attn_mask = next_batch(batch, current_block)
                 opt.zero_grad(set_to_none=True)
-                # Loss-scaled microbatch accumulation: summed microbatch grads equal a
-                # single full-batch mean-CE backward while capping peak logit memory.
                 loss_weighted = None
                 for start, end in _microbatch_ranges(batch, train_microbatch_size):
                     xb = x[start:end]
@@ -2277,10 +1967,6 @@ else:
         else:
             init_speedrun_weights(model)
 
-            # --- Portable: tie embed/lm_head for later untie ---
-            # BigramHashEmbedding does not expose a flat .weight (its learned
-            # token_embed has a different shape), so weight-tying is shape-
-            # incompatible; skip the tie in that case.
             if untie_at_frac > 0.0 and hasattr(model.embed, "weight"):
                 model.lm_head.weight = model.embed.weight
 
@@ -2366,7 +2052,6 @@ else:
                     effective_batch, current_block
                 )
 
-                # --- Portable: multi-token prediction targets ---
                 use_mt = (
                     multi_token_pred > 0
                     and hasattr(model, "multi_heads")
@@ -2404,10 +2089,6 @@ else:
                                 future_targets.append(seg)
                         y_future.append(torch.stack(future_targets).to(device))
 
-                # Loss-scaled microbatch accumulation: honor scheduled effective_batch
-                # tokens/update while capping peak full-vocab logit memory. Grads sum
-                # across microbatches so the net .grad equals a single full-effective
-                # -batch mean-CE backward before any optimizer/accumulation bookkeeping.
                 if grad_accum_embed_head_steps <= 1:
                     muon_opt.zero_grad(set_to_none=True)
                 loss_weighted = None
@@ -2442,7 +2123,6 @@ else:
                             piece if loss_weighted is None else loss_weighted + piece
                         )
 
-                # --- Portable: true N-step gradient accumulation for embed + lm_head ---
                 if grad_accum_embed_head_steps > 1:
                     embed_head_params = []
                     for name, p in model.named_parameters():
@@ -2453,10 +2133,6 @@ else:
                         ):
                             embed_head_params.append(p)
 
-                    # backward() already ran per-microbatch above; grads for embed/head
-                    # /multi-head params are fully summed for this effective batch.
-                    # Accumulate embed/head/multi-head grads into a buffer, then
-                    # zero p.grad so the next backward starts fresh (no double-count).
                     if accum_buffer_embed_head is None:
                         accum_buffer_embed_head = {}
                         for p in embed_head_params:
@@ -2472,7 +2148,6 @@ else:
                     accum_count += 1
 
                     if accum_count >= grad_accum_embed_head_steps:
-                        # Restore accumulated buffer to embed/head/multi-head param grads.
                         for name, p in model.named_parameters():
                             if (
                                 name.startswith("embed.")
@@ -2485,12 +2160,6 @@ else:
                                         .clone()
                                         .to(device=p.device)
                                     )
-                        # Per-optimizer clipping occurs inside the actual updates below.
-                        # force_adam=True: a closing cycle always carries freshly
-                        # restored embed/head/multi-head grads that must be applied
-                        # now, regardless of step parity — otherwise the unconditional
-                        # adam_opt.zero_grad() below would silently drop them when the
-                        # cycle happens to close on an even step under adam_on_odd_steps.
                         step_speedrun_optimizers(
                             muon_opt,
                             adam_opt,
@@ -2513,23 +2182,10 @@ else:
                             cautious_wd=cautious_wd,
                             lr_scale=lr_scale,
                         )
-                        # Zero all grads between micro-steps so stale gradients do
-                        # not accumulate for any param group.  Embed/head/multi-head
-                        # grads are safe in the buffer; everything else must be
-                        # cleared so the next backward produces fresh gradients.
+                        # Clear grads between micro-steps.
                         muon_opt.zero_grad(set_to_none=True)
                         adam_opt.zero_grad(set_to_none=True)
                 else:
-                    # Original modded-nanogpt flow: Muon gets a fresh gradient and
-                    # is stepped + cleared every step. Adam-managed params (embed,
-                    # lm_head, value_embeds, scalars) are only stepped on odd
-                    # steps -- on a skipped (even) step their .grad is left alone
-                    # rather than zeroed, so the next backward() accumulates on
-                    # top of it (PyTorch's default add-into-.grad), matching the
-                    # original's "don't clear Adam grads on even steps" behavior
-                    # instead of silently discarding the even step's gradient.
-                    # (muon grads were zeroed before the microbatch backward loop; the
-                    # loss-scaled backward already ran per microbatch above.)
                     adam_stepped = step_speedrun_optimizers(
                         muon_opt,
                         adam_opt,
@@ -2543,16 +2199,12 @@ else:
                     if adam_stepped:
                         adam_opt.zero_grad(set_to_none=True)
 
-                # --- Portable: untie embed and lm_head at 2/3 of training ---
                 if untie_at_frac > 0.0 and step == int(steps * untie_at_frac):
                     if (
                         hasattr(model.embed, "weight")
                         and model.lm_head.weight.data_ptr()
                         == model.embed.weight.data_ptr()
                     ):
-                        # The split KEEPS the tied values (only optimizer state
-                        # starts fresh); zero-initing the new head here -- the
-                        # previous behavior -- discarded 2/3 of training.
                         model.lm_head.weight = nn.Parameter(
                             model.lm_head.weight.data.clone()
                         )
@@ -2597,8 +2249,6 @@ else:
                         f"| {tokens_per_sec:.0f} tok/s | elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
                     )
 
-        # Flush any remaining partial accumulation cycle so embed/head grads
-        # from the last incomplete cycle are not silently dropped.
         if (
             training_recipe != "record_01_adamw"
             and grad_accum_embed_head_steps > 1
@@ -2629,8 +2279,6 @@ else:
             accum_count = 0
 
         pbar.close()
-        # Drop optimizer state before the held-out pass so validation activations are
-        # not competing with Muon/Adam buffers for the last ~10GB on A100-80GB.
         if training_recipe == "record_01_adamw":
             del opt
         else:
@@ -2791,10 +2439,7 @@ else:
         torch.manual_seed(seed)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         encoder = tiktoken.get_encoding(str(cfg.get("tokenizer", "gpt2")))
-        # Speedrun-style padded vocab: next multiple of 128 (50257 -> 50304), so
-        # embed/lm_head shapes match the records (and this package's host-side
-        # parameter estimates) and stay tensor-core friendly. Padded ids never
-        # occur in data, so CE semantics are unchanged.
+        # Vocab pad to multiple of 128 (50257 -> 50304).
         vocab_size = ((encoder.n_vocab + 127) // 128) * 128
 
         eos_aligned_batches = bool(cfg.get("eos_aligned_batches", True))

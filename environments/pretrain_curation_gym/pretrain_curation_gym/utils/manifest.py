@@ -1,9 +1,4 @@
-"""Manifest parsing and non-production trace recovery.
-
-Workspace manifests are the sole scoreable deliverable.  Trace-derived
-manifests are intentionally exposed only as diagnostics when that file is
-missing, preserving the original anti-reward-hacking boundary.
-"""
+"""Manifest parsing and non-production trace recovery."""
 
 from __future__ import annotations
 
@@ -15,7 +10,7 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable
 
 import verifiers.v1 as vf
-from verifiers.v1.types import content_text  # pyright: ignore[reportAttributeAccessIssue]
+from verifiers.v1.types import content_text
 from pydantic import ValidationError
 
 from .models import FilterSpec, Manifest, Sampling, Source
@@ -105,14 +100,7 @@ class ManifestParser:
 
     @staticmethod
     def json_objects(text: str) -> Iterable[dict[str, Any]]:
-        """Yield every top-level JSON object embedded in ``text``.
-
-        The stdlib decoder does the quote/escape-aware parsing: scan for
-        candidate ``{`` offsets, `raw_decode` at each, and resume after a
-        successful object so nested objects are not double-yielded. An
-        unparseable candidate advances one character, which also recovers
-        valid objects nested inside malformed enclosing braces.
-        """
+        """Yield every top-level JSON object embedded in ``text``."""
         decoder = json.JSONDecoder()
         index = 0
         while (start := text.find("{", index)) >= 0:
@@ -353,10 +341,6 @@ class TraceManifestCandidates:
             )
         return raw
 
-    # Flattening a message body to text is the framework's `content_text`: same
-    # contract (str passes through, parts join on "\n", images drop). Kept as a
-    # method so call sites read the same; trace messages are validated models by
-    # this point, so the framework's TextContentPart check covers them.
     message_text = staticmethod(content_text)
 
     @classmethod

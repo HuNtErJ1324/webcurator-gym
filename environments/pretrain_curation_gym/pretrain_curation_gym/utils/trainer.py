@@ -1,13 +1,4 @@
-"""Proxy-student training: the Perf(M) term.
-
-`ProxyStudentTrainer` is the contract the reward calls. Backends implementing it:
-
-  - `HeuristicProxyTrainer`: deterministic, CPU-only stand-in that predicts
-    loss/accuracy from corpus statistics. Used in tests and as the default so the
-    environment is usable without GPU.
-  - `RuntimeProxyTrainer`: trains a fixed small GPT-2-scale model through the
-    live v1 Runtime.
-"""
+"""Proxy-student training: the Perf(M) term."""
 
 from __future__ import annotations
 
@@ -22,18 +13,13 @@ import verifiers.v1 as vf
 from pydantic import BaseModel
 
 from .corpus import CuratedCorpus
-from .async_utils import LoopLocalSemaphore, run_blocking_drained, run_shielded
+from .async_utils import run_blocking_drained, run_shielded, training_semaphore
 from .models import ProxyStudentConfig
 
 logger = logging.getLogger(__name__)
 
-# Loop-local bound on concurrent sandbox-training jobs, so a rollout group with
-# the real trainer never spawns more GPU sandboxes than configured at once.
-_TRAIN_SEMAPHORES = LoopLocalSemaphore()
-
-
-def training_semaphore(limit: int) -> asyncio.Semaphore:
-    return _TRAIN_SEMAPHORES.get(limit)
+TRAIN_GPT_PATH = Path(__file__).resolve().parent.parent / "gpu" / "train_gpt.py"
+TRAIN_GPT_SOURCE = TRAIN_GPT_PATH.read_text(encoding="utf-8")
 
 
 class TrainerError(RuntimeError):
@@ -50,7 +36,6 @@ class TrainResult(BaseModel):
     flops: float
     tokens_trained: int
     backend: str
-    # Set when the training run succeeded but post-run sandbox cleanup did not.
     cleanup_error: str | None = None
 
 
@@ -65,13 +50,7 @@ class ProxyStudentTrainer(Protocol):
 
 
 def estimate_param_count(config: ProxyStudentConfig) -> int:
-    """Exact instantiated parameter count for the modded-nanogpt student.
-
-    ``train_gpt`` model (and therefore ``torch``) is imported lazily so the
-    package can load for Hub integration / heuristic scoring without a
-    runtime torch dependency. Real GPU training embeds the model source into
-    the sandbox script and never needs this import path.
-    """
+    """Exact instantiated parameter count for the modded-nanogpt student."""
     from ..gpu.train_gpt import estimate_instantiated_param_count
 
     arch = config.arch
@@ -104,17 +83,7 @@ def estimate_train_flops(config: ProxyStudentConfig, tokens_trained: int) -> flo
 
 
 class HeuristicProxyTrainer:
-    """Deterministic surrogate: lower loss for larger, cleaner, more diverse data.
-
-    This is NOT a trained model; it is a reproducible proxy used when no GPU
-    sandbox is available, and as the default backend for fast iteration/tests.
-
-    It does NOT compute a per-token cross-entropy over a held-out token stream, so
-    the held-out validation set (the NanoGPT-speedrun FineWeb val tokens) does not
-    apply to this backend — it is consumed only by the real (Docker/Modal)
-    harness-runtime trainers. Its ``loss`` is a synthetic statistic, not a
-    nats/token cross-entropy.
-    """
+    """Deterministic surrogate: lower loss for larger, cleaner, more diverse data."""
 
     def __init__(self, reference_loss: float = 5.0) -> None:
         self._reference_loss = reference_loss
@@ -127,16 +96,12 @@ class HeuristicProxyTrainer:
         runtime: vf.Runtime | None = None,
     ) -> TrainResult:
         del runtime
-        # The per-document cleanliness/diversity scan is CPU work over the whole
-        # corpus; keep it off the event loop.
-        return await asyncio.to_thread(self._train_and_eval_sync, corpus, config)
+        return await run_blocking_drained(self._train_and_eval_sync, corpus, config)
 
     def _train_and_eval_sync(
         self, corpus: CuratedCorpus, config: ProxyStudentConfig
     ) -> TrainResult:
         if corpus.is_empty():
-            # Nothing to train on (e.g. every source failed to fetch); report the
-            # same infinite-loss sentinel the sandbox backend uses so perf is 0.
             return TrainResult(
                 loss=float("inf"),
                 accuracy=0.0,
@@ -145,16 +110,10 @@ class HeuristicProxyTrainer:
                 backend="heuristic",
             )
         tokens = corpus.total_tokens
-        # ``effective_train_tokens`` folds in ``train_token_budget`` (steps derived
-        # so scheduled presentations under batch_stage_muls meet the budget when
-        # set), so a larger budget raises the data the schedule would consume;
-        # ``tokens_trained`` is still capped at the corpus's tokens, so the
-        # heuristic never bills for data it does not have and stays cheap.
+        # Caps on effective_train_tokens (includes train_token_budget).
         target_tokens = max(config.effective_train_tokens, 1)
         tokens_trained = min(tokens, target_tokens)
 
-        # Data-scale term: more (effective) tokens -> lower loss, with diminishing
-        # returns. Cleanliness and diversity nudge it further down.
         scale = math.log1p(tokens_trained) / math.log1p(target_tokens)
         cleanliness = _avg_cleanliness(corpus)
         diversity = _source_diversity(corpus)
@@ -173,8 +132,6 @@ class HeuristicProxyTrainer:
 
 
 def _avg_cleanliness(corpus: CuratedCorpus) -> float:
-    # Streams from disk (`iter_documents()`) rather than materializing the full
-    # corpus text, accumulating just a running sum/count of the per-doc ratio.
     total_ratio = 0.0
     count = 0
     for doc in corpus.iter_documents():
@@ -198,12 +155,9 @@ def _source_diversity(corpus: CuratedCorpus) -> float:
     return entropy / math.log(len(non_empty))
 
 
-TRAIN_GPT_PATH = Path(__file__).resolve().parent.parent / "gpu" / "train_gpt.py"
-
-
 def _nanogpt_train_script() -> str:
     """Return the single-file trainer copied into the sandbox workspace."""
-    return TRAIN_GPT_PATH.read_text(encoding="utf-8")
+    return TRAIN_GPT_SOURCE
 
 
 def __getattr__(name: str) -> Any:
@@ -213,12 +167,7 @@ def __getattr__(name: str) -> Any:
 
 
 class RuntimeProxyTrainer:
-    """Train through the live v1 runtime selected by the harness config.
-
-    Docker and Modal share one write/run/read implementation. Docker-only
-    cgroup and daemon inspection is an optional diagnostic layer around that
-    common launch path.
-    """
+    """Train through the live v1 runtime selected by the harness config."""
 
     STREAM_TAIL = 8000
     TRACEBACK_MARKER = "Traceback (most recent call last)"
@@ -252,9 +201,6 @@ class RuntimeProxyTrainer:
             if self._max_corpus_chars is not None
             else config.effective_max_corpus_chars
         )
-        # Joining the on-disk corpus is a blocking filesystem pass. Yield here
-        # so Decon can begin its independent read while this input is prepared,
-        # and drain the worker before a cancelled rollout can clean up the files.
         try:
             text = await run_blocking_drained(corpus.joined_text, cap)
         except BaseException:
@@ -355,7 +301,6 @@ class RuntimeProxyTrainer:
                 f"proxy-student training exited with code {result.exit_code}",
                 stderr_tail=self._training_diagnostic(result.stdout, stderr),
             )
-        # The runtime's own result shape, rebuilt with the merged stderr.
         return vf.ProgramResult(
             exit_code=result.exit_code,
             stdout=result.stdout or "",
@@ -457,13 +402,7 @@ class RuntimeProxyTrainer:
 
     @staticmethod
     async def _stop_cancel_safe(runtime: vf.Runtime) -> None:
-        """Drain runtime teardown to completion; cancellation wins, errors log.
-
-        ``run_shielded`` supplies the framework-native drain semantics: teardown
-        always finishes, a caller cancellation re-raises afterwards (with any
-        teardown error chained beneath it), and a plain teardown failure is
-        logged rather than masking the exception that triggered the stop.
-        """
+        """Drain runtime teardown to completion; cancellation wins, errors log."""
         try:
             await run_shielded(runtime.stop())
         except asyncio.CancelledError:

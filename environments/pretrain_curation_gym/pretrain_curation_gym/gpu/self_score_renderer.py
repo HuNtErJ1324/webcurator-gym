@@ -1,21 +1,4 @@
-"""Render the leakage-safe development self-scoring script for a rollout.
-
-The rendered script samples candidate training sources named in the agent's
-draft manifest. Its implementation lives in ``self_score_runtime.py`` — a real,
-lint-checked, directly importable module — and rendering substitutes that
-module's scoring-constant assignments with the task's configured values, so
-the shipped file stays standalone (stdlib-only) with everything baked in.
-
-The configured final-validation repository is represented only by a SHA-256
-digest and rejected before any network request; the script contains no
-validation filename, tokens, decoded leakage reference, or final-scoring
-implementation.
-
-When ``use_real_trainer`` is enabled, setup also writes ``self_score_train.py``,
-which runs the same proxy-student training recipe as production scoring (minus
-the held-out validation shard). The dev script scores corpus-split cross-entropy
-plus benchmark decon leakage — the same two reward terms as final scoring.
-"""
+"""Render the leakage-safe development self-scoring script for a rollout."""
 
 from __future__ import annotations
 
@@ -28,35 +11,44 @@ from ..utils.trainer import _nanogpt_train_script
 
 SELF_SCORE_FILENAME = "self_score.py"
 SELF_SCORE_TRAIN_FILENAME = "self_score_train.py"
-# One JSON line per completed self_score run, appended by the rendered script in
-# the runtime workspace; ingested by `CuratorTask.finalize` for iteration metrics.
 SELF_SCORE_HISTORY_FILENAME = ".self_score_history.jsonl"
 SELF_SCORE_TRAIN_TIMEOUT_SECONDS = 900
 
 _RUNTIME_PATH = Path(__file__).resolve().with_name("self_score_runtime.py")
+_SHARED_PATH = Path(__file__).resolve().with_name("scoring_shared.py")
+_SHARED_IMPORT = """from .scoring_shared import (
+    CHARS_PER_TOKEN,
+    apply_filters,
+    build_decon_detect_command,
+    estimate_tokens,
+    weighted_token_target,
+)
+"""
+_RUNTIME_SOURCE = _RUNTIME_PATH.read_text(encoding="utf-8")
+_SHARED_SOURCE = _SHARED_PATH.read_text(encoding="utf-8")
 
 
 def _runtime_source() -> str:
-    """The self-score implementation, read verbatim from its module file."""
-    return _RUNTIME_PATH.read_text(encoding="utf-8")
+    """Build standalone source from the cached runtime and shared helpers."""
+    source, count = re.subn(
+        re.escape(_SHARED_IMPORT),
+        lambda _: _SHARED_SOURCE,
+        _RUNTIME_SOURCE,
+        count=1,
+    )
+    if count != 1:
+        raise RuntimeError("self-score shared-helper import not found")
+    return source
 
 
 def __getattr__(name: str) -> str:
-    # Historical alias for the template text; the runtime module now IS the
-    # template, so expose its source under the tested name without keeping a
-    # second copy in memory at import time.
     if name == "_SCRIPT":
         return _runtime_source()
     raise AttributeError(name)
 
 
 def _substitute_constants(source: str, values: dict[str, object]) -> str:
-    """Replace each module-level ``NAME = <default>`` with the configured value.
-
-    Every constant must match exactly once, so a renamed or removed runtime
-    constant fails loudly at render time instead of silently shipping a
-    default.
-    """
+    """Replace each module-level ``NAME = <default>`` with the configured value."""
     for name, value in values.items():
         pattern = re.compile(rf"^{name} = .*$", re.MULTILINE)
         replacement = f"{name} = {value!r}"
@@ -72,8 +64,8 @@ def render_self_score_script(
     config: CuratorConfig,
     *,
     hf_token_env: str = "HF_TOKEN",
-    decon_binary: str = "decon",
-    decon_evals_dir: str | None = None,
+    runtime_decon_binary: str = "decon/bin/decon",
+    runtime_decon_evals_dir: str = "decon/bundled-evals",
     decon_threshold: float = 0.8,
 ) -> bytes:
     """Return a configured self-score script without exposing held-out data."""
@@ -83,8 +75,6 @@ def render_self_score_script(
         DEFAULT_DECON_NGRAM_SIZE,
         DEFAULT_DECON_TOKENIZER,
         OLMO3_DETECT_ARGS,
-        resolve_decon_binary,
-        resolve_decon_evals_dir,
     )
 
     values: dict[str, object] = {
@@ -102,8 +92,8 @@ def render_self_score_script(
             config.validation_set.dataset_id.encode()
         ).hexdigest(),
         "HF_TOKEN_ENV": hf_token_env,
-        "DECON_BINARY": resolve_decon_binary(decon_binary),
-        "DECON_EVALS_DIR": resolve_decon_evals_dir(decon_evals_dir),
+        "DECON_BINARY": runtime_decon_binary,
+        "DECON_EVALS_DIR": runtime_decon_evals_dir,
         "DECON_THRESHOLD": decon_threshold,
         "DECON_TOKENIZER": DEFAULT_DECON_TOKENIZER,
         "DECON_NGRAM_SIZE": DEFAULT_DECON_NGRAM_SIZE,
@@ -117,14 +107,7 @@ def render_self_score_script(
 def render_self_score_train_script() -> bytes:
     """Return the workspace-local proxy-student trainer used by ``self_score.py``."""
     body = _nanogpt_train_script()
-    # Point the trainer at the directory passed as argv[1] instead of the baked
-    # ``/workspace``. This cannot route through ``_substitute_constants``: that
-    # helper emits ``repr(value)`` for constants, whereas the replacement here is
-    # a bare name reference rather than a literal. The raise-on-miss contract is
-    # the same, and is the point — ``train_perf`` hands the trainer a private
-    # temp directory, while the workspace root holds the identically-named
-    # ``config.json`` / ``corpus.txt`` that final scoring writes. A silently
-    # unsubstituted constant would send the trainer to those instead.
+    # Train against argv[1] workspace, not baked /workspace.
     body, substitutions = re.subn(
         r"^TRAIN_WORKDIR = .*$",
         lambda _: "TRAIN_WORKDIR = WORKDIR",
@@ -137,7 +120,6 @@ def render_self_score_train_script() -> bytes:
             "train_gpt constant 'TRAIN_WORKDIR' not found for substitution"
         )
     wrapper = (
-        "#!/usr/bin/env python3\n"
         '"""Workspace-local proxy-student trainer for self_score.py."""\n'
         "import os\n"
         "import sys\n\n"

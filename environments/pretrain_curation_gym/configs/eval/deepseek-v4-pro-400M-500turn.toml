@@ -1,0 +1,94 @@
+# deepseek-v4-pro / 400M tokens / 500 turns (Docker GPU).
+model = "deepseek/deepseek-v4-pro"
+num_tasks = 1
+num_rollouts = 1
+max_concurrent = 1
+max_turns = 500
+verbose = true
+rich = true
+
+[sampling]
+temperature = 0.6
+top_p = 0.9
+
+[retries.rollout]
+# Retry empty / decon-failure rollouts (paired with error_on_* below).
+max_retries = 1
+include = ["EmptyRolloutError", "DeconUnavailableError"]
+
+[taskset]
+id = "pretrain-curation-gym"
+
+[taskset.task]
+max_turns = 500
+hf_token_env = "HF_TOKEN"
+manifest_filename = "manifest.json"
+screen_val_set = true
+error_on_empty_rollout = true
+error_on_decon_failure = true
+
+[taskset.task.curator]
+cutoff_date = "2024-12-31"
+token_budget = 400000000
+candidate_limit = 64
+allow_local_sources = true
+max_local_source_bytes = 134217728
+alpha_perf = 1.0
+lambda_leakage = 1.0
+max_concurrent_fetches = 8
+max_concurrent_training = 1
+fetch_timeout_seconds = 120.0
+fetch_timeout_per_doc_seconds = 0.02
+fetch_max_attempts = 5
+use_real_trainer = true
+
+[taskset.task.curator.proxy_student.run]
+batch_size = 16
+train_microbatch_size = 32
+val_logit_chunk_tokens = 1024
+train_token_budget = 400000000
+
+# A100-80GB portable features (microbatch 32 ~45GB peak).
+[taskset.task.curator.proxy_student.features]
+bigram_hash_embed = true
+smear_embed = true
+partial_key_offset = true
+paired_head = true
+mudd_pairs = 2
+xsa_enabled = true
+xsa_pairs = 6
+single_act_last_k = 2
+exp_residual_decay = 0.995
+multi_token_pred = 2
+grad_accum_embed_head_steps = 2
+seq_len_schedule = true
+cautious_wd = true
+polar_express = true
+
+# wd_ref_steps vs seq-schedule step count (400M not fully calibrated).
+[taskset.task.curator.proxy_student.optimizer]
+wd_ref_steps = 1390
+
+[taskset.task.curator.proxy_student.sandbox]
+max_corpus_chars = 1600000000
+timeout_minutes = 720
+upload_timeout_seconds = 600.0
+
+[harness]
+id = "codex"
+forward_env = ["HF_TOKEN", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]
+
+[harness.env]
+PATH = "/workspace/.agents/bin:/opt/conda/bin:/usr/local/bin:/usr/bin:/bin"
+
+[timeout]
+scoring = 45660.0
+
+[harness.runtime]
+type = "docker"
+image = "ghcr.io/hunterj1324/webcurator-runtime:0.1.0"
+workdir = "/workspace"
+gpu = "1"
+cpu = 8.0
+memory = 96.0
+disk = 60.0

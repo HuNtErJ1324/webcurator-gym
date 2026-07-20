@@ -1,28 +1,4 @@
-"""Held-out validation token stream for the downstream cross-entropy signal.
-
-`Perf(M)` (the reward's downstream-loss term) is meant to be the cross-entropy a
-fixed proxy-student — trained on the curated corpus — achieves on a *fixed,
-held-out* token stream. This module owns that held-out set.
-
-The default is the **NanoGPT speedrun** (``KellerJordan/modded-nanogpt``)
-validation set: the FineWeb ``sample-10BT`` subset, GPT-2-BPE-tokenized, published
-as ``kjj0/fineweb10B-gpt2`` (the ``fineweb_val_*.bin`` shard), scored as
-cross-entropy in nats/token over the FIRST ``val_tokens`` tokens
-(``val_tokens = 10_485_760`` in modded-nanogpt's ``train_gpt.py``).
-
-The ``.bin`` format mirrors modded-nanogpt's ``_load_data_shard``: a 256-int32
-header (``header[0]`` magic ``20240520``, ``header[1]`` version ``1``,
-``header[2]`` token count), followed by ``num_tokens`` little-endian ``uint16``
-GPT-2 token ids.
-
-Loading goes through the SAME robustness machinery as Hub document fetches in
-``hf_access`` — off-event-loop work, a per-attempt timeout, bounded retry/backoff,
-a loop-local concurrency semaphore, and typed ``DatasetAccessError`` — plus a
-process-level deterministic cache (keyed by ``(dataset_id, filename, val_tokens)``)
-with single-flight, so the (large) shard is downloaded and parsed exactly once and
-a fetch failure degrades to a typed error the caller turns into a sentinel rather
-than crashing.
-"""
+"""Held-out validation token stream for the downstream cross-entropy signal."""
 
 from __future__ import annotations
 
@@ -34,42 +10,30 @@ from typing import Callable
 import numpy as np
 from pydantic import BaseModel, Field
 
-from .async_utils import LoopLocalLocks
+from .async_utils import LoopLocalLocks, hf_fetch_semaphore
 from .hf_access import (
     DatasetAccessError,
     RetryPolicy,
-    hf_fetch_semaphore,
     run_blocking_with_retry,
 )
 from ..gpu.train_gpt import plan_val_windows
 
-# --- NanoGPT speedrun validation-set spec (verified against modded-nanogpt) ---
-# Source dataset (GPT-2-BPE-tokenized FineWeb sample-10BT) and the val shard.
 NANOGPT_VAL_DATASET_ID = "kjj0/fineweb10B-gpt2"
 NANOGPT_VAL_FILENAME = "fineweb_val_000000.bin"
 NANOGPT_VAL_REPO_TYPE = "dataset"
-# Tokenizer the shard is encoded with; the proxy-student must use the same BPE.
+# Must match proxy-student BPE.
 NANOGPT_VAL_TOKENIZER = "gpt2"
-# modded-nanogpt train_gpt.py: ``val_tokens: int = 10485760`` — the validation
-# slice is the FIRST this-many tokens of the val shard.
 NANOGPT_VAL_TOKENS = 10_485_760
 
-# modded-nanogpt .bin shard header layout (``_load_data_shard``).
 SHARD_HEADER_INTS = 256
-SHARD_HEADER_BYTES = SHARD_HEADER_INTS * 4  # 256 * int32
+SHARD_HEADER_BYTES = SHARD_HEADER_INTS * 4
 SHARD_MAGIC = 20240520
 SHARD_VERSION = 1
-_TOKEN_DTYPE = np.dtype("<u2")  # little-endian uint16 GPT-2 token ids
+_TOKEN_DTYPE = np.dtype("<u2")
 
 
 class ValidationSetConfig(BaseModel):
-    """Held-out validation set for the downstream cross-entropy (``Perf``) signal.
-
-    Defaults to the NanoGPT speedrun set: FineWeb ``sample-10BT`` GPT-2-BPE val
-    tokens (``kjj0/fineweb10B-gpt2`` / ``fineweb_val_000000.bin``), the first
-    ``val_tokens`` tokens, scored as cross-entropy in nats/token. Every field is
-    bounded so a nonsensical val-set spec fails fast at load time.
-    """
+    """Held-out validation set for the downstream cross-entropy (``Perf``) signal."""
 
     dataset_id: str = Field(default=NANOGPT_VAL_DATASET_ID, min_length=1)
     filename: str = Field(default=NANOGPT_VAL_FILENAME, min_length=1)
@@ -85,7 +49,7 @@ class HeldOutValSet:
     dataset_id: str
     filename: str
     tokenizer: str
-    tokens: np.ndarray  # 1-D uint16 GPT-2 token ids
+    tokens: np.ndarray
     n_tokens: int
 
     def to_uint16_bytes(self) -> bytes:
@@ -101,13 +65,7 @@ def parse_token_shard(
     filename: str = NANOGPT_VAL_FILENAME,
     tokenizer: str = NANOGPT_VAL_TOKENIZER,
 ) -> HeldOutValSet:
-    """Parse a modded-nanogpt ``.bin`` token shard and slice the first ``limit``.
-
-    Validates the header (magic + version), reads the declared token count, and
-    returns exactly the first ``min(limit, num_tokens)`` ``uint16`` tokens. A
-    malformed shard raises a permanent ``DatasetAccessError(kind="bad_field")`` so
-    it is surfaced (and not retried) like any other classified access failure.
-    """
+    """Parse a modded-nanogpt ``.bin`` token shard and slice the first ``limit``."""
     if limit < 1:
         raise DatasetAccessError(
             f"val_tokens must be >= 1, got {limit}",
@@ -137,8 +95,6 @@ def parse_token_shard(
     body_bytes = raw[
         SHARD_HEADER_BYTES : SHARD_HEADER_BYTES + num_tokens * _TOKEN_DTYPE.itemsize
     ]
-    # A truncated/corrupt shard can leave a dangling odd byte; np.frombuffer would
-    # raise a bare ValueError, so classify it as a typed bad_field access failure.
     if len(body_bytes) % _TOKEN_DTYPE.itemsize != 0:
         raise DatasetAccessError(
             f"{filename}: token body has {len(body_bytes)} bytes, "
@@ -165,14 +121,7 @@ def parse_token_shard(
 
 
 def mean_held_out_ce(n_tokens, block, window_loss_sum):
-    """Mean cross-entropy (nats/token) over every held-out predictable position.
-
-    ``window_loss_sum(start, length)`` returns the SUMMED token-level CE over that
-    window's ``length`` targets. Pure and torch-free for testability; it raises
-    (via ``plan_val_windows``) on an empty val set, and the denominator is the
-    actual number of scored targets (``n_tokens - 1``, always > 0 here), so a
-    zero-position eval degrades rather than reporting a bogus ``0.0``.
-    """
+    """Mean cross-entropy (nats/token) over every held-out predictable position."""
     windows = plan_val_windows(n_tokens, block)
     loss_sum = 0.0
     total = 0
@@ -182,8 +131,6 @@ def mean_held_out_ce(n_tokens, block, window_loss_sum):
     return loss_sum / total
 
 
-# Download a repo file to a local path. Injectable so the loader is testable
-# without the Hub; the live default uses ``huggingface_hub.hf_hub_download``.
 DownloadFn = Callable[[str, str, str], str]
 
 
@@ -205,14 +152,7 @@ def _default_download(
 
 
 class ValTokenLoader:
-    """Loads (and caches) the held-out validation token stream, robustly.
-
-    Mirrors ``CorpusBuilder``'s deterministic-cache + single-flight discipline and
-    reuses ``hf_access``'s off-loop/timeout/retry/semaphore/typed-error wrapper, so
-    the val set is fetched through the same paths as every other external access —
-    never around them. The val set is global (identical across rollouts), so the
-    cache lives on the loader instance rather than in per-rollout state.
-    """
+    """Loads (and caches) the held-out validation token stream, robustly."""
 
     def __init__(
         self,
@@ -228,8 +168,6 @@ class ValTokenLoader:
         self._retry = retry_policy or RetryPolicy()
         self._fetch_limit = fetch_limit
         self._cache: dict[str, HeldOutValSet] = {}
-        # Loop-local single-flight locks (one per cache key), so concurrent first
-        # loads coalesce onto a single download+parse and a single cache write.
         self._locks = LoopLocalLocks()
 
     @property
@@ -240,11 +178,7 @@ class ValTokenLoader:
         )
 
     async def load(self) -> HeldOutValSet:
-        """Return the held-out val set, fetching once. Raises ``DatasetAccessError``.
-
-        Double-checked locking against the process-level cache, so even under
-        concurrent first calls the shard is downloaded and parsed exactly once.
-        """
+        """Return the held-out val set, fetching once."""
         key = self.cache_key
         cached = self._cache.get(key)
         if cached is not None:
@@ -265,8 +199,7 @@ class ValTokenLoader:
     def _load_sync(self) -> HeldOutValSet:
         cfg = self._config
         path = self._download_fn(cfg.dataset_id, cfg.filename, cfg.repo_type)
-        # Only the header plus the first ``val_tokens`` tokens are needed, so we
-        # never materialize more of the (multi-GB) shard than the slice requires.
+        # Slice header + val_tokens only (shard is multi-GB).
         want = SHARD_HEADER_BYTES + cfg.val_tokens * _TOKEN_DTYPE.itemsize
         with open(path, "rb") as fh:
             raw = fh.read(want)

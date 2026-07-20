@@ -1,12 +1,4 @@
-"""Cutoff-filtered Hugging Face data access.
-
-The `DatasetSearchClient` Protocol keeps the environment testable with a fake
-client, while `HuggingFaceDatasetClient` provides the live Hub implementation.
-
-External access is wrapped with timeouts, bounded retry/backoff (tenacity),
-typed errors (`DatasetAccessError`), and a process-wide concurrency bound so a
-flaky or missing dataset never crashes a tool call or the reward pass.
-"""
+"""Cutoff-filtered Hugging Face data access."""
 
 from __future__ import annotations
 
@@ -31,19 +23,15 @@ from tenacity import (
     wait_exponential,
 )
 
-from .async_utils import LoopLocalSemaphore
+from ..gpu.scoring_shared import CHARS_PER_TOKEN, estimate_tokens
+from .async_utils import AdaptiveSemaphore, run_shielded
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+_DRAIN_TASKS: set[asyncio.Task[None]] = set()
 
-# Cheap chars→tokens divisor shared by every token estimate in the package
-# (document estimates here, corpus caps in models.py, decon span weighting in
-# leakage.py, and the rendered self-score config).
-CHARS_PER_TOKEN = 4
-
-# Error kinds that are deterministic facts about the request and must NOT be
-# retried (the answer will not change); everything else is treated as transient.
+# Non-retryable Hub errors; all others treated as transient.
 PERMANENT_KINDS = frozenset(
     {
         "missing",
@@ -57,11 +45,7 @@ PERMANENT_KINDS = frozenset(
 
 
 class DatasetAccessError(RuntimeError):
-    """A classified, structured failure accessing the Hugging Face Hub.
-
-    `kind` is one of: ``missing``, ``auth``, ``bad_split``, ``bad_config``,
-    ``bad_field``, ``script_dataset``, ``network``, ``timeout``, ``unknown``.
-    """
+    """A classified, structured failure accessing the Hugging Face Hub."""
 
     def __init__(
         self, message: str, *, kind: str = "unknown", dataset_id: str | None = None
@@ -79,18 +63,11 @@ class DatasetAccessError(RuntimeError):
 
 
 def classify_exception(exc: BaseException) -> str:
-    """Map an arbitrary access exception onto a stable `DatasetAccessError.kind`.
-
-    `huggingface_hub`'s typed errors (a hard dependency) are matched directly;
-    everything else falls back to name/message heuristics so `datasets`-raised
-    errors classify identically regardless of which error class raised them,
-    and so tests can simulate failures with plain exceptions.
-    """
+    """Map an arbitrary access exception onto a stable `DatasetAccessError.kind`."""
     if isinstance(exc, DatasetAccessError):
         return exc.kind
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "timeout"
-    # GatedRepoError subclasses RepositoryNotFoundError: check auth first.
     if isinstance(exc, GatedRepoError):
         return "auth"
     if isinstance(
@@ -143,11 +120,7 @@ def classify_exception(exc: BaseException) -> str:
 
 @dataclass(frozen=True)
 class FetchKey:
-    """Deterministic cache identity for a sampled document slice.
-
-    Two fetches with the same `(dataset_id, config, split, text_field, n)` MUST
-    observe identical documents (so a preview and final scoring agree).
-    """
+    """Deterministic cache identity for a sampled document slice."""
 
     dataset_id: str
     config: str | None
@@ -183,40 +156,52 @@ class RetryPolicy:
         return self.timeout + max(n, 0) * self.per_doc_seconds
 
 
-# Loop-local concurrency bound for Hub fetches (a rare, explicitly sanctioned
-# process-level handle; see LoopLocalSemaphore).
-_FETCH_SEMAPHORES = LoopLocalSemaphore()
-
-
-def hf_fetch_semaphore(limit: int) -> asyncio.Semaphore:
-    """Process-wide (loop-local) bound on concurrent Hugging Face fetches."""
-    return _FETCH_SEMAPHORES.get(limit)
-
-
 async def run_blocking_with_retry(
     fn: Callable[[], T],
     *,
     policy: RetryPolicy,
-    semaphore: asyncio.Semaphore,
+    semaphore: AdaptiveSemaphore,
     dataset_id: str | None = None,
     timeout: float | None = None,
 ) -> T:
-    """Run a blocking callable off the event loop with bound+timeout+retry.
-
-    Offloads `fn` via `asyncio.to_thread`, caps each attempt with
-    `asyncio.wait_for`, and classifies every failure into a
-    `DatasetAccessError`. tenacity owns the retry loop: permanent kinds raise
-    immediately, transient kinds retry with exponential backoff, and the last
-    classified error is raised on exhaustion.
-    """
+    """Run a blocking callable off the event loop with bound+timeout+retry."""
     attempt_timeout = policy.timeout if timeout is None else timeout
 
+    def drain_and_release(
+        worker: asyncio.Task[T], limiter: AdaptiveSemaphore
+    ) -> None:
+        async def drain() -> None:
+            try:
+                await run_shielded(worker)
+            except BaseException:
+                pass
+            finally:
+                await limiter.release()
+
+        task = asyncio.create_task(drain())
+        _DRAIN_TASKS.add(task)
+        task.add_done_callback(_DRAIN_TASKS.discard)
+
     async def attempt() -> T:
+        acquired = False
+        delegated_release = False
         try:
-            async with semaphore:
+            await semaphore.acquire()
+            acquired = True
+            worker = asyncio.create_task(asyncio.to_thread(fn))
+            try:
                 return await asyncio.wait_for(
-                    asyncio.to_thread(fn), timeout=attempt_timeout
+                    asyncio.shield(worker), timeout=attempt_timeout
                 )
+            except (asyncio.TimeoutError, TimeoutError):
+                # On timeout, drain the slot in background; return promptly.
+                delegated_release = True
+                drain_and_release(worker, semaphore)
+                raise
+            except asyncio.CancelledError:
+                delegated_release = True
+                drain_and_release(worker, semaphore)
+                raise
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise DatasetAccessError(
                 f"access to {dataset_id or 'dataset'} timed out after "
@@ -232,14 +217,15 @@ async def run_blocking_with_retry(
                 kind=classify_exception(exc),
                 dataset_id=dataset_id,
             ) from exc
+        finally:
+            if acquired and not delegated_release:
+                await semaphore.release()
 
     def transient(exc: BaseException) -> bool:
         return isinstance(exc, DatasetAccessError) and exc.kind not in PERMANENT_KINDS
 
     retryer = AsyncRetrying(
         stop=stop_after_attempt(policy.attempts),
-        # tenacity's first wait is multiplier * 2**1; halving the multiplier
-        # reproduces the historical base_delay * 2**(attempt-1) series exactly.
         wait=wait_exponential(multiplier=policy.base_delay / 2, max=policy.max_delay),
         retry=retry_if_exception(transient),
         reraise=True,
@@ -259,9 +245,9 @@ async def fetch_documents(
     key: FetchKey,
     *,
     policy: RetryPolicy,
-    semaphore: asyncio.Semaphore,
+    semaphore: AdaptiveSemaphore,
 ) -> list[str]:
-    """Fetch documents for `key` via `sample_fn`, robustly. Raises DatasetAccessError."""
+    """Fetch documents for `key` via `sample_fn`, robustly."""
 
     def _call() -> list[str]:
         return list(
@@ -381,9 +367,7 @@ class HuggingFaceDatasetClient:
                 token=self._token,
             )
         except RuntimeError as exc:
-            # ``datasets`` already detects script-backed repositories while
-            # resolving the dataset module. Avoid a separate Hub metadata
-            # request for every source while retaining actionable guidance.
+            # datasets detects script-backed repos at resolve time.
             if classify_exception(exc) == "script_dataset":
                 self._reject_script_dataset(dataset_id)
             raise
@@ -412,7 +396,6 @@ class HuggingFaceDatasetClient:
                     self._reject_script_dataset(dataset_id)
                 raise
         docs: list[str] = []
-        # Stop before requesting row n+1 from the remote iterator.
         for row in islice(stream, max(n, 0)):
             if not isinstance(row, dict):
                 continue
@@ -433,10 +416,3 @@ class HuggingFaceDatasetClient:
             if config.endswith(".en") or config.startswith("en."):
                 return config
         return configs[0]
-
-
-def estimate_tokens(text: str) -> int:
-    """Cheap, deterministic token estimate (~4 chars/token, min by whitespace)."""
-    if not text:
-        return 0
-    return max(len(text.split()), len(text) // CHARS_PER_TOKEN)

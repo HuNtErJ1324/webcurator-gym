@@ -16,35 +16,24 @@ def load_taskset(config: CuratorTasksetConfig) -> CuratorTaskset:
 
 
 def reconcile_max_turns(config: CuratorEnvConfig) -> int:
-    """Agree the enforced turn limit and the one the agent is told about.
-
-    ``EnvConfig.max_turns`` is enforced by the framework; ``task.max_turns`` is
-    what the prompt and ``turns.py`` report. They are separate fields because
-    task code cannot read the framework's limit (see ``CuratorTaskConfig``), so
-    a programmatic caller that sets only one would otherwise silently mislead
-    the agent about its budget. Setting either here is enough; setting both to
-    different values is a mistake worth failing on rather than picking a winner.
-    """
+    """Agree the enforced turn limit and the one the agent is told about."""
+    declared = config.taskset.task.max_turns
     env_set = "max_turns" in config.model_fields_set
-    task_set = "max_turns" in config.taskset.task.model_fields_set
-    if env_set and task_set and config.max_turns != config.taskset.task.max_turns:
+    task_set = declared is not None
+    if env_set and task_set and config.max_turns != declared:
         raise ValueError(
             "max_turns is set in two places and they disagree: "
             f"max_turns={config.max_turns} (enforced by the framework) vs "
-            f"taskset.task.max_turns={config.taskset.task.max_turns} (shown to "
-            "the agent). Set one, or set both to the same value."
+            f"taskset.task.max_turns={declared} (shown to the agent). "
+            "Set one, or set both to the same value."
         )
     if task_set and not env_set:
-        return config.taskset.task.max_turns
+        return declared
     return config.max_turns
 
 
 def load_environment(config: CuratorEnvConfig | None = None) -> vf.Environment:
-    """Compose the curator taskset with a stock v1 harness.
-
-    Runtime placement is owned by ``config.harness.runtime`` so discovery,
-    finalization, and real training share one rollout runtime.
-    """
+    """Compose the curator taskset with a stock v1 harness."""
     config = config or CuratorEnvConfig()
     task = config.taskset.task
     curator = task.curator
@@ -67,11 +56,6 @@ def load_environment(config: CuratorEnvConfig | None = None) -> vf.Environment:
         else:
             ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
 
-    # The workspace `hf` audit wrapper records nothing unless its directory
-    # precedes the real CLI on PATH. The runtime image puts it there (see
-    # Dockerfile.runtime), but an explicit harness PATH replaces that value
-    # wholesale, which would silently empty the audit log rather than fail. Repair
-    # such an override here, where the wrapper's location is already known.
     workdir = getattr(runtime, "workdir", None)
     if harness_env.get("PATH") and workdir:
         wrapper_dir = posixpath.join(

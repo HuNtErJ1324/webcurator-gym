@@ -9,10 +9,9 @@ from .task import CuratorTask
 from .taskdata import CuratorTaskData
 
 
-# The framework's TaskT bound is invariant over Task state/config today, even
-# though Taskset only yields it. The concrete specialization is runtime-valid.
-class CuratorTaskset(  # pyright: ignore[reportInvalidTypeArguments]
-    vf.Taskset[CuratorTask, CuratorTasksetConfig]  # pyright: ignore[reportInvalidTypeArguments]
+# TaskT is invariant; Taskset only yields it.
+class CuratorTaskset(
+    vf.Taskset[CuratorTask, CuratorTasksetConfig]
 ):
     """Load the single curation row; behavior remains on ``CuratorTask``."""
 

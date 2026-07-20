@@ -1,26 +1,4 @@
-"""The curation scoring pass.
-
-``CuratorScorer`` computes
-
-    R(M) = alpha_perf * Perf_scaled(M) - lambda_leakage*Leakage(M)
-
-where, by default,
-
-    Perf_scaled(M) = (baseline_loss - loss(M)) / (baseline_loss - target_loss)
-
-so the neutral baseline maps to 0.0, the nanoGPT speedrun target maps to 1.0,
-and worse-than-baseline training can make the performance term negative.
-
-where Leakage(M) is a token-weighted contamination scalar from the decon
-Rust n-gram detector run against PUBLIC BENCHMARK eval sets AND, optionally,
-the held-out validation set (detokenised from GPT-2-BPE token IDs back to
-text via tiktoken at scoring time only; the val set is NEVER exposed to the
-agent).
-
-Performance and leakage derive from the task's single keyed reward. The
-expensive corpus build and proxy-student training therefore happen exactly once
-per rollout without a second framework, cache, or family of metric wrappers.
-"""
+"""The curation scoring pass."""
 
 from __future__ import annotations
 
@@ -36,17 +14,11 @@ from .utils.leakage import DeconError, DeconLeakageDetector, LeakageScores
 from .utils.models import CuratorConfig, ScoringResult
 from .state import CuratorState
 from .utils.trainer import ProxyStudentTrainer, TrainResult
-from .utils.async_utils import LoopLocalSemaphore, run_blocking_drained
+from .utils.async_utils import decon_semaphore, run_blocking_drained
 from .utils.hf_access import DatasetAccessError
 from .utils.val_set import ValTokenLoader
 
 logger = logging.getLogger(__name__)
-
-# Decon and proxy training have separate loop-local gates so one of each can
-# overlap for a rollout without an eval fan-out spawning an unbounded number of
-# CPU/RAM-heavy Decon subprocesses. The shared config's heavy-scoring limit is
-# applied independently to both gates.
-_DECON_SEMAPHORES = LoopLocalSemaphore()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,28 +56,40 @@ class CuratorScorer:
             return self._empty_scoring()
 
         corpus = await self.corpus_builder.materialize(manifest, state, runtime=runtime)
-        # Both final scorers only read the materialized corpus. Start training
-        # first to preserve its historical first access to the shared val loader;
-        # Decon then runs in parallel with the GPU train/validation phase.
         train_outcome, leakage_outcome = await asyncio.gather(
             self._train(corpus, state, runtime),
             self._score_leakage(corpus, state),
             return_exceptions=True,
         )
-        # Expected branch failures are converted to their historical sentinels
-        # inside each branch. Drain both branches before propagating anything
-        # unexpected so no worker survives scoring and races state cleanup.
-        if isinstance(train_outcome, BaseException):
-            raise train_outcome
-        if isinstance(leakage_outcome, BaseException):
-            raise leakage_outcome
+        failures = [
+            outcome
+            for outcome in (train_outcome, leakage_outcome)
+            if isinstance(outcome, BaseException)
+        ]
+        cancellations = [
+            failure
+            for failure in failures
+            if isinstance(failure, asyncio.CancelledError)
+        ]
+        if cancellations:
+            others = [failure for failure in failures if failure not in cancellations]
+            if others:
+                raise cancellations[0] from BaseExceptionGroup(
+                    "scoring also failed during cancellation", others
+                )
+            raise cancellations[0]
+        if len(failures) == 2:
+            raise BaseExceptionGroup("training and leakage scoring failed", failures)
+        if failures:
+            raise failures[0]
+        assert isinstance(leakage_outcome, _LeakageResult)
+        assert isinstance(train_outcome, TrainResult)
         leakage_result = leakage_outcome
         train_result = train_outcome
 
         scores = leakage_result.scores
         return ScoringResult(
             perf=self._perf(train_result),
-            # Rounded exactly as the historical LeakageScores.as_dict surface.
             leakage_score=round(scores.leakage_score, 6),
             num_contaminated_matches=scores.num_contaminated_matches,
             decon_error=leakage_result.decon_error,
@@ -141,10 +125,8 @@ class CuratorScorer:
                 )
                 val_screen_skipped = True
 
-        # Decon owns a blocking subprocess and filesystem pass, so keep the
-        # entire detector call off the event loop while GPU work is in flight.
         try:
-            async with _DECON_SEMAPHORES.get(self.config.max_concurrent_training):
+            async with decon_semaphore(self.config.max_concurrent_training):
                 scores = await run_blocking_drained(
                     self.decon_detector.score,
                     corpus.iter_documents(),

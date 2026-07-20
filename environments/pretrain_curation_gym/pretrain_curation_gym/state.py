@@ -1,10 +1,4 @@
-"""Typed, per-rollout state for corpus curation.
-
-The state is the only mutable rollout-owned object.  Domain code talks to it
-directly; there is no parallel store/facade to keep in sync with Verifiers.
-Large document payloads live in a rollout scratch directory and only filenames
-cross the state boundary.
-"""
+"""Typed, per-rollout state for corpus curation."""
 
 from __future__ import annotations
 
@@ -59,9 +53,6 @@ class CuratorState(vf.State):
     self_score_history: list[dict[str, Any]] = Field(default_factory=list)
     hf_cli_history: list[dict[str, Any]] = Field(default_factory=list)
 
-    # Task.score runs @metric methods before @reward methods. Keep the one
-    # expensive scoring result on rollout-owned state so both v1 primitives use
-    # it without materializing/training twice.
     _scoring_result: ScoringResult | None = PrivateAttr(default=None)
     _turn_runtime: vf.Runtime | None = PrivateAttr(default=None)
 

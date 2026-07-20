@@ -1,6 +1,9 @@
 # decon (vendored)
 
 Leakage scoring invokes the [allenai/decon](https://github.com/allenai/decon) CLI as a subprocess.
+The binary is baked into `Dockerfile.runtime` for agent self-score, kept in
+this source tree for host-side scoring, and force-included into the manylinux
+wheel via `scripts/hatch_build.py` (gitignored local build hook).
 
 ## Vendored binary
 

@@ -18,6 +18,46 @@ You need `HF_TOKEN`. For real Modal training, also set `MODAL_TOKEN_ID` and
 
 Use the `eval` command above (not `prime eval run`) for this environment.
 
+### Required config
+
+The CLI builds the taskset directly from `[taskset.*]` and never calls this
+package's `load_environment` (a programmatic-only entry point), so these must be
+set in your run's TOML:
+
+```toml
+max_turns = 300                        # enforced by the framework
+
+[taskset.task]
+max_turns = 300                        # optional; what the agent is TOLD it has
+
+[harness]
+forward_env = ["HF_TOKEN"]             # or the agent's `hf` CLI is unauthenticated
+
+[harness.runtime]                      # when type = "docker"
+workdir = "/workspace"                 # must match Dockerfile.runtime's WORKDIR
+```
+
+`forward_env` is the only way `HF_TOKEN` reaches the agent's container: the
+harness passes its resolved env to the agent program, and nothing else in the
+image carries the token. Without it, host-side scoring still authenticates (it
+reads the token from the host environment), so the failure is quiet — the agent
+just can't reach gated datasets.
+
+`[taskset.task] max_turns` is a second field because task code cannot read the
+framework's limit — v1 never plumbs it to a `Task`. Leave it unset and the agent
+is told nothing about its budget; `turns.py` still reports the current turn
+(which comes from the framework), just no total or remaining. Set it and keep it
+equal to the top-level `max_turns`. If it is ever lower than what the framework
+enforces, the run logs a warning naming both values.
+
+`[harness.runtime] workdir` defaults to `/app`, but `Dockerfile.runtime` sets
+`WORKDIR /workspace` and bakes two things at absolute paths under it: the `hf`
+audit wrapper's `PATH` entry (`/workspace/.agents/bin`) and the decon binary with
+its bundled eval sets (`/workspace/decon/`). Leaving the default silently
+detaches both — the audit log stays empty and the baked assets are not where the
+agent or the rendered self-score script look for them. See
+`configs/eval/deepseek-v4-pro-400M-500turn.toml` for a complete working example.
+
 ## How it works
 
 The agent gets an open-ended prompt and a shell. It searches Hugging Face,
@@ -68,24 +108,18 @@ pretrain-curation-gym --help` for the full option list.
 
 ### Evaluation profiles
 
-`configs/` is workspace-local and git-ignored, so these profiles are **not** part
-of the published package — they are reference settings to copy, not files a
-`prime env install` provides. Ready-made configs live in `configs/eval/`:
+The shipped production profile is
+`configs/eval/deepseek-v4-pro-400M-500turn.toml` (400M-token budget, 500 turns).
+Other local eval/RL/smoke TOMLs under `configs/` stay git-ignored.
 
 | Config | Token budget | Turns |
 | --- | --- | --- |
-| `deepseek-v4-pro-10M-100turn.toml` | 10M | 100 |
-| `deepseek-v4-pro-100M-300turn.toml` | 100M | 300 |
-| `deepseek-v4-pro-100M-300turn-claude-code.toml` | 100M | 300 |
-| `deepseek-v4-pro-400M-300turn.toml` | 400M | 300 |
+| `deepseek-v4-pro-400M-500turn.toml` | 400M | 500 |
 
 ```bash
 uv run --project environments/pretrain_curation_gym \
-  eval @ environments/pretrain_curation_gym/configs/eval/deepseek-v4-pro-10M-100turn.toml
+  eval @ environments/pretrain_curation_gym/configs/eval/deepseek-v4-pro-400M-500turn.toml
 ```
-
-Hosted training profiles are in `configs/rl/`. Publish the package to
-`hunterj/pretrain-curation-gym` before launching those runs.
 
 Codex and Claude Code are opaque external harnesses: Verifiers does not receive
 their native conversation nodes. When such a harness returns an empty trace,
@@ -122,9 +156,28 @@ uv run --project environments/pretrain_curation_gym \
   ruff check environments/pretrain_curation_gym
 ```
 
-`.gitignore` keeps `**/tests/` and `**/test_*.py` local, so the suite under
-`environments/pretrain_curation_gym/tests/` stays workspace-only and is not
-part of the published package.
+The repository tracks this environment's tests and release profiles, but they
+are not included in the wheel.
+
+### Runtime image
+
+Docker and Modal profiles use the versioned runtime image referenced by the
+shipped TOML files. Build and publish it before running those profiles:
+
+```bash
+docker build \
+  -f environments/pretrain_curation_gym/Dockerfile.runtime \
+  -t ghcr.io/hunterj1324/webcurator-runtime:0.1.0 \
+  environments/pretrain_curation_gym
+docker push ghcr.io/hunterj1324/webcurator-runtime:0.1.0
+```
+
+Treat release tags as immutable. The image supplies CUDA PyTorch, the real `hf`
+CLI, the Hugging Face `datasets` library, tokenizer dependencies, and the
+vendored `decon` binary with `decon/bundled-evals`. The same tree is
+force-included into the manylinux wheel (via `scripts/hatch_build.py`) so Hub
+installs get a working host-side detector. Task setup fails early if any
+required runtime asset is missing.
 
 ### Runtime PATH
 
@@ -133,4 +186,5 @@ which populates the `hf_cli_calls` metric and `trace.info.hf_cli_history`. It
 records nothing unless that directory precedes the real CLI on `PATH`.
 `Dockerfile.runtime` sets this up for every container; `load_environment`
 re-prepends the directory when a harness config supplies its own `PATH`. A
-custom runtime image must do the same, or the audit log will be silently empty.
+custom runtime image must do the same. Setup verifies both the wrapper and the
+underlying real CLI before the rollout begins.

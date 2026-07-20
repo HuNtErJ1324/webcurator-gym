@@ -7,10 +7,12 @@ import json
 import logging
 import math
 import os
+import shlex
 from importlib import resources
 from typing import Any, Literal, cast
 
 import verifiers.v1 as vf
+from verifiers import ensure_keys
 from verifiers.v1.errors import RolloutError
 
 from .config import CuratorTaskConfig
@@ -34,7 +36,12 @@ from .gpu.turns import (
     render_turn_state,
     render_turns_script,
 )
-from .utils.leakage import DEFAULT_EVAL_SETS_DIR, DeconLeakageDetector
+from .utils.leakage import (
+    DEFAULT_EVAL_SETS_DIR,
+    DeconLeakageDetector,
+    resolve_decon_binary,
+    resolve_decon_evals_dir,
+)
 from .utils.manifest import ManifestParser, TraceManifestCandidates
 from .utils.models import (
     CuratorConfig,
@@ -57,54 +64,25 @@ from .utils.val_set import ValTokenLoader
 
 logger = logging.getLogger(__name__)
 
+_WARNED_TURN_BUDGET = False
+
 
 class EmptyRolloutError(RolloutError):
-    """A rollout produced no usable artifact — no valid workspace manifest and
-    zero self-scores — while ``error_on_empty_rollout`` was enabled.
-
-    Under an opaque agent harness (e.g. codex) the trace carries no turns,
-    messages, or token usage, so this workspace-derived signature is the only
-    reliable evidence that the agent never engaged the task. Because setup and
-    the harness came up first, it points to an infrastructure or model-endpoint
-    failure rather than a legitimate empty submission. Subclassing
-    ``RolloutError`` makes the framework capture it as
-    ``error.type='EmptyRolloutError'`` so ``[retries.rollout]
-    include=['EmptyRolloutError']`` retries the whole rollout — a transient blip
-    self-heals instead of being scored as a silent zero-reward success.
-    """
+    """Empty rollout while error_on_empty_rollout is enabled."""
 
 
 class DeconUnavailableError(RolloutError):
-    """The contamination screen could not run, while ``error_on_decon_failure``
-    was enabled.
-
-    A failed detector is not a clean corpus. Decon owns the only leakage signal,
-    so a missing binary, crash, or timeout would otherwise reduce the reward to
-    ``alpha_perf * perf - 0`` — strictly larger than the same corpus scored with
-    a working detector, and therefore an RL incentive to break the screen (the
-    exhaustive ``--sample-every-m-tokens 1`` pass is timeout-bounded, so a large
-    enough corpus can reach it). ``CuratorTask.score_manifest`` always withholds
-    the reward in that case; this error additionally lets eval profiles retry the
-    rollout via ``[retries.rollout] include=['DeconUnavailableError']`` instead
-    of banking an unscoreable sample.
-    """
+    """Decon unavailable while error_on_decon_failure is enabled."""
 
 
 class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
-    """Own setup, finalization, and one keyed scoring pass.
-
-    The stock v1 task machinery records metric and reward mappings. The heavy
-    scoring result is retained only on rollout state so those primitives share
-    one materialization/training pass.
-    """
+    """Own setup, finalization, and one keyed scoring pass."""
 
     FINALIZE_ATTEMPTS = 6
     FINALIZE_INTERVAL_SECONDS = 0.5
     HF_SKILL_PATH = ".agents/skills/hf-cli/SKILL.md"
     TRAINER_ERROR_LIMIT = 20_000
 
-    # The v1 base class stores its generic arguments at runtime but its current
-    # type hints expose the unspecialized attributes to subclasses.
     data: CuratorTaskData
     config: CuratorTaskConfig
 
@@ -189,24 +167,75 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
                 "use_real_trainer=True requires a Docker or Modal harness runtime "
                 f"(got {runtime.type!r})"
             )
+        if self.curator.use_real_trainer and runtime.type == "modal":
+            ensure_keys(["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"])
+        if runtime.type == "subprocess":
+            runtime_decon_binary = resolve_decon_binary(self.config.decon_binary)
+            runtime_decon_evals_dir = resolve_decon_evals_dir(
+                self.config.decon_evals_dir
+            )
+        else:
+            runtime_decon_binary = self.config.runtime_decon_binary
+            runtime_decon_evals_dir = self.config.runtime_decon_evals_dir
         await runtime.write(
             SELF_SCORE_FILENAME,
             render_self_score_script(
                 self.curator,
                 hf_token_env=token_env,
-                decon_binary=self.config.decon_binary,
-                decon_evals_dir=self.config.decon_evals_dir,
+                runtime_decon_binary=runtime_decon_binary,
+                runtime_decon_evals_dir=runtime_decon_evals_dir,
                 decon_threshold=self.config.decon_threshold,
             ),
         )
         skill = self.hf_skill_package_file()
-        await runtime.write(self.HF_SKILL_PATH, skill.read_bytes())
+        skill_bytes = await run_blocking_drained(skill.read_bytes)
+        await runtime.write(self.HF_SKILL_PATH, skill_bytes)
         await runtime.write(HF_CLI_WRAPPER_FILENAME, render_hf_cli_wrapper())
         chmod = await runtime.run(["chmod", "+x", HF_CLI_WRAPPER_FILENAME], {})
         if chmod.exit_code != 0:
             raise RuntimeError(
                 "failed to make the workspace hf audit wrapper executable: "
                 + chmod.stderr.strip()[-500:]
+            )
+        # Docker/Modal exec only sees env we pass here.
+        token_value = os.environ.get(token_env)
+        if not token_value:
+            raise RuntimeError(
+                f"{token_env} is set in the host process check but empty at "
+                "preflight; cannot forward it into the runtime"
+            )
+        preflight_env = {token_env: token_value}
+        preflight = await runtime.run(
+            [
+                "sh",
+                "-c",
+                (
+                    f'test -n "${{{token_env}:-}}" || '
+                    f'{{ echo "{token_env} is not forwarded to the runtime" >&2; '
+                    "exit 20; }; "
+                    f'expected="$PWD/{HF_CLI_WRAPPER_FILENAME}"; '
+                    'actual="$(command -v hf || true)"; '
+                    'test "$actual" = "$expected" || '
+                    '{ echo "workspace hf audit wrapper is not first on PATH: '
+                    'expected $expected, got ${actual:-missing}" >&2; exit 21; }; '
+                    'backend="$(PATH="${PATH#"$PWD:"}" command -v hf || true)"; '
+                    'test -n "$backend" || '
+                    '{ echo "real hf executable is missing behind the audit wrapper" '
+                    ">&2; exit 22; }; "
+                    f"test -x {shlex.quote(runtime_decon_binary)} || "
+                    '{ echo "runtime decon binary is missing or not executable" '
+                    ">&2; exit 23; }; "
+                    f"test -d {shlex.quote(runtime_decon_evals_dir)} || "
+                    '{ echo "runtime decon eval directory is missing" '
+                    ">&2; exit 24; }"
+                ),
+            ],
+            preflight_env,
+        )
+        if preflight.exit_code != 0:
+            raise RuntimeError(
+                "runtime Hugging Face preflight failed: "
+                + preflight.stderr.strip()[-500:]
             )
         state = cast(CuratorState, trace.state)
         state._turn_runtime = runtime
@@ -223,14 +252,27 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
     @vf.stop
     async def refresh_turn_state(self, trace: vf.Trace) -> bool:
         """Refresh agent-visible telemetry without enforcing a second limit."""
+        global _WARNED_TURN_BUDGET
         state = cast(CuratorState, trace.state)
+        declared = self.data.max_turns
+        if declared is not None and trace.num_turns >= declared and not _WARNED_TURN_BUDGET:
+            _WARNED_TURN_BUDGET = True
+            logger.warning(
+                "declared turn budget (%d) is lower than the framework's enforced "
+                "max_turns: the rollout is on turn %d and has not been capped. The "
+                "agent was told it had %d turns. Set [taskset.task] max_turns to "
+                "match the top-level max_turns.",
+                declared,
+                trace.num_turns + 1,
+                declared,
+            )
         if state._turn_runtime is not None:
             try:
                 await state._turn_runtime.write(
                     TURN_STATE_FILENAME,
                     render_turn_state(trace.num_turns, self.data.max_turns),
                 )
-            except Exception:  # runtime backends expose different transport errors
+            except Exception:
                 logger.debug("turn-state refresh failed", exc_info=True)
         return False
 
@@ -464,14 +506,7 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             )
 
     def accessed_validation_set(self, trace: vf.Trace, state: CuratorState) -> bool:
-        """Whether the agent named the held-out validation repository.
-
-        Codex and Claude Code return no conversation nodes, so the trace scan
-        below is empty for exactly the harnesses the eval profiles use. The
-        workspace ``hf`` audit log is the only evidence that survives an opaque
-        harness, so it is scanned too. Decon's val screen remains the scoring
-        backstop; this is the diagnostic that says the agent went looking.
-        """
+        """Whether the agent named the held-out validation repository."""
         dataset_id = self.curator.validation_set.dataset_id
         for record in state.hf_cli_history:
             if any(dataset_id in str(arg) for arg in record.get("argv") or []):
@@ -487,20 +522,14 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
         return False
 
     def _empty_rollout(self, state: CuratorState) -> bool:
-        """Whether the rollout produced nothing usable: no valid workspace
-        manifest (provenance is ``missing``) and the agent never ran the
-        self-score script. See ``EmptyRolloutError``."""
+        """True when there is no workspace manifest and no self-score."""
         return (
             state.manifest_provenance == MANIFEST_PROVENANCE_MISSING
             and state.self_score_runs == 0
         )
 
     def _decon_failed(self, state: CuratorState) -> bool:
-        """Whether the scoring pass ran but its contamination screen did not.
-
-        An empty rollout never reaches decon, so its zero-signal sentinel is not
-        a detector failure. See ``DeconUnavailableError``.
-        """
+        """Whether the scoring pass ran but its contamination screen did not."""
         scoring = state._scoring_result
         return scoring is not None and scoring.decon_error
 
@@ -569,56 +598,16 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
             "empty_rollout": float(self._empty_rollout(state)),
             "decon_error": float(scoring.decon_error),
             "val_screen_skipped": float(scoring.val_screen_skipped),
+            "trainer_error": float(bool(trainer_error)),
             "trainer_error_msg": float(bool(trainer_error)),
         }
-        first_ts = next(
-            (
-                float(record["ts"])
-                for record in state.self_score_history
-                if isinstance(record.get("ts"), (int, float))
-            ),
-            None,
-        )
-        for index, record in enumerate(state.self_score_history, start=1):
-            prefix = f"self_score_{index:03d}"
-            metrics[f"{prefix}_ok"] = float(record.get("ok") is True)
-            for field in (
-                "reward",
-                "perf_reward",
-                "leakage_penalty",
-                "perf_loss",
-                "leakage_score",
-                "sampled_documents",
-                "sampled_tokens",
-                "budget_fill_ratio",
-                "train_documents",
-                "val_documents",
-                "proxy_token_budget",
-                "proxy_weight_l1_error",
-            ):
-                value = record.get(field)
-                if (
-                    isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and math.isfinite(value)
-                ):
-                    metrics[f"{prefix}_{field}"] = float(value)
-            timestamp = record.get("ts")
-            if first_ts is not None and isinstance(timestamp, (int, float)):
-                metrics[f"{prefix}_elapsed_seconds"] = float(timestamp) - first_ts
         return metrics
 
     @vf.reward
     async def score_manifest(
         self, trace: vf.Trace, runtime: vf.Runtime | None = None
     ) -> dict[str, float]:
-        """Emit reward components from the scoring pass already used by metrics.
-
-        A failed contamination screen cannot certify a clean corpus, so it yields
-        no reward at all rather than the unscreened ``alpha_perf * perf - 0``.
-        Withholding is unconditional: scoring a corpus whose leakage is unknown
-        is never a legitimate configuration. See ``DeconUnavailableError``.
-        """
+        """Emit reward components from the scoring pass already used by metrics."""
         scoring = await self._compute_scoring(trace, runtime)
         if scoring.decon_error:
             return {"perf_reward": 0.0, "leakage_penalty": 0.0}
@@ -630,13 +619,11 @@ class CuratorTask(vf.Task[CuratorTaskData, CuratorState, CuratorTaskConfig]):
     async def score(self, trace: vf.Trace, runtime: vf.Runtime | None = None) -> None:
         state = cast(CuratorState, trace.state)
         try:
+            await self._compute_scoring(trace, runtime)
             await super().score(trace, runtime)
         finally:
-            # Scratch corpora can be large; recursive deletion must not stall
-            # unrelated rollouts sharing this event loop.
+            # Offload large scratch deletes off the event loop.
             await run_blocking_drained(state.cleanup)
-        # The reward is already withheld by score_manifest; raising here only
-        # converts an unscoreable sample into a retryable one.
         if self.config.error_on_decon_failure and self._decon_failed(state):
             raise DeconUnavailableError(
                 "the contamination screen did not run, so corpus leakage is "

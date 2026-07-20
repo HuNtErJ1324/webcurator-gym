@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from pydantic import Field, field_validator
 
 import verifiers.v1 as vf
@@ -17,45 +19,20 @@ class CuratorTaskConfig(vf.TaskConfig):
     """Knobs consumed by one curation task and its scoring lifecycle."""
 
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
-    max_turns: int = Field(default=DEFAULT_MAX_TURNS, ge=1, le=1000)
-    """Turn budget the agent is TOLD it has: rendered into the task prompt and
-    reported by the workspace ``turns.py``.
-
-    It must equal ``EnvConfig.max_turns``, which is what actually enforces the
-    limit. It cannot be derived from that field at load time: v1 never plumbs
-    ``RolloutLimits`` to task code, and the CLI builds the taskset straight from
-    ``[taskset.*]`` via ``loaders.load_taskset`` without calling
-    ``load_environment``. So this is a real, serialized field — a private
-    attribute set by ``load_environment`` reaches neither the CLI (which skips
-    that function) nor an env-server worker (which rebuilds the config from
-    ``model_dump``, and private attributes do not serialize).
-
-    ``load_environment`` reconciles the two for programmatic callers, so setting
-    either one there is enough. A TOML-driven run has no such hook: set the
-    framework's ``max_turns`` and this to the same value."""
+    max_turns: int | None = Field(default=None, ge=1, le=1000)
+    """Prompted turn budget (must match EnvConfig.max_turns when set). None = omit total."""
     hf_token_env: str = "HF_TOKEN"
     manifest_filename: str = MANIFEST_FILENAME
     decon_binary: str = DEFAULT_DECON_BINARY
     decon_evals_dir: str | None = None
-    # OLMo 3's calibrated contamination decision threshold (paper Appendix A.5;
-    # the decon package's production default). Matches below it are increasingly
-    # likely to be eval *source material* rather than eval-derived text.
+    runtime_decon_binary: str = "decon/bin/decon"
+    runtime_decon_evals_dir: str = "decon/bundled-evals"
     decon_threshold: float = 0.8
     screen_val_set: bool = True
     error_on_empty_rollout: bool = False
-    """Raise a retryable ``EmptyRolloutError`` when a rollout produced no usable
-    artifact — no valid workspace manifest and zero self-scores. Off by default
-    so RL keeps its legitimate silent zero-reward signal; smoke/eval configs
-    enable it together with ``[retries.rollout] include=['EmptyRolloutError']``
-    so a transient model-endpoint failure retries instead of being recorded as a
-    spurious zero-reward success."""
+    """If True, empty rollouts raise retryable EmptyRolloutError (off for RL zeros)."""
     error_on_decon_failure: bool = False
-    """Raise a retryable ``DeconUnavailableError`` when the contamination screen
-    could not run. Independent of the reward, which is always withheld in that
-    case — an unscreened corpus is never scoreable. Off by default so RL records
-    a zero-reward sample rather than erroring; eval configs enable it together
-    with ``[retries.rollout] include=['DeconUnavailableError']`` so a transient
-    detector failure retries instead of banking an unscoreable rollout."""
+    """If True, decon failures raise retryable DeconUnavailableError (off for RL)."""
 
     @field_validator("manifest_filename")
     @classmethod
@@ -64,14 +41,27 @@ class CuratorTaskConfig(vf.TaskConfig):
             raise ValueError("manifest_filename must be a runtime-workspace filename")
         return value
 
+    @field_validator("hf_token_env")
+    @classmethod
+    def environment_variable_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("hf_token_env must be a valid environment variable name")
+        return value
+
+    @field_validator("runtime_decon_binary", "runtime_decon_evals_dir")
+    @classmethod
+    def nonempty_runtime_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("runtime decon paths must not be empty")
+        return value
+
 
 class CuratorTasksetConfig(vf.TasksetConfig):
     """The taskset owns one typed task configuration and no duplicate knobs."""
 
     id: str = ENV_ID
-    # Plugin configs intentionally specialize the framework's mutable Pydantic
-    # field; pyright cannot express that runtime narrowing through SerializeAsAny.
-    task: CuratorTaskConfig = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+    # pyright: TaskConfig specialization via SerializeAsAny
+    task: CuratorTaskConfig = Field(
         default_factory=CuratorTaskConfig
     )
 
@@ -79,15 +69,12 @@ class CuratorTasksetConfig(vf.TasksetConfig):
 class CuratorEnvConfig(vf.EnvConfig):
     """Concrete composition config used by ``load_environment``."""
 
-    taskset: CuratorTasksetConfig = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+    taskset: CuratorTasksetConfig = Field(
         default_factory=CuratorTasksetConfig
     )
     harness: vf.HarnessConfig = Field(
         default_factory=lambda: vf.HarnessConfig(id="default")
     )
-    # The ENFORCED turn limit: EnvConfig passes it to the framework's interception
-    # session, which refuses turns past it for every harness. The agent-visible
-    # copy is CuratorTaskConfig.max_turns; load_environment reconciles them.
     max_turns: int = Field(default=DEFAULT_MAX_TURNS, ge=1, le=1000)
 
 

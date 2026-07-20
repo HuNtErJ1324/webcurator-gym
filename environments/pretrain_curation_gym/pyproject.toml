@@ -38,9 +38,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["pretrain_curation_gym"]
 
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "scripts/hatch_build.py"
+
 [tool.hatch.build.targets.wheel.force-include]
 "decon/bin/decon" = "pretrain_curation_gym/decon/bin/decon"
 "decon/bundled-evals" = "pretrain_curation_gym/decon/bundled-evals"
+"pyproject.toml" = "pretrain_curation_gym/pyproject.toml"
 
 [tool.hatch.build]
 include = [
@@ -48,6 +52,7 @@ include = [
     "pretrain_curation_gym/**/*.md",
     "decon/bin/decon",
     "decon/bundled-evals/*.jsonl.gz",
+    "scripts/hatch_build.py",
     "pyproject.toml",
 ]
 

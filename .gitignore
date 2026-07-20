@@ -48,6 +48,7 @@ secrets.env
 /environments/*/configs/
 
 # Ephemeral local eval / scratch helpers (use configs/ and prime eval run instead)
+/environments/pretrain_curation_gym/smoke-10m.toml
 /run_eval_*.py
 /scripts/
 /environments/*/scripts/
@@ -93,3 +94,11 @@ pod_scratch/
 /environments/*/tests/
 **/tests/
 **/test_*.py
+
+# Release assets for pretrain-curation-gym are intentionally versioned.
+# Only the production 400M / 500-turn DeepSeek V4 Pro eval profile is tracked;
+# other local eval/RL/smoke TOMLs under configs/ stay ignored.
+!/environments/pretrain_curation_gym/configs/
+/environments/pretrain_curation_gym/configs/**
+!/environments/pretrain_curation_gym/configs/eval/
+!/environments/pretrain_curation_gym/configs/eval/deepseek-v4-pro-400M-500turn.toml

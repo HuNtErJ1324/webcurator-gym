@@ -1,17 +1,4 @@
-#!/usr/bin/env python3
-"""Development sample scorer: corpus-split CE + benchmark decon only.
-
-This module IS the ``self_score.py`` file written into each rollout's runtime
-workspace: ``gpu/self_score_renderer.py`` substitutes the scoring-constant
-assignments below with the task's configured values and ships the result
-verbatim. It runs standalone on the container's Python with only the standard
-library, so nothing here may import the package or third-party code.
-
-The configured final-validation repository is represented only by a SHA-256
-digest and rejected before any network request; this file contains no
-validation filename, tokens, decoded leakage reference, or the final-scoring
-implementation.
-"""
+"""Development sample scorer: corpus-split CE + benchmark decon only."""
 
 import argparse
 import atexit
@@ -33,11 +20,16 @@ import urllib.request
 from pathlib import Path
 from typing import NoReturn
 
-# --- scoring constants -------------------------------------------------------
-# The defaults keep this module importable/testable; the renderer replaces each
-# assignment with the task's configured value (see self_score_renderer.py).
+from .scoring_shared import (
+    CHARS_PER_TOKEN,
+    apply_filters,
+    build_decon_detect_command,
+    estimate_tokens,
+    weighted_token_target,
+)
+
 EXPECTED_TOKEN_BUDGET = 0
-PERF_BASELINE_LOSS = 10.825839875788878  # ln(50304)
+PERF_BASELINE_LOSS = 10.825839875788878
 PERF_TARGET_LOSS = 3.28
 PERF_SCALING_EXPONENT = 2.0
 BASELINE_RELATIVE_PERF = True
@@ -51,11 +43,10 @@ HF_TOKEN_ENV = "HF_TOKEN"
 DECON_BINARY = "decon"
 DECON_EVALS_DIR = ""
 DECON_THRESHOLD = 0.8
-# Pinned to match production ``leakage.build_decon_detect_command`` / OLMo 3.
+# Match host leakage.decon / OLMo 3 defaults.
 DECON_TOKENIZER = "cl100k"
 DECON_NGRAM_SIZE = 5
 DECON_DETECT_EXTRA_ARGS = ("--sample-every-m-tokens", "1", "--question-max-consecutive-misses", "11", "--answer-ngram-size", "3", "--passage-ngram-size", "4", "--perfect-match-decay-start", "20", "--perfect-match-decay-end", "50", "--eval-min-token-length", "20", "--eval-min-unique-word-count", "4")
-CHARS_PER_TOKEN = 4
 EST_TOKENS_PER_DOC = 250
 
 DATASETS_SERVER = "https://datasets-server.huggingface.co"
@@ -226,75 +217,6 @@ def remote_docs(source, limit):
     return docs, meta
 
 
-def estimate_tokens(text):
-    return max(len(text.split()), len(text) // CHARS_PER_TOKEN)
-
-
-def apply_filters(docs, filters):
-    """Apply manifest filters with production-parity semantics.
-
-    Defaults for missing params mirror ``DocumentFilter`` exactly (e.g. a
-    ``max_chars`` filter without a value keeps everything), ratio filters use
-    the production empty-document conventions, and a filter whose params are
-    invalid is skipped — matching the production parser dropping it at
-    manifest-parse time. Guarded by the parity tests against the production
-    implementations.
-    """
-    result = list(docs)
-    for spec in filters or []:
-        if not isinstance(spec, dict):
-            continue
-        kind = spec.get("kind")
-        params = spec.get("params") or {}
-        try:
-            if kind == "min_chars":
-                threshold = int(params.get("value", 0))
-                result = [x for x in result if len(x) >= threshold]
-            elif kind == "max_chars":
-                threshold = int(params.get("value", 10**9))
-                result = [x for x in result if len(x) <= threshold]
-            elif kind == "min_tokens":
-                threshold = int(params.get("value", 0))
-                result = [x for x in result if estimate_tokens(x) >= threshold]
-            elif kind == "max_symbol_ratio":
-                threshold = float(params.get("value", 1.0))
-                result = [
-                    x for x in result
-                    if (
-                        sum(not (c.isalnum() or c.isspace()) for c in x) / len(x)
-                        if x
-                        else 1.0
-                    )
-                    <= threshold
-                ]
-            elif kind == "min_alpha_ratio":
-                threshold = float(params.get("value", 0.0))
-                result = [
-                    x for x in result
-                    if (sum(c.isalpha() for c in x) / len(x) if x else 0.0)
-                    >= threshold
-                ]
-            elif kind in ("drop_regex", "keep_regex"):
-                pattern = re.compile(str(params.get("pattern", "")))
-                result = [
-                    x for x in result
-                    if (not pattern.search(x)) == (kind == "drop_regex")
-                ]
-            elif kind == "dedup_exact":
-                seen = set()
-                kept = []
-                for x in result:
-                    key = x.strip()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    kept.append(x)
-                result = kept
-        except (TypeError, ValueError, OverflowError, re.error):
-            continue
-    return result
-
-
 def joined_corpus(train_docs, val_docs):
     """Serialize an explicit stratified corpus split for proxy training."""
     return json.dumps(
@@ -349,7 +271,7 @@ def weighted_sample(source_docs, sources, weights, token_budget):
     surplus = [[] for _ in sources]
     targets = []
     for index, (docs, source, weight) in enumerate(zip(source_docs, sources, weights)):
-        target = int(token_budget * weight / total_weight) if weight > 0 else 0
+        target = weighted_token_target(weight, total_weight, token_budget) or 0
         max_tokens = _source_cap(source, "max_tokens")
         if max_tokens is not None:
             target = min(target, max_tokens)
@@ -362,8 +284,6 @@ def weighted_sample(source_docs, sources, weights, token_budget):
 
     used = sum(estimate_tokens(doc) for docs in selected for doc in docs)
     remaining = max(0, int(token_budget) - used)
-    # Production redistributes unfilled weighted allocation to fetched surplus
-    # in manifest order without another network request.
     for index, (source, docs) in enumerate(zip(sources, surplus)):
         if remaining <= 0:
             break
@@ -412,8 +332,6 @@ def stratified_split(source_docs, sources, val_fraction):
             val_indices = set()
         source_train = [doc for index, doc in enumerate(docs) if index not in val_indices]
         source_val = [doc for index, doc in enumerate(docs) if index in val_indices]
-        # Hash-sort across sources so neither training nor validation is a
-        # manifest-order suffix while remaining reproducible across candidates.
         train.extend((source_index, doc) for doc in source_train)
         val.extend((source_index, doc) for doc in source_val)
         stats.append({
@@ -479,8 +397,7 @@ def _reduce_report(report_lines, total_tokens):
                 q_end if q_end is not None else ans_end or 0,
             )
             span_chars = max(int(end) - int(start), 1)
-            # Literal 4 (== CHARS_PER_TOKEN): the reducer must stay
-            # self-contained so tests can extract and exec it standalone.
+            # Keep literal 4 here; tests exec this reducer standalone.
             est_tokens = max(1, span_chars // 4)
 
         contribution = score * est_tokens
@@ -495,12 +412,7 @@ def _reduce_report(report_lines, total_tokens):
     return leakage, len(best_per_doc)
 
 
-# --- Progress heartbeats ----------------------------------------------------
-# A healthy run is silent for many minutes (corpus sampling, materialization,
-# decon, trainer startup). Without progress output an agent cannot tell a slow
-# run from a hang and may try to kill it -- which can take down its own harness.
-# Heartbeats go to stderr, flushed, at a bounded interval; stdout stays reserved
-# for the single machine-readable JSON result.
+# Heartbeats: long silent phases otherwise look hung.
 _START_TIME = time.monotonic()
 
 
@@ -514,7 +426,7 @@ def _heartbeat_seconds():
 
 
 def progress(phase, **fields):
-    """Emit one flushed stderr heartbeat: `[self-score] phase=... elapsed=...`."""
+    """Emit one flushed stderr heartbeat: `[self-score] phase=..."""
     parts = [
         "[self-score] phase=%s elapsed=%ds"
         % (phase, int(time.monotonic() - _START_TIME))
@@ -534,12 +446,7 @@ def _decon_timeout_seconds():
 
 
 def _communicate_with_heartbeat(proc, timeout, phase, **fields):
-    """``proc.communicate(timeout=...)`` with bounded periodic heartbeats.
-
-    Waits in heartbeat-sized slices so a long child (proxy trainer, decon) keeps
-    reporting liveness, and still raises ``TimeoutExpired`` exactly at the
-    caller's overall timeout.
-    """
+    """``proc.communicate(timeout=...)`` with bounded periodic heartbeats."""
     interval = _heartbeat_seconds()
     deadline = None if timeout is None else time.monotonic() + float(timeout)
     budget = "none" if timeout is None else "%ds" % int(timeout)
@@ -560,12 +467,7 @@ def _communicate_with_heartbeat(proc, timeout, phase, **fields):
 
 
 def _read_trainer_stderr_tail(workdir, *, max_chars=8000):
-    """Read trainer-redirected stderr before the temp workdir is deleted.
-
-    ``self_score_train.py`` redirects ``sys.stderr`` into ``WORKDIR/stderr.txt``
-    (line-buffered). Captured subprocess stderr is therefore often empty on
-    crash; surface the file tail so CUDA OOM / traceback lines survive cleanup.
-    """
+    """Read trainer-redirected stderr before the temp workdir is deleted."""
     path = os.path.join(workdir, "stderr.txt")
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -578,11 +480,6 @@ def _read_trainer_stderr_tail(workdir, *, max_chars=8000):
     return text[-max_chars:]
 
 
-# Single-flight GPU trainer lock for this evaluation container. Concurrent
-# `python self_score.py` invocations serialize here so at most one proxy trainer
-# occupies the GPU. The lock fd is passed into the trainer process group so an
-# orphaned group continues to hold the flock until it exits; the lock file also
-# records the trainer pgid for stale-group recovery after a crash.
 _TRAIN_LOCK_PATH = os.environ.get(
     "PDC_SELF_SCORE_LOCK", "/tmp/pdc_self_score_train.lock"
 )
@@ -694,21 +591,7 @@ def _pgid_alive(pgid):
 
 
 def _group_signal_guard(pgid, expected_starttime=None, allow_missing_leader=False):
-    """Return a skip reason when signalling this group would be unsafe, else None.
-
-    ``killpg`` hits every member of a group, so this fails closed. Without a
-    recorded starttime there is nothing to prove the pid is still the process we
-    recorded (after PID reuse it can name an unrelated leader -- in the eval
-    container, plausibly the harness's own session), so a missing identity is
-    never signalled. Otherwise /proc must still show the pid as its own group
-    leader (pid == pgid) with exactly the recorded starttime.
-
-    ``allow_missing_leader`` covers a group we created and still own whose leader
-    has already been reaped. A signal there can only reach surviving members of
-    the original group or raise ESRCH: a *reused* pgid requires a live process
-    with pid == pgid, and there is none (no /proc entry) -- the kernel also
-    refuses ``setsid`` for a pid that still names a live process group.
-    """
+    """Return a skip reason when signalling this group would be unsafe, else None."""
     if pgid is None:
         return "no_pgid"
     if expected_starttime is None:
@@ -762,11 +645,7 @@ def _terminate_pgid(
         return details
 
     def _guard():
-        """Re-prove ownership immediately before a signal; never killpg blind.
-
-        Called again before every ``killpg`` (not once up front) so a leader that
-        exits and has its PID reused mid-cleanup cannot inherit our signal.
-        """
+        """Re-prove ownership immediately before a signal; never killpg blind."""
         reason = _group_signal_guard(
             pgid,
             expected_starttime=expected_starttime,
@@ -791,7 +670,7 @@ def _terminate_pgid(
     if child_proc is None and not _pgid_alive(pgid):
         details["reaped"] = True
         return details
-    if _guard():  # revalidate: the checks above are not free of wall-clock time
+    if _guard():
         return details
     try:
         os.killpg(pgid, signal.SIGTERM)
@@ -815,8 +694,6 @@ def _terminate_pgid(
                 if child_done and not alive:
                     details["reaped"] = True
                     return True
-                # Leader reaped but other members remain, or leader still running:
-                # keep polling until grace expires.
                 time.sleep(0.05)
                 continue
             if not alive:
@@ -847,12 +724,7 @@ def _terminate_pgid(
 
 
 def _reap_stale_lock_holder(fh):
-    """After acquiring the exclusive lock, terminate any recorded stale trainer pgid.
-
-    The recorded pid is only signalled when it is still the live leader of its own
-    group with the recorded starttime; on any mismatch (exited, PID reused, no
-    longer a group leader) the record is cleared and nothing is signalled.
-    """
+    """After acquiring the exclusive lock, terminate any recorded stale trainer pgid."""
     stale, expected_start = _read_lock_holder(fh)
     if stale is None:
         return None
@@ -960,14 +832,7 @@ def _release_decon_lock(fh):
 
 
 def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None):
-    """SIGTERM then SIGKILL an entire session/process group and reap it.
-
-    The group was created here (``start_new_session=True``), so its leader is our
-    own child. While that child is unreaped its PID cannot be reused, so when no
-    starttime was recorded we may still read one from /proc and prove the leader
-    is the same child, in its own group. With the child already reaped and no
-    recorded identity there is nothing left to prove: the guard refuses to signal.
-    """
+    """SIGTERM then SIGKILL an entire session/process group and reap it."""
     details = {
         "pid": getattr(proc, "pid", None),
         "pgid": getattr(proc, "pid", None),
@@ -984,11 +849,9 @@ def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None
         return details
     if expected_starttime is None:
         if proc.poll() is None:
-            # Unreaped child: /proc still describes exactly this process.
             expected_starttime = _pgid_starttime(proc.pid)
         else:
-            # A reaped leader with live descendants needs its recorded identity
-            # to prove group ownership. Without one, fail closed.
+            # Keep reaped leader id while descendants still live.
             details["skipped"] = True
             details["reason"] = "no_recorded_identity"
             details["reaped"] = False
@@ -1016,19 +879,10 @@ def _terminate_process_group(proc, *, grace_seconds=5.0, expected_starttime=None
 
 
 def _cleanup_active_train_proc():
-    """Terminate active scorer subprocess groups during cancellation or exit.
-
-    The historical name remains part of the standalone script's tested helper
-    surface. It now covers both concurrent scoring branches so neither the GPU
-    trainer nor Decon can outlive an interrupted ``self_score.py`` process.
-    """
+    """Terminate active scorer subprocess groups during cancellation or exit."""
     global _ACTIVE_TRAIN_PROC, _ACTIVE_TRAIN_IDENTITY
     global _ACTIVE_DECON_PROC, _ACTIVE_DECON_IDENTITY
     global _ACTIVE_DECON_LOCK_FH, _DECON_STARTING, _ACTIVE_LOCK_FH
-    # Decon launches in a worker thread. If a signal lands after Popen created
-    # the child but before that thread publishes it below, briefly let the
-    # registration finish so cleanup cannot miss a live process group. This is
-    # bounded so a worker wedged inside Popen cannot wedge signal handling.
     registration_deadline = time.monotonic() + 1.0
     while (
         _DECON_STARTING
@@ -1157,7 +1011,6 @@ def _run_in_process_group(argv, *, timeout, lock_fh=None):
         pg_details.update(term)
         raise
     finally:
-        # Hold the flock until group cleanup is complete, then clear pgid.
         if proc.poll() is None or _pgid_alive(proc.pid):
             term = _terminate_process_group(proc, expected_starttime=starttime)
             if pg_details.get("cleanup_reason") is None:
@@ -1220,11 +1073,7 @@ def _classify_trainer_kill(
     docker_oom_killed=None,
     process_group=None,
 ):
-    """Deterministic kill classification from cgroup/Docker/stderr/timeout evidence.
-
-    Priority: timeout → cgroup/container OOM → CUDA OOM → external SIGKILL → unknown.
-    Local timeout/error/signal cleanup is never labeled external_sigkill.
-    """
+    """Deterministic kill classification from cgroup/Docker/stderr/timeout evidence."""
     pg = process_group or {}
     if timed_out or pg.get("timed_out"):
         return "timeout"
@@ -1240,7 +1089,6 @@ def _classify_trainer_kill(
     if oom_delta > 0:
         return "cgroup_oom"
     if docker_oom_killed:
-        # Docker State.OOMKilled is the container cgroup OOM killer.
         return "cgroup_oom"
 
     text = stderr or ""
@@ -1270,11 +1118,6 @@ def decon_score(docs):
     """Run decon on sampled documents, return (leakage_score, num_matches) or (None, None)."""
     global _ACTIVE_DECON_PROC, _ACTIVE_DECON_IDENTITY
     global _ACTIVE_DECON_LOCK_FH, _DECON_STARTING
-    # ``DECON_BINARY``/``DECON_EVALS_DIR`` are rendered as host absolute paths at
-    # setup time, but this script runs inside the agent's ``/workspace`` docker
-    # harness runtime where those host paths don't exist. The webcurator-runtime
-    # image bakes decon at ``<workspace>/decon`` (``COPY decon/ decon/``), so also
-    # probe the script-relative, ``/workspace`` and PATH locations before giving up.
     here = os.path.dirname(os.path.abspath(__file__))
     binary = next(
         (
@@ -1333,23 +1176,21 @@ def decon_score(docs):
         _DECON_STARTING = True
         try:
             proc = subprocess.Popen(
-                [
-                    binary, "detect",
-                    "--training-dir", tmp,
-                    "--content-key", "text",
-                    "--evals-dir", evals_dir,
-                    "--report-output-dir", report_dir,
-                    "--tokenizer", DECON_TOKENIZER,
-                    "--ngram-size", str(DECON_NGRAM_SIZE),
-                    "--contamination-score-threshold", str(DECON_THRESHOLD),
-                    *DECON_DETECT_EXTRA_ARGS,
-                ],
+                build_decon_detect_command(
+                    binary,
+                    training_dir=tmp,
+                    content_key="text",
+                    evals_dir=evals_dir,
+                    report_output_dir=report_dir,
+                    tokenizer=DECON_TOKENIZER,
+                    ngram_size=DECON_NGRAM_SIZE,
+                    threshold=DECON_THRESHOLD,
+                    extra_args=DECON_DETECT_EXTRA_ARGS,
+                ),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 start_new_session=True,
                 pass_fds=(lock_fh.fileno(),),
             )
-            # Publish the Popen object before slower identity/fsync work. The
-            # signal cleanup path waits through this tiny registration window.
             _ACTIVE_DECON_PROC = proc
             starttime = _pgid_starttime(proc.pid)
             _ACTIVE_DECON_IDENTITY = starttime
@@ -1361,8 +1202,7 @@ def decon_score(docs):
                 proc, decon_timeout, "decon_running"
             )
         except subprocess.TimeoutExpired:
-            # A slow decon must never cost the run its JSON result: kill and reap
-            # the detector, report it, and report leakage as unavailable.
+            # Timeout: kill decon; leakage unavailable, still emit JSON.
             _terminate_process_group(proc, expected_starttime=starttime)
             progress("decon_timeout", documents=len(docs), timeout="%ds" % decon_timeout)
             print(
@@ -1426,7 +1266,6 @@ def train_perf(train_docs, val_docs, *, max_steps, train_timeout):
     pg_details = None
     try:
         _install_train_signal_handlers()
-        # Serialize GPU trainers across concurrent self_score invocations.
         progress(
             "train_lock_wait",
             train_documents=len(train_docs),
@@ -1453,8 +1292,6 @@ def train_perf(train_docs, val_docs, *, max_steps, train_timeout):
         )
         events_after = _snapshot_cgroup_memory()
         if result.returncode != 0:
-            # Trainer redirects its own stderr into WORKDIR/stderr.txt (line-buffered).
-            # Read that tail BEFORE cleanup — captured process stderr is often empty.
             file_stderr = _read_trainer_stderr_tail(tmp)
             detail = file_stderr or result.stderr or result.stdout or ""
             kill_class = _classify_trainer_kill(
@@ -1548,17 +1385,8 @@ def train_perf(train_docs, val_docs, *, max_steps, train_timeout):
 
 
 def score_components(train_call, decon_call):
-    """Run proxy training and Decon concurrently, preserving result semantics.
-
-    Results are joined in their historical sequential order (training first,
-    Decon second), so exception precedence stays stable. On cancellation or an
-    unexpected worker exception, both futures are cancelled when possible and
-    every registered subprocess group is terminated before the exception is
-    re-raised. ``decon_call=None`` preserves the empty-corpus fast path.
-    """
+    """Run proxy training and Decon concurrently, preserving result semantics."""
     if decon_call is None:
-        # Preserve the historical empty-corpus behavior: train_perf performs its
-        # normal no-op checks, while Decon is not launched at all.
         return train_call(), (None, None)
 
     executor = concurrent.futures.ThreadPoolExecutor(
@@ -1580,19 +1408,11 @@ def score_components(train_call, decon_call):
         _cleanup_active_train_proc()
         raise
     finally:
-        # Worker functions have bounded subprocess timeouts, and the exception
-        # path above terminates their active children before waiting for
-        # thread teardown.
         executor.shutdown(wait=True)
 
 
 def sample_reason(source, meta, sampled_texts, kept_docs):
-    """Explain why a source yielded no usable documents, or None when it did.
-
-    Reports what was actually observed (line/row counts, the fields present in
-    the rows, whether filters removed everything) so a zero-document source is
-    actionable instead of silently scoring zero.
-    """
+    """Explain why a source yielded no usable documents, or None when it did."""
     if kept_docs:
         return None
     kind = source.get("kind", "hf")
@@ -1843,9 +1663,7 @@ def main():
         and sampled_tokens > 0
         and bool(train_docs)
         and bool(val_docs)
-        # An unmeasured leakage term is not a zero leakage term. Final scoring
-        # withholds the reward when its screen fails, so a candidate whose decon
-        # run died must not preview a leakage-free score here either.
+        # Missing leakage != 0.
         and leakage_score is not None
     )
     if ok and leakage_score is not None:
@@ -1853,10 +1671,7 @@ def main():
         leakage_penalty = -LAMBDA_LEAKAGE * leakage_score
         reward = perf_reward + leakage_penalty
     else:
-        # A candidate with a dead source was never scored as written: part of the
-        # mixture contributed nothing. Reporting a number here would be read as a
-        # score, and 0.0 would be indistinguishable from a trained candidate that
-        # genuinely scored 0.0. Only a fully sampled candidate gets a reward.
+        # Dead sources invalidate the written mixture.
         perf_reward = None
         leakage_penalty = None
         reward = None

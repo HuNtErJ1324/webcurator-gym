@@ -1,22 +1,4 @@
-"""Materialize a curated corpus from a manifest.
-
-`CorpusBuilder` turns a `Manifest` into concrete documents by sampling each
-source through the `DatasetSearchClient`, applying its filters, and honoring
-per-source sampling caps. `DocumentFilter` owns the supported filter kinds.
-
-Fetched-and-filtered document TEXT is streamed to per-rollout scratch files on
-disk as it is produced rather than accumulated in Python lists: `SourceCorpus`/
-`CuratedCorpus` hold file paths + lightweight counts (doc/token counts), not the
-text itself, so peak host memory for a rollout's corpus stays bounded to one
-transient fetch+filter pass per allowed concurrent fetch instead of growing with
-every source and document retained over the rollout's lifetime. See
-`state.CuratorState
-.scratch_dir` for the backing directory and its cleanup, and `SourceCorpus
-.documents`/`CuratedCorpus.documents` for the (materializing, test/debug-only)
-convenience accessors -- production consumers (reward scoring, the proxy-student
-trainer, the docker/modal upload) use the streaming `iter_documents()`/
-`joined_text()` instead.
-"""
+"""Materialize a curated corpus from a manifest."""
 
 from __future__ import annotations
 
@@ -33,12 +15,13 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import orjson
 import verifiers.v1 as vf
 
-from .async_utils import LoopLocalLocks, run_blocking_drained
+from ..gpu.scoring_shared import apply_filters_iter, weighted_token_target
+from .async_utils import LoopLocalLocks, hf_fetch_semaphore, run_blocking_drained
 from .hf_access import (
     DatasetAccessError,
     DatasetSearchClient,
@@ -47,7 +30,6 @@ from .hf_access import (
     estimate_tokens,
     extract_text_from_row,
     fetch_documents,
-    hf_fetch_semaphore,
 )
 from .models import FilterSpec, Manifest, Source
 from ..state import CuratorState
@@ -59,11 +41,7 @@ _LOW_BUDGET_FILL_RATIO = 0.5
 
 
 def _write_jsonl(path: Path, docs: Iterable[str]) -> tuple[int, int]:
-    """Stream `docs` to `path` (one JSON-encoded string per line).
-
-    Returns `(doc_count, token_count)`, accumulated as each doc is written so
-    the caller never needs the full text again to know these counts.
-    """
+    """Stream `docs` to `path` (one JSON-encoded string per line)."""
     doc_count = 0
     token_count = 0
     with path.open("wb") as fh:
@@ -122,12 +100,7 @@ def _iter_local_documents(
 def _materialize_local_docs(
     raw_path: Path, raw_text: str, fmt: str, text_field: str | None
 ) -> list[str]:
-    """Write a runtime-pulled file and parse it off the event loop.
-
-    The blocking write + parse of a runtime-local source is run through
-    `asyncio.to_thread` by ``fetch_local_docs`` so the async fetch path never
-    blocks on disk I/O; results are identical to an inline parse.
-    """
+    """Write a runtime-pulled file and parse it off the event loop."""
     raw_path.write_text(raw_text, encoding="utf-8")
     return list(_iter_local_documents(raw_path, fmt, text_field))
 
@@ -137,8 +110,6 @@ class SourceCorpus:
     dataset_id: str
     config: str | None
     weight: float
-    # The surviving (post-filter, post-sampling) documents, JSONL-encoded on
-    # disk; `None` when the source contributed no documents.
     path: Path | None
     doc_count: int = 0
     tokens: int = 0
@@ -148,13 +119,7 @@ class SourceCorpus:
 
     @property
     def documents(self) -> list[str]:
-        """Materializes every document into memory.
-
-        Convenience for small fixture corpora and tests; production consumers
-        (leakage scoring, the trainer, the docker/modal upload) must use
-        `iter_documents()` instead so peak memory does not scale with corpus
-        size.
-        """
+        """Materializes every document into memory."""
         return list(self.iter_documents())
 
     @classmethod
@@ -167,24 +132,7 @@ class SourceCorpus:
         *,
         dest_dir: Path | None = None,
     ) -> "SourceCorpus":
-        """Stream `docs` to a scratch file and return the resulting corpus.
-
-        The blocking disk write is the point: the async fetch/materialize
-        paths call this through `asyncio.to_thread` to keep it off the event
-        loop. `dest_dir` is normally a rollout's shared scratch directory (see
-        `CuratorState.workspace`), whose cleanup the caller owns. When
-        omitted (standalone/test construction), a private temp directory is
-        created and registered for best-effort cleanup via `weakref.finalize`
-        on the returned object.
-
-        The owned directory's creation, and the `weakref.finalize`
-        registration that guards its eventual cleanup, are BOTH inside the
-        `try`/`except` below (not just the write in between): if `mkdtemp`,
-        `_write_jsonl`, or even `weakref.finalize` itself raises before this
-        function returns, there would otherwise be nothing left to ever clean
-        the directory up -- so a raise anywhere in this block removes it
-        synchronously instead of leaking it.
-        """
+        """Stream `docs` to a scratch file and return the resulting corpus."""
         owned_dir: Path | None = None
         try:
             directory = dest_dir
@@ -237,12 +185,7 @@ class CuratedCorpus:
 
     @property
     def documents(self) -> list[str]:
-        """Materializes every document across every source into memory.
-
-        Convenience for small fixture corpora and tests; production consumers
-        must use `iter_documents()`/`joined_text()` instead (see `SourceCorpus
-        .documents`).
-        """
+        """Materializes every document across every source into memory."""
         return list(self.iter_documents())
 
     @property
@@ -253,17 +196,7 @@ class CuratedCorpus:
         return all(source.doc_count == 0 for source in self.sources)
 
     def joined_text(self, cap: int) -> str:
-        """Serialize the capped source document list for trainer upload.
-
-        The historical method name is retained for backend compatibility, but
-        the payload is tagged JSON rather than blank-line-joined prose. Keeping
-        documents as explicit list entries preserves first/blank/embedded-newline
-        boundaries and lets the tokenizer insert EOT/BOS without guessing via
-        ``text.split``. ``cap`` bounds source-document characters at whole-document
-        granularity: the longest prefix whose documents fit is serialized, and the
-        first document that would cross the cap stops the stream. Documents are
-        never truncated, so their eventual EOT prefixes cannot be lost or detached.
-        """
+        """Serialize the capped source document list for trainer upload."""
         documents: list[str] = []
         remaining = max(0, int(cap))
         for doc in self.iter_documents():
@@ -271,8 +204,6 @@ class CuratedCorpus:
                 break
             documents.append(doc)
             remaining -= len(doc)
-        # orjson output is compact and UTF-8 by default, matching the
-        # historical ensure_ascii=False + (",", ":") separators exactly.
         return orjson.dumps(
             {"format": "document-list-v1", "documents": documents}
         ).decode("utf-8")
@@ -286,14 +217,7 @@ def _iter_sampling(
     already_docs: int = 0,
     already_tokens: int = 0,
 ) -> Iterator[str]:
-    """Streaming equivalent of the old list-based `_apply_sampling`.
-
-    Applies `Sampling.max_docs` (stop after N documents) and the effective
-    token cap (`weight_target`, tightened by `Sampling.max_tokens` if set).
-    Documents that do not fit the remaining token budget are skipped so a later
-    smaller document can still be selected. The generator stops pulling from
-    upstream as soon as the document cap is hit.
-    """
+    """Streaming equivalent of the old list-based `_apply_sampling`."""
     max_docs = source.sampling.max_docs
     token_cap = weight_target
     if source.sampling.max_tokens is not None:
@@ -329,99 +253,27 @@ class DocumentFilter:
     def apply_iter(
         self, docs: Iterable[str], filters: list[FilterSpec]
     ) -> Iterator[str]:
-        stream: Iterable[str] = docs
-        for spec in filters:
-            stream = self._apply_one_iter(stream, spec)
-        return iter(stream)
-
-    def _apply_one_iter(self, docs: Iterable[str], spec: FilterSpec) -> Iterator[str]:
-        kind = spec.kind
-        params = spec.params
-        if kind == "min_chars":
-            threshold = int(cast(Any, params.get("value", 0)))
-            return (d for d in docs if len(d) >= threshold)
-        if kind == "max_chars":
-            threshold = int(cast(Any, params.get("value", 10**9)))
-            return (d for d in docs if len(d) <= threshold)
-        if kind == "min_tokens":
-            threshold = int(cast(Any, params.get("value", 0)))
-            return (d for d in docs if estimate_tokens(d) >= threshold)
-        if kind == "max_symbol_ratio":
-            threshold = float(cast(Any, params.get("value", 1.0)))
-            return (d for d in docs if _symbol_ratio(d) <= threshold)
-        if kind == "min_alpha_ratio":
-            threshold = float(cast(Any, params.get("value", 0.0)))
-            return (d for d in docs if _alpha_ratio(d) >= threshold)
-        if kind == "drop_regex":
-            pattern = re.compile(str(params.get("pattern", "")))
-            return (d for d in docs if not pattern.search(d))
-        if kind == "keep_regex":
-            pattern = re.compile(str(params.get("pattern", "")))
-            return (d for d in docs if pattern.search(d))
-        if kind == "dedup_exact":
-            return _dedup_exact_iter(docs)
-        # Unknown filter kinds are ignored rather than raising, so an agent's
-        # experimentation never hard-fails the rollout.
-        return iter(docs)
-
-
-def _symbol_ratio(text: str) -> float:
-    if not text:
-        return 1.0
-    symbols = sum(1 for c in text if not c.isalnum() and not c.isspace())
-    return symbols / len(text)
-
-
-def _alpha_ratio(text: str) -> float:
-    if not text:
-        return 0.0
-    return sum(1 for c in text if c.isalpha()) / len(text)
-
-
-def _doc_digest(text: str) -> bytes:
-    """16-byte identity digest for dedup bookkeeping (not adversarial hashing)."""
-    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
-
-
-def _dedup_exact_iter(docs: Iterable[str]) -> Iterator[str]:
-    """Streaming `dedup_exact`: a running set of fixed-size digests, not the
-    full document list (nor the full stripped text -- a `set[str]` of
-    stripped documents would itself be a second complete copy of every
-    surviving document's text), is all that is needed to detect duplicates.
-    Collision probability at BLAKE2b-128 is astronomically below any realistic
-    corpus size, so this is exact in practice, matching the previous
-    full-text-equality semantics.
-    """
-    seen: set[bytes] = set()
-    for doc in docs:
-        digest = _doc_digest(doc.strip())
-        if digest in seen:
-            continue
-        seen.add(digest)
-        yield doc
+        return apply_filters_iter(docs, filters)
 
 
 def _weight_token_target(
     source: Source, token_budget: int, total_weight: float
 ) -> int | None:
     """Return the weight-proportional token target for `source`, or None if uncapped."""
-    if total_weight <= 0:
-        return None
-    if source.weight == 0:
-        return 0
-    return int((source.weight / total_weight) * token_budget)
+    return weighted_token_target(source.weight, total_weight, token_budget)
 
 
 def _est_fetch_docs(token_target: int, cap: int | None) -> int:
-    """Estimate docs needed to reach `token_target`, conservatively at 250 tokens/doc.
-
-    When the agent sets ``sample_docs_per_source`` on the manifest, never over-fetch
-    past that cap; otherwise fetch enough to cover the weight-proportional target.
-    """
+    """Estimate docs needed to reach `token_target`, conservatively at 250 tokens/doc."""
     est = max(token_target // EST_TOKENS_PER_DOC, 1)
     if cap is None:
         return est
     return min(est, cap)
+
+
+def _doc_digest(text: str) -> bytes:
+    """16-byte identity digest for dedup bookkeeping (not adversarial hashing)."""
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
 
 
 def _iter_unsampled(
@@ -443,16 +295,7 @@ def _iter_unsampled(
 
 
 class CorpusBuilder:
-    """Builds a `CuratedCorpus` from a `Manifest` using a search client.
-
-    The async `materialize` path is the one used by the environment and reward:
-    it fetches each source's documents through a per-rollout deterministic cache
-    (so a preview and final scoring observe identical docs), offloads the
-    blocking fetch off the event loop, bounds
-    concurrency, and degrades a failed source to an empty slice (recording the
-    error in state) rather than raising. The synchronous `build` is retained for
-    direct, cache-free use (e.g. unit tests of filtering/sampling).
-    """
+    """Builds a `CuratedCorpus` from a `Manifest` using a search client."""
 
     def __init__(
         self,
@@ -466,10 +309,7 @@ class CorpusBuilder:
         self._client = client
         self._filter = document_filter or DocumentFilter()
         self._retry = retry_policy or RetryPolicy()
-        # `fetch_limit` bounds both the Hub fetch fan-out and the full
-        # fetch→filter→scratch-write pipeline. It must be a positive integer:
-        # 0 (or None/negative) would build a zero-bounded semaphore and hang
-        # the pipeline forever instead of failing, so reject it up front.
+        # fetch_limit covers Hub fan-out and filter/write pipeline.
         if not isinstance(fetch_limit, int) or isinstance(fetch_limit, bool):
             raise ValueError(
                 f"fetch_limit must be a positive int, got {fetch_limit!r} "
@@ -480,60 +320,24 @@ class CorpusBuilder:
         self._fetch_limit = fetch_limit
         self._allow_local_sources = allow_local_sources
         self._max_local_source_bytes = max_local_source_bytes
-        # Serializes the offloaded `CuratorState.cache_documents` writes so the
-        # shared `CuratorState` read-modify-write (scratch filename -> doc_cache)
-        # never runs concurrently across worker threads. This is an *asyncio*
-        # lock: it is acquired/released on the event-loop thread and is never
-        # held on a worker thread while awaiting `asyncio.to_thread`, so the
-        # event loop stays free while the disk write is offloaded.
+        # Serialize cache_documents RMW on shared CuratorState.
         self._store_lock = asyncio.Lock()
-        # Loop-local single-flight guard: concurrent fetches sharing one
-        # (rollout, source key) coalesce onto a single Hub fetch. Guards are
-        # keyed by "<rollout token>\x00<cache key>" and live off-state (see
-        # LoopLocalLocks for why they cannot live in rollout state).
-        #
-        # Offloaded writes inside these guards go through
-        # `run_blocking_drained`, which awaits the worker thread to completion
-        # even under cancellation — so a guard (this lock, the store lock, or
-        # the pipeline semaphore) is never released while a worker can still
-        # be writing, and a follower can never observe a half-written state or
-        # transiently exceed `fetch_limit`.
+        # Single-flight per (rollout, source) key.
         self._fetch_locks = LoopLocalLocks()
 
     async def fetch_source_docs(
         self, state: CuratorState, key: FetchKey
     ) -> tuple[list[str], dict[str, Any] | None]:
-        """Return `(docs, error)` for `key`, using/populating the rollout cache.
-
-        On a cache hit the stored docs are returned with no re-streaming. On a
-        miss the fetch is attempted (bounded + timed + retried); success stores
-        the docs once; failure records typed telemetry and returns an empty
-        slice with the structured error (and is *not* cached, so a later attempt
-        may still succeed).
-
-        Concurrent same-key callers (e.g. a preview racing the scoring fetch)
-        are coalesced by a per-(rollout, key) single-flight lock with the same
-        double-checked locking as ``CuratorRubric._prepared``: the cache is
-        re-checked inside the lock so the underlying fetch fires exactly once,
-        and the losers read the cached result.
-        """
+        """Return `(docs, error)` for `key`, using/populating the rollout cache."""
         cache_key = key.as_str()
-        # Cache files hold a source's full fetched docs; both the fast-path
-        # read and the re-check under the lock stay off the event loop.
         cached = await run_blocking_drained(state.cached_documents, cache_key)
         if cached is not None:
             return cached, None
-        # The single-flight lock is keyed per (rollout, fetch key). The rollout's
-        # identity is the live state object: in v1 each rollout owns one
-        # ``CuratorState`` for its lifetime, so ``id(state)`` is stable within the
-        # rollout (mirrors the v0 fallback when no trajectory id was present).
         token = str(id(state))
         lock_key = f"{token}\x00{cache_key}"
         lock = self._fetch_locks.get(lock_key)
         try:
             async with lock:
-                # Re-check under the lock: a racing caller may have already
-                # fetched and stored this key while we waited.
                 cached = await run_blocking_drained(
                     state.cached_documents, cache_key
                 )
@@ -549,13 +353,6 @@ class CorpusBuilder:
                 except DatasetAccessError as exc:
                     state.record_error(exc.kind)
                     return [], exc.as_dict()
-                # Offloaded write to the shared rollout state. `async with
-                # self._store_lock` serializes these across worker threads so the
-                # state's read-modify-write stays race-free; the lock lives on the
-                # event-loop thread and is never held on a worker thread. The
-                # drained offload holds the lock until the worker *completes*, so
-                # a cancellation mid-write cannot release the lock early and let a
-                # second write race or observe a half-written state.
                 async with self._store_lock:
                     await run_blocking_drained(
                         state.cache_documents, cache_key, docs
@@ -618,7 +415,7 @@ class CorpusBuilder:
                     return cached, None
 
                 path = source.local_path
-                assert path is not None  # validated by Source
+                assert path is not None
                 quoted_path = shlex.quote(path)
                 try:
                     probe = await runtime.run(
@@ -684,33 +481,10 @@ class CorpusBuilder:
         *,
         runtime: vf.Runtime | None = None,
     ) -> CuratedCorpus:
-        """Cache-aware async corpus build; the single materialization per rollout.
-
-        Each source's surviving (filtered + sampled) documents are streamed
-        straight to a file under the rollout's shared scratch directory (see
-        `CuratorState.workspace`) as they are produced, instead of being
-        accumulated into a Python list kept alive for the corpus's lifetime --
-        so retained memory is bounded by in-flight fetch concurrency, not by the
-        sum of every source's docs across the whole rollout.
-        """
+        """Cache-aware async corpus build; the single materialization per rollout."""
         total_weight = sum(s.weight for s in manifest.sources)
-        # The agent's manifest may request its own per-rollout fetch cap; it wins over the
-        # human-configured default when set. `n` (derived from this cap) feeds
-        # directly into `FetchKey.n` below, so two calls that land on different
-        # *effective fetch counts* get distinct cache entries; two different caps
-        # that happen to estimate the same `n` (e.g. both are well above a small
-        # weight-derived token target) correctly share one cache entry, since the
-        # underlying fetch parameters are then identical.
         cap = manifest.sample_docs_per_source
         dest_dir = state.workspace()
-        # Bound the full fetch→filter→scratch-write pipeline per source. The Hub
-        # fetch semaphore alone releases before `from_docs`; without this, the
-        # to_thread offload would let the next source fetch while the prior
-        # source's docs are still being written, stacking payloads in memory.
-        # Matching `fetch_limit` preserves concurrent fan-out when configured
-        # and keeps the fetch_limit=1 disk-streaming peak flat. The slot is held
-        # until the `from_docs` worker completes (see `_offloaded_to_completion`),
-        # so a cancellation mid-write cannot transiently release it.
         pipeline_sem = asyncio.Semaphore(self._fetch_limit)
 
         async def materialize_source(
@@ -761,11 +535,6 @@ class CorpusBuilder:
 
                 filtered = tracked_filtered()
                 sampled = _iter_sampling(filtered, source, weight_target)
-                # Persistent write, offloaded. This runs inside `async with
-                # pipeline_sem` above, and the drained offload keeps the
-                # semaphore held until the worker finishes, so a cancellation
-                # mid-write cannot transiently release the slot and let another
-                # pipeline's write overlap beyond `fetch_limit`.
                 corpus = await run_blocking_drained(
                     SourceCorpus.from_docs,
                     source.dataset_id,
@@ -786,9 +555,6 @@ class CorpusBuilder:
         )
         sources = [result[0] for result in materialized]
 
-        # Redistribute unused weighted budget to already-fetched documents that
-        # survived filtering but were not selected in the first pass. Re-reading
-        # the rollout's on-disk raw cache avoids additional Hub calls.
         if total_weight > 0:
             remaining_budget = max(
                 manifest.token_budget - sum(source.tokens for source in sources),

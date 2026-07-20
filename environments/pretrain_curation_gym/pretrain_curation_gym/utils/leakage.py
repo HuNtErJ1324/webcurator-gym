@@ -1,29 +1,4 @@
-"""Benchmark and held-out val-set contamination detection via decon.
-
-Replaces the previous exact/fuzzy/semantic detectors. Decon runs offline against
-*public benchmark eval sets* (bundled under ``decon/bundled-evals/``) AND,
-optionally, the held-out validation set (detokenised from GPT-2-BPE token IDs
-back to text via tiktoken). The val-derived eval set is built once per
-validation-set identity into a detector-owned temp directory that is reused by
-every scoring pass and removed when the detector is garbage-collected — it is
-NEVER written into ``decon/bundled-evals/``, the workspace, or any container
-image.
-
-PRODUCTION path (leakage.py): reads eval sets from the baked
-decon/bundled-evals directory combined with the cached val eval file.
-DEV path (rendered self_score script) uses the same pinned detect argv as
-production, but only against the baked benchmark eval sets — the val set is
-NEVER exposed inside the agent container.
-
-The report JSONL schema (observed from decon detect):
-  contamination_score: float [0,1] — combined score for this match
-  training_file:       str — the training JSONL filename
-  training_line:       int — 0-based line in that file
-  eval_dataset:        str — name of the matched eval set
-  question_start_idx   / question_end_idx   — char offsets of question match
-  answer_start_idx     / answer_end_idx     — char offsets of answer match
-  cluster_token_length — token length of the n-gram cluster
-"""
+"""Benchmark and held-out val-set contamination detection via decon."""
 
 from __future__ import annotations
 
@@ -43,6 +18,9 @@ from typing import TYPE_CHECKING
 
 import orjson
 
+from ..gpu.scoring_shared import (
+    build_decon_detect_command as _build_decon_detect_command,
+)
 from .hf_access import CHARS_PER_TOKEN
 
 if TYPE_CHECKING:
@@ -50,56 +28,62 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Minimum tokens to avoid division by zero.
+# Avoid div-by-zero.
 _MIN_TOKENS = 1
 
 DEFAULT_DECON_BINARY = "decon"
 
 
-def _bundled_asset(*parts: str) -> str:
-    """Locate an asset in an installed wheel or the editable source tree."""
-    utils_dir = Path(__file__).resolve().parent
-    for root in (utils_dir, utils_dir.parent, utils_dir.parent.parent):
-        candidate = root.joinpath(*parts)
+def _env_tree_decon(*parts: str) -> str | None:
+    """Locate decon assets in a source checkout (decon/, then scripts/decon)."""
+    # utils/ -> package -> environments/pretrain_curation_gym/
+    env_root = Path(__file__).resolve().parent.parent.parent
+    for base in ("decon", "scripts/decon"):
+        candidate = env_root.joinpath(base, *parts)
         if candidate.exists():
             return str(candidate)
-    return str(utils_dir.parent.joinpath(*parts))
+    return None
 
 
-DEFAULT_EVAL_SETS_DIR = _bundled_asset("decon", "bundled-evals")
-_BUNDLED_DECON_BINARY = _bundled_asset("decon", "bin", "decon")
+def _installed_decon(*parts: str) -> str | None:
+    """Locate decon assets shipped inside an installed wheel."""
+    pkg_root = Path(__file__).resolve().parent.parent
+    candidate = pkg_root.joinpath("decon", *parts)
+    return str(candidate) if candidate.exists() else None
+
+
+DEFAULT_EVAL_SETS_DIR = (
+    _env_tree_decon("bundled-evals")
+    or _installed_decon("bundled-evals")
+    or "decon/bundled-evals"
+)
+_LOCAL_DECON_BINARY = _env_tree_decon("bin", "decon") or _installed_decon("bin", "decon")
 
 
 def resolve_decon_binary(decon_binary: str = DEFAULT_DECON_BINARY) -> str:
-    """Resolve the vendored decon binary to an absolute path when possible."""
+    """Resolve decon: explicit path, checkout/wheel binary, or PATH name."""
     if (
         decon_binary
         and decon_binary != DEFAULT_DECON_BINARY
         and os.path.isfile(decon_binary)
     ):
         return os.path.abspath(decon_binary)
-    if os.path.isfile(_BUNDLED_DECON_BINARY):
-        return os.path.abspath(_BUNDLED_DECON_BINARY)
-    return decon_binary
+    if _LOCAL_DECON_BINARY and os.path.isfile(_LOCAL_DECON_BINARY):
+        return os.path.abspath(_LOCAL_DECON_BINARY)
+    found = shutil.which(decon_binary) if decon_binary else None
+    return found or decon_binary
 
 
 def resolve_decon_evals_dir(evals_dir: str | None = None) -> str:
-    """Resolve bundled benchmark eval sets to an absolute directory."""
+    """Resolve benchmark eval sets from config, checkout, or installed wheel."""
     path = evals_dir or DEFAULT_EVAL_SETS_DIR
     return os.path.abspath(path)
 
 
-# Decon eval-set constants for the cached val-set eval file.
 _VAL_EVAL_KEY = "heldout_val"
-_VAL_EVAL_CHUNK_TOKENS = 1024  # GPT-2 BPE tokens per val eval record
+_VAL_EVAL_CHUNK_TOKENS = 1024
 
-# OLMo 3 decontamination parameters (paper Appendix A.5; decon's production
-# defaults). Pinned explicitly on the detect command so a vendored-binary
-# upgrade can never silently change final-scoring semantics. The one deliberate
-# deviation is ``--sample-every-m-tokens 1``: OLMo 3 strides its sampling for
-# throughput over trillions of tokens, while our final pass scores one corpus
-# of at most a few hundred million tokens, so exhaustive sampling is
-# affordable and maximizes recall. Shared with the rendered self-score script.
+# OLMo 3 / decon production defaults (Appendix A.5).
 DEFAULT_DECON_TOKENIZER = "cl100k"
 DEFAULT_DECON_NGRAM_SIZE = 5
 OLMO3_DETECT_ARGS = (
@@ -112,7 +96,7 @@ OLMO3_DETECT_ARGS = (
     "--eval-min-token-length", "20",
     "--eval-min-unique-word-count", "4",
 )
-_DECON_TIMEOUT_SECONDS = 1800  # exhaustive stride at 400M-token corpora
+_DECON_TIMEOUT_SECONDS = 1800
 
 
 def build_decon_detect_command(
@@ -127,35 +111,21 @@ def build_decon_detect_command(
     ngram_size: int = DEFAULT_DECON_NGRAM_SIZE,
 ) -> list[str]:
     """Build the pinned ``decon detect`` argv used by final scoring and self-score."""
-    return [
+    return _build_decon_detect_command(
         binary,
-        "detect",
-        "--training-dir",
-        training_dir,
-        "--content-key",
-        content_key,
-        "--evals-dir",
-        evals_dir,
-        "--report-output-dir",
-        report_output_dir,
-        "--tokenizer",
-        tokenizer,
-        "--ngram-size",
-        str(ngram_size),
-        "--contamination-score-threshold",
-        str(threshold),
-        *OLMO3_DETECT_ARGS,
-    ]
+        training_dir=training_dir,
+        content_key=content_key,
+        evals_dir=evals_dir,
+        report_output_dir=report_output_dir,
+        tokenizer=tokenizer,
+        ngram_size=ngram_size,
+        threshold=threshold,
+        extra_args=OLMO3_DETECT_ARGS,
+    )
 
 
 class DeconError(RuntimeError):
-    """Raised when the decon detector fails (binary missing, timeout, crash).
-
-    The scorer records a diagnostic error metric AND withholds the reward:
-    awarding zero leakage here would score an unscreened corpus strictly higher
-    than the same corpus with a working detector, which is exploitable in RL.
-    See ``CuratorTask.score_manifest`` and ``DeconUnavailableError``.
-    """
+    """Raised when the decon detector fails (binary missing, timeout, crash)."""
 
 
 @dataclass
@@ -165,15 +135,7 @@ class LeakageScores:
 
 
 class DeconLeakageDetector:
-    """Runs decon via subprocess on a materialized corpus JSONL directory.
-
-    When ``screen_val_set`` is ``True`` and a ``HeldOutValSet`` is passed to
-    ``score()``, the detector points decon at a combined evals directory
-    (bundled benchmarks + detokenized held-out val set). That directory is
-    deterministic per validation-set identity, so it is built once, cached on
-    the detector, and reused by every scoring pass; it is removed when the
-    detector is garbage-collected.
-    """
+    """Runs decon via subprocess on a materialized corpus JSONL directory."""
 
     def __init__(
         self,
@@ -190,8 +152,6 @@ class DeconLeakageDetector:
         self._ngram_size = ngram_size
         self._tokenizer = tokenizer
         self._screen_val_set = screen_val_set
-        # ``score`` runs on worker threads; the caches below are shared across
-        # them, so their population is serialized.
         self._cache_lock = threading.Lock()
         self._probed_binary: str | None = None
         self._combined_dirs: dict[tuple[str, str, int], str] = {}
@@ -202,15 +162,7 @@ class DeconLeakageDetector:
         output_path: str,
         chunk_tokens: int = _VAL_EVAL_CHUNK_TOKENS,
     ) -> None:
-        """Detokenize the held-out val tokens and write decon eval JSONL records.
-
-        Each record contains one chunk of detokenized text in the ``question``
-        field (``answer`` is left empty since this is raw text, not Q&A).
-        The ``eval_key`` is ``"heldout_val"`` so decon report lines are
-        distinguishable from benchmark matches. Tokens are decoded chunk by
-        chunk so the (10M-token) stream is never materialized as one Python
-        list.
-        """
+        """Detokenize the held-out val tokens and write decon eval JSONL records."""
         import tiktoken
 
         enc = tiktoken.get_encoding("gpt2")
@@ -236,12 +188,7 @@ class DeconLeakageDetector:
                 idx += 1
 
     def _combined_evals_dir(self, val_set: HeldOutValSet) -> str:
-        """Bundled benchmarks + val eval file, built once per val identity.
-
-        Copied (no symlinks, to avoid filesystem-boundary issues) into a
-        detector-owned temp directory OUTSIDE any run's ``--training-dir`` so
-        decon's directory walk cannot ingest eval files as training input.
-        """
+        """Bundled benchmarks + val eval file, built once per val identity."""
         key = (val_set.dataset_id, val_set.filename, val_set.n_tokens)
         with self._cache_lock:
             cached = self._combined_dirs.get(key)
@@ -275,8 +222,6 @@ class DeconLeakageDetector:
                 if os.path.isfile(resolved):
                     binary = resolved
             if not os.path.isfile(binary):
-                # Not cached: a later call may find a newly-installed binary,
-                # and the caller surfaces this as a typed DeconError anyway.
                 return self._binary
             try:
                 probe = subprocess.run(
@@ -307,18 +252,7 @@ class DeconLeakageDetector:
         docs: Iterable[str],
         val_set: HeldOutValSet | None = None,
     ) -> LeakageScores:
-        """Run decon on ``docs`` against bundled benchmarks and optional val set.
-
-        Writes the document stream to a temporary JSONL file, invokes the decon
-        subprocess against the (cached) combined eval sets, parses its report,
-        and reduces to a token-weighted scalar.
-
-        Raises:
-            DeconError: if the decon binary is missing, returns a non-zero exit
-                code, times out, or any other unexpected error occurs. The caller
-                is expected to catch this and record an error-state diagnostic,
-                NOT silently treat it as a clean corpus.
-        """
+        """Run decon on ``docs`` against bundled benchmarks and optional val set."""
         total_chars = 0
         temp_dir = tempfile.mkdtemp(prefix="decon_corpus_")
         corpus_path = os.path.join(temp_dir, "corpus.jsonl")
@@ -388,19 +322,7 @@ class DeconLeakageDetector:
     def _reduce_report(
         self, report_lines: list[str], total_tokens: int
     ) -> LeakageScores:
-        """Reduce the decon report JSONL to a token-weighted leakage scalar.
-
-        Dedup rule: for each unique ``(training_file, training_line)`` pair we
-        keep the match with the highest ``contamination_score * estimated_tokens``
-        product, so one training document's tokens are not double-counted across
-        multiple eval-match records.
-
-        Token weight is estimated in order of preference:
-          1. ``cluster_token_length`` (the decon-reported token length of the
-             matched n-gram cluster) when present and > 0.
-          2. Character span derived from answer/question end-start offsets
-             divided by ``CHARS_PER_TOKEN``.
-        """
+        """Reduce the decon report JSONL to a token-weighted leakage scalar."""
         best_per_doc: dict[tuple[str, int], float] = {}
 
         for line in report_lines:
@@ -415,7 +337,6 @@ class DeconLeakageDetector:
             doc_key = (r.get("training_file", ""), r.get("training_line", 0))
             score = float(r.get("contamination_score", 0.0))
 
-            # Prefer cluster_token_length when available.
             cluster_tok = r.get("cluster_token_length")
             if cluster_tok is not None and int(cluster_tok) > 0:
                 est_tokens = int(cluster_tok)
